@@ -1,0 +1,55 @@
+// (begin core library)
+
+unpack ./std. Type Opt _=>_ _+_ _-_
+
+unpack fadeno.
+  Int list_length Tag
+  EventTypeId mk_event_type
+  DataId
+  UserId
+  Timestamp
+  Id
+  EventTypeId
+  Gear mk_gear
+  mk_query query_delta
+
+// Begin core
+
+// Events are defined by listing their "group" (fields) and body.
+EventDef =
+ {(.key = Tag | .group = Type | .body = Type)}
+
+// End core
+
+Branch = DataId {( .creator = UserId | .created_at = Timestamp )}
+Doc = Id
+
+// "Invite" user to the branch.
+/: EventTypeId
+Invite = mk_event_type
+ { .tag = .Invite
+ | .group = Branch
+ | .body = UserId
+ }
+
+// Logic
+
+/: Fun (Branch) -> Gear Int
+invites_count = \branch. mk_gear
+  { // primary input: union variant "event table", with event type Attach and group fields matching `branch`
+    .primary = { .tag = .event_table | .type = Invite | .group = branch }
+    // none secondary inputs for now
+  | .secondary = []
+    // initial cache: input query & associated counter
+  | .initial_cache = { .query = mk_query | .out = 0 }
+    // step function
+  | .step = \cache primary _secondary.
+    res = query_delta cache.query primary
+    out = (cache.out + (list_length res.delta.added)) - (list_length res.delta.removed)
+    in { .cache = { .query = res.query | .out = out } | .out = out }
+  }
+
+in
+  { .Invite = Invite
+  | .invites_count = invites_count
+  }

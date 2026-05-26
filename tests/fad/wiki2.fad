@@ -1,0 +1,122 @@
+// (begin core library)
+
+unpack ./std. Type Opt _=>_ _+_ unit loop_iter iter_list opt_unwrap
+unpack fadeno.
+  Tag Bool if
+  EventTypeId mk_event_type
+  Id DataId resolve_data
+  UserId sender-to>user user_eq
+  Gear mk_gear
+  Query mk_query query_delta
+  StateGraph StateGraphOut mk_stategraph stategraph_apply stategraph_out
+    sgctx_query sgctx_update sgctx_dep_query
+  secondary_get
+  TextUpd
+    AnchorAgg mk_anchor_agg anchor_agg_apply
+    TextAgg mk_text_agg text_agg_apply text_agg_merge
+  Text
+  Timestamp
+
+// Begin core
+
+// Events are defined by listing their "group" (fields) and body.
+EventDef =
+ {(.key = Tag | .group = Type | .body = Type)}
+
+// End core
+
+Branch = DataId {( .creator = UserId | .created_at = Timestamp )}
+Doc = Id
+
+// "Invite" user to the branch.
+/: EventTypeId
+Invite = mk_event_type
+ { .tag = .Invite
+ | .group = Branch
+ | .body = UserId
+ }
+
+UpdatePayload =
+  {( .is_merge = Bool )} \./
+    if ..is_merge
+      // This is fork event
+      {( .from = Branch )}
+      // This is just a textual update
+      {( .edit = TextUpd )}
+
+// Attach edit to the document on the branch.
+/: EventTypeId
+Attach = mk_event_type
+  { .tag = .Attach
+  | .group = Doc
+  | .body = {( .branch = Branch )} \./ UpdatePayload
+  }
+
+// Logic
+
+/: Fun (Branch) -> Gear (StateGraphOut UserId Bool) // is user invited?
+invited = \branch.
+  creator = sender-to>user (resolve_data branch).creator
+  in mk_gear
+    { // primary input: union variant "event table", with event type Invite and group fields matching `branch`
+      .primary = { .tag = .event_table | .type = Invite | .group = branch }
+      // initial cache: input query & associated counter
+    | .initial_cache = { .query = mk_query | .sg = mk_stategraph }
+      // step function
+    | .step = \cache primary _secondary.
+      q_res = query_delta cache.query primary // .res : DeltaList (LocEventId Invite)
+      sg = stategraph_apply
+        cache.sg
+        (\event.
+          sender = sender-to>user event.sender
+          sender_invited = opt_unwrap (sgctx_query sender) (\_. user_eq sender creator)
+          in if sender_invited
+          (
+              sgctx_update event.body true // mark as invited
+          )
+          (unit)
+        )
+      (\never. never) // dep resolver
+      q_res.delta
+      in { .cache = { .query = q_res.query | .sg = sg } | .out = stategraph_out sg }
+    }
+
+/: Fun (Doc) -> Gear {( .anchors = AnchorAgg | .text = StateGraphOut Branch TextAgg )}
+doc_content = \doc. mk_gear
+  { .primary = { .tag = .event_table | .type = Attach | .group = doc }
+  | .initial_cache = { .query = mk_query | .anchors = mk_anchor_agg | .sg = mk_stategraph }
+  | .step = \cache primary secondary.
+    res = query_delta cache.query primary
+    anchors = loop_iter
+      (iter_list res.delta.added)
+      (\upd anchors. anchor_agg_apply anchors upd)
+      cache.anchors
+    dep_resolver = \branch. secondary_get (invited branch)
+    sg = stategraph_apply
+      cache.sg
+      (\event.
+        // Check if the author is invited on this branch
+        creator = sender-to>user (resolve_data event.body.branch).creator
+        sender = sender-to>user event.sender
+        is_invited = opt_unwrap (sgctx_dep_query event.body.branch sender) (\_. user_eq sender creator)
+        in if is_invited
+          ( curr_text_agg = opt_unwrap (sgctx_query event.body.branch) (\_. mk_text_agg)
+          in
+            sgctx_update event.body.branch
+              (if event.body.is_merge
+                (text_agg_merge curr_text_agg (opt_unwrap (sgctx_query event.body.from) (\_. mk_text_agg)))
+                (text_agg_apply curr_text_agg event.body.edit))
+          )
+          unit
+      )
+      dep_resolver
+      res.delta
+    in { .cache = { .query = res.query | .anchors = anchors | .sg = sg } | .out = { .anchors = anchors | .text = stategraph_out sg } }
+  }
+
+in
+  { .Invite = Invite
+  | .Attach = Attach
+  | .invited = invited
+  | .doc_content = doc_content
+  }

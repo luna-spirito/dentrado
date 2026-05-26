@@ -1,0 +1,3 @@
+unpack ./std. loop_iter iter_list
+in
+  loop_iter (iter_list [1, 2, 3]) (\x acc. x + acc) 0

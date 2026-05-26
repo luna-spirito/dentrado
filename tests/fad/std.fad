@@ -1,0 +1,203 @@
+// WIP standard library
+
+// Import builtins
+unpack fadeno. Type^ Int Tag List Bool Eq refl Row^ list_length list_indexl list_viewl
+  if W int_>=0 loop Never Any int_neg tag_== <=~trans list_viewl~dec W w_wrap w_unwrap
+
+/: Fun (Int) (Int) -> Int
+_+_ = fadeno.int_add
+_-_ = \a b. a + (int_neg b)
+
+// Comparison operators derived from int_>=0 function.
+/: Fun (Int) (Int) -> Bool
+_>=_ = \a b. int_>=0 (a - b)
+_>_ = \a b. a >= (b + 1)
+_<=_ = \a b. b >= a
+_<_ = \a b. b > a
+
+// Convenience aliases for universe levels
+
+Kind = Type^ 1
+/: Kind
+Type = Type^ 0
+/: Kind
+Row = Row^ 0
+
+// Polymorphic identity function
+/: Fun {A} (A) -> A
+id = \x. x
+
+// Definition of an operator. Accepts `a` as left operand and `b` as right operand, returns a record `{ .k = a | .v = b }`
+/: Fun {K} {V} (K) (V) -> {( .k = K | .v = V )}
+_=>_ = \k v. { .k = k | .v = v }
+
+// "Unit" type is implemented as an empty record
+/: Row
+Unit = {()}
+/: Unit
+unit = {}
+
+// Logical negation: `Not A` is the type of functions that derive absurdity from `A`
+/: Fun {u} (Type^ u) -> Type^ u
+Not = \A. Fun (A) -> Never
+
+// Type-level constraint: `Where b` <=> `b = true`
+/: Fun (Bool) -> Type
+Where = \x. Eq x true
+
+// Type for non-negative integer numbers, defined via refinement
+/: Type
+Int+ = Int @|>=0 : Where (. >= 0)|
+
+// Verified addition operator for non-negative numbers that erases to `_+_`
+/: Fun (Int+) (Int+) -> Int+
+_++_ = \a b. (a + b) @|<=~trans @0 @b @(a + b) b.@>=0 a.@>=0|
+
+// Verified `Int` to `Int+` that clamps negative values to 0
+/: Fun (Int) -> Int+
+int-clamp>int+ = \x.
+  if @Int+ (x >= 0)
+    (\@yes. x @|yes|)
+    (0 @|refl|)
+
+// Symmetry of equality: `a = b` <=> `b = a`
+/: Fun {a : Any} {b : Any} (Eq a b) -> Eq b a
+~sym = \@_ @_ aToB. rewrite aToB in refl
+
+// Definition of "Maybe" type via dependent row concatenation
+// Defined as "opaque" (nominative) type.
+// Operations over internal structure in structural typing sense require `rewrite Opt.@un in ...` context.
+opaque Opt = \R. {( .has = Bool )} \./ (if ..has {( .body = R )} Unit)
+
+// `Some`/`None` constructors for opaque `Opt`
+/: Fun {A} -> Opt A
+mk_none = rewrite Opt.@un in ({ .has = false } \/ {})
+/: Fun {A} (A) -> Opt A
+mk_some = \val. rewrite Opt.@un in ({ .has = true } \/ { .body = val })
+
+// Conditional constructor for `Opt`. Unconditionally fills `.has` tag field, conditionally concatenates body.
+/: Fun {A} (has : Bool) (Fun {_ : Where has} ({()}) -> A) -> Opt A
+mk_some_if = \has body. rewrite Opt.@un in ({ .has = has } \/ if has
+  (\@yes. rewrite yes in { .body = body {} })
+  (\@no. rewrite no in {}))
+
+// TODO
+/: Fun {A} (Opt A) (Fun ({()}) -> A) -> A
+opt_unwrap = \x fallback. rewrite Opt.@un in
+  if x.has
+    (\@yes. rewrite yes in x.body)
+    (\@_. fallback {})
+
+// Object properties are passed explicitly (in ML-style) as objects, we call this "traits".
+
+/: Fun (j : Int+) -> Type^ (j + 1)
+Trait^ = \u. Fun (Type^ u) -> Type^ u
+Trait = Trait^ 0
+
+// `ImplOf^ trait` is a type of any implementer of the `trait`. Analogous to Rust's `impl Trait`
+opaque ImplOf^ = \u trait. @|T: Type^ u| {( .obj = T | .impl = trait T )}
+
+// Iterator trait. `Iter ElT T` is a type of a function that, given iterator `T`, attempts to produce
+// a new element `ElT` and an updated iterator `T`.
+opaque Iter = \ElT T. Fun (T) -> Opt {( .curr = ElT | .rest = T)}
+
+// Finite iterator trait. Erases to `Iterator`, but provides maximum amount of steps from any state.
+opaque FinIter = \ElT T.
+  rewrite Opt.@un in
+  rewrite Iter.@un in
+  @|maxsize : Fun (T) -> Int+|
+    Iter ElT T
+    @|dec :
+        Fun (curr : T) {r : Where (. curr).has} ->
+        Where (rewrite r in (maxsize (. curr).body.rest < maxsize curr)) |
+
+// Bounded `Int+`, analogous to Idris2's `Fin`
+Int+< = \to. Int+ @|< : Where (. < to)|
+
+// Construct finitely iterable range from `0` until `n`
+/: Fun (to : Int+) -> ImplOf^ 0 (FinIter (Int+< to))
+iter_< = \to.
+  rewrite ImplOf^.@un in
+  @|Int+|
+  { .obj = 0 @|refl|
+  | .impl =
+    /: Iter (Int+< to) Int+
+    iter = rewrite Iter.@un in \curr. mk_some_if (curr < to) (\@yes _. rewrite yes in { .curr = curr | .rest = curr ++ 1 })
+    rewrite FinIter.@un
+    in
+      @|\curr. int-clamp>int+ (to - curr)|
+      iter
+      @|\curr @has. rewrite has rewrite <=~trans @curr @(curr + 1) @to refl refl in refl|
+  }
+
+// Iterator implementation for list
+/: Fun {u} {A : Type^ u} (l : List A) -> ImplOf^ u (FinIter A)
+iter_list = \@_ @A start.
+  rewrite ImplOf^.@un in
+  @|List A|
+  { .obj = start
+  | .impl =
+    /: Iter A (List A)
+    iter = rewrite Iter.@un in \curr. mk_some_if (list_length curr > 0)
+      (\@yes _.
+        res = list_viewl curr @yes
+        in { .curr = res.left | .rest = res.rest })
+    rewrite FinIter.@un
+    in @|list_length| iter @|\curr @has. rewrite has rewrite list_viewl~dec curr in refl|
+  }
+
+// Loop, at each iteration getting a new element from an iterator.
+/: Fun {u} {A} {O} (ImplOf^ u (FinIter A)) (Fun (A) (O) -> O) (O) -> O
+loop_iter = \@_ @A @O iter0 f final.
+  rewrite ImplOf^.@un
+  step = iter0.@_.impl
+  rewrite FinIter.@un
+  in loop @iter0.@T @step.@maxsize @O iter0.@_.obj (\iterT rec.
+    rewrite Iter.@un
+    next = step iterT
+    rewrite Opt.@un
+    in if next.has
+      (\@yes. rewrite yes in f next.body.curr (rewrite step.@dec iterT @refl in rec next.body.rest @refl))
+      final
+  )
+
+// Church encoding of functor `F`
+/: Fun (u : Int+) (Fun (Type^ u) -> Type^ u) -> Type^ (u + 1)
+Church = \u F. Fun {X : Type^ u} (Fun (F X) -> X) -> X
+
+in
+  { ._+_ = _+_
+  | ._-_ = _-_
+  | ._>=_ = _>=_
+  | ._>_ = _>_
+  | ._<=_ = _<=_
+  | ._<_ = _<_
+  | .Kind = Kind
+  | .Type = Type
+  | .Row = Row
+  | .id = id
+  | ._=>_ = _=>_
+  | .Unit = Unit
+  | .unit = unit
+  | .Not = Not
+  | .Where = Where
+  | .Int+ = Int+
+  | ._++_ = _++_
+  | .int-clamp>int+ = int-clamp>int+
+  | .~sym = ~sym
+  | .Opt = Opt
+  | .mk_none = mk_none
+  | .mk_some = mk_some
+  | .mk_some_if = mk_some_if
+  | .Trait^ = Trait^
+  | .Trait = Trait
+  | .ImplOf^ = ImplOf^
+  | .Iter = Iter
+  | .FinIter = FinIter
+  | .Int+< = Int+<
+  | .iter_< = iter_<
+  | .iter_list = iter_list
+  | .loop_iter = loop_iter
+  | .Church = Church
+  | .opt_unwrap = opt_unwrap
+  }
