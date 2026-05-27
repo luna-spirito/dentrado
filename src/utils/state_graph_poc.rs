@@ -1,7 +1,7 @@
 use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, StateGraphOut};
 use crate::core::gear::EmptyRuntime;
 use crate::core::loc_ctx::{EventContext, LocCtx, StoredEvent};
-use crate::types::{AnyLocEventId, GlobalCoreId, LocGroupId, LocSenderId, SenderPk};
+use crate::types::{AnyLocEventId, GlobalCoreId, LocGroupId, SenderPk};
 use im::OrdMap;
 use proptest::prelude::*;
 use std::collections::BTreeMap;

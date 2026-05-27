@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use kolorinko::{
     core::gear::Runtime,
     fadeno::{
@@ -10,7 +8,7 @@ use kolorinko::{
     types::*,
     utils::{
         state_graph::StateGraphOut,
-        text::{AnchorPos, TextAgg, TextUpd, ROOT_ANCHOR},
+        text::{AnchorPos, TextUpd, ROOT_ANCHOR},
     },
     wire::WireEventBody,
 };
@@ -99,22 +97,34 @@ fn make_attach_fork_event(
     }
 }
 
-fn has_non_empty_text(sg: &StateGraphOut<LocValue, LocValue>) -> bool {
-    sg.iter().any(|(_, timeline)| {
-        timeline
-            .iter()
-            .any(|(_, v)| matches!(v, LocValue::KolTextAgg(ta) if ta.clone() != TextAgg::default()))
-    })
+fn extract_doc_text(
+    output: &LocValue,
+    tags: &TagRegistry,
+    branch_did: LocDataId,
+) -> Option<String> {
+    let anchor_agg = match tags
+        .record_get(output, b"anchors")
+        .expect("missing .anchors")
+    {
+        LocValue::KolAnchorAgg(a) => a,
+        other => panic!("expected KolAnchorAgg, got {other:?}"),
+    };
+    let sg = extract_text_sg(output, tags);
+    let branch_key = LocValue::KolDataId(branch_did);
+    let timeline = sg.iter().find(|(k, _)| **k == branch_key);
+    let (_, val) = match timeline.and_then(|(_, tl)| tl.last()) {
+        Some(v) => v,
+        None => return None,
+    };
+    let text_agg = match val {
+        LocValue::KolTextAgg(ta) => ta,
+        other => panic!("expected KolTextAgg, got {other:?}"),
+    };
+    Some(text_agg.get_text(&anchor_agg))
 }
 
-fn count_branches_with_text(sg: &StateGraphOut<LocValue, LocValue>) -> usize {
-    sg.iter()
-        .filter(|(_, timeline)| {
-            timeline.iter().any(
-                |(_, v)| matches!(v, LocValue::KolTextAgg(ta) if ta.clone() != TextAgg::default()),
-            )
-        })
-        .count()
+fn count_branches(sg: &StateGraphOut<LocValue, LocValue>) -> usize {
+    sg.iter().count()
 }
 
 fn extract_text_sg(
@@ -125,23 +135,6 @@ fn extract_text_sg(
     match text_out {
         LocValue::KolStateGraphOut(sg) => sg,
         other => panic!("expected KolStateGraphOut for .text, got {other:?}"),
-    }
-}
-
-fn extract_branch_text_agg(
-    sg: &StateGraphOut<LocValue, LocValue>,
-    branch_did: LocDataId,
-) -> TextAgg {
-    let branch_key = LocValue::KolDataId(branch_did);
-    let timeline = sg
-        .iter()
-        .find(|(k, _)| **k == branch_key)
-        .map(|(_, tl)| tl)
-        .expect("branch should be in StateGraphOut");
-    let (_, val) = timeline.last().expect("timeline not empty");
-    match val {
-        LocValue::KolTextAgg(ta) => (*ta).clone(),
-        other => panic!("expected KolTextAgg, got {other:?}"),
     }
 }
 
@@ -306,39 +299,27 @@ fn retroactive_invite_cross_core_e2e() {
     assert_ne!(invited_core, doc_core, "gears must be on different cores");
 
     let output1 = tc.run_gear_on(0, doc_gear.clone());
-    let sg1 = extract_text_sg(&output1, &tags);
-    assert!(
-        !has_non_empty_text(&sg1),
-        "run 1: should have no real text (placeholder invited), but found non-empty TextAgg"
+    let text1 = extract_doc_text(&output1, &tags, b0);
+    assert_eq!(
+        text1, None,
+        "run 1: no text expected (placeholder invited, cross-core deps not yet resolved)"
     );
 
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     let output2 = tc.run_gear_on(0, doc_gear.clone());
     let sg2 = extract_text_sg(&output2, &tags);
-
-    assert!(
-        has_non_empty_text(&sg2),
-        "run 2: should have real text from Bob and Dave"
-    );
+    let text2 = extract_doc_text(&output2, &tags, b0);
     assert_eq!(
-        count_branches_with_text(&sg2),
-        1,
-        "run 2: exactly one branch should have text"
-    );
-
-    let text_agg = extract_branch_text_agg(&sg2, b0);
-    assert_ne!(
-        text_agg,
-        TextAgg::default(),
-        "B0 TextAgg should not be empty — Bob and Dave's edits should be applied"
+        text2,
+        Some("Dave says hiHello from Bob".to_string()),
+        "run 2: invited users' edits appear (RGA: higher tx_id first)"
     );
 
     let output3 = tc.run_gear_on(0, doc_gear);
-    let sg3 = extract_text_sg(&output3, &tags);
+    let text3 = extract_doc_text(&output3, &tags, b0);
     assert_eq!(
-        count_branches_with_text(&sg3),
-        1,
+        text3, text2,
         "run 3: output should be stable (no new dep changes)"
     );
 }
@@ -469,52 +450,51 @@ fn text_agg_merge_cross_core_e2e() {
 
     let output1 = tc.run_gear_on(0, doc_gear.clone());
     let sg1 = extract_text_sg(&output1, &tags);
-    assert!(
-        has_non_empty_text(&sg1),
-        "run 1: should have text from branch creators even with placeholder invited"
+    let text1_b0 = extract_doc_text(&output1, &tags, b0);
+    let text1_b1 = extract_doc_text(&output1, &tags, b1);
+    assert_eq!(
+        text1_b0,
+        Some("BBBAAA".to_string()),
+        "run 1 B0: Alice (creator) edit present, Carol's BBB merged via fork"
+    );
+    assert_eq!(
+        text1_b1,
+        Some("AAA".to_string()),
+        "run 1 B1: placeholder invited, but Carol (creator) edit visible"
     );
 
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     let output2 = tc.run_gear_on(0, doc_gear.clone());
     let sg2 = extract_text_sg(&output2, &tags);
+    assert_eq!(
+        count_branches(&sg2),
+        2,
+        "run 2: both B0 and B1 should have entries"
+    );
 
-    assert!(
-        has_non_empty_text(&sg2),
-        "run 2: should have real text from invited users"
+    let text2_b0 = extract_doc_text(&output2, &tags, b0);
+    let text2_b1 = extract_doc_text(&output2, &tags, b1);
+    assert_eq!(
+        text2_b0,
+        Some("BBBAAA".to_string()),
+        "run 2 B0: Alice + merged Carol text"
     );
     assert_eq!(
-        count_branches_with_text(&sg2),
-        2,
-        "run 2: both B0 and B1 should have text"
-    );
-
-    let b0_text_agg = extract_branch_text_agg(&sg2, b0);
-    let b1_text_agg = extract_branch_text_agg(&sg2, b1);
-
-    assert_ne!(
-        b0_text_agg,
-        TextAgg::default(),
-        "B0 TextAgg should not be empty"
+        text2_b1,
+        Some("AAA".to_string()),
+        "run 2 B1: Carol (creator) + merged Alice text"
     );
     assert_ne!(
-        b1_text_agg,
-        TextAgg::default(),
-        "B1 TextAgg should not be empty"
-    );
-
-    assert_ne!(
-        b1_text_agg, b0_text_agg,
-        "B1's TextAgg should differ from B0's — merge must have combined both branches' content"
+        text2_b1, text2_b0,
+        "B1's text should differ from B0's — different branches"
     );
 
     let output3 = tc.run_gear_on(0, doc_gear);
-    let sg3 = extract_text_sg(&output3, &tags);
-    assert_eq!(
-        count_branches_with_text(&sg3),
-        2,
-        "run 3: output should be stable"
-    );
+    let text3_b0 = extract_doc_text(&output3, &tags, b0);
+    let text3_b1 = extract_doc_text(&output3, &tags, b1);
+    assert_eq!(text3_b0, text2_b0, "run 3: B0 text should be stable");
+    assert_eq!(text3_b1, text2_b1, "run 3: B1 text should be stable");
 }
 
 #[test]
@@ -686,54 +666,33 @@ fn multi_user_doc_assembly_cross_core_e2e() {
     assert_ne!(invited_core, doc_core, "gears must be on different cores");
 
     let output1 = tc.run_gear_on(0, doc_gear.clone());
-    let sg1 = extract_text_sg(&output1, &tags);
-    assert!(
-        has_non_empty_text(&sg1),
-        "run 1: should have text from Alice (creator) even with placeholder invited"
-    );
+    let text1 = extract_doc_text(&output1, &tags, b0);
     assert_eq!(
-        count_branches_with_text(&sg1),
-        1,
-        "run 1: only one branch (B0) should have text with placeholder invited"
+        text1,
+        Some("Hello".to_string()),
+        "run 1: Alice (creator) edit present with placeholder invited"
     );
 
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     let output2 = tc.run_gear_on(0, doc_gear.clone());
     let sg2 = extract_text_sg(&output2, &tags);
-
-    assert!(
-        has_non_empty_text(&sg2),
-        "run 2: should have real text from invited users"
-    );
     assert_eq!(
-        count_branches_with_text(&sg2),
+        count_branches(&sg2),
         1,
-        "run 2: exactly one branch should have text"
+        "run 2: exactly one branch should have entries"
     );
 
-    let text_agg = extract_branch_text_agg(&sg2, b0);
-    assert_ne!(
-        text_agg,
-        TextAgg::default(),
-        "B0 TextAgg should not be empty — invited users' edits should be applied"
-    );
-
-    let anchors_out = tags
-        .record_get(&output2, b"anchors")
-        .expect("doc_content output missing .anchors");
-    assert!(
-        matches!(anchors_out, LocValue::KolAnchorAgg(_)),
-        "expected KolAnchorAgg for .anchors, got {anchors_out:?}"
+    let text2 = extract_doc_text(&output2, &tags, b0);
+    assert_eq!(
+        text2,
+        Some(" [Dave]!WorldHello".to_string()),
+        "run 2: all invited users' edits (RGA: higher tx_id first), Eve excluded"
     );
 
     let output3 = tc.run_gear_on(0, doc_gear);
-    let sg3 = extract_text_sg(&output3, &tags);
-    assert_eq!(
-        count_branches_with_text(&sg3),
-        1,
-        "run 3: output should be stable"
-    );
+    let text3 = extract_doc_text(&output3, &tags, b0);
+    assert_eq!(text3, text2, "run 3: output should be stable");
 }
 
 #[test]
@@ -823,17 +782,10 @@ fn retroactive_invite_point_in_time_same_core_e2e() {
             .clone(),
         vec![LocValue::Num(doc_id as i64)],
     );
-    let sg = extract_text_sg(&output, &tags);
-
-    assert!(
-        has_non_empty_text(&sg),
-        "doc_content should have text from Bob's post-invite edit"
-    );
-
-    let text_agg = extract_branch_text_agg(&sg, b0);
-    assert_ne!(
-        text_agg,
-        TextAgg::default(),
-        "B0 TextAgg should not be empty — Bob's post-invite edit should be applied"
+    let text = extract_doc_text(&output, &tags, b0);
+    assert_eq!(
+        text,
+        Some("Bob after invite".to_string()),
+        "only Bob's post-invite edit should appear; pre-invite edit excluded"
     );
 }

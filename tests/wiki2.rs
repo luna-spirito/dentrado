@@ -1,10 +1,5 @@
-use std::sync::Arc;
-
 use kolorinko::{
-    core::{
-        gear::Runtime,
-        loc_ctx::{EventContext, LocCtx, StoredEvent},
-    },
+    core::gear::Runtime,
     fadeno::{
         bridge::{FadenoModule, FadenoRuntime},
         compiler::{compile_file, find_binary},
@@ -13,7 +8,7 @@ use kolorinko::{
     types::*,
     utils::{
         state_graph::StateGraphOut,
-        text::{AnchorPos, TextAgg, TextUpd, ROOT_ANCHOR},
+        text::{AnchorPos, TextUpd, ROOT_ANCHOR},
     },
     wire::WireLocCtxBuilder,
 };
@@ -70,12 +65,30 @@ fn extract_text_sg(
     }
 }
 
-fn has_non_empty_text(sg: &StateGraphOut<LocValue, LocValue>) -> bool {
-    sg.iter().any(|(_, timeline)| {
-        timeline
-            .iter()
-            .any(|(_, v)| matches!(v, LocValue::KolTextAgg(ta) if ta.clone() != TextAgg::default()))
-    })
+fn extract_doc_text(
+    output: &LocValue,
+    tags: &TagRegistry,
+    branch_did: LocDataId,
+) -> Option<String> {
+    let anchor_agg = match tags
+        .record_get(output, b"anchors")
+        .expect("missing .anchors")
+    {
+        LocValue::KolAnchorAgg(a) => a,
+        other => panic!("expected KolAnchorAgg, got {other:?}"),
+    };
+    let sg = extract_text_sg(output, tags);
+    let branch_key = LocValue::KolDataId(branch_did);
+    let timeline = sg.iter().find(|(k, _)| **k == branch_key);
+    let (_, val) = match timeline.and_then(|(_, tl)| tl.last()) {
+        Some(v) => v,
+        None => return None,
+    };
+    let text_agg = match val {
+        LocValue::KolTextAgg(ta) => ta,
+        other => panic!("expected KolTextAgg, got {other:?}"),
+    };
+    Some(text_agg.get_text(&anchor_agg))
 }
 
 #[test]
@@ -262,29 +275,11 @@ fn doc_content_same_core_e2e() {
         .clone();
     let output = tc.build_and_run_gear(doc_content_closure, vec![LocValue::Num(doc_id as i64)]);
 
-    let sg = extract_text_sg(&output, &tags);
-
-    let entries: Vec<_> = sg.iter().collect();
+    let text = extract_doc_text(&output, &tags, b0);
     assert_eq!(
-        entries.len(),
-        1,
-        "expected 1 branch in text output, got {}",
-        entries.len()
-    );
-
-    let branch_key = LocValue::KolDataId(b0);
-    assert_eq!(entries[0].0, &branch_key, "branch key mismatch");
-
-    let timeline = entries[0].1;
-    let (_, text_agg_val) = timeline.last().expect("timeline should not be empty");
-    let LocValue::KolTextAgg(text_agg) = text_agg_val else {
-        panic!("expected KolTextAgg, got {text_agg_val:?}");
-    };
-
-    assert_ne!(
-        text_agg,
-        &TextAgg::default(),
-        "TextAgg should not be empty — Bob's edit should have been applied"
+        text,
+        Some("Hello from Bob".to_string()),
+        "document text mismatch"
     );
 }
 
@@ -381,18 +376,19 @@ fn doc_content_cross_core_e2e() {
     );
 
     let output1 = tc.run_gear_on(0, doc_gear.clone());
-    let sg1 = extract_text_sg(&output1, &tags);
-    assert!(
-        !has_non_empty_text(&sg1),
-        "first run should have no real text (placeholder invited), but found non-empty TextAgg"
+    let text1 = extract_doc_text(&output1, &tags, b0);
+    assert_eq!(
+        text1, None,
+        "first run: no text expected (placeholder invited, cross-core deps not yet resolved)"
     );
 
     std::thread::sleep(std::time::Duration::from_millis(10));
 
     let output2 = tc.run_gear_on(0, doc_gear);
-    let sg2 = extract_text_sg(&output2, &tags);
-    assert!(
-        has_non_empty_text(&sg2),
-        "second run should have real text (populated secondary cache), but found none"
+    let text2 = extract_doc_text(&output2, &tags, b0);
+    assert_eq!(
+        text2,
+        Some("Hello from Bob".to_string()),
+        "second run: Bob's text should appear after secondary cache resolves invited dep"
     );
 }

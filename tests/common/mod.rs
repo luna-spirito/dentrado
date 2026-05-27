@@ -10,7 +10,7 @@ use kolorinko::{
     core::{
         db::{create_peer_channel_pair, Db, DbConfig, DbHandle, PeerChannels},
         gear::Runtime,
-        loc_ctx::{EventContext, LocCtx, StoredEvent},
+        loc_ctx::{EventContext, LocCtx},
     },
     fadeno::{
         bridge::{FadenoModule, FadenoRuntime},

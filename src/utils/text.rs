@@ -298,7 +298,7 @@ impl TextAgg {
     }
 
     #[must_use]
-    pub(crate) fn get_text(&self, agg: &AnchorAgg) -> String {
+    pub fn get_text(&self, agg: &AnchorAgg) -> String {
         let mut result = String::new();
         self.build_text(agg, ROOT_ANCHOR, &mut result);
         result
@@ -560,7 +560,7 @@ fn char_slice(s: &str, start: usize, end: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{core::gear::EmptyRuntime, fadeno::types::LocValue};
+    use crate::core::gear::EmptyRuntime;
 
     const S1: LocSenderId = LocSenderId(1);
     const _S2: LocSenderId = LocSenderId(2);

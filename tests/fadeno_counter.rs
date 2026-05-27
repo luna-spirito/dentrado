@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use kolorinko::{
     fadeno::{
         bridge::FadenoModule,
@@ -83,9 +81,6 @@ fn wiki_engine() {
     };
 
     let alice = tc.add_user(SenderPk([42u8; 32]), alice_uid);
-    let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
-    let carol = tc.add_user(SenderPk([3u8; 32]), carol_uid);
-    let dave = tc.add_user(SenderPk([10u8; 32]), dave_uid);
 
     let alice_loc_uid = tc.mk_loc_user(alice_uid);
     let b0 = tc.add_seed_branch(invite_mt, alice_loc_uid);
