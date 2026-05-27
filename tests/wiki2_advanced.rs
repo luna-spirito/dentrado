@@ -305,7 +305,7 @@ fn retroactive_invite_cross_core_e2e() {
         .route(2);
     assert_ne!(invited_core, doc_core, "gears must be on different cores");
 
-    let output1 = tc.run_gear(doc_gear.clone());
+    let output1 = tc.run_gear_on(0, doc_gear.clone());
     let sg1 = extract_text_sg(&output1, &tags);
     assert!(
         !has_non_empty_text(&sg1),
@@ -314,7 +314,7 @@ fn retroactive_invite_cross_core_e2e() {
 
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    let output2 = tc.run_gear(doc_gear.clone());
+    let output2 = tc.run_gear_on(0, doc_gear.clone());
     let sg2 = extract_text_sg(&output2, &tags);
 
     assert!(
@@ -334,7 +334,7 @@ fn retroactive_invite_cross_core_e2e() {
         "B0 TextAgg should not be empty — Bob and Dave's edits should be applied"
     );
 
-    let output3 = tc.run_gear(doc_gear);
+    let output3 = tc.run_gear_on(0, doc_gear);
     let sg3 = extract_text_sg(&output3, &tags);
     assert_eq!(
         count_branches_with_text(&sg3),
@@ -467,7 +467,7 @@ fn text_agg_merge_cross_core_e2e() {
         .route(2);
     assert_ne!(invited_core, doc_core, "gears must be on different cores");
 
-    let output1 = tc.run_gear(doc_gear.clone());
+    let output1 = tc.run_gear_on(0, doc_gear.clone());
     let sg1 = extract_text_sg(&output1, &tags);
     assert!(
         has_non_empty_text(&sg1),
@@ -476,7 +476,7 @@ fn text_agg_merge_cross_core_e2e() {
 
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    let output2 = tc.run_gear(doc_gear.clone());
+    let output2 = tc.run_gear_on(0, doc_gear.clone());
     let sg2 = extract_text_sg(&output2, &tags);
 
     assert!(
@@ -508,7 +508,7 @@ fn text_agg_merge_cross_core_e2e() {
         "B1's TextAgg should differ from B0's — merge must have combined both branches' content"
     );
 
-    let output3 = tc.run_gear(doc_gear);
+    let output3 = tc.run_gear_on(0, doc_gear);
     let sg3 = extract_text_sg(&output3, &tags);
     assert_eq!(
         count_branches_with_text(&sg3),
@@ -685,7 +685,7 @@ fn multi_user_doc_assembly_cross_core_e2e() {
         .route(2);
     assert_ne!(invited_core, doc_core, "gears must be on different cores");
 
-    let output1 = tc.run_gear(doc_gear.clone());
+    let output1 = tc.run_gear_on(0, doc_gear.clone());
     let sg1 = extract_text_sg(&output1, &tags);
     assert!(
         has_non_empty_text(&sg1),
@@ -699,7 +699,7 @@ fn multi_user_doc_assembly_cross_core_e2e() {
 
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    let output2 = tc.run_gear(doc_gear.clone());
+    let output2 = tc.run_gear_on(0, doc_gear.clone());
     let sg2 = extract_text_sg(&output2, &tags);
 
     assert!(
@@ -727,7 +727,7 @@ fn multi_user_doc_assembly_cross_core_e2e() {
         "expected KolAnchorAgg for .anchors, got {anchors_out:?}"
     );
 
-    let output3 = tc.run_gear(doc_gear);
+    let output3 = tc.run_gear_on(0, doc_gear);
     let sg3 = extract_text_sg(&output3, &tags);
     assert_eq!(
         count_branches_with_text(&sg3),

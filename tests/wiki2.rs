@@ -380,7 +380,7 @@ fn doc_content_cross_core_e2e() {
         "gears must be on different cores for cross-core test"
     );
 
-    let output1 = tc.run_gear(doc_gear.clone());
+    let output1 = tc.run_gear_on(0, doc_gear.clone());
     let sg1 = extract_text_sg(&output1, &tags);
     assert!(
         !has_non_empty_text(&sg1),
@@ -389,7 +389,7 @@ fn doc_content_cross_core_e2e() {
 
     std::thread::sleep(std::time::Duration::from_millis(10));
 
-    let output2 = tc.run_gear(doc_gear);
+    let output2 = tc.run_gear_on(0, doc_gear);
     let sg2 = extract_text_sg(&output2, &tags);
     assert!(
         has_non_empty_text(&sg2),

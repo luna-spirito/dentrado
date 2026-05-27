@@ -161,6 +161,15 @@ impl<R: Runtime> TestCluster<R> {
             .expect("run_gear failed")
     }
 
+    pub(crate) fn run_gear_on(&self, machine_idx: usize, gear: R::GearId) -> R::GearOut {
+        self.drain();
+        let (wire_gear, wire_ctx) = self.remap_gear(gear);
+        let handle = &self.nodes[machine_idx].handle;
+        handle
+            .run_gear(wire_gear, wire_ctx)
+            .expect("run_gear failed")
+    }
+
     #[must_use]
     pub(crate) fn data_id(&self, did: LocDataId) -> DataId {
         self.loc_ctx
