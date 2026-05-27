@@ -8,7 +8,7 @@ use std::{
 
 use kolorinko::{
     core::{
-        db::{create_peer_channel_pair, Db, DbConfig, DbHandle, PeerChannels},
+        db::{create_peer_channel_pair, Db, DbConfig, PeerChannels},
         gear::Runtime,
         loc_ctx::{EventContext, LocCtx},
     },
@@ -42,8 +42,7 @@ impl XorShift64 {
 }
 
 struct Node<R: Runtime> {
-    _db: Db<R>,
-    handle: DbHandle<R>,
+    db: Db<R>,
 }
 
 pub(crate) struct TestCluster<R: Runtime> {
@@ -99,12 +98,12 @@ impl<R: Runtime> TestCluster<R> {
                 module: module.clone(),
                 peers: std::mem::take(&mut all_peers[i]),
             };
-            let (_db, handle) = Db::start(config).expect("Db::start failed");
-            nodes.push(Node { _db, handle });
+            let db = Db::start(config).expect("Db::start failed");
+            nodes.push(Node { db });
         }
 
         let drain_duration = if num_nodes > 1 {
-            Duration::from_millis(10)
+            Duration::from_millis(100)
         } else {
             Duration::ZERO
         };
@@ -146,7 +145,7 @@ impl<R: Runtime> TestCluster<R> {
             .collect();
         let wire_ctx = builder.build();
 
-        let handle = self.random_handle();
+        let handle = self.random_db();
         handle
             .post_events(wire_ctx, wire_events, timestamp)
             .expect("post_events failed");
@@ -155,7 +154,7 @@ impl<R: Runtime> TestCluster<R> {
     pub(crate) fn run_gear(&self, gear: R::GearId) -> R::GearOut {
         self.drain();
         let (wire_gear, wire_ctx) = self.remap_gear(gear);
-        let handle = self.random_handle();
+        let handle = self.random_db();
         handle
             .run_gear(wire_gear, wire_ctx)
             .expect("run_gear failed")
@@ -164,7 +163,7 @@ impl<R: Runtime> TestCluster<R> {
     pub(crate) fn run_gear_on(&self, machine_idx: usize, gear: R::GearId) -> R::GearOut {
         self.drain();
         let (wire_gear, wire_ctx) = self.remap_gear(gear);
-        let handle = &self.nodes[machine_idx].handle;
+        let handle = &self.nodes[machine_idx].db;
         handle
             .run_gear(wire_gear, wire_ctx)
             .expect("run_gear failed")
@@ -184,9 +183,9 @@ impl<R: Runtime> TestCluster<R> {
         (wire_gear, wire_ctx)
     }
 
-    fn random_handle(&self) -> &DbHandle<R> {
+    fn random_db(&self) -> &Db<R> {
         let idx = self.rng.next_usize(self.nodes.len());
-        &self.nodes[idx].handle
+        &self.nodes[idx].db
     }
 
     fn drain(&self) {

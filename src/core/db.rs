@@ -1,13 +1,16 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    future::Future,
     io,
+    rc::Rc,
     sync::{mpsc, Arc},
     thread,
+    time::Duration,
 };
 
 use crate::{
     core::{
-        core_ctx::{Core, CoreCmd, InterCoreMsg, NodeMsg, RerouteMsg},
+        core_ctx::{ClientOp, CoordCmd, Core, InterCoreMsg, InterNodeMsg, RerouteMsg},
         gear::Runtime,
     },
     types::{GlobalCoreId, NodeId},
@@ -27,8 +30,8 @@ pub struct PeerChannels<R: Runtime> {
 }
 
 pub struct PeerChannelHalf<R: Runtime> {
-    pub(crate) tx: mpsc::Sender<NodeMsg<R>>,
-    pub(crate) rx: mpsc::Receiver<NodeMsg<R>>,
+    pub(crate) tx: mpsc::Sender<InterNodeMsg<R>>,
+    pub(crate) rx: mpsc::Receiver<InterNodeMsg<R>>,
 }
 
 #[must_use]
@@ -47,142 +50,111 @@ pub fn create_peer_channel_pair<R: Runtime>() -> (PeerChannelHalf<R>, PeerChanne
     )
 }
 
+// TODO: simplify?
+/// Used by `DbHandle` to send commands
 #[derive(Clone)]
 struct CoreHandle<R: Runtime> {
-    cmd_tx: mpsc::Sender<CoreCmd<R>>,
-    intercore_tx: mpsc::Sender<InterCoreMsg<R>>,
-    #[allow(dead_code)]
-    core_idx: u32,
+    cmd_tx: mpsc::Sender<CoordCmd<R>>,
 }
 
-impl<R: Runtime> CoreHandle<R> {
-    fn post_events(
-        &self,
-        wire_ctx: Arc<WireLocCtx<R>>,
-        events: Arc<[WireEventBody<R::Group, R::Body>]>,
-        global_core_ids: Arc<[GlobalCoreId]>,
-        timestamp: u32,
-        seed_indices: Vec<u32>,
-    ) -> io::Result<Result<(), MergeError>> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.cmd_tx
-            .send(CoreCmd::PostEvents {
-                wire_ctx,
-                events,
-                global_core_ids,
-                timestamp,
-                seed_indices,
-                reply: reply_tx,
-            })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "core channel closed"))?;
-        reply_rx
-            .recv()
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "core reply dropped"))
-    }
+// common routing logic
 
-    fn run_gear(
-        &self,
-        gear: R::GearId,
-        wire_ctx: Arc<WireLocCtx<R>>,
-    ) -> io::Result<Result<R::GearOut, RunGearError>> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.cmd_tx
-            .send(CoreCmd::RunGear {
-                gear,
-                wire_ctx,
-                reply: reply_tx,
-            })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "core channel closed"))?;
-        reply_rx
-            .recv()
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "core reply dropped"))
-    }
+/// Result of routing events to their target cores.
+pub(crate) struct RoutedEvents<R: Runtime> {
+    pub(crate) wire_ctx: Arc<WireLocCtx<R>>,
+    pub(crate) events: Arc<[WireEventBody<R::Group, R::Body>]>,
+    pub(crate) global_core_ids: Arc<[GlobalCoreId]>,
+    /// From `target_core` to `event ids`.
+    pub(crate) core_seeds: HashMap<u32, Vec<u32>>,
 }
 
-#[derive(Clone)]
-pub struct DbHandle<R: Runtime> {
-    core_handles: Vec<CoreHandle<R>>,
-}
+/// Shared function to route events events
+pub(crate) fn route_events<R: Runtime>(
+    wire_ctx: WireLocCtx<R>,
+    events: Vec<WireEventBody<R::Group, R::Body>>,
+    num_cores: u32,
+) -> Result<RoutedEvents<R>, MergeError> {
+    let global_core_ids: Vec<GlobalCoreId> = events
+        .iter()
+        .map(|e| R::route_group(&e.group, &wire_ctx))
+        .collect::<Result<_, _>>()
+        .map_err(MergeError::Route)?;
 
-impl<R: Runtime> DbHandle<R> {
-    #[allow(clippy::cast_possible_truncation)]
-    fn core_idx_for_global_core_id(&self, global_core_id: &GlobalCoreId) -> usize {
-        let num_cores = self.core_handles.len() as u32;
-        global_core_id.route(num_cores) as usize
+    let wire_ctx = Arc::new(wire_ctx);
+    let events: Arc<[WireEventBody<R::Group, R::Body>]> = Arc::from(events);
+    let global_core_ids: Arc<[GlobalCoreId]> = Arc::from(global_core_ids);
+
+    let mut core_seeds: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (i, gcid) in global_core_ids.iter().enumerate() {
+        let target_core = gcid.route(num_cores);
+        core_seeds.entry(target_core).or_default().push(i as u32);
     }
 
-    pub fn post_events(
-        &self,
-        wire_ctx: WireLocCtx<R>,
-        events: Vec<WireEventBody<R::Group, R::Body>>,
-        timestamp: u32,
-    ) -> Result<(), MergeError> {
-        let global_core_ids: Vec<GlobalCoreId> = events
-            .iter()
-            .map(|e| R::route_group(&e.group, &wire_ctx))
-            .collect::<Result<_, _>>()
-            .map_err(MergeError::Route)?;
+    Ok(RoutedEvents {
+        wire_ctx,
+        events,
+        global_core_ids,
+        core_seeds,
+    })
+}
 
-        let wire_ctx = Arc::new(wire_ctx);
-        let events: Arc<[WireEventBody<R::Group, R::Body>]> = Arc::from(events);
-        let global_core_ids: Arc<[GlobalCoreId]> = Arc::from(global_core_ids);
+/// Shared function to route gear to the target core
+pub(crate) fn route_gear<R: Runtime>(
+    gear: &R::GearId,
+    wire_ctx: &WireLocCtx<R>,
+    num_cores: u32,
+) -> Result<u32, RunGearError> {
+    let (_, group) = R::meta(gear);
+    let global_core_id = R::route_group(&group, wire_ctx).map_err(RunGearError::Route)?;
+    Ok(global_core_id.route(num_cores))
+}
 
-        let mut core_seeds: HashMap<usize, Vec<u32>> = HashMap::new();
-        for (i, global_core_id) in global_core_ids.iter().enumerate() {
-            let core_idx = self.core_idx_for_global_core_id(global_core_id);
-            core_seeds.entry(core_idx).or_default().push(i as u32);
+pub(crate) async fn wait_for_reply<T>(rx: mpsc::Receiver<T>) -> T {
+    loop {
+        match rx.try_recv() {
+            Ok(v) => return v,
+            Err(mpsc::TryRecvError::Empty) => {
+                compio::runtime::time::sleep(Duration::from_micros(100)).await;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                panic!("wait_for_reply: reply channel disconnected")
+            }
         }
-
-        for (core_idx, seed_indices) in core_seeds {
-            let core = &self.core_handles[core_idx];
-            let result = core
-                .post_events(
-                    Arc::clone(&wire_ctx),
-                    Arc::clone(&events),
-                    Arc::clone(&global_core_ids),
-                    timestamp,
-                    seed_indices,
-                )
-                .unwrap_or_else(|_| panic!("post_events: core {core_idx} channel closed"));
-            result?;
-        }
-
-        Ok(())
-    }
-
-    pub fn run_gear(
-        &self,
-        gear: R::GearId,
-        wire_ctx: WireLocCtx<R>,
-    ) -> Result<R::GearOut, RunGearError> {
-        let (_, group) = R::meta(&gear);
-        let global_core_id = R::route_group(&group, &wire_ctx).map_err(RunGearError::Route)?;
-        let core_idx = self.core_idx_for_global_core_id(&global_core_id);
-        let core = &self.core_handles[core_idx];
-
-        core.run_gear(gear, Arc::new(wire_ctx))
-            .unwrap_or_else(|_| panic!("run_gear: core channel closed"))
     }
 }
+
+impl<R: Runtime> Db<R> {}
 
 pub struct Db<R: Runtime> {
-    shutdown_handles: Vec<mpsc::Sender<CoreCmd<R>>>,
+    tx: Vec<mpsc::Sender<CoordCmd<R>>>,
     join_handles: Vec<thread::JoinHandle<()>>,
 }
 
 impl<R: Runtime> Db<R> {
-    pub fn start(mut config: DbConfig<R>) -> io::Result<(Self, DbHandle<R>)> {
+    /// Start the database with no user worker function.
+    /// Cores run only the core event loop.
+    pub fn start(config: DbConfig<R>) -> io::Result<Self> {
+        Self::start_with_worker(config, |_| std::future::pending::<()>())
+    }
+
+    /// Start the database with a user-provided worker function per core.
+    pub fn start_with_worker<W, F>(mut config: DbConfig<R>, worker_fn: W) -> io::Result<Self>
+    where
+        W: Fn(&Core<R>) -> F + Clone + Send + 'static,
+        F: Future<Output = ()> + 'static,
+    {
         let num_cores = config.num_cores;
         let node_id = config.node_id;
 
         let mut peers_ordered: Vec<(NodeId, PeerChannels<R>)> = config.peers.drain().collect();
         peers_ordered.sort_by_key(|(nid, _)| nid.0);
 
-        let mut core_inter_node_peers: Vec<Vec<(NodeId, u32, Option<mpsc::Sender<NodeMsg<R>>>)>> =
-            (0..num_cores)
-                .map(|_| Vec::with_capacity(peers_ordered.len()))
-                .collect();
-        let mut inter_node_rxs: Vec<Vec<Option<mpsc::Receiver<NodeMsg<R>>>>> = (0..num_cores)
+        let mut core_inter_node_peers: Vec<
+            Vec<(NodeId, u32, Option<mpsc::Sender<InterNodeMsg<R>>>)>,
+        > = (0..num_cores)
+            .map(|_| Vec::with_capacity(peers_ordered.len()))
+            .collect();
+        let mut inter_node_rxs: Vec<Vec<Option<mpsc::Receiver<InterNodeMsg<R>>>>> = (0..num_cores)
             .map(|_| Vec::with_capacity(peers_ordered.len()))
             .collect();
 
@@ -207,20 +179,22 @@ impl<R: Runtime> Db<R> {
             }
         }
 
-        let mut core_handles = Vec::with_capacity(num_cores as usize);
-        let mut shutdown_handles = Vec::with_capacity(num_cores as usize);
-        let mut join_handles = Vec::with_capacity(num_cores as usize);
+        // tx_from_to[i][j] = sender from core i to core j
+        let mut tx_from_to: Vec<Vec<mpsc::Sender<InterCoreMsg<R>>>> = (0..num_cores)
+            .map(|_| Vec::with_capacity(num_cores as usize))
+            .collect();
+        // rx_on_from[j][i] = receiver on core j from core i
+        let mut rx_on_from: Vec<Vec<mpsc::Receiver<InterCoreMsg<R>>>> = (0..num_cores)
+            .map(|_| Vec::with_capacity(num_cores as usize))
+            .collect();
 
-        let mut intercore_txs: Vec<mpsc::Sender<InterCoreMsg<R>>> =
-            Vec::with_capacity(num_cores as usize);
-        let mut intercore_rxs: Vec<mpsc::Receiver<InterCoreMsg<R>>> =
-            Vec::with_capacity(num_cores as usize);
-        for _ in 0..num_cores {
-            let (tx, rx) = mpsc::channel::<InterCoreMsg<R>>();
-            intercore_txs.push(tx);
-            intercore_rxs.push(rx);
+        for i in 0..num_cores as usize {
+            for j in 0..num_cores as usize {
+                let (tx, rx) = mpsc::channel::<InterCoreMsg<R>>();
+                tx_from_to[i].push(tx);
+                rx_on_from[j].push(rx);
+            }
         }
-        let all_intercore_txs: Vec<mpsc::Sender<InterCoreMsg<R>>> = intercore_txs.clone();
 
         let mut reroute_txs: Vec<mpsc::Sender<RerouteMsg<R>>> =
             Vec::with_capacity(num_cores as usize);
@@ -233,128 +207,205 @@ impl<R: Runtime> Db<R> {
         }
         let all_reroute_txs: Vec<mpsc::Sender<RerouteMsg<R>>> = reroute_txs.clone();
 
+        let mut tx = Vec::with_capacity(num_cores as usize);
+        let mut join_handles = Vec::with_capacity(num_cores as usize);
+
         for core_id in 0..num_cores {
-            let (cmd_tx, cmd_rx) = mpsc::channel::<CoreCmd<R>>();
+            let (cmd_tx, cmd_rx) = mpsc::channel::<CoordCmd<R>>();
             let module = config.module.clone();
-            let intercore_rx = intercore_rxs.remove(0);
-            let intercore_senders = all_intercore_txs.clone();
+
+            // This core's inter-core senders (indexed by target core)
+            let intercore_senders = std::mem::take(&mut tx_from_to[core_id as usize]);
+            // This core's inter-core receivers (indexed by source core)
+            let intercore_rxs = std::mem::take(&mut rx_on_from[core_id as usize]);
+
             let reroute_rx = reroute_rxs.remove(0);
             let reroute_senders = all_reroute_txs.clone();
             let inter_node_peers = std::mem::take(&mut core_inter_node_peers[core_id as usize]);
             let core_inter_node_rxs = std::mem::take(&mut inter_node_rxs[core_id as usize]);
 
+            let worker_fn = worker_fn.clone();
+
             let join = thread::Builder::new()
                 .name(format!("kolorinko-core-{core_id}"))
                 .spawn(move || {
-                    core_event_loop::<R>(
-                        num_cores,
-                        core_id,
-                        node_id,
-                        cmd_rx,
-                        intercore_rx,
-                        intercore_senders,
-                        reroute_rx,
-                        reroute_senders,
-                        inter_node_peers,
-                        core_inter_node_rxs,
-                        module,
-                    );
+                    let runtime = compio::runtime::RuntimeBuilder::new()
+                        .thread_affinity(HashSet::from([core_id as usize]))
+                        .build()
+                        .expect("compio runtime build failed");
+
+                    runtime.block_on(async {
+                        let state = Rc::new(Core::new(
+                            num_cores,
+                            core_id,
+                            node_id,
+                            module,
+                            intercore_senders,
+                            reroute_senders,
+                            inter_node_peers,
+                        ));
+
+                        // Task A: user worker function (async, runs on compio runtime)
+                        compio::runtime::spawn(worker_fn(&state)).detach();
+
+                        // Task B: core event loop (async, yields to compio runtime for worker task)
+                        core_event_loop(
+                            state,
+                            cmd_rx,
+                            intercore_rxs,
+                            reroute_rx,
+                            core_inter_node_rxs,
+                        )
+                        .await;
+                    });
                 })?;
 
-            core_handles.push(CoreHandle {
-                cmd_tx: cmd_tx.clone(),
-                intercore_tx: intercore_txs[core_id as usize].clone(),
-                core_idx: core_id,
-            });
-            shutdown_handles.push(cmd_tx);
+            tx.push(cmd_tx);
             join_handles.push(join);
         }
 
-        let db = Self {
-            shutdown_handles,
-            join_handles,
-        };
+        Ok(Self { tx, join_handles })
+    }
 
-        let cluster = DbHandle { core_handles };
+    pub fn post_events(
+        &self,
+        wire_ctx: WireLocCtx<R>,
+        events: Vec<WireEventBody<R::Group, R::Body>>,
+        timestamp: u32,
+    ) -> Result<(), MergeError> {
+        let routed = route_events(wire_ctx, events, self.tx.len() as u32)?;
 
-        Ok((db, cluster))
+        let mut reply_rxs = Vec::with_capacity(routed.core_seeds.len());
+        for (target_core, seed_indices) in routed.core_seeds {
+            let tx = &self.tx[target_core as usize];
+            let (reply_tx, reply_rx) = mpsc::channel();
+            tx.send(CoordCmd::Op(ClientOp::PostEvents {
+                wire_ctx: routed.wire_ctx.clone(),
+                events: routed.events.clone(),
+                global_core_ids: routed.global_core_ids.clone(),
+                timestamp,
+                seed_indices,
+                reply: reply_tx,
+            }))
+            .expect("core channel closed");
+            reply_rxs.push(reply_rx);
+        }
+        for reply_rx in reply_rxs {
+            reply_rx.recv().expect("core channel closed")?;
+        }
+
+        Ok(())
+    }
+
+    pub fn run_gear(
+        &self,
+        gear: R::GearId,
+        wire_ctx: WireLocCtx<R>,
+    ) -> Result<R::GearOut, RunGearError> {
+        let target_core = route_gear(&gear, &wire_ctx, self.tx.len() as u32)?;
+        let core = &self.tx[target_core as usize];
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+        core.send(CoordCmd::Op(ClientOp::RunGear {
+            gear,
+            wire_ctx,
+            reply: reply_tx,
+        }))
+        .expect("core channel closed");
+        reply_rx.recv().expect("core channel closed")
     }
 }
 
 impl<R: Runtime> Drop for Db<R> {
     fn drop(&mut self) {
-        for tx in &self.shutdown_handles {
-            tx.send(CoreCmd::<R>::Shutdown)
-                .expect("Db::drop: failed to send Shutdown to core");
+        for tx in &self.tx {
+            let _ = tx.send(CoordCmd::<R>::Shutdown);
         }
         for handle in self.join_handles.drain(..) {
-            handle.join().expect("Db::drop: core thread panicked");
+            let _ = handle.join();
         }
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn core_event_loop<R: Runtime>(
-    num_cores: u32,
-    core_id: u32,
-    node_id: NodeId,
-    cmd_rx: mpsc::Receiver<CoreCmd<R>>,
-    intercore_rx: mpsc::Receiver<InterCoreMsg<R>>,
-    intercore_senders: Vec<mpsc::Sender<InterCoreMsg<R>>>,
+async fn core_event_loop<R: Runtime>(
+    state: Rc<Core<R>>,
+    cmd_rx: mpsc::Receiver<CoordCmd<R>>,
+    intercore_rxs: Vec<mpsc::Receiver<InterCoreMsg<R>>>,
     reroute_rx: mpsc::Receiver<RerouteMsg<R>>,
-    reroute_senders: Vec<mpsc::Sender<RerouteMsg<R>>>,
-    inter_node_peers: Vec<(NodeId, u32, Option<mpsc::Sender<NodeMsg<R>>>)>,
-    inter_node_rxs: Vec<Option<mpsc::Receiver<NodeMsg<R>>>>,
-    module: Arc<R::Module>,
+    inter_node_rxs: Vec<Option<mpsc::Receiver<InterNodeMsg<R>>>>,
 ) {
-    let mut state: Core<R> = Core::new(
-        num_cores,
-        core_id,
-        node_id,
-        module,
-        intercore_senders,
-        reroute_senders,
-        inter_node_peers,
-    );
+    let drain_timeout = Duration::from_millis(1);
 
-    let recv_timeout = std::time::Duration::from_millis(1);
     loop {
+        let mut did_work = false;
+
+        // 1. Drain commands (from Db)
         loop {
             match cmd_rx.try_recv() {
-                Ok(cmd) => {
-                    if state.handle_cmd(cmd) {
-                        return;
-                    }
+                Ok(CoordCmd::Op(op)) => {
+                    state.handle_client_op(op);
+                    did_work = true;
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                Ok(CoordCmd::Shutdown) => return,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return,
             }
         }
 
-        while let Ok(msg) = intercore_rx.try_recv() {
-            state.handle_intercore_msg(msg);
+        // 2. Drain inter-core SPSC channels
+        for rx in &intercore_rxs {
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        state.handle_intercore_msg(msg);
+                        did_work = true;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
         }
 
+        // 3. Drain inter-node channels
         for (peer_idx, rx_opt) in inter_node_rxs.iter().enumerate() {
             if let Some(rx) = rx_opt {
-                while let Ok(msg) = rx.try_recv() {
-                    state.handle_inter_node_msg(peer_idx, msg);
+                loop {
+                    match rx.try_recv() {
+                        Ok(msg) => {
+                            state.handle_inter_node_msg(peer_idx, msg);
+                            did_work = true;
+                        }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => break,
+                    }
                 }
             }
         }
 
-        while let Ok(msg) = reroute_rx.try_recv() {
-            state.handle_reroute_msg(msg);
+        // 4. Drain reroute channel
+        loop {
+            match reroute_rx.try_recv() {
+                Ok(msg) => {
+                    state.handle_reroute_msg(msg);
+                    did_work = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return,
+            }
         }
 
-        match cmd_rx.recv_timeout(recv_timeout) {
-            Ok(cmd) => {
-                if state.handle_cmd(cmd) {
-                    return;
+        // 5. If no work, yield: compio sleep lets worker task run,
+        // TODO: let's, like, not us timer.
+        if !did_work {
+            compio::runtime::time::sleep(Duration::from_micros(10)).await;
+            match cmd_rx.recv_timeout(drain_timeout) {
+                Ok(CoordCmd::Op(op)) => {
+                    state.handle_client_op(op);
                 }
+                Ok(CoordCmd::Shutdown) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
 }

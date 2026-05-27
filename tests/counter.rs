@@ -9,7 +9,7 @@ use kolorinko::{
     types::*,
     wire::{MergeError, WireEventBody, WireLocCtx},
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 mod common;
 use common::TestCluster;
@@ -339,16 +339,13 @@ fn doc_counter() {
 
 #[test]
 fn malformed_wire_ctx_returns_error_not_panic() {
-    use kolorinko::core::db::DbHandle;
-    use std::collections::HashMap;
-
     let alice_pk = SenderPk([42u8; 32]);
     let alice_uid = UserId {
         id: 1,
         identity_server_pk: IdentityServerPk([0; 32]),
     };
 
-    let (_db, cluster): (Db<CounterRuntime>, DbHandle<CounterRuntime>) = Db::start(DbConfig {
+    let db: Db<CounterRuntime> = Db::start(DbConfig {
         num_cores: 1,
         node_id: NodeId(0),
         module: Arc::new(()),
@@ -362,7 +359,7 @@ fn malformed_wire_ctx_returns_error_not_panic() {
             senders: vec![(alice_pk, 99)],
             ..Default::default()
         };
-        let err = cluster
+        let err = db
             .post_events(
                 wire_ctx,
                 vec![WireEventBody {
@@ -384,7 +381,7 @@ fn malformed_wire_ctx_returns_error_not_panic() {
             senders: vec![(alice_pk, 0)],
             ..Default::default()
         };
-        let err = cluster
+        let err = db
             .post_events(
                 wire_ctx,
                 vec![WireEventBody {
@@ -406,7 +403,7 @@ fn malformed_wire_ctx_returns_error_not_panic() {
             senders: vec![(alice_pk, 0)],
             ..Default::default()
         };
-        let err = cluster
+        let err = db
             .post_events(
                 wire_ctx,
                 vec![WireEventBody {
@@ -435,7 +432,7 @@ fn malformed_wire_ctx_returns_error_not_panic() {
             senders: vec![(alice_pk, 0)],
             data: vec![(dummy_data_id, self_referencing_content)],
         };
-        let err = cluster
+        let err = db
             .post_events(
                 wire_ctx,
                 vec![WireEventBody {

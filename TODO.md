@@ -56,3 +56,8 @@ bridge.rs:
 
 * There is a on-going `git stash` about `compio` integration. Reason for delay: we use `&mut` for certain operations with LocCtx & Core... yeeeeaaaahh....
 * Remove LocValue from counter.rs
+* Suggestion: have the same Core, but make a lot of different newtype wrappers for it.
+* So, what's with high/low-priority channels? Get rid of separate reroute channels? What with overload? What with delays?
+* Remove CoreHandle?
+* And get rid of reply channel? A bad practice I feel.
+* Deduplicate post_events (core<~>db)
