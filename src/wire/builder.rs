@@ -104,7 +104,7 @@ impl<'a, R: Runtime> WireLocCtxBuilder<'a, R> {
 
         let (data_id, content) = self
             .ctx
-            .get_data(did)
+            .get_data(did, Clone::clone)
             .ok_or(BuildError::DataNotFound { did })?;
 
         let localized = content
@@ -118,7 +118,7 @@ impl<'a, R: Runtime> WireLocCtxBuilder<'a, R> {
         let wire_idx = {
             let mut inner = self.inner.borrow_mut();
             let wire_idx = inner.objects.len() as u32;
-            inner.objects.push((*data_id, localized));
+            inner.objects.push((data_id, localized));
             inner.data_to_wire.insert(did.0, wire_idx);
             wire_idx
         };

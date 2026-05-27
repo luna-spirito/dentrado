@@ -127,7 +127,7 @@ pub fn hash_loc_value(
         LocValue::KolAnchorAgg(_) => return Err(GroupRouteError::DomainValue("KolAnchorAgg")),
         LocValue::KolTextAgg(_) => return Err(GroupRouteError::DomainValue("KolTextAgg")),
         LocValue::KolTextUpd(_) => return Err(GroupRouteError::DomainValue("KolTextUpd")),
-        LocValue::KolQuery(_) => return Err(GroupRouteError::DomainValue("KolQuery")),
+        LocValue::KolQuery(_, _) => return Err(GroupRouteError::DomainValue("KolQuery")),
         LocValue::KolSenderId(_) => return Err(GroupRouteError::DomainValue("KolSenderId")),
         LocValue::Panic => return Err(GroupRouteError::DomainValue("Panic")),
         LocValue::Builtin(_) => return Err(GroupRouteError::DomainValue("Builtin")),

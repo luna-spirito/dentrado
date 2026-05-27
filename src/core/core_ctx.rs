@@ -12,7 +12,7 @@ use crate::{
     },
     types::{
         AnyLocEventId, DataId, DataVerifyError, GlobalCoreId, LocDataId, LocGroupId, LocMsgTypeId,
-        LocSenderEventId, LocSenderId, LocUserId, NodeId, SenderPk, UserId,
+        LocSenderId, LocUserId, NodeId, SenderPk, UserId,
     },
     wire::{
         MergeError, RunGearError, WireEventBody, WireLocCtx, WireLocCtxBuilder, WireLocCtxMerger,
@@ -80,6 +80,7 @@ struct CoreInner<R: Runtime> {
     gear_cache: HashMap<R::GearId, Box<dyn Any>>,
     gear_in_flight: HashSet<R::GearId>,
     secondary_cache: HashMap<R::GearId, R::GearOut>,
+    events_by_group: HashMap<LocGroupId, EventGroup>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -93,19 +94,13 @@ pub struct Core<R: Runtime> {
     num_cores: u32,
     core_id: u32,
     node_id: NodeId,
-
-    loc_ctx: LocCtx<R>,
-
     module: Arc<R::Module>,
 
-    events_by_group: HashMap<LocGroupId, EventGroup>,
-
     intercore_senders: Vec<mpsc::Sender<InterCoreMsg<R>>>,
-
     reroute_senders: Vec<mpsc::Sender<RerouteMsg<R>>>,
-
     inter_node_peers: Vec<(NodeId, u32, Option<mpsc::Sender<NodeMsg<R>>>)>,
 
+    loc_ctx: LocCtx<R>,
     inner: RefCell<CoreInner<R>>,
 }
 
@@ -125,7 +120,6 @@ impl<R: Runtime> Core<R> {
             node_id,
             loc_ctx: LocCtx::new(),
             module,
-            events_by_group: HashMap::new(),
             intercore_senders,
             reroute_senders,
             inter_node_peers,
@@ -133,6 +127,7 @@ impl<R: Runtime> Core<R> {
                 gear_cache: HashMap::new(),
                 gear_in_flight: HashSet::new(),
                 secondary_cache: HashMap::new(),
+                events_by_group: HashMap::new(),
             }),
         }
     }
@@ -493,36 +488,40 @@ impl<R: Runtime> Core<R> {
     }
 
     #[must_use]
-    pub fn query_events(
+    pub fn query_events<F>(
         &self,
         group: LocGroupId,
-        since: usize,
-    ) -> (&[AnyLocEventId], &[AnyLocEventId]) {
-        self.events_by_group
+        since: (usize, usize),
+        f: impl Fn(&[AnyLocEventId], &[AnyLocEventId]) -> F,
+    ) -> Option<F> {
+        self.inner
+            .borrow()
+            .events_by_group
             .get(&group)
-            .map_or((&[], &[]), |eg| (&eg.added[since..], &eg.removed))
+            .map(|eg| f(&eg.added[since.0..], &eg.removed[since.1..]))
     }
 }
 
 impl<R: Runtime> EventContext<R> for Core<R> {
-    fn mk_loc_user(&mut self, uid: UserId) -> LocUserId {
+    fn mk_loc_user(&self, uid: UserId) -> LocUserId {
         self.loc_ctx.mk_loc_user(uid)
     }
 
-    fn mk_loc_sender(&mut self, pk: SenderPk, uid: Option<UserId>) -> LocSenderId {
+    fn mk_loc_sender(&self, pk: SenderPk, uid: Option<UserId>) -> LocSenderId {
         self.loc_ctx.mk_loc_sender(pk, uid)
     }
 
-    fn mk_loc_group(&mut self, msg_type: LocMsgTypeId, group: R::Group) -> LocGroupId {
+    fn mk_loc_group(&self, msg_type: LocMsgTypeId, group: R::Group) -> LocGroupId {
         self.loc_ctx.mk_loc_group(msg_type, group)
     }
 
-    fn store_event(&mut self, ev: StoredEvent<R::Body>) -> Option<StoreResultSuccess> {
+    fn store_event(&self, ev: StoredEvent<R::Body>) -> Option<StoreResultSuccess> {
         let group_id = ev.group;
 
         let res = self.loc_ctx.store_event(ev);
         if let Some(StoreResultSuccess { old, new }) = res {
-            let group = self.events_by_group.entry(group_id).or_default();
+            let mut s = self.inner.borrow_mut();
+            let group = s.events_by_group.entry(group_id).or_default();
             group.added.push(new);
             if let Some(old) = old {
                 group.removed.push(old);
@@ -535,7 +534,7 @@ impl<R: Runtime> EventContext<R> for Core<R> {
         &self.loc_ctx
     }
 
-    fn mk_data(&mut self, data_id: DataId, content: R::Data) -> Result<LocDataId, DataVerifyError> {
+    fn mk_data(&self, data_id: DataId, content: R::Data) -> Result<LocDataId, DataVerifyError> {
         self.loc_ctx.mk_data(data_id, content)
     }
 }

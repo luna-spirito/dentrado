@@ -614,7 +614,7 @@ impl Vm<'_> {
                 | LocValue::BuiltinsVar
                 | LocValue::Builtin(_)
                 | LocValue::Import(_)
-                | LocValue::KolQuery(_) => Ok(v.clone()),
+                | LocValue::KolQuery(_, _) => Ok(v.clone()),
                 other => Err(VmError::TypeError {
                     op: "builtin",
                     expected: "plain LocValue",
@@ -1054,7 +1054,7 @@ impl Vm<'_> {
                 }
             }
 
-            BuiltinT::KolMkQuery => Ok(LocValue::KolQuery(0)),
+            BuiltinT::KolMkQuery => Ok(LocValue::KolQuery(0, 0)),
             BuiltinT::KolMkStateGraph => Ok(LocValue::KolStateGraph(Box::default())),
 
             BuiltinT::KolStateGraphApply => {
@@ -1137,7 +1137,7 @@ impl Vm<'_> {
                 let event_resolver =
                     |lid: AnyLocEventId| -> (crate::utils::sg_ord_map::SGEventId, LocValue) {
                         let stored = event_resolver_core
-                            .get_stored_event(lid)
+                            .get_stored_event(lid, |x| x.clone())
                             .expect("event_resolver: event not found in core");
 
                         let sg_event_id = crate::utils::sg_ord_map::SGEventId::new(
@@ -1148,11 +1148,12 @@ impl Vm<'_> {
                             lid,
                         );
 
-                        let body_val = stored.body.clone();
-
                         let event_rec = LocValue::Record {
                             tag_set: Arc::new(vec![self.common.event_rec_tag_set]),
-                            fields: Arc::new(vec![LocValue::KolSenderId(stored.sender), body_val]),
+                            fields: Arc::new(vec![
+                                LocValue::KolSenderId(stored.sender),
+                                stored.body,
+                            ]),
                         };
 
                         (sg_event_id, event_rec)
@@ -1223,9 +1224,9 @@ impl Vm<'_> {
             },
 
             BuiltinT::KolQueryDelta => {
-                let since: usize = match args.first() {
-                    Some(LocValue::KolQuery(n)) => *n as usize,
-                    Some(LocValue::Builtin(BuiltinT::KolMkQuery)) => 0,
+                let since: (usize, usize) = match args.first() {
+                    Some(LocValue::KolQuery(n, m)) => (*n as usize, *m as usize),
+                    Some(LocValue::Builtin(BuiltinT::KolMkQuery)) => (0, 0),
                     Some(other) => {
                         return Err(VmError::TypeError {
                             op: "query_delta",
@@ -1264,20 +1265,17 @@ impl Vm<'_> {
                     }
                 };
 
-                let (added_ids, removed_ids) = if let Some(group) = group {
-                    core.query_events(group, since)
-                } else {
-                    (&[][..], &[][..])
-                };
-                let next_since = (since + added_ids.len()) as u64;
-                let added: Vec<LocValue> = added_ids
-                    .iter()
-                    .map(|eid| LocValue::KolEventId(*eid))
-                    .collect();
-                let removed: Vec<LocValue> = removed_ids
-                    .iter()
-                    .map(|eid| LocValue::KolEventId(*eid))
-                    .collect();
+                let (added, removed, next_since) = group
+                    .and_then(|group| {
+                        core.query_events(group, since, |added, removed| {
+                            (
+                                added.iter().copied().map(LocValue::KolEventId).collect(),
+                                removed.iter().copied().map(LocValue::KolEventId).collect(),
+                                (since.0 + added.len(), since.1 + removed.len()),
+                            )
+                        })
+                    })
+                    .unwrap_or((Vec::new(), Vec::new(), since));
 
                 let delta = LocValue::Record {
                     tag_set: Arc::new(vec![self.common.delta_tag_set]),
@@ -1288,7 +1286,10 @@ impl Vm<'_> {
                 };
                 Ok(LocValue::Record {
                     tag_set: Arc::new(vec![self.common.query_result_tag_set]),
-                    fields: Arc::new(vec![LocValue::KolQuery(next_since), delta]),
+                    fields: Arc::new(vec![
+                        LocValue::KolQuery(next_since.0 as u64, next_since.1 as u64),
+                        delta,
+                    ]),
                 })
             }
 

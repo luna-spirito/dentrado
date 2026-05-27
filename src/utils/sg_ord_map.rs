@@ -86,19 +86,19 @@ fn cmp_tx_sender<R: Runtime>(
     a: AnyLocEventId,
     b: AnyLocEventId,
 ) -> std::cmp::Ordering {
-    let a_stored = ctx
-        .get_stored_event(a)
+    let (a_tx, a_sender) = ctx
+        .get_stored_event(a, |ev| (ev.tx_id, ev.sender))
         .expect("cmp_tx_sender: event not found");
-    let b_stored = ctx
-        .get_stored_event(b)
+    let (b_tx, b_sender) = ctx
+        .get_stored_event(b, |ev| (ev.tx_id, ev.sender))
         .expect("cmp_tx_sender: event not found");
-    match a_stored.tx_id.cmp(&b_stored.tx_id) {
+    match a_tx.cmp(&b_tx) {
         std::cmp::Ordering::Equal => {
             let a_pk = ctx
-                .sender_pk(a_stored.sender)
+                .sender_pk(a_sender)
                 .expect("cmp_tx_sender: sender_pk not found");
             let b_pk = ctx
-                .sender_pk(b_stored.sender)
+                .sender_pk(b_sender)
                 .expect("cmp_tx_sender: sender_pk not found");
             a_pk.cmp(&b_pk)
         }

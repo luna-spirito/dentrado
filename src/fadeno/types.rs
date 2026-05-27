@@ -164,7 +164,7 @@ pub enum LocValue {
     KolDataId(LocDataId),
     KolEventTypeId(LocMsgTypeId),
     KolUserId(LocUserId),
-    KolQuery(u64),
+    KolQuery(u64, u64),
     KolPrimary,
     KolGear(Box<KolGear>),
     KolStateGraph(Box<StateGraph<LocValue, LocValue, LocValue, LocValue, LocValue>>),
@@ -224,7 +224,7 @@ impl Localizable for LocValue {
             | LocValue::Builtin(_)
             | LocValue::Panic
             | LocValue::Import(_)
-            | LocValue::KolQuery(_)
+            | LocValue::KolQuery(_, _)
             | LocValue::KolEventTypeId(_) => Ok(None),
 
             LocValue::KolPrimary | LocValue::KolSecondary => {
@@ -697,7 +697,7 @@ impl fmt::Display for LocValue {
             LocValue::KolDataId(id) => write!(f, "DataId({})", id.0),
             LocValue::KolEventTypeId(id) => write!(f, "EventTypeId({})", id.0),
             LocValue::KolUserId(id) => write!(f, "UserId({})", id.0),
-            LocValue::KolQuery(n) => write!(f, "Query({n})"),
+            LocValue::KolQuery(n, m) => write!(f, "Query({n}, {m})"),
             LocValue::KolGear(g) => write!(f, "Gear({:?})", g.primary_group),
             LocValue::KolStateGraph(_) => write!(f, "StateGraph"),
             LocValue::KolStateGraphOut(_) => write!(f, "StateGraphOut"),

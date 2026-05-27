@@ -389,7 +389,6 @@ fn read_value(cur: &mut Cursor) -> Result<LocValue, DeError> {
         6 => Ok(LocValue::Builtin(read_builtin(cur)?)),
         7 => Ok(LocValue::Panic),
         8 => Ok(LocValue::Import(cur.read_u64_le("vimport")?)),
-        9 => Ok(LocValue::KolQuery(cur.read_u64_le("vkolquery")?)),
         tag => Err(DeError::UnknownTag {
             context: "Value",
             tag,

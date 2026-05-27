@@ -53,3 +53,5 @@ bridge.rs:
 * Recheck advanced tests
 * TODO: cluster communication is currently kinda blunt, it's better to design proper async way that doesn't resent the whole "untrusted" client WireContext
 * Think a little more about cross-core cross-node communication, routing, errors?
+
+* There is a on-going `git stash` about `compio` integration. Reason for delay: we use `&mut` for certain operations with LocCtx & Core... yeeeeaaaahh....
