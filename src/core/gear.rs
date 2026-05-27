@@ -3,7 +3,6 @@ use std::{any::Any, fmt::Debug, hash::Hash};
 use crate::{
     core::core_ctx::Core,
     types::{GlobalCoreId, GlobalResolver, GroupRouteError, LocGroupId, LocMsgTypeId, Localizable},
-    wire::WireLocCtx,
 };
 
 pub trait Runtime: Debug + Send + Sync + Sized + 'static {
@@ -26,7 +25,7 @@ pub trait Runtime: Debug + Send + Sync + Sized + 'static {
 
     fn route_group(
         key: &Self::Group,
-        wire_ctx: &WireLocCtx<Self>,
+        resolver: &dyn GlobalResolver,
     ) -> Result<GlobalCoreId, GroupRouteError>;
 
     fn meta(gear: &Self::GearId) -> (LocMsgTypeId, Self::Group);
@@ -53,7 +52,7 @@ impl Runtime for EmptyRuntime {
 
     fn route_group(
         _key: &Self::Group,
-        _wire_ctx: &WireLocCtx<Self>,
+        _resolver: &dyn GlobalResolver,
     ) -> Result<GlobalCoreId, crate::types::GroupRouteError> {
         Ok(GlobalCoreId(0))
     }

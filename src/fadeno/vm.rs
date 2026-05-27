@@ -41,13 +41,6 @@ pub(crate) struct CommonTags {
 }
 
 impl CommonTags {
-    fn ensure_tag_set(tags: &mut TagRegistry, tag_ids: &[u64]) -> u64 {
-        if let Some(ts) = tags.find_exact_tag_set(tag_ids) {
-            return ts;
-        }
-        tags.push_tag_set(tag_ids.iter().map(|&t| (t, 1u8)).collect())
-    }
-
     pub(crate) fn ensure(tags: &mut TagRegistry) -> Self {
         let sender = tags.ensure_tag_id(b"sender");
         let body = tags.ensure_tag_id(b"body");
@@ -72,17 +65,17 @@ impl CommonTags {
         let from = tags.ensure_tag_id(b"from");
         let curr = tags.ensure_tag_id(b"curr");
 
-        let viewl_tag_set = Self::ensure_tag_set(tags, &[left, rest]);
-        let query_result_tag_set = Self::ensure_tag_set(tags, &[query, delta]);
-        let delta_tag_set = Self::ensure_tag_set(tags, &[removed, added]);
-        let opt_none_tag_set = Self::ensure_tag_set(tags, &[has]);
-        let opt_some_tag_set = Self::ensure_tag_set(tags, &[has, body]);
-        let event_rec_tag_set = Self::ensure_tag_set(tags, &[sender, body]);
-        let sender_tag_set = Self::ensure_tag_set(tags, &[sender]);
+        let viewl_tag_set = tags.ensure_tag_set(&[left, rest]);
+        let query_result_tag_set = tags.ensure_tag_set(&[query, delta]);
+        let delta_tag_set = tags.ensure_tag_set(&[removed, added]);
+        let opt_none_tag_set = tags.ensure_tag_set(&[has]);
+        let opt_some_tag_set = tags.ensure_tag_set(&[has, body]);
+        let event_rec_tag_set = tags.ensure_tag_set(&[sender, body]);
+        let sender_tag_set = tags.ensure_tag_set(&[sender]);
 
-        let _ = Self::ensure_tag_set(tags, &[branch, is_merge, edit]);
-        let _ = Self::ensure_tag_set(tags, &[branch, is_merge, from]);
-        let _ = Self::ensure_tag_set(tags, &[has, curr, rest]);
+        let _ = tags.ensure_tag_set(&[branch, is_merge, edit]);
+        let _ = tags.ensure_tag_set(&[branch, is_merge, from]);
+        let _ = tags.ensure_tag_set(&[has, curr, rest]);
 
         Self {
             sender,
@@ -125,7 +118,11 @@ pub enum VmError {
     },
     NumericOverflow,
     DivisionByZero,
-    Panic,
+    Panic(&'static str),
+    RecordGetFailed {
+        record: LocValue,
+        tag: Option<String>,
+    },
     MissingImport(i64),
     InvalidArgCount {
         expected: u8,
@@ -150,13 +147,16 @@ impl std::fmt::Display for VmError {
             }
             VmError::NumericOverflow => write!(f, "numeric overflow"),
             VmError::DivisionByZero => write!(f, "division by zero"),
-            VmError::Panic => write!(f, "runtime panic"),
+            VmError::Panic(x) => write!(f, "runtime panic at: {x}"),
             VmError::MissingImport(n) => write!(f, "missing import #{n}"),
             VmError::InvalidArgCount { expected, got } => {
                 write!(f, "invalid arg count: expected {expected}, got {got}")
             }
             VmError::WireError { op, detail } => {
                 write!(f, "wire error in {op}: {detail}")
+            }
+            VmError::RecordGetFailed { record, tag } => {
+                write!(f, "record get failed: {tag:?} in {record}")
             }
         }
     }
@@ -774,7 +774,7 @@ impl Vm<'_> {
                     (LocValue::List(vs), LocValue::Num(i)) => {
                         if *i < 0 || *i as usize >= vs.len() {
                             {
-                                Err(VmError::Panic)
+                                Err(VmError::Panic("ListIndexL"))
                             }
                         } else {
                             Ok(vs[*i as usize].clone())
@@ -806,7 +806,7 @@ impl Vm<'_> {
                     LocValue::List(vs) => {
                         if vs.is_empty() {
                             {
-                                Err(VmError::Panic)
+                                Err(VmError::Panic("ListViewL empty"))
                             }
                         } else {
                             let left = vs[0].clone();
@@ -881,19 +881,16 @@ impl Vm<'_> {
                 let record = &args[1];
 
                 let field_val = match (&tag, record) {
-                    (LocValue::Tag(t), LocValue::Record { .. }) => {
-                        if let Some(val) = self.tags.record_get_by_tag(record, *t) {
-                            Ok(val)
-                        } else {
-                            let name_bytes = self.tags.tag_to_name(*t).unwrap_or(b"?");
-                            let name = String::from_utf8_lossy(name_bytes);
-                            if let Ok(b) = Self::resolve_builtin_by_name(&name) {
-                                Ok(LocValue::Builtin(b))
-                            } else {
-                                Err(VmError::Panic)
-                            }
-                        }
-                    }
+                    (LocValue::Tag(t), LocValue::Record { .. }) => self
+                        .tags
+                        .record_get_by_tag(record, *t)
+                        .ok_or_else(|| VmError::RecordGetFailed {
+                            record: record.clone(),
+                            tag: self
+                                .tags
+                                .tag_to_name(*t)
+                                .map(|x| String::from_utf8_lossy(x).to_string()),
+                        }),
                     (LocValue::Tag(t), LocValue::BuiltinsVar) => {
                         let name_bytes = self.tags.tag_to_name(*t).unwrap_or(b"?");
                         let name = String::from_utf8_lossy(name_bytes);
@@ -1137,7 +1134,7 @@ impl Vm<'_> {
                 let event_resolver =
                     |lid: AnyLocEventId| -> (crate::utils::sg_ord_map::SGEventId, LocValue) {
                         let stored = event_resolver_core
-                            .get_stored_event(lid, |x| x.clone())
+                            .get_stored_event(lid, std::clone::Clone::clone)
                             .expect("event_resolver: event not found in core");
 
                         let sg_event_id = crate::utils::sg_ord_map::SGEventId::new(
@@ -1148,7 +1145,7 @@ impl Vm<'_> {
                             lid,
                         );
 
-                        let event_rec = LocValue::Record {
+                        let _event_rec = LocValue::Record {
                             tag_set: Arc::new(vec![self.common.event_rec_tag_set]),
                             fields: Arc::new(vec![
                                 LocValue::KolSenderId(stored.sender),
@@ -1156,7 +1153,7 @@ impl Vm<'_> {
                             ]),
                         };
 
-                        (sg_event_id, event_rec)
+                        (sg_event_id, LocValue::KolEventId(lid))
                     };
 
                 let dep_resolver = {
@@ -1423,14 +1420,44 @@ impl Vm<'_> {
                         });
                     }
                 };
-                let logged = ctx
-                    .get_stored_event(event_id)
+                let (sender, body) = ctx
+                    .get_stored_event(event_id, |s| (s.sender, s.body.clone()))
                     .expect("resolve_event: event not found in core");
 
                 Ok(LocValue::Record {
-                    tag_set: Arc::new(vec![self.common.sender_tag_set]),
-                    fields: Arc::new(vec![LocValue::KolSenderId(logged.sender)]),
+                    tag_set: Arc::new(vec![self.common.event_rec_tag_set]),
+                    fields: Arc::new(vec![LocValue::KolSenderId(sender), body]),
                 })
+            }
+
+            BuiltinT::KolResolveData => {
+                let did = match args.first() {
+                    Some(LocValue::KolDataId(id)) => *id,
+                    Some(other) => {
+                        return Err(VmError::TypeError {
+                            op: "resolve_data",
+                            expected: "KolDataId",
+                            got: format!("{other:?}"),
+                        })
+                    }
+                    None => {
+                        return Err(VmError::InvalidArgCount {
+                            expected: 1,
+                            got: 0,
+                        })
+                    }
+                };
+                let ctx = match self.stage {
+                    VmStage::Run { ctx, .. } => ctx,
+                    _ => {
+                        return Err(VmError::OutsideGearStepContext { op: "resolve_data" });
+                    }
+                };
+                ctx.get_data(did, |(_data_id, content)| content.clone())
+                    .ok_or(VmError::WireError {
+                        op: "resolve_data",
+                        detail: format!("data not found for LocDataId({})", did.0),
+                    })
             }
 
             BuiltinT::KolUserEq => {
@@ -1488,7 +1515,7 @@ impl Vm<'_> {
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
-                            expected: 2,
+                            expected: 3,
                             got: args.len(),
                         })
                     }
@@ -1504,37 +1531,45 @@ impl Vm<'_> {
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
-                            expected: 2,
+                            expected: 3,
                             got: args.len(),
                         })
                     }
                 };
-                let core = match &self.stage {
-                    VmStage::Run { ctx, .. } => ctx,
+                let upd = match args.get(2) {
+                    Some(LocValue::KolTextUpd(u)) => u,
+                    Some(other) => {
+                        return Err(VmError::TypeError {
+                            op: "anchor_agg_apply",
+                            expected: "TextUpd",
+                            got: format!("{other}"),
+                        })
+                    }
+                    None => {
+                        return Err(VmError::InvalidArgCount {
+                            expected: 3,
+                            got: args.len(),
+                        })
+                    }
+                };
+                let ctx = match &self.stage {
+                    VmStage::Run {
+                        ctx,
+                        impure_core: Some(_),
+                        ..
+                    } => ctx,
                     _ => {
                         return Err(VmError::OutsideGearStepContext {
                             op: "anchor_agg_apply",
                         });
                     }
                 };
-                let logged = core
-                    .get_stored_event(event_id)
+                let loc_sender_eid = ctx
+                    .get_stored_event(event_id, |s| {
+                        crate::types::LocSenderEventId(s.sender, s.global_core_id, s.tx_id)
+                    })
                     .expect("anchor_agg_apply: event not found in ctx");
-                let upd = match self.tags.record_get_by_tag(&logged.body, self.common.edit) {
-                    Some(LocValue::KolTextUpd(u)) => u,
-                    _ => {
-                        return Ok(LocValue::KolAnchorAgg(agg));
-                    }
-                };
-                Ok(LocValue::KolAnchorAgg(agg.apply(
-                    crate::types::LocSenderEventId(
-                        logged.sender,
-                        logged.global_core_id,
-                        logged.tx_id,
-                    ),
-                    &upd,
-                    core,
-                )))
+                Ok(LocValue::KolAnchorAgg(agg.apply(loc_sender_eid, upd, ctx)))
             }
 
             BuiltinT::KolMkTextAgg => Ok(LocValue::KolTextAgg(crate::utils::text::TextAgg::new())),
@@ -1554,107 +1589,61 @@ impl Vm<'_> {
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
-                            expected: 2,
+                            expected: 3,
                             got: args.len(),
                         })
                     }
                 };
-
-                let (event_id, upd) = if args.len() >= 3 {
-                    let eid = match args.get(1) {
-                        Some(LocValue::KolEventId(id)) => *id,
-                        Some(other) => {
-                            return Err(VmError::TypeError {
-                                op: "text_agg_apply",
-                                expected: "KolEventId",
-                                got: format!("{other}"),
-                            })
-                        }
-                        None => {
-                            return Err(VmError::InvalidArgCount {
-                                expected: 3,
-                                got: args.len(),
-                            })
-                        }
-                    };
-                    let u = match args.get(2) {
-                        Some(LocValue::KolTextUpd(u)) => u.clone(),
-                        Some(other) => {
-                            return Err(VmError::TypeError {
-                                op: "text_agg_apply",
-                                expected: "TextUpd",
-                                got: format!("{other}"),
-                            })
-                        }
-                        None => {
-                            return Err(VmError::InvalidArgCount {
-                                expected: 3,
-                                got: args.len(),
-                            })
-                        }
-                    };
-                    (eid, u)
-                } else {
-                    let u = match args.get(1) {
-                        Some(LocValue::KolTextUpd(u)) => u.clone(),
-                        Some(other) => {
-                            return Err(VmError::TypeError {
-                                op: "text_agg_apply",
-                                expected: "TextUpd",
-                                got: format!("{other}"),
-                            })
-                        }
-                        None => {
-                            return Err(VmError::InvalidArgCount {
-                                expected: 2,
-                                got: args.len(),
-                            })
-                        }
-                    };
-                    let sg_ctx = handler_ctx
-                        .expect("text_agg_apply 2-arg: must be called inside stategraph handler");
-                    let core = match &self.stage {
-                        VmStage::Run {
-                            impure_core: Some(core),
-                            ..
-                        } => core,
-                        _ => {
-                            return Err(VmError::OutsideGearStepContext {
-                                op: "text_agg_apply",
-                            });
-                        }
-                    };
-                    let stored = core
-                        .loc_ctx()
-                        .get_stored_event(sg_ctx.ctx.event_id.1)
-                        .expect("text_agg_apply: event not found");
-                    let loc_sender_eid =
-                        LocSenderEventId(stored.sender, stored.global_core_id, stored.tx_id);
-                    let eid = core
-                        .loc_ctx()
-                        .find_event_by_sender_tx(loc_sender_eid)
-                        .expect("text_agg_apply: event not found by sender_tx");
-                    (eid, u)
+                let event_id = match args.get(1) {
+                    Some(LocValue::KolEventId(id)) => *id,
+                    Some(other) => {
+                        return Err(VmError::TypeError {
+                            op: "text_agg_apply",
+                            expected: "KolEventId",
+                            got: format!("{other}"),
+                        })
+                    }
+                    None => {
+                        return Err(VmError::InvalidArgCount {
+                            expected: 3,
+                            got: args.len(),
+                        })
+                    }
                 };
-                let core = match &self.stage {
+                let upd = match args.get(2) {
+                    Some(LocValue::KolTextUpd(u)) => u.clone(),
+                    Some(other) => {
+                        return Err(VmError::TypeError {
+                            op: "text_agg_apply",
+                            expected: "TextUpd",
+                            got: format!("{other}"),
+                        })
+                    }
+                    None => {
+                        return Err(VmError::InvalidArgCount {
+                            expected: 3,
+                            got: args.len(),
+                        })
+                    }
+                };
+                let ctx = match &self.stage {
                     VmStage::Run {
-                        impure_core: Some(core),
+                        ctx,
+                        impure_core: Some(_),
                         ..
-                    } => *core,
+                    } => ctx,
                     _ => {
                         return Err(VmError::OutsideGearStepContext {
                             op: "text_agg_apply",
                         });
                     }
                 };
-                let logged = core
-                    .loc_ctx()
-                    .get_stored_event(event_id)
-                    .expect("text_agg_apply: event not found in core");
-                Ok(LocValue::KolTextAgg(agg.apply(
-                    LocSenderEventId(logged.sender, logged.global_core_id, logged.tx_id),
-                    &upd,
-                )))
+                let loc_sender_eid = ctx
+                    .get_stored_event(event_id, |s| {
+                        LocSenderEventId(s.sender, s.global_core_id, s.tx_id)
+                    })
+                    .expect("text_agg_apply: event not found");
+                Ok(LocValue::KolTextAgg(agg.apply(loc_sender_eid, &upd)))
             }
 
             BuiltinT::KolTextAggMerge => {
@@ -1814,7 +1803,8 @@ impl Vm<'_> {
             | BuiltinT::KolLocalUserId
             | BuiltinT::KolTextUpdT
             | BuiltinT::KolAnchorAggT
-            | BuiltinT::KolTextAggT => Ok(LocValue::Panic),
+            | BuiltinT::KolTextAggT
+            | BuiltinT::KolResolveData => Ok(LocValue::Panic),
         }
     }
 
@@ -1917,6 +1907,7 @@ impl Vm<'_> {
             "sgctx_update" => Ok(BuiltinT::KolSgCtxUpdate),
             "sgctx_dep_query" => Ok(BuiltinT::KolSgCtxDepQuery),
             "resolve_event" => Ok(BuiltinT::KolResolveEvent),
+            "resolve_data" => Ok(BuiltinT::KolResolveData),
             "user_eq" => Ok(BuiltinT::KolUserEq),
             "EventTypeId" => Ok(BuiltinT::KolEventTypeId),
             "LocEventId" => Ok(BuiltinT::KolLocEventId),
@@ -1932,7 +1923,7 @@ impl Vm<'_> {
             "secondary_get" => Ok(BuiltinT::KolSecondaryGet),
             "loop_iter" => Ok(BuiltinT::KolLoopIter),
             "iter_list" => Ok(BuiltinT::KolIterList),
-            _ => Err(VmError::Panic),
+            _ => Err(VmError::Panic("unknown builtin")),
         }
     }
 }

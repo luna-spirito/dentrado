@@ -5,7 +5,6 @@ use crate::{
         vm,
     },
     types::{GlobalCoreId, GlobalResolver, GroupRouteError, LocGroupId, LocMsgTypeId},
-    wire::format::WireLocCtx,
 };
 
 #[derive(Debug)]
@@ -30,7 +29,7 @@ impl Runtime for FadenoRuntime {
 
     fn route_group(
         key: &LocValue,
-        wire_ctx: &WireLocCtx<Self>,
+        wire_ctx: &dyn GlobalResolver,
     ) -> Result<GlobalCoreId, GroupRouteError> {
         let mut hasher = blake3::Hasher::new();
         hash_loc_value(key, wire_ctx, &mut hasher)?;
@@ -140,7 +139,7 @@ pub fn hash_loc_value(
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FadenoModule {
     pool: Vec<Instr>,
     constants: Vec<LocValue>,
@@ -196,6 +195,16 @@ impl FadenoModule {
     #[must_use]
     pub fn tags(&self) -> &TagRegistry {
         &self.tags
+    }
+
+    #[must_use]
+    pub fn ensure_tag_id(&mut self, name: &[u8]) -> u64 {
+        self.tags.ensure_tag_id(name)
+    }
+
+    #[must_use]
+    pub fn ensure_tag_set(&mut self, tags: &[u64]) -> u64 {
+        self.tags.ensure_tag_set(tags)
     }
 
     #[must_use]

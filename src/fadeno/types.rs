@@ -76,6 +76,7 @@ pub enum BuiltinT {
     KolStateGraphOutT,  // 47
     KolStateGraphT,     // 48
     KolTimestamp,       // 49
+    KolResolveData,     // 50
 
     KolMkQuery,
     KolResolveEvent,
@@ -605,7 +606,7 @@ impl TagRegistry {
     }
 
     #[must_use]
-    pub(crate) fn find_exact_tag_set(&self, tag_ids: &[u64]) -> Option<u64> {
+    pub fn find_exact_tag_set(&self, tag_ids: &[u64]) -> Option<u64> {
         for (entries, ts_id) in &self.tag_sets {
             if entries.len() == tag_ids.len()
                 && entries
@@ -619,7 +620,7 @@ impl TagRegistry {
         None
     }
 
-    pub(crate) fn push_tag_set(&mut self, entries: Vec<(u64, u8)>) -> u64 {
+    fn push_tag_set(&mut self, entries: Vec<(u64, u8)>) -> u64 {
         let id = self.tag_sets.len() as u64;
         let idx = self.tag_sets.len();
         self.tag_sets.push((entries, id));
@@ -636,6 +637,13 @@ impl TagRegistry {
         self.name_to_tag.insert(name.to_vec(), new_id);
         new_id
     }
+
+    pub(crate) fn ensure_tag_set(&mut self, tag_ids: &[u64]) -> u64 {
+        if let Some(ts) = self.find_exact_tag_set(tag_ids) {
+            return ts;
+        }
+        self.push_tag_set(tag_ids.iter().map(|&t| (t, 1u8)).collect())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -644,6 +652,12 @@ pub struct Compiled {
     pub(crate) constants: Vec<LocValue>,
     pub(crate) pool: Vec<Instr>,
     pub(crate) module_ranges: Vec<InstrRange>,
+}
+
+impl Compiled {
+    pub fn tags_mut(&mut self) -> &mut TagRegistry {
+        &mut self.tags
+    }
 }
 
 impl fmt::Display for LocValue {

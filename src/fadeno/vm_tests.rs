@@ -1,7 +1,7 @@
 use crate::{
     core::{
         core_ctx::Core,
-        gear::Runtime,
+        gear::{EmptyRuntime, Runtime},
         loc_ctx::{EventContext, StoredEvent},
     },
     fadeno::{
@@ -186,7 +186,7 @@ fn sg_apply_preserves_stack() {
     let group_id = EventContext::mk_loc_group(&mut core, msg_type, group.clone());
     let global_core_id = crate::fadeno::bridge::FadenoRuntime::route_group(
         &group,
-        &WireLocCtx {
+        &WireLocCtx::<EmptyRuntime> {
             users: vec![],
             senders: vec![],
             data: vec![],

@@ -36,12 +36,16 @@ struct AttachBody {
 
 #[derive(Clone, Copy, Debug)]
 struct Query {
-    processed_count: usize,
+    processed_added: usize,
+    processed_removed: usize,
 }
 
 impl Query {
     fn new() -> Self {
-        Self { processed_count: 0 }
+        Self {
+            processed_added: 0,
+            processed_removed: 0,
+        }
     }
 }
 
@@ -150,7 +154,7 @@ impl Runtime for CounterRuntime {
 
     fn route_group(
         group: &LocValue,
-        wire_ctx: &WireLocCtx<Self>,
+        wire_ctx: &dyn GlobalResolver,
     ) -> Result<GlobalCoreId, GroupRouteError> {
         let mut hasher = blake3::Hasher::new();
         hash_loc_value(group, wire_ctx, &mut hasher)?;
@@ -190,26 +194,33 @@ impl Runtime for CounterRuntime {
         let Some(group) = group else {
             return cache.cache;
         };
-        let (added_ids, removed_ids) = core.query_events(group, cache.input.processed_count);
-        for eid in added_ids {
-            let event = core
+        let Some((added_ids, removed_ids)) = core.query_events(
+            group,
+            (cache.input.processed_added, cache.input.processed_removed),
+            |a, r| (a.to_vec(), r.to_vec()),
+        ) else {
+            return cache.cache;
+        };
+        for eid in &added_ids {
+            let body = core
                 .loc_ctx()
-                .get_stored_event(*eid)
+                .get_stored_event(*eid, |e| e.body.clone())
                 .expect("counter gear: event not found");
-            if let LocValue::Num(delta) = &event.body {
+            if let LocValue::Num(delta) = &body {
                 cache.cache += delta;
             }
         }
-        for eid in removed_ids {
-            let event = core
+        for eid in &removed_ids {
+            let body = core
                 .loc_ctx()
-                .get_stored_event(*eid)
+                .get_stored_event(*eid, |e| e.body.clone())
                 .expect("counter gear: removed event not found");
-            if let LocValue::Num(delta) = &event.body {
+            if let LocValue::Num(delta) = &body {
                 cache.cache -= delta;
             }
         }
-        cache.input.processed_count += added_ids.len();
+        cache.input.processed_added += added_ids.len();
+        cache.input.processed_removed += removed_ids.len();
         let _ = gear;
         cache.cache
     }
@@ -238,7 +249,7 @@ fn branch_create_wire_event(
 
 #[test]
 fn doc_counter() {
-    let mut tc: TestCluster<CounterRuntime> = TestCluster::start(&[2, 3, 4], Arc::new(()));
+    let mut tc: TestCluster<CounterRuntime> = TestCluster::start(&[2, 3, 4], ());
 
     let alice_pk = SenderPk([42u8; 32]);
     let alice_uid = UserId {
@@ -355,7 +366,7 @@ fn malformed_wire_ctx_returns_error_not_panic() {
             .post_events(
                 wire_ctx,
                 vec![WireEventBody {
-                    sender: LocSenderId(0),
+                    sender: LocSenderId::new_debug(0),
                     tx_id: 0,
                     msg_type: LocMsgTypeId(0),
                     group: LocValue::Num(0),
@@ -377,7 +388,7 @@ fn malformed_wire_ctx_returns_error_not_panic() {
             .post_events(
                 wire_ctx,
                 vec![WireEventBody {
-                    sender: LocSenderId(5),
+                    sender: LocSenderId::new_debug(5),
                     tx_id: 0,
                     msg_type: LocMsgTypeId(0),
                     group: LocValue::Num(0),
@@ -399,11 +410,11 @@ fn malformed_wire_ctx_returns_error_not_panic() {
             .post_events(
                 wire_ctx,
                 vec![WireEventBody {
-                    sender: LocSenderId(0),
+                    sender: LocSenderId::new_debug(0),
                     tx_id: 0,
                     msg_type: LocMsgTypeId(0),
                     group: LocValue::Num(0),
-                    body: LocValue::KolUserId(LocUserId(50)),
+                    body: LocValue::KolUserId(LocUserId::new_debug(50)),
                 }],
                 0,
             )
@@ -413,7 +424,7 @@ fn malformed_wire_ctx_returns_error_not_panic() {
 
     {
         let self_referencing_content = LocValue::List(Arc::new(vec![
-            LocValue::KolDataId(LocDataId(0)), // self-reference = forward ref
+            LocValue::KolDataId(LocDataId::new_debug(0)), // self-reference = forward ref
         ]));
         let dummy_data_id = DataId {
             timestamp: 0,
@@ -428,11 +439,11 @@ fn malformed_wire_ctx_returns_error_not_panic() {
             .post_events(
                 wire_ctx,
                 vec![WireEventBody {
-                    sender: LocSenderId(0),
+                    sender: LocSenderId::new_debug(0),
                     tx_id: 0,
                     msg_type: LocMsgTypeId(0),
                     group: LocValue::Num(0),
-                    body: LocValue::KolDataId(LocDataId(0)),
+                    body: LocValue::KolDataId(LocDataId::new_debug(0)),
                 }],
                 0,
             )

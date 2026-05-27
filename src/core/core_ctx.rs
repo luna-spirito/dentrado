@@ -161,7 +161,7 @@ impl<R: Runtime> Core<R> {
         let group = self.loc_ctx().find_group(msg_type, group);
 
         {
-            let inner = &mut *self.inner.borrow_mut();
+            let mut inner = self.inner.borrow_mut();
             assert!(
                 !inner.gear_in_flight.contains(&gear),
                 "run_any_gear: gear is already in-flight (re-entrant execution)",
@@ -204,12 +204,9 @@ impl<R: Runtime> Core<R> {
         if target_core == self.core_id {
             self.run_any_gear(gear.clone(), msg_type, &group)
         } else {
+            let cached = self.inner.borrow().secondary_cache.get(&gear).cloned();
             let output =
-                if let Some(cached) = self.inner.borrow().secondary_cache.get(&gear).cloned() {
-                    cached
-                } else {
-                    self.run_any_gear(gear.clone(), msg_type, &group)
-                };
+                cached.unwrap_or_else(|| self.run_any_gear(gear.clone(), msg_type, &group));
 
             let req_builder = WireLocCtxBuilder::new(&self.loc_ctx);
             let gear_wire = req_builder.remap(gear).expect("secondary_get: gear remap");

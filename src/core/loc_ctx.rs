@@ -71,6 +71,16 @@ impl<R: Runtime> LocCtx<R> {
     }
 
     #[must_use]
+    pub fn all_users(&self) -> Vec<(LocUserId, UserId)> {
+        self.0
+            .borrow()
+            .local_to_user_id
+            .iter()
+            .map(|(&lid, &uid)| (lid, uid))
+            .collect()
+    }
+
+    #[must_use]
     pub(crate) fn sender_pk(&self, sid: LocSenderId) -> Option<SenderPk> {
         self.0.borrow().sender_to_pk.get(&sid).copied()
     }

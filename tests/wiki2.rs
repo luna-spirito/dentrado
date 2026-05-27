@@ -19,9 +19,11 @@ use kolorinko::{
 };
 
 mod common;
-use common::{wire_event, FadenoTestCluster};
+use common::wire_event;
 
-fn setup_wiki2() -> Option<Arc<FadenoModule>> {
+use crate::common::WikiTestCluster;
+
+fn setup_wiki2() -> Option<FadenoModule> {
     let binary = find_binary()?;
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fad/wiki2");
     let output = compile_file(&binary, &path)
@@ -34,10 +36,10 @@ fn setup_wiki2() -> Option<Arc<FadenoModule>> {
             return None;
         }
     };
-    Some(Arc::new(module))
+    Some(module)
 }
 
-fn extract_invited_pairs(output: LocValue) -> Vec<(u64, bool)> {
+fn extract_invited_pairs(output: LocValue) -> Vec<(LocUserId, bool)> {
     let sg = match output {
         LocValue::KolStateGraphOut(sg) => sg,
         other => panic!("expected KolStateGraphOut, got {other:?}"),
@@ -45,7 +47,7 @@ fn extract_invited_pairs(output: LocValue) -> Vec<(u64, bool)> {
     let mut result = Vec::new();
     for (key, timeline) in sg.iter() {
         let uid = match key {
-            LocValue::KolUserId(id) => id.0,
+            LocValue::KolUserId(id) => *id,
             other => panic!("expected KolUserId key, got {other:?}"),
         };
         if let Some((_, b_val)) = timeline.last() {
@@ -85,34 +87,30 @@ fn invited_simple_e2e() {
         return;
     };
 
-    let mut tc = FadenoTestCluster::start(&[2, 3, 4], module);
+    let mut tc = WikiTestCluster::start(&[2, 3, 4], module);
     let invite_mt = tc.msg_type(b"Invite");
     let tags = tc.tags().clone();
     let exports = tc.module().exports().clone();
 
-    let alice = tc.add_user(
-        SenderPk([1u8; 32]),
-        UserId {
-            id: 1,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let bob = tc.add_user(
-        SenderPk([2u8; 32]),
-        UserId {
-            id: 2,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let carol = tc.add_user(
-        SenderPk([3u8; 32]),
-        UserId {
-            id: 3,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
+    let alice_uid = UserId {
+        id: 1,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let bob_uid = UserId {
+        id: 2,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let carol_uid = UserId {
+        id: 3,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
 
-    let b0 = tc.add_seed_branch(invite_mt, alice);
+    let alice = tc.add_user(SenderPk([1u8; 32]), alice_uid);
+    let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
+    let carol = tc.add_user(SenderPk([3u8; 32]), carol_uid);
+
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let b0 = tc.add_seed_branch(invite_mt, alice_loc_uid);
 
     tc.post_events(
         vec![
@@ -120,22 +118,22 @@ fn invited_simple_e2e() {
                 alice,
                 0,
                 invite_mt,
-                LocValue::KolDataId(LocDataId(b0.0)),
-                LocValue::KolUserId(LocUserId(bob.0 as u64)),
+                LocValue::KolDataId(b0),
+                tc.kol_user_id(bob_uid),
             ),
             wire_event(
                 alice,
                 1,
                 invite_mt,
-                LocValue::KolDataId(LocDataId(b0.0)),
-                LocValue::KolUserId(LocUserId(carol.0 as u64)),
+                LocValue::KolDataId(b0),
+                tc.kol_user_id(carol_uid),
             ),
             wire_event(
                 bob,
                 2,
                 invite_mt,
-                LocValue::KolDataId(LocDataId(b0.0)),
-                LocValue::KolUserId(LocUserId(carol.0 as u64)),
+                LocValue::KolDataId(b0),
+                tc.kol_user_id(carol_uid),
             ),
         ],
         1,
@@ -145,7 +143,7 @@ fn invited_simple_e2e() {
         .record_get(&exports, b"invited")
         .expect("missing invited export")
         .clone();
-    let gear = tc.build_gear(invited_closure, vec![LocValue::KolDataId(LocDataId(b0.0))]);
+    let gear = tc.build_gear(invited_closure, vec![LocValue::KolDataId(b0)]);
     let output = tc.run_gear(gear);
     let pairs = extract_invited_pairs(output);
     let invited_count = pairs.iter().filter(|(_, b)| *b).count();
@@ -163,155 +161,6 @@ fn invited_simple_e2e() {
 }
 
 #[test]
-fn invited_remapping_e2e() {
-    let module = if let Some(m) = setup_wiki2() {
-        m
-    } else {
-        eprintln!("skipping: fadeno-lang not found");
-        return;
-    };
-
-    let mut tc = FadenoTestCluster::start(&[2, 3, 4], module);
-    let invite_mt = tc.msg_type(b"Invite");
-    let tags = tc.tags().clone();
-    let exports = tc.module().exports().clone();
-
-    let alice = tc.add_user(
-        SenderPk([1u8; 32]),
-        UserId {
-            id: 1,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let bob = tc.add_user(
-        SenderPk([2u8; 32]),
-        UserId {
-            id: 2,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let carol = tc.add_user(
-        SenderPk([3u8; 32]),
-        UserId {
-            id: 3,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-
-    let b0 = tc.add_seed_branch(invite_mt, alice);
-
-    tc.post_events(
-        vec![
-            wire_event(
-                alice,
-                0,
-                invite_mt,
-                LocValue::KolDataId(LocDataId(b0.0)),
-                LocValue::KolUserId(LocUserId(bob.0 as u64)),
-            ),
-            wire_event(
-                alice,
-                1,
-                invite_mt,
-                LocValue::KolDataId(LocDataId(b0.0)),
-                LocValue::KolUserId(LocUserId(carol.0 as u64)),
-            ),
-            wire_event(
-                bob,
-                2,
-                invite_mt,
-                LocValue::KolDataId(LocDataId(b0.0)),
-                LocValue::KolUserId(LocUserId(carol.0 as u64)),
-            ),
-        ],
-        2,
-    );
-
-    let mut loc_ctx = LocCtx::<FadenoRuntime>::new();
-    EventContext::mk_loc_sender(
-        &mut loc_ctx,
-        SenderPk([3u8; 32]),
-        Some(UserId {
-            id: 3,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        }),
-    );
-    EventContext::mk_loc_sender(
-        &mut loc_ctx,
-        SenderPk([2u8; 32]),
-        Some(UserId {
-            id: 2,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        }),
-    );
-    let alice_sid = EventContext::mk_loc_sender(
-        &mut loc_ctx,
-        SenderPk([1u8; 32]),
-        Some(UserId {
-            id: 1,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        }),
-    );
-
-    let branch_group =
-        EventContext::mk_loc_group(&mut loc_ctx, invite_mt, LocValue::KolDataId(LocDataId(0)));
-    let b_core_id = tc.branch_core_id(b0);
-    EventContext::mk_data(
-        &mut loc_ctx,
-        tc.data_id(b0),
-        FadenoTestCluster::empty_record(),
-    )
-    .expect("mk_data branch");
-    EventContext::store_event(
-        &mut loc_ctx,
-        StoredEvent {
-            group: branch_group,
-            sender: alice_sid,
-            global_core_id: b_core_id,
-            tx_id: 0,
-            timestamp: 0,
-            source_node: NodeId(0),
-            body: FadenoTestCluster::empty_record(),
-        },
-    );
-
-    let invited_closure = tags
-        .record_get(&exports, b"invited")
-        .expect("missing invited export")
-        .clone();
-    let result = tc
-        .module()
-        .call_with_storage(
-            invited_closure,
-            vec![LocValue::KolDataId(LocDataId(0))],
-            &loc_ctx,
-        )
-        .expect("gear call failed");
-    let LocValue::KolGear(gear) = result else {
-        panic!("expected KolGear, got {result:?}");
-    };
-
-    let builder = WireLocCtxBuilder::new(&loc_ctx);
-    builder
-        .remap(LocValue::KolDataId(LocDataId(0)))
-        .expect("WireLocCtxBuilder: import branch DataId");
-    let gear_wire = builder
-        .remap((*gear).clone())
-        .expect("WireLocCtxBuilder: remap gear");
-    let _wire_ctx = builder.build();
-
-    let output = tc.run_gear(gear_wire);
-    let pairs = extract_invited_pairs(output);
-    let invited_count = pairs.iter().filter(|(_, b)| *b).count();
-
-    assert!(
-        invited_count <= 2,
-        "expected at most 2 explicitly invited users, got {:?}",
-        pairs
-    );
-}
-
-#[test]
 fn doc_content_same_core_e2e() {
     let module = if let Some(m) = setup_wiki2() {
         m
@@ -320,43 +169,39 @@ fn doc_content_same_core_e2e() {
         return;
     };
 
-    let mut tc = FadenoTestCluster::start(&[2, 3, 4], module);
+    let mut tc = WikiTestCluster::start(&[2, 3, 4], module);
     let invite_mt = tc.msg_type(b"Invite");
     let attach_mt = tc.msg_type(b"Attach");
     let tags = tc.tags().clone();
     let exports = tc.module().exports().clone();
 
-    let alice = tc.add_user(
-        SenderPk([1u8; 32]),
-        UserId {
-            id: 1,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let bob = tc.add_user(
-        SenderPk([2u8; 32]),
-        UserId {
-            id: 2,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let eve = tc.add_user(
-        SenderPk([3u8; 32]),
-        UserId {
-            id: 3,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
+    let alice_uid = UserId {
+        id: 1,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let bob_uid = UserId {
+        id: 2,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let eve_uid = UserId {
+        id: 3,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
 
-    let b0 = tc.add_seed_branch(invite_mt, alice);
+    let alice = tc.add_user(SenderPk([1u8; 32]), alice_uid);
+    let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
+    let eve = tc.add_user(SenderPk([3u8; 32]), eve_uid);
+
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let b0 = tc.add_seed_branch(invite_mt, alice_loc_uid);
 
     tc.post_events(
         vec![wire_event(
             alice,
             0,
             invite_mt,
-            LocValue::KolDataId(LocDataId(b0.0)),
-            LocValue::KolUserId(LocUserId(bob.0 as u64)),
+            LocValue::KolDataId(b0),
+            tc.kol_user_id(bob_uid),
         )],
         1,
     );
@@ -368,7 +213,7 @@ fn doc_content_same_core_e2e() {
         vec!["Hello from Bob".to_string()],
     );
     let bob_attach_body = tags.make_record(&[
-        (b"branch", LocValue::KolDataId(LocDataId(b0.0))),
+        (b"branch", LocValue::KolDataId(b0)),
         (b"is_merge", LocValue::Bool(false)),
         (b"edit", LocValue::KolTextUpd(text_upd)),
     ]);
@@ -389,7 +234,7 @@ fn doc_content_same_core_e2e() {
         vec!["Eve was here".to_string()],
     );
     let eve_attach_body = tags.make_record(&[
-        (b"branch", LocValue::KolDataId(LocDataId(b0.0))),
+        (b"branch", LocValue::KolDataId(b0)),
         (b"is_merge", LocValue::Bool(false)),
         (b"edit", LocValue::KolTextUpd(eve_text_upd)),
     ]);
@@ -409,8 +254,7 @@ fn doc_content_same_core_e2e() {
         .record_get(&exports, b"invited")
         .expect("missing invited export")
         .clone();
-    let _invited_output =
-        tc.build_and_run_gear(invited_closure, vec![LocValue::KolDataId(LocDataId(b0.0))]);
+    let _invited_output = tc.build_and_run_gear(invited_closure, vec![LocValue::KolDataId(b0)]);
 
     let doc_content_closure = tags
         .record_get(&exports, b"doc_content")
@@ -428,12 +272,8 @@ fn doc_content_same_core_e2e() {
         entries.len()
     );
 
-    let branch_key = LocValue::KolDataId(LocDataId(b0.0));
-    assert_eq!(
-        entries[0].0, &branch_key,
-        "branch key should be KolDataId({})",
-        b0.0
-    );
+    let branch_key = LocValue::KolDataId(b0);
+    assert_eq!(entries[0].0, &branch_key, "branch key mismatch");
 
     let timeline = entries[0].1;
     let (_, text_agg_val) = timeline.last().expect("timeline should not be empty");
@@ -457,34 +297,32 @@ fn doc_content_cross_core_e2e() {
         return;
     };
 
-    let mut tc = FadenoTestCluster::start(&[2, 3, 4], module);
+    let mut tc = WikiTestCluster::start(&[2, 3, 4], module);
     let invite_mt = tc.msg_type(b"Invite");
     let attach_mt = tc.msg_type(b"Attach");
     let tags = tc.tags().clone();
     let exports = tc.module().exports().clone();
 
-    let alice = tc.add_user(
-        SenderPk([1u8; 32]),
-        UserId {
-            id: 1,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let bob = tc.add_user(
-        SenderPk([2u8; 32]),
-        UserId {
-            id: 2,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
+    let alice_uid = UserId {
+        id: 1,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let bob_uid = UserId {
+        id: 2,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
 
-    let b0 = tc.add_seed_branch(invite_mt, alice);
+    let alice = tc.add_user(SenderPk([1u8; 32]), alice_uid);
+    let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
+
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let b0 = tc.add_seed_branch(invite_mt, alice_loc_uid);
 
     let invited_closure = tags
         .record_get(&exports, b"invited")
         .expect("missing invited export")
         .clone();
-    let invited_gear = tc.build_gear(invited_closure, vec![LocValue::KolDataId(LocDataId(b0.0))]);
+    let invited_gear = tc.build_gear(invited_closure, vec![LocValue::KolDataId(b0)]);
     let invited_core = {
         let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear.clone());
         FadenoRuntime::route_group(invited_gear_wire.group(), &invited_wire_ctx)
@@ -500,8 +338,8 @@ fn doc_content_cross_core_e2e() {
             alice,
             0,
             invite_mt,
-            LocValue::KolDataId(LocDataId(b0.0)),
-            LocValue::KolUserId(LocUserId(bob.0 as u64)),
+            LocValue::KolDataId(b0),
+            tc.kol_user_id(bob_uid),
         )],
         5,
     );
@@ -511,7 +349,7 @@ fn doc_content_cross_core_e2e() {
         vec!["Hello from Bob".to_string()],
     );
     let bob_attach_body = tags.make_record(&[
-        (b"branch", LocValue::KolDataId(LocDataId(b0.0))),
+        (b"branch", LocValue::KolDataId(b0)),
         (b"is_merge", LocValue::Bool(false)),
         (b"edit", LocValue::KolTextUpd(text_upd)),
     ]);

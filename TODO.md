@@ -55,3 +55,4 @@ bridge.rs:
 * Think a little more about cross-core cross-node communication, routing, errors?
 
 * There is a on-going `git stash` about `compio` integration. Reason for delay: we use `&mut` for certain operations with LocCtx & Core... yeeeeaaaahh....
+* Remove LocValue from counter.rs

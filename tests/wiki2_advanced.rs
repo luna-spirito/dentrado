@@ -16,9 +16,9 @@ use kolorinko::{
 };
 
 mod common;
-use common::FadenoTestCluster;
+use common::WikiTestCluster;
 
-fn setup_wiki2() -> Option<Arc<FadenoModule>> {
+fn setup_wiki2() -> Option<FadenoModule> {
     let binary = find_binary()?;
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fad/wiki2");
     let output = compile_file(&binary, &path)
@@ -31,7 +31,7 @@ fn setup_wiki2() -> Option<Arc<FadenoModule>> {
             return None;
         }
     };
-    Some(Arc::new(module))
+    Some(module)
 }
 
 fn make_invite_event(
@@ -154,55 +154,51 @@ fn retroactive_invite_cross_core_e2e() {
         return;
     };
 
-    let mut tc = FadenoTestCluster::start(&[2, 3, 4], module);
+    let mut tc = WikiTestCluster::start(&[2, 3, 4], module);
     let invite_mt = tc.msg_type(b"Invite");
     let attach_mt = tc.msg_type(b"Attach");
     let tags = tc.tags().clone();
 
-    let alice = tc.add_user(
-        SenderPk([1u8; 32]),
-        UserId {
-            id: 1,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let bob = tc.add_user(
-        SenderPk([2u8; 32]),
-        UserId {
-            id: 2,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let carol = tc.add_user(
-        SenderPk([3u8; 32]),
-        UserId {
-            id: 3,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let dave = tc.add_user(
-        SenderPk([4u8; 32]),
-        UserId {
-            id: 4,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let eve = tc.add_user(
-        SenderPk([5u8; 32]),
-        UserId {
-            id: 5,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
+    let alice_uid = UserId {
+        id: 1,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let bob_uid = UserId {
+        id: 2,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let carol_uid = UserId {
+        id: 3,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let dave_uid = UserId {
+        id: 4,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let eve_uid = UserId {
+        id: 5,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
 
-    let b0 = tc.add_seed_branch(invite_mt, alice);
+    let alice = tc.add_user(SenderPk([1u8; 32]), alice_uid);
+    let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
+    let carol = tc.add_user(SenderPk([3u8; 32]), carol_uid);
+    let dave = tc.add_user(SenderPk([4u8; 32]), dave_uid);
+    let eve = tc.add_user(SenderPk([5u8; 32]), eve_uid);
+
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.mk_loc_user(bob_uid);
+    let carol_loc_uid = tc.mk_loc_user(carol_uid);
+    let dave_loc_uid = tc.mk_loc_user(dave_uid);
+
+    let b0 = tc.add_seed_branch(invite_mt, alice_loc_uid);
 
     let invited_gear = tc.build_gear(
         tc.tags()
             .record_get(tc.module().exports(), b"invited")
             .expect("missing invited")
             .clone(),
-        vec![LocValue::KolDataId(LocDataId(b0.0))],
+        vec![LocValue::KolDataId(b0)],
     );
     let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear);
     let invited_core = FadenoRuntime::route_group(invited_gear_wire.group(), &invited_wire_ctx)
@@ -213,7 +209,7 @@ fn retroactive_invite_cross_core_e2e() {
     eprintln!("retroactive_invite: doc_id={doc_id}, invited_core={invited_core}");
 
     tc.post_events(
-        vec![make_invite_event(alice, 1, invite_mt, b0, LocUserId(bob.0))],
+        vec![make_invite_event(alice, 1, invite_mt, b0, bob_loc_uid)],
         2,
     );
 
@@ -252,18 +248,12 @@ fn retroactive_invite_cross_core_e2e() {
     );
 
     tc.post_events(
-        vec![make_invite_event(
-            alice,
-            4,
-            invite_mt,
-            b0,
-            LocUserId(carol.0),
-        )],
+        vec![make_invite_event(alice, 4, invite_mt, b0, carol_loc_uid)],
         5,
     );
 
     tc.post_events(
-        vec![make_invite_event(bob, 5, invite_mt, b0, LocUserId(dave.0))],
+        vec![make_invite_event(bob, 5, invite_mt, b0, dave_loc_uid)],
         6,
     );
 
@@ -362,42 +352,40 @@ fn text_agg_merge_cross_core_e2e() {
         return;
     };
 
-    let mut tc = FadenoTestCluster::start(&[2, 3, 4], module);
+    let mut tc = WikiTestCluster::start(&[2, 3, 4], module);
     let invite_mt = tc.msg_type(b"Invite");
     let attach_mt = tc.msg_type(b"Attach");
     let tags = tc.tags().clone();
 
-    let alice = tc.add_user(
-        SenderPk([1u8; 32]),
-        UserId {
-            id: 1,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let carol = tc.add_user(
-        SenderPk([2u8; 32]),
-        UserId {
-            id: 2,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let eve = tc.add_user(
-        SenderPk([3u8; 32]),
-        UserId {
-            id: 3,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
+    let alice_uid = UserId {
+        id: 1,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let carol_uid = UserId {
+        id: 2,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let eve_uid = UserId {
+        id: 3,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
 
-    let b0 = tc.add_seed_branch(invite_mt, alice);
-    let b1 = tc.add_seed_branch(invite_mt, carol);
+    let alice = tc.add_user(SenderPk([1u8; 32]), alice_uid);
+    let carol = tc.add_user(SenderPk([2u8; 32]), carol_uid);
+    let eve = tc.add_user(SenderPk([3u8; 32]), eve_uid);
+
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let carol_loc_uid = tc.mk_loc_user(carol_uid);
+
+    let b0 = tc.add_seed_branch(invite_mt, alice_loc_uid);
+    let b1 = tc.add_seed_branch(invite_mt, carol_loc_uid);
 
     let invited_gear = tc.build_gear(
         tc.tags()
             .record_get(tc.module().exports(), b"invited")
             .expect("missing invited")
             .clone(),
-        vec![LocValue::KolDataId(LocDataId(b0.0))],
+        vec![LocValue::KolDataId(b0)],
     );
     let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear);
     let invited_core = FadenoRuntime::route_group(invited_gear_wire.group(), &invited_wire_ctx)
@@ -538,55 +526,51 @@ fn multi_user_doc_assembly_cross_core_e2e() {
         return;
     };
 
-    let mut tc = FadenoTestCluster::start(&[2, 3, 4], module);
+    let mut tc = WikiTestCluster::start(&[2, 3, 4], module);
     let invite_mt = tc.msg_type(b"Invite");
     let attach_mt = tc.msg_type(b"Attach");
     let tags = tc.tags().clone();
 
-    let alice = tc.add_user(
-        SenderPk([1u8; 32]),
-        UserId {
-            id: 1,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let bob = tc.add_user(
-        SenderPk([2u8; 32]),
-        UserId {
-            id: 2,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let carol = tc.add_user(
-        SenderPk([3u8; 32]),
-        UserId {
-            id: 3,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let dave = tc.add_user(
-        SenderPk([4u8; 32]),
-        UserId {
-            id: 4,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let eve = tc.add_user(
-        SenderPk([5u8; 32]),
-        UserId {
-            id: 5,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
+    let alice_uid = UserId {
+        id: 1,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let bob_uid = UserId {
+        id: 2,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let carol_uid = UserId {
+        id: 3,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let dave_uid = UserId {
+        id: 4,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let eve_uid = UserId {
+        id: 5,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
 
-    let b0 = tc.add_seed_branch(invite_mt, alice);
+    let alice = tc.add_user(SenderPk([1u8; 32]), alice_uid);
+    let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
+    let carol = tc.add_user(SenderPk([3u8; 32]), carol_uid);
+    let dave = tc.add_user(SenderPk([4u8; 32]), dave_uid);
+    let eve = tc.add_user(SenderPk([5u8; 32]), eve_uid);
+
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.mk_loc_user(bob_uid);
+    let carol_loc_uid = tc.mk_loc_user(carol_uid);
+    let dave_loc_uid = tc.mk_loc_user(dave_uid);
+
+    let b0 = tc.add_seed_branch(invite_mt, alice_loc_uid);
 
     let invited_gear = tc.build_gear(
         tc.tags()
             .record_get(tc.module().exports(), b"invited")
             .expect("missing invited")
             .clone(),
-        vec![LocValue::KolDataId(LocDataId(b0.0))],
+        vec![LocValue::KolDataId(b0)],
     );
     let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear);
     let invited_core = FadenoRuntime::route_group(invited_gear_wire.group(), &invited_wire_ctx)
@@ -598,9 +582,9 @@ fn multi_user_doc_assembly_cross_core_e2e() {
 
     tc.post_events(
         vec![
-            make_invite_event(alice, 1, invite_mt, b0, LocUserId(bob.0)), // Alice→Bob
-            make_invite_event(alice, 2, invite_mt, b0, LocUserId(carol.0)), // Alice→Carol
-            make_invite_event(alice, 3, invite_mt, b0, LocUserId(dave.0)), // Alice→Dave
+            make_invite_event(alice, 1, invite_mt, b0, bob_loc_uid), // Alice→Bob
+            make_invite_event(alice, 2, invite_mt, b0, carol_loc_uid), // Alice→Carol
+            make_invite_event(alice, 3, invite_mt, b0, dave_loc_uid), // Alice→Dave
         ],
         16,
     );
@@ -763,26 +747,26 @@ fn retroactive_invite_point_in_time_same_core_e2e() {
 
     let tags = module.tags().clone();
 
-    let mut tc = FadenoTestCluster::start(&[2, 3, 4], module);
+    let mut tc = WikiTestCluster::start(&[2, 3, 4], module);
     let invite_mt = tc.msg_type(b"Invite");
     let attach_mt = tc.msg_type(b"Attach");
 
-    let alice = tc.add_user(
-        SenderPk([1u8; 32]),
-        UserId {
-            id: 1,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let bob = tc.add_user(
-        SenderPk([2u8; 32]),
-        UserId {
-            id: 2,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
+    let alice_uid = UserId {
+        id: 1,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let bob_uid = UserId {
+        id: 2,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
 
-    let b0 = tc.add_seed_branch(invite_mt, alice);
+    let alice = tc.add_user(SenderPk([1u8; 32]), alice_uid);
+    let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
+
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.mk_loc_user(bob_uid);
+
+    let b0 = tc.add_seed_branch(invite_mt, alice_loc_uid);
 
     let doc_id: u64 = 42;
     let bob_text_upd_1 = TextUpd::new(
@@ -803,7 +787,7 @@ fn retroactive_invite_point_in_time_same_core_e2e() {
     );
 
     tc.post_events(
-        vec![make_invite_event(alice, 2, invite_mt, b0, LocUserId(bob.0))],
+        vec![make_invite_event(alice, 2, invite_mt, b0, bob_loc_uid)],
         24,
     );
 
@@ -829,7 +813,7 @@ fn retroactive_invite_point_in_time_same_core_e2e() {
             .record_get(tc.module().exports(), b"invited")
             .expect("missing invited")
             .clone(),
-        vec![LocValue::KolDataId(LocDataId(b0.0))],
+        vec![LocValue::KolDataId(b0)],
     );
 
     let output = tc.build_and_run_gear(

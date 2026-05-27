@@ -4,6 +4,7 @@ unpack ./std. Type Opt _=>_ _+_ unit loop_iter iter_list opt_unwrap
 unpack fadeno.
   Tag Bool if
   EventTypeId mk_event_type
+  resolve_event
   Id DataId resolve_data
   UserId sender-to>user user_eq
   Gear mk_gear
@@ -14,7 +15,6 @@ unpack fadeno.
   TextUpd
     AnchorAgg mk_anchor_agg anchor_agg_apply
     TextAgg mk_text_agg text_agg_apply text_agg_merge
-  Text
   Timestamp
 
 // Begin core
@@ -56,7 +56,7 @@ Attach = mk_event_type
 
 /: Fun (Branch) -> Gear (StateGraphOut UserId Bool) // is user invited?
 invited = \branch.
-  creator = sender-to>user (resolve_data branch).creator
+  creator = (resolve_data branch).creator
   in mk_gear
     { // primary input: union variant "event table", with event type Invite and group fields matching `branch`
       .primary = { .tag = .event_table | .type = Invite | .group = branch }
@@ -67,7 +67,8 @@ invited = \branch.
       q_res = query_delta cache.query primary // .res : DeltaList (LocEventId Invite)
       sg = stategraph_apply
         cache.sg
-        (\event.
+        (\event_id.
+          event = resolve_event event_id
           sender = sender-to>user event.sender
           sender_invited = opt_unwrap (sgctx_query sender) (\_. user_eq sender creator)
           in if sender_invited
@@ -89,14 +90,20 @@ doc_content = \doc. mk_gear
     res = query_delta cache.query primary
     anchors = loop_iter
       (iter_list res.delta.added)
-      (\upd anchors. anchor_agg_apply anchors upd)
+      (\upd anchors.
+        body = (resolve_event upd).body
+        in if body.is_merge
+          anchors
+          (anchor_agg_apply anchors upd body.edit))
       cache.anchors
     dep_resolver = \branch. secondary_get (invited branch)
     sg = stategraph_apply
       cache.sg
-      (\event.
+      (\event_id.
+        // Resolve the event to get sender and body
+        event = resolve_event event_id
         // Check if the author is invited on this branch
-        creator = sender-to>user (resolve_data event.body.branch).creator
+        creator = (resolve_data event.body.branch).creator
         sender = sender-to>user event.sender
         is_invited = opt_unwrap (sgctx_dep_query event.body.branch sender) (\_. user_eq sender creator)
         in if is_invited
@@ -105,7 +112,7 @@ doc_content = \doc. mk_gear
             sgctx_update event.body.branch
               (if event.body.is_merge
                 (text_agg_merge curr_text_agg (opt_unwrap (sgctx_query event.body.from) (\_. mk_text_agg)))
-                (text_agg_apply curr_text_agg event.body.edit))
+                (text_agg_apply curr_text_agg event_id event.body.edit))
           )
           unit
       )

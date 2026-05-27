@@ -110,19 +110,40 @@ impl<T, D: rkyv::rancor::Fallible + ?Sized> rkyv::Deserialize<LocEventId<T>, D>
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LocSenderId(pub u64);
+pub struct LocSenderId(pub(crate) u64);
+
+impl LocSenderId {
+    #[must_use]
+    pub const fn new_debug(id: u64) -> Self {
+        Self(id)
+    }
+}
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LocUserId(pub u64);
+pub struct LocUserId(pub(crate) u64);
+
+impl LocUserId {
+    #[must_use]
+    pub const fn new_debug(id: u64) -> Self {
+        Self(id)
+    }
+}
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LocMsgTypeId(pub u64);
+pub struct LocMsgTypeId(pub u64); // TODO: Switch to pub(crate)
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LocGroupId(pub u64);
+pub struct LocGroupId(pub(crate) u64);
+
+impl LocGroupId {
+    #[must_use]
+    pub const fn new_debug(id: u64) -> Self {
+        Self(id)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GlobalCoreId(pub u32);
@@ -223,7 +244,14 @@ impl std::error::Error for DataVerifyError {
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LocDataId(pub u64);
+pub struct LocDataId(pub(crate) u64);
+
+impl LocDataId {
+    #[must_use]
+    pub const fn new_debug(id: u64) -> Self {
+        Self(id)
+    }
+}
 
 #[repr(transparent)]
 #[derive(

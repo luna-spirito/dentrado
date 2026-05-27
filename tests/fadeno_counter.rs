@@ -10,16 +10,17 @@ use kolorinko::{
 };
 
 mod common;
-use common::{wire_event, FadenoTestCluster};
+use common::wire_event;
 
-fn setup() -> Option<Arc<FadenoModule>> {
+use crate::common::WikiTestCluster;
+
+fn setup() -> Option<FadenoModule> {
     let binary = find_binary()?;
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fad/wiki");
     let output = compile_file(&binary, &path)
         .ignore_type_error()
         .expect("wiki compilation failed");
-    let module = FadenoModule::new(output.bytecode).expect("wiki bootstrap failed");
-    Some(Arc::new(module))
+    Some(FadenoModule::new(output.bytecode).expect("wiki bootstrap failed"))
 }
 
 #[test]
@@ -56,7 +57,7 @@ fn wiki_engine() {
         return;
     };
 
-    let mut tc = FadenoTestCluster::start(&[2, 3, 4], module.clone());
+    let mut tc = WikiTestCluster::start(&[2, 3, 4], module);
     let invite_mt = tc.msg_type(b"Invite");
     let invites_count = tc
         .tags()
@@ -64,40 +65,31 @@ fn wiki_engine() {
         .expect("missing invites_count")
         .clone();
 
-    let alice = tc.add_user(
-        SenderPk([42u8; 32]),
-        UserId {
-            id: 1,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let bob = tc.add_user(
-        SenderPk([2u8; 32]),
-        UserId {
-            id: 2,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let carol = tc.add_user(
-        SenderPk([3u8; 32]),
-        UserId {
-            id: 3,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
-    let dave = tc.add_user(
-        SenderPk([10u8; 32]),
-        UserId {
-            id: 10,
-            identity_server_pk: IdentityServerPk([0; 32]),
-        },
-    );
+    let alice_uid = UserId {
+        id: 1,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let bob_uid = UserId {
+        id: 2,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let carol_uid = UserId {
+        id: 3,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let dave_uid = UserId {
+        id: 10,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
 
-    let b0 = tc.add_seed_branch(invite_mt, alice);
-    let gear_0 = tc.build_gear(
-        invites_count.clone(),
-        vec![LocValue::KolDataId(LocDataId(b0.0))],
-    );
+    let alice = tc.add_user(SenderPk([42u8; 32]), alice_uid);
+    let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
+    let carol = tc.add_user(SenderPk([3u8; 32]), carol_uid);
+    let dave = tc.add_user(SenderPk([10u8; 32]), dave_uid);
+
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let b0 = tc.add_seed_branch(invite_mt, alice_loc_uid);
+    let gear_0 = tc.build_gear(invites_count.clone(), vec![LocValue::KolDataId(b0)]);
 
     tc.post_events(
         vec![
@@ -105,15 +97,15 @@ fn wiki_engine() {
                 alice,
                 0,
                 invite_mt,
-                LocValue::KolDataId(LocDataId(b0.0)),
-                LocValue::KolUserId(LocUserId(bob.0 as u64)),
+                LocValue::KolDataId(b0),
+                tc.kol_user_id(bob_uid),
             ),
             wire_event(
                 alice,
                 1,
                 invite_mt,
-                LocValue::KolDataId(LocDataId(b0.0)),
-                LocValue::KolUserId(LocUserId(carol.0 as u64)),
+                LocValue::KolDataId(b0),
+                tc.kol_user_id(carol_uid),
             ),
         ],
         1,
@@ -131,8 +123,8 @@ fn wiki_engine() {
             alice,
             2,
             invite_mt,
-            LocValue::KolDataId(LocDataId(b0.0)),
-            LocValue::KolUserId(LocUserId(dave.0 as u64)),
+            LocValue::KolDataId(b0),
+            tc.kol_user_id(dave_uid),
         )],
         2,
     );
@@ -144,16 +136,16 @@ fn wiki_engine() {
     };
     assert_eq!(count, 3);
 
-    let b1 = tc.add_seed_branch(invite_mt, alice);
-    let gear_1 = tc.build_gear(invites_count, vec![LocValue::KolDataId(LocDataId(b1.0))]);
+    let b1 = tc.add_seed_branch(invite_mt, alice_loc_uid);
+    let gear_1 = tc.build_gear(invites_count, vec![LocValue::KolDataId(b1)]);
 
     tc.post_events(
         vec![wire_event(
             alice,
             3,
             invite_mt,
-            LocValue::KolDataId(LocDataId(b1.0)),
-            LocValue::KolUserId(LocUserId(dave.0 as u64)),
+            LocValue::KolDataId(b1),
+            tc.kol_user_id(dave_uid),
         )],
         4,
     );

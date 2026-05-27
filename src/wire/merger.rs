@@ -5,7 +5,7 @@ use crate::{
         gear::Runtime,
         loc_ctx::{EventContext, StoreResultSuccess, StoredEvent},
     },
-    types::{AnyLocEventId, GlobalCoreId, LocDataId, LocSenderId, LocUserId, Localizable, NodeId},
+    types::{GlobalCoreId, LocDataId, LocSenderId, LocUserId, Localizable, NodeId},
     wire::format::{MergeError, WireEventBody, WireLocCtx},
 };
 
@@ -15,14 +15,14 @@ pub(crate) struct WireLocCtxMerger<'a, R: Runtime, Target: EventContext<R>> {
 }
 
 struct MergerInner<'a, Target> {
-    target: &'a mut Target,
+    target: &'a Target,
     user_map: Vec<Option<LocUserId>>,
     sender_map: Vec<Option<LocSenderId>>,
     data_map: Vec<Option<LocDataId>>,
 }
 
 impl<'a, R: Runtime, Target: EventContext<R>> WireLocCtxMerger<'a, R, Target> {
-    pub(crate) fn new(source: &'a WireLocCtx<R>, target: &'a mut Target) -> Self {
+    pub(crate) fn new(source: &'a WireLocCtx<R>, target: &'a Target) -> Self {
         Self {
             source,
             inner: RefCell::new(MergerInner {
@@ -55,7 +55,7 @@ impl<'a, R: Runtime, Target: EventContext<R>> WireLocCtxMerger<'a, R, Target> {
         let group = self.remap_value(&event.group)?;
         let body = self.remap_value(&event.body)?;
 
-        let mut inner = self.inner.borrow_mut();
+        let inner = self.inner.borrow_mut();
         let group_id = inner.target.mk_loc_group(event.msg_type, group);
         Ok(inner.target.store_event(StoredEvent {
             group: group_id,

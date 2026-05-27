@@ -1,10 +1,20 @@
-use std::{cell::Cell, collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    ops::{Deref, DerefMut},
+    sync::Arc,
+    time::Duration,
+};
 
 use kolorinko::{
     core::{
         db::{create_peer_channel_pair, Db, DbConfig, DbHandle, PeerChannels},
         gear::Runtime,
         loc_ctx::{EventContext, LocCtx, StoredEvent},
+    },
+    fadeno::{
+        bridge::{FadenoModule, FadenoRuntime},
+        types::{KolGear, LocValue, TagRegistry},
     },
     types::*,
     wire::{WireEventBody, WireLocCtx, WireLocCtxBuilder},
@@ -46,9 +56,10 @@ pub(crate) struct TestCluster<R: Runtime> {
 }
 
 impl<R: Runtime> TestCluster<R> {
-    pub(crate) fn start(core_counts: &[u32], module: Arc<R::Module>) -> Self {
+    pub(crate) fn start(core_counts: &[u32], module: R::Module) -> Self {
         let num_nodes = core_counts.len();
         assert!(num_nodes > 0, "TestCluster needs at least one node");
+        let module = Arc::new(module);
 
         let mut all_peers: Vec<HashMap<NodeId, PeerChannels<R>>> =
             (0..num_nodes).map(|_| HashMap::new()).collect();
@@ -115,7 +126,11 @@ impl<R: Runtime> TestCluster<R> {
     pub(crate) fn add_data(&mut self, content: R::Data) -> LocDataId {
         let ts = self.next_data_ts;
         self.next_data_ts += 1;
-        let data_id = compute_data_id::<R>(ts, &content);
+        let hash = R::hash_data(&content, &self.loc_ctx).expect("hash_data failed");
+        let data_id = DataId {
+            timestamp: ts,
+            hash,
+        };
         EventContext::mk_data(&mut self.loc_ctx, data_id, content).expect("mk_data failed")
     }
 
@@ -148,7 +163,9 @@ impl<R: Runtime> TestCluster<R> {
 
     #[must_use]
     pub(crate) fn data_id(&self, did: LocDataId) -> DataId {
-        self.loc_ctx.get_data(did).expect("data not found").0
+        self.loc_ctx
+            .get_data(did, |(d, _)| *d)
+            .expect("data not found")
     }
 
     pub(crate) fn remap_gear(&self, gear: R::GearId) -> (R::GearId, WireLocCtx<R>) {
@@ -170,39 +187,51 @@ impl<R: Runtime> TestCluster<R> {
     }
 }
 
-use kolorinko::fadeno::{
-    bridge::{FadenoModule, FadenoRuntime},
-    types::*,
-};
+pub(crate) struct WikiTestCluster(TestCluster<FadenoRuntime>);
 
-pub(crate) type FadenoTestCluster = TestCluster<FadenoRuntime>;
+impl Deref for WikiTestCluster {
+    type Target = TestCluster<FadenoRuntime>;
 
-impl TestCluster<FadenoRuntime> {
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl DerefMut for WikiTestCluster {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl WikiTestCluster {
+    pub(crate) fn start(core_counts: &[u32], mut module: FadenoModule) -> Self {
+        let creator = module.ensure_tag_id(b"creator");
+        let created_at = module.ensure_tag_id(b"created_at");
+        let _ = module.ensure_tag_set(&[creator, created_at]);
+        Self(TestCluster::start(core_counts, module))
+    }
+
     pub(crate) fn add_seed_branch(
         &mut self,
         invite_mt: LocMsgTypeId,
-        creator_sid: LocSenderId,
+        creator_uid: LocUserId,
     ) -> LocDataId {
-        let content = Self::empty_record();
+        let content = self.tags().make_record(&[
+            (b"creator", LocValue::KolUserId(creator_uid)),
+            (b"created_at", LocValue::Num(1i64)),
+        ]);
         let did = self.add_data(content.clone());
 
-        let b_core_id = compute_branch_core_id(self.data_id(did), &content);
-
-        let group =
-            EventContext::mk_loc_group(&mut self.loc_ctx, invite_mt, LocValue::KolDataId(did));
-        EventContext::store_event(
-            &mut self.loc_ctx,
-            StoredEvent {
-                group,
-                sender: creator_sid,
-                global_core_id: b_core_id,
-                tx_id: 0,
-                timestamp: 1,
-                source_node: NodeId(0),
-                body: Self::empty_record(),
-            },
-        );
+        self.loc_ctx
+            .mk_loc_group(invite_mt, LocValue::KolDataId(did));
         did
+    }
+
+    pub(crate) fn mk_loc_user(&self, uid: UserId) -> LocUserId {
+        EventContext::mk_loc_user(&self.loc_ctx, uid)
+    }
+
+    pub(crate) fn kol_user_id(&self, uid: UserId) -> LocValue {
+        LocValue::KolUserId(self.mk_loc_user(uid))
     }
 
     pub(crate) fn build_gear(&self, closure: LocValue, args: Vec<LocValue>) -> KolGear {
@@ -242,8 +271,8 @@ impl TestCluster<FadenoRuntime> {
     }
 
     pub(crate) fn branch_core_id(&self, did: LocDataId) -> GlobalCoreId {
-        let (data_id, content) = self.loc_ctx.get_data(did).expect("data not found");
-        compute_branch_core_id(*data_id, content)
+        FadenoRuntime::route_group(&LocValue::KolDataId(did), &self.loc_ctx)
+            .expect("route_group failed")
     }
 
     pub(crate) fn find_cross_core_doc_id(&self, invited_core: u32, num_cores: u32) -> u64 {
@@ -305,20 +334,4 @@ pub(crate) fn wire_event(
         group,
         body,
     }
-}
-
-pub(crate) fn compute_data_id<R: Runtime>(timestamp: u32, content: &R::Data) -> DataId {
-    let empty_resolver = WireLocCtx::<R>::default();
-    let hash = R::hash_data(content, &empty_resolver).expect("hash_data failed");
-    DataId { timestamp, hash }
-}
-
-pub(crate) fn compute_branch_core_id(data_id: DataId, content: &LocValue) -> GlobalCoreId {
-    let wire_ctx = WireLocCtx::<FadenoRuntime> {
-        users: vec![],
-        senders: vec![],
-        data: vec![(data_id, content.clone())],
-    };
-    FadenoRuntime::route_group(&LocValue::KolDataId(LocDataId(0)), &wire_ctx)
-        .expect("route_group failed")
 }
