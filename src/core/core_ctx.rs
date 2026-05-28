@@ -180,10 +180,6 @@ impl<R: Runtime> Core<R> {
         group: &R::Group,
     ) -> R::GearOut {
         let group = self.loc_ctx().find_group(msg_type, group);
-        eprintln!(
-            "N{}C{}: run_any_gear msg_type={msg_type:?} find_group={group:?}",
-            self.node_id.0, self.core_id
-        );
 
         {
             let mut inner = self.inner.borrow_mut();
@@ -222,6 +218,11 @@ impl<R: Runtime> Core<R> {
             .remap(group.clone())
             .expect("secondary_get: group remap");
         let wire_ctx = builder.build();
+        println!(
+            "SECONDARY REQUEST TO {:?}, WHICH IS {:?}",
+            group_wire,
+            R::route_group(&group_wire, &wire_ctx).unwrap()
+        );
         let target_core = R::route_group(&group_wire, &wire_ctx)
             .expect("secondary_get: route_group")
             .route(self.num_cores);
@@ -425,16 +426,7 @@ impl<R: Runtime> Core<R> {
         for (peer_idx, (_node_id, remote_num_cores, sender_opt)) in
             self.inter_node_peers.iter().enumerate()
         {
-            eprintln!(
-                "N{}C{}: We want to send to peer {peer_idx}",
-                self.node_id.0, self.core_id
-            );
-            eprintln!(
-                "Remote has {remote_num_cores} cores, sender_opt.is_some: {}",
-                sender_opt.is_some()
-            );
             if let Some((sender, doorbell)) = sender_opt {
-                eprintln!("... and we do it directly.");
                 let _ = sender.send(InterNodeMsg::ForwardEvents {
                     wire_ctx: (*wire_ctx).clone(),
                     events: events.clone(),
@@ -442,7 +434,6 @@ impl<R: Runtime> Core<R> {
                 });
                 doorbell.ring();
             } else {
-                eprintln!("... but we don't have the connection, so we reroute.");
                 let mut proxy_groups: HashMap<u32, Vec<u32>> = HashMap::new();
                 for (i, gcid) in global_core_ids.iter().enumerate() {
                     let proxy_core = gcid.route(*remote_num_cores);
@@ -450,9 +441,6 @@ impl<R: Runtime> Core<R> {
                 }
 
                 for (proxy_core, seed_indices) in proxy_groups {
-                    eprintln!(
-                        "Since target has {remote_num_cores} cores, we send via our {proxy_core}"
-                    );
                     let proxy_events: Vec<_> = seed_indices
                         .iter()
                         .map(|&idx| events[idx as usize].clone())
@@ -582,25 +570,16 @@ impl<R: Runtime> EventContext<R> for Core<R> {
 
     fn store_event(&self, ev: StoredEvent<R::Body>) -> Option<StoreResultSuccess> {
         let group_id = ev.group;
-        let core_id = self.core_id;
-        let num_added;
 
         let res = self.loc_ctx.store_event(ev);
         if let Some(StoreResultSuccess { old, new }) = res {
             let mut s = self.inner.borrow_mut();
             let group = s.events_by_group.entry(group_id).or_default();
             group.added.push(new);
-            num_added = group.added.len();
             if let Some(old) = old {
                 group.removed.push(old);
             }
-        } else {
-            num_added = 0;
         }
-        eprintln!(
-            "N{}C{}: store_event group={group_id:?} added_now={num_added}",
-            self.node_id.0, core_id
-        );
         res
     }
 

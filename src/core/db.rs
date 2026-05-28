@@ -364,11 +364,6 @@ async fn core_event_loop<R: Runtime>(
                 loop {
                     match rx.try_recv() {
                         Ok(msg) => {
-                            eprintln!(
-                                "N{}C{}: Received {msg:?}",
-                                state.node_id().0,
-                                state.core_id()
-                            );
                             state.handle_inter_node_msg(peer_idx, msg);
                             did_work = true;
                         }
@@ -384,11 +379,6 @@ async fn core_event_loop<R: Runtime>(
             loop {
                 match rx.try_recv() {
                     Ok(msg) => {
-                        eprintln!(
-                            "N{}C{}: Received {msg:?}",
-                            state.node_id().0,
-                            state.core_id()
-                        );
                         state.handle_intercore_msg(msg);
                         did_work = true;
                     }
@@ -402,11 +392,6 @@ async fn core_event_loop<R: Runtime>(
         loop {
             match reroute_rx.try_recv() {
                 Ok(msg) => {
-                    eprintln!(
-                        "N{}C{}: Received {msg:?}",
-                        state.node_id().0,
-                        state.core_id()
-                    );
                     state.handle_reroute_msg(msg);
                     did_work = true;
                 }
@@ -419,11 +404,6 @@ async fn core_event_loop<R: Runtime>(
         loop {
             match cmd_rx.try_recv() {
                 Ok(CoordCmd::Op(op)) => {
-                    eprintln!(
-                        "N{}C{}: Received {op:?}",
-                        state.node_id().0,
-                        state.core_id()
-                    );
                     state.handle_client_op(op);
                     did_work = true;
                 }

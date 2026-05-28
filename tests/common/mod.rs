@@ -113,9 +113,9 @@ impl<R: Runtime> TestCluster<R> {
         }
 
         let drain_duration = if num_nodes > 1 {
-            Duration::from_millis(100)
-        } else {
             Duration::from_millis(10)
+        } else {
+            Duration::ZERO
         };
 
         Self {
