@@ -175,6 +175,7 @@ fn sg_apply_preserves_stack() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
     );
     let pk = SenderPk([1u8; 32]);
     let uid = UserId {

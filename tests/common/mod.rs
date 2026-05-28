@@ -8,7 +8,7 @@ use std::{
 
 use kolorinko::{
     core::{
-        db::{create_peer_channel_pair, Db, DbConfig, PeerChannels},
+        db::{create_peer_channel_pair, Db, DbConfig, Doorbell, DoorbellHandle, PeerChannels},
         gear::Runtime,
         loc_ctx::{EventContext, LocCtx},
     },
@@ -60,6 +60,12 @@ impl<R: Runtime> TestCluster<R> {
         assert!(num_nodes > 0, "TestCluster needs at least one node");
         let module = Arc::new(module);
 
+        // Create doorbells upfront: one per core per node.
+        let mut all_doorbells: Vec<Vec<(Doorbell, DoorbellHandle)>> = core_counts
+            .iter()
+            .map(|&nc| (0..nc).map(|_| Doorbell::new()).collect())
+            .collect();
+
         let mut all_peers: Vec<HashMap<NodeId, PeerChannels<R>>> =
             (0..num_nodes).map(|_| HashMap::new()).collect();
 
@@ -68,8 +74,10 @@ impl<R: Runtime> TestCluster<R> {
                 let num_channels = core_counts[i].min(core_counts[j]);
                 let mut halves_i = Vec::with_capacity(num_channels as usize);
                 let mut halves_j = Vec::with_capacity(num_channels as usize);
-                for _ in 0..num_channels {
-                    let (hi, hj) = create_peer_channel_pair::<R>();
+                for c in 0..num_channels as usize {
+                    let doorbell_i = all_doorbells[i][c].1.clone();
+                    let doorbell_j = all_doorbells[j][c].1.clone();
+                    let (hi, hj) = create_peer_channel_pair::<R>(doorbell_j, doorbell_i);
                     halves_i.push(hi);
                     halves_j.push(hj);
                 }
@@ -92,11 +100,13 @@ impl<R: Runtime> TestCluster<R> {
 
         let mut nodes = Vec::with_capacity(num_nodes);
         for (i, &num_cores) in core_counts.iter().enumerate() {
+            let doorbells = std::mem::take(&mut all_doorbells[i]);
             let config = DbConfig {
                 num_cores,
                 node_id: NodeId(i as u32),
                 module: module.clone(),
                 peers: std::mem::take(&mut all_peers[i]),
+                doorbells,
             };
             let db = Db::start(config).expect("Db::start failed");
             nodes.push(Node { db });
@@ -105,7 +115,7 @@ impl<R: Runtime> TestCluster<R> {
         let drain_duration = if num_nodes > 1 {
             Duration::from_millis(100)
         } else {
-            Duration::ZERO
+            Duration::from_millis(10)
         };
 
         Self {

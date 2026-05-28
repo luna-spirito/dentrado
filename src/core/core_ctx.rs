@@ -8,6 +8,7 @@ use std::{
 use crate::{
     core::{
         db,
+        doorbell::DoorbellHandle,
         gear::Runtime,
         loc_ctx::{EventContext, LocCtx, StoreResultSuccess, StoredEvent},
     },
@@ -24,6 +25,7 @@ use crate::{
 /// Represents an operation initiate by a direct client of the DBMS.
 /// Shared between `CoordCmd` (arrives via `cmd_rx`) and `InterCoreMsg`
 /// (arrives via SPSC inter-core channels) to avoid duplicating handler logic.
+#[derive(Debug)]
 pub(crate) enum ClientOp<R: Runtime> {
     PostEvents {
         wire_ctx: Arc<WireLocCtx<R>>,
@@ -31,22 +33,23 @@ pub(crate) enum ClientOp<R: Runtime> {
         global_core_ids: Arc<[GlobalCoreId]>,
         timestamp: u32,
         seed_indices: Vec<u32>,
-        reply: mpsc::Sender<Result<(), MergeError>>,
+        reply: flume::Sender<Result<(), MergeError>>,
     },
     RunGear {
         gear: R::GearId,
         wire_ctx: WireLocCtx<R>,
-        reply: mpsc::Sender<Result<R::GearOut, RunGearError>>,
+        reply: flume::Sender<Result<R::GearOut, RunGearError>>,
     },
 }
 
-/// Command sent from the DBMS's coordinator, i. e. from the caller of Db::start.
+/// Command sent from the DBMS's coordinator, i. e. from the caller of `Db::start`.
 pub(crate) enum CoordCmd<R: Runtime> {
     Op(ClientOp<R>),
     Shutdown,
 }
 
 /// Inter-node singnals.
+#[derive(Debug)]
 pub(crate) enum InterNodeMsg<R: Runtime> {
     ForwardEvents {
         wire_ctx: Arc<WireLocCtx<R>>,
@@ -56,6 +59,7 @@ pub(crate) enum InterNodeMsg<R: Runtime> {
     },
 }
 
+#[derive(Debug)]
 pub(crate) enum RerouteMsg<R: Runtime> {
     ForwardToPeer {
         peer_idx: usize,
@@ -66,6 +70,7 @@ pub(crate) enum RerouteMsg<R: Runtime> {
     },
 }
 
+#[derive(Debug)]
 pub(crate) enum InterCoreMsg<R: Runtime> {
     Op(ClientOp<R>),
     SecondaryRequest {
@@ -110,7 +115,13 @@ pub struct Core<R: Runtime> {
 
     intercore_tx: Vec<mpsc::Sender<InterCoreMsg<R>>>,
     reroute_tx: Vec<mpsc::Sender<RerouteMsg<R>>>,
-    inter_node_peers: Vec<(NodeId, u32, Option<mpsc::Sender<InterNodeMsg<R>>>)>,
+    /// One doorbell handle per core (including self). Ring after sending.
+    doorbells: Vec<DoorbellHandle>,
+    inter_node_peers: Vec<(
+        NodeId,
+        u32,
+        Option<(mpsc::Sender<InterNodeMsg<R>>, DoorbellHandle)>,
+    )>,
 
     loc_ctx: LocCtx<R>,
     inner: RefCell<CoreInner<R>>,
@@ -124,7 +135,12 @@ impl<R: Runtime> Core<R> {
         module: Arc<R::Module>,
         intercore_tx: Vec<mpsc::Sender<InterCoreMsg<R>>>,
         reroute_tx: Vec<mpsc::Sender<RerouteMsg<R>>>,
-        inter_node_peers: Vec<(NodeId, u32, Option<mpsc::Sender<InterNodeMsg<R>>>)>,
+        doorbells: Vec<DoorbellHandle>,
+        inter_node_peers: Vec<(
+            NodeId,
+            u32,
+            Option<(mpsc::Sender<InterNodeMsg<R>>, DoorbellHandle)>,
+        )>,
     ) -> Self {
         Self {
             num_cores,
@@ -134,6 +150,7 @@ impl<R: Runtime> Core<R> {
             module,
             intercore_tx,
             reroute_tx,
+            doorbells,
             inter_node_peers,
             inner: RefCell::new(CoreInner {
                 gear_cache: HashMap::new(),
@@ -171,6 +188,10 @@ impl<R: Runtime> Core<R> {
         group: &R::Group,
     ) -> R::GearOut {
         let group = self.loc_ctx().find_group(msg_type, group);
+        eprintln!(
+            "N{}C{}: run_any_gear msg_type={msg_type:?} find_group={group:?}",
+            self.node_id.0, self.core_id
+        );
 
         {
             let mut inner = self.inner.borrow_mut();
@@ -228,6 +249,7 @@ impl<R: Runtime> Core<R> {
                 wire_ctx: req_wire_ctx,
                 from_core: self.core_id,
             });
+            self.doorbells[target_core as usize].ring();
 
             output
         }
@@ -242,6 +264,12 @@ impl<R: Runtime> Core<R> {
         timestamp: u32,
         seed_indices: Vec<u32>,
     ) -> Result<(), MergeError> {
+        eprintln!(
+            "N{}C{}: handle_client_post seed_indices={seed_indices:?} num_events={}",
+            self.node_id.0,
+            self.core_id,
+            events.len()
+        );
         let node_id = self.node_id;
         let merger = WireLocCtxMerger::new(wire_ctx, self);
         for &idx in &seed_indices {
@@ -329,6 +357,7 @@ impl<R: Runtime> Core<R> {
                         output: output_wire,
                         wire_ctx: reply_wire_ctx,
                     });
+                self.doorbells[from_core as usize].ring();
             }
             InterCoreMsg::SecondaryResponse {
                 gear,
@@ -387,6 +416,11 @@ impl<R: Runtime> Core<R> {
                     }
                 }
 
+                eprintln!(
+                    "N{}C{}: ForwardEvents local_indices={local_indices:?} forwarded={forwarded:?}",
+                    self.node_id.0, self.core_id
+                );
+
                 let merger = WireLocCtxMerger::new(&wire_ctx, self);
                 for &idx in &local_indices {
                     if let Err(e) = merger.import_new_event(
@@ -418,6 +452,7 @@ impl<R: Runtime> Core<R> {
                             source_node,
                         },
                     );
+                    self.doorbells[target_core as usize].ring();
                 }
             }
         }
@@ -432,7 +467,7 @@ impl<R: Runtime> Core<R> {
                 global_core_ids,
                 timestamp,
             } => {
-                let sender = self
+                let (sender, doorbell) = self
                     .inter_node_peers
                     .get(peer_idx)
                     .and_then(|(_, _, s)| s.as_ref())
@@ -443,6 +478,7 @@ impl<R: Runtime> Core<R> {
                     global_core_ids,
                     timestamp,
                 });
+                doorbell.ring();
             }
         }
     }
@@ -457,14 +493,25 @@ impl<R: Runtime> Core<R> {
         for (peer_idx, (_node_id, remote_num_cores, sender_opt)) in
             self.inter_node_peers.iter().enumerate()
         {
-            if let Some(sender) = sender_opt {
+            eprintln!(
+                "N{}C{}: We want to send to peer {peer_idx}",
+                self.node_id.0, self.core_id
+            );
+            eprintln!(
+                "Remote has {remote_num_cores} cores, sender_opt.is_some: {}",
+                sender_opt.is_some()
+            );
+            if let Some((sender, doorbell)) = sender_opt {
+                eprintln!("... and we do it directly.");
                 let _ = sender.send(InterNodeMsg::ForwardEvents {
                     wire_ctx: Arc::clone(wire_ctx),
                     events: Arc::clone(events),
                     global_core_ids: Arc::clone(global_core_ids),
                     timestamp,
                 });
+                doorbell.ring();
             } else {
+                eprintln!("... but we don't have the connection, so we reroute.");
                 let mut proxy_groups: HashMap<u32, Vec<u32>> = HashMap::new();
                 for (i, gcid) in global_core_ids.iter().enumerate() {
                     let proxy_core = gcid.route(*remote_num_cores);
@@ -472,6 +519,9 @@ impl<R: Runtime> Core<R> {
                 }
 
                 for (proxy_core, seed_indices) in proxy_groups {
+                    eprintln!(
+                        "Since target has {remote_num_cores} cores, we send via our {proxy_core}"
+                    );
                     let proxy_events: Vec<_> = seed_indices
                         .iter()
                         .map(|&idx| events[idx as usize].clone())
@@ -488,6 +538,7 @@ impl<R: Runtime> Core<R> {
                         global_core_ids: Arc::from(proxy_gcids),
                         timestamp,
                     });
+                    self.doorbells[proxy_core as usize].ring();
                 }
             }
         }
@@ -528,7 +579,7 @@ impl<R: Runtime> Core<R> {
                 our_task = Some(seed_indices);
             } else {
                 // Remote: send through SPSC intercore channel
-                let (reply_tx, reply_rx) = mpsc::channel();
+                let (reply_tx, reply_rx) = flume::bounded(1);
                 let op = ClientOp::PostEvents {
                     wire_ctx: Arc::clone(&routed.wire_ctx),
                     events: Arc::clone(&routed.events),
@@ -540,6 +591,7 @@ impl<R: Runtime> Core<R> {
                 self.intercore_tx[target_core as usize]
                     .send(InterCoreMsg::Op(op))
                     .expect("post_events: intercore channel closed");
+                self.doorbells[target_core as usize].ring();
                 reply_rxs.push(reply_rx);
             }
         }
@@ -554,7 +606,7 @@ impl<R: Runtime> Core<R> {
             )?;
         }
         for reply_rx in reply_rxs {
-            db::wait_for_reply(reply_rx).await?;
+            reply_rx.recv_async().await.expect("channel closed")?;
         }
 
         Ok(())
@@ -575,16 +627,17 @@ impl<R: Runtime> Core<R> {
             self.handle_run_gear(gear, &wire_ctx)
         } else {
             // Remote: send through SPSC intercore channel
-            let (reply_tx, reply_rx) = mpsc::channel();
+            let (reply_tx, reply_rx) = flume::bounded(1);
             let op = ClientOp::RunGear {
                 gear,
-                wire_ctx: wire_ctx,
+                wire_ctx,
                 reply: reply_tx,
             };
             self.intercore_tx[target_core as usize]
                 .send(InterCoreMsg::Op(op))
                 .expect("run_gear: intercore channel closed");
-            db::wait_for_reply(reply_rx).await
+            self.doorbells[target_core as usize].ring();
+            reply_rx.recv_async().await.expect("channel closed")
         }
     }
 }
@@ -604,16 +657,25 @@ impl<R: Runtime> EventContext<R> for Core<R> {
 
     fn store_event(&self, ev: StoredEvent<R::Body>) -> Option<StoreResultSuccess> {
         let group_id = ev.group;
+        let core_id = self.core_id;
+        let num_added;
 
         let res = self.loc_ctx.store_event(ev);
         if let Some(StoreResultSuccess { old, new }) = res {
             let mut s = self.inner.borrow_mut();
             let group = s.events_by_group.entry(group_id).or_default();
             group.added.push(new);
+            num_added = group.added.len();
             if let Some(old) = old {
                 group.removed.push(old);
             }
+        } else {
+            num_added = 0;
         }
+        eprintln!(
+            "N{}C{}: store_event group={group_id:?} added_now={num_added}",
+            self.node_id.0, core_id
+        );
         res
     }
 

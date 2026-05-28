@@ -1,7 +1,7 @@
 use kolorinko::{
     core::{
         core_ctx::Core,
-        db::{Db, DbConfig},
+        db::{Db, DbConfig, Doorbell},
         gear::Runtime,
         loc_ctx::EventContext,
     },
@@ -345,11 +345,13 @@ fn malformed_wire_ctx_returns_error_not_panic() {
         identity_server_pk: IdentityServerPk([0; 32]),
     };
 
+    let (doorbell, dbh) = Doorbell::new();
     let db: Db<CounterRuntime> = Db::start(DbConfig {
         num_cores: 1,
         node_id: NodeId(0),
         module: Arc::new(()),
         peers: HashMap::new(),
+        doorbells: vec![(doorbell, dbh)],
     })
     .unwrap();
 

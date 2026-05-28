@@ -5,7 +5,6 @@ use std::{
     rc::Rc,
     sync::{mpsc, Arc},
     thread,
-    time::Duration,
 };
 
 use crate::{
@@ -17,11 +16,16 @@ use crate::{
     wire::{MergeError, RunGearError, WireEventBody, WireLocCtx},
 };
 
+pub use crate::core::doorbell::{Doorbell, DoorbellHandle};
+
 pub struct DbConfig<R: Runtime> {
     pub num_cores: u32,
     pub node_id: NodeId,
     pub module: Arc<R::Module>,
     pub peers: HashMap<NodeId, PeerChannels<R>>,
+    /// One doorbell per core (the waiting side). Created by the caller,
+    /// passed here so `Db::start` can use them in `core_event_loop`.
+    pub doorbells: Vec<(Doorbell, DoorbellHandle)>,
 }
 
 pub struct PeerChannels<R: Runtime> {
@@ -31,33 +35,38 @@ pub struct PeerChannels<R: Runtime> {
 
 pub struct PeerChannelHalf<R: Runtime> {
     pub(crate) tx: mpsc::Sender<InterNodeMsg<R>>,
+    /// Doorbell of the remote core that receives from this channel.
+    pub(crate) remote_doorbell: DoorbellHandle,
     pub(crate) rx: mpsc::Receiver<InterNodeMsg<R>>,
 }
 
 #[must_use]
-pub fn create_peer_channel_pair<R: Runtime>() -> (PeerChannelHalf<R>, PeerChannelHalf<R>) {
+pub fn create_peer_channel_pair<R: Runtime>(
+    doorbell_a: DoorbellHandle,
+    doorbell_b: DoorbellHandle,
+) -> (PeerChannelHalf<R>, PeerChannelHalf<R>) {
     let (tx_ab, rx_ab) = mpsc::channel();
     let (tx_ba, rx_ba) = mpsc::channel();
     (
         PeerChannelHalf {
             tx: tx_ab,
+            remote_doorbell: doorbell_b,
             rx: rx_ba,
         },
         PeerChannelHalf {
             tx: tx_ba,
+            remote_doorbell: doorbell_a,
             rx: rx_ab,
         },
     )
 }
 
-// TODO: simplify?
-/// Used by `DbHandle` to send commands
+/// Used by `Db` to send commands to a core.
 #[derive(Clone)]
 struct CoreHandle<R: Runtime> {
     cmd_tx: mpsc::Sender<CoordCmd<R>>,
+    doorbell: DoorbellHandle,
 }
-
-// common routing logic
 
 /// Result of routing events to their target cores.
 pub(crate) struct RoutedEvents<R: Runtime> {
@@ -68,7 +77,7 @@ pub(crate) struct RoutedEvents<R: Runtime> {
     pub(crate) core_seeds: HashMap<u32, Vec<u32>>,
 }
 
-/// Shared function to route events events
+/// Shared function to route events
 pub(crate) fn route_events<R: Runtime>(
     wire_ctx: WireLocCtx<R>,
     events: Vec<WireEventBody<R::Group, R::Body>>,
@@ -109,24 +118,8 @@ pub(crate) fn route_gear<R: Runtime>(
     Ok(global_core_id.route(num_cores))
 }
 
-pub(crate) async fn wait_for_reply<T>(rx: mpsc::Receiver<T>) -> T {
-    loop {
-        match rx.try_recv() {
-            Ok(v) => return v,
-            Err(mpsc::TryRecvError::Empty) => {
-                compio::runtime::time::sleep(Duration::from_micros(100)).await;
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                panic!("wait_for_reply: reply channel disconnected")
-            }
-        }
-    }
-}
-
-impl<R: Runtime> Db<R> {}
-
 pub struct Db<R: Runtime> {
-    tx: Vec<mpsc::Sender<CoordCmd<R>>>,
+    handles: Vec<CoreHandle<R>>,
     join_handles: Vec<thread::JoinHandle<()>>,
 }
 
@@ -149,8 +142,16 @@ impl<R: Runtime> Db<R> {
         let mut peers_ordered: Vec<(NodeId, PeerChannels<R>)> = config.peers.drain().collect();
         peers_ordered.sort_by_key(|(nid, _)| nid.0);
 
+        // Doorbell handles for this node's cores (cloned everywhere)
+        let doorbell_handles: Vec<DoorbellHandle> =
+            config.doorbells.iter().map(|(_d, h)| h.clone()).collect();
+
         let mut core_inter_node_peers: Vec<
-            Vec<(NodeId, u32, Option<mpsc::Sender<InterNodeMsg<R>>>)>,
+            Vec<(
+                NodeId,
+                u32,
+                Option<(mpsc::Sender<InterNodeMsg<R>>, DoorbellHandle)>,
+            )>,
         > = (0..num_cores)
             .map(|_| Vec::with_capacity(peers_ordered.len()))
             .collect();
@@ -165,7 +166,7 @@ impl<R: Runtime> Db<R> {
                 core_inter_node_peers[core_id].push((
                     peer_node_id,
                     remote_num_cores,
-                    Some(half.tx),
+                    Some((half.tx, half.remote_doorbell)),
                 ));
                 inter_node_rxs[core_id].push(Some(half.rx));
             }
@@ -207,22 +208,21 @@ impl<R: Runtime> Db<R> {
         }
         let all_reroute_txs: Vec<mpsc::Sender<RerouteMsg<R>>> = reroute_txs.clone();
 
-        let mut tx = Vec::with_capacity(num_cores as usize);
+        let mut handles = Vec::with_capacity(num_cores as usize);
         let mut join_handles = Vec::with_capacity(num_cores as usize);
 
-        for core_id in 0..num_cores {
+        for (core_id, (doorbell, _dbh)) in (0..num_cores).zip(config.doorbells) {
             let (cmd_tx, cmd_rx) = mpsc::channel::<CoordCmd<R>>();
             let module = config.module.clone();
 
-            // This core's inter-core senders (indexed by target core)
             let intercore_senders = std::mem::take(&mut tx_from_to[core_id as usize]);
-            // This core's inter-core receivers (indexed by source core)
             let intercore_rxs = std::mem::take(&mut rx_on_from[core_id as usize]);
 
             let reroute_rx = reroute_rxs.remove(0);
             let reroute_senders = all_reroute_txs.clone();
             let inter_node_peers = std::mem::take(&mut core_inter_node_peers[core_id as usize]);
             let core_inter_node_rxs = std::mem::take(&mut inter_node_rxs[core_id as usize]);
+            let core_doorbells = doorbell_handles.clone();
 
             let worker_fn = worker_fn.clone();
 
@@ -242,15 +242,15 @@ impl<R: Runtime> Db<R> {
                             module,
                             intercore_senders,
                             reroute_senders,
+                            core_doorbells,
                             inter_node_peers,
                         ));
 
-                        // Task A: user worker function (async, runs on compio runtime)
                         compio::runtime::spawn(worker_fn(&state)).detach();
 
-                        // Task B: core event loop (async, yields to compio runtime for worker task)
                         core_event_loop(
                             state,
+                            doorbell,
                             cmd_rx,
                             intercore_rxs,
                             reroute_rx,
@@ -260,11 +260,17 @@ impl<R: Runtime> Db<R> {
                     });
                 })?;
 
-            tx.push(cmd_tx);
+            handles.push(CoreHandle {
+                cmd_tx,
+                doorbell: doorbell_handles[core_id as usize].clone(),
+            });
             join_handles.push(join);
         }
 
-        Ok(Self { tx, join_handles })
+        Ok(Self {
+            handles,
+            join_handles,
+        })
     }
 
     pub fn post_events(
@@ -273,21 +279,24 @@ impl<R: Runtime> Db<R> {
         events: Vec<WireEventBody<R::Group, R::Body>>,
         timestamp: u32,
     ) -> Result<(), MergeError> {
-        let routed = route_events(wire_ctx, events, self.tx.len() as u32)?;
+        let routed = route_events(wire_ctx, events, self.handles.len() as u32)?;
 
         let mut reply_rxs = Vec::with_capacity(routed.core_seeds.len());
         for (target_core, seed_indices) in routed.core_seeds {
-            let tx = &self.tx[target_core as usize];
-            let (reply_tx, reply_rx) = mpsc::channel();
-            tx.send(CoordCmd::Op(ClientOp::PostEvents {
-                wire_ctx: routed.wire_ctx.clone(),
-                events: routed.events.clone(),
-                global_core_ids: routed.global_core_ids.clone(),
-                timestamp,
-                seed_indices,
-                reply: reply_tx,
-            }))
-            .expect("core channel closed");
+            let handle = &self.handles[target_core as usize];
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            handle
+                .cmd_tx
+                .send(CoordCmd::Op(ClientOp::PostEvents {
+                    wire_ctx: routed.wire_ctx.clone(),
+                    events: routed.events.clone(),
+                    global_core_ids: routed.global_core_ids.clone(),
+                    timestamp,
+                    seed_indices,
+                    reply: reply_tx,
+                }))
+                .expect("core channel closed");
+            handle.doorbell.ring();
             reply_rxs.push(reply_rx);
         }
         for reply_rx in reply_rxs {
@@ -302,76 +311,61 @@ impl<R: Runtime> Db<R> {
         gear: R::GearId,
         wire_ctx: WireLocCtx<R>,
     ) -> Result<R::GearOut, RunGearError> {
-        let target_core = route_gear(&gear, &wire_ctx, self.tx.len() as u32)?;
-        let core = &self.tx[target_core as usize];
+        let target_core = route_gear(&gear, &wire_ctx, self.handles.len() as u32)?;
+        let handle = &self.handles[target_core as usize];
 
-        let (reply_tx, reply_rx) = mpsc::channel();
-        core.send(CoordCmd::Op(ClientOp::RunGear {
-            gear,
-            wire_ctx,
-            reply: reply_tx,
-        }))
-        .expect("core channel closed");
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        handle
+            .cmd_tx
+            .send(CoordCmd::Op(ClientOp::RunGear {
+                gear,
+                wire_ctx,
+                reply: reply_tx,
+            }))
+            .expect("core channel closed");
+        handle.doorbell.ring();
         reply_rx.recv().expect("core channel closed")
     }
 }
 
 impl<R: Runtime> Drop for Db<R> {
     fn drop(&mut self) {
-        for tx in &self.tx {
-            let _ = tx.send(CoordCmd::<R>::Shutdown);
+        for handle in &self.handles {
+            let _ = handle.cmd_tx.send(CoordCmd::<R>::Shutdown);
+            handle.doorbell.ring();
         }
-        for handle in self.join_handles.drain(..) {
-            let _ = handle.join();
+        for join in self.join_handles.drain(..) {
+            let _ = join.join();
         }
     }
 }
 
 async fn core_event_loop<R: Runtime>(
     state: Rc<Core<R>>,
+    doorbell: Doorbell,
     cmd_rx: mpsc::Receiver<CoordCmd<R>>,
     intercore_rxs: Vec<mpsc::Receiver<InterCoreMsg<R>>>,
     reroute_rx: mpsc::Receiver<RerouteMsg<R>>,
     inter_node_rxs: Vec<Option<mpsc::Receiver<InterNodeMsg<R>>>>,
 ) {
-    let drain_timeout = Duration::from_millis(1);
-
     loop {
+        // Clear doorbell BEFORE draining. any ring during drain
+        // sets the flag, so the next wait returns immediately.
+        doorbell.clear();
+
         let mut did_work = false;
 
-        // 1. Drain commands (from Db)
-        loop {
-            match cmd_rx.try_recv() {
-                Ok(CoordCmd::Op(op)) => {
-                    state.handle_client_op(op);
-                    did_work = true;
-                }
-                Ok(CoordCmd::Shutdown) => return,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => return,
-            }
-        }
-
-        // 2. Drain inter-core SPSC channels
-        for rx in &intercore_rxs {
-            loop {
-                match rx.try_recv() {
-                    Ok(msg) => {
-                        state.handle_intercore_msg(msg);
-                        did_work = true;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => break,
-                }
-            }
-        }
-
-        // 3. Drain inter-node channels
+        // 1. Drain inter-node channels (forwarded events first)
         for (peer_idx, rx_opt) in inter_node_rxs.iter().enumerate() {
             if let Some(rx) = rx_opt {
                 loop {
                     match rx.try_recv() {
                         Ok(msg) => {
+                            eprintln!(
+                                "N{}C{}: Received {msg:?}",
+                                state.node_id().0,
+                                state.core_id()
+                            );
                             state.handle_inter_node_msg(peer_idx, msg);
                             did_work = true;
                         }
@@ -382,10 +376,34 @@ async fn core_event_loop<R: Runtime>(
             }
         }
 
-        // 4. Drain reroute channel
+        // 2. Drain inter-core SPSC channels
+        for rx in &intercore_rxs {
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        eprintln!(
+                            "N{}C{}: Received {msg:?}",
+                            state.node_id().0,
+                            state.core_id()
+                        );
+                        state.handle_intercore_msg(msg);
+                        did_work = true;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+
+        // 3. Drain reroute channel
         loop {
             match reroute_rx.try_recv() {
                 Ok(msg) => {
+                    eprintln!(
+                        "N{}C{}: Received {msg:?}",
+                        state.node_id().0,
+                        state.core_id()
+                    );
                     state.handle_reroute_msg(msg);
                     did_work = true;
                 }
@@ -394,18 +412,27 @@ async fn core_event_loop<R: Runtime>(
             }
         }
 
-        // 5. If no work, yield: compio sleep lets worker task run,
-        // TODO: let's, like, not us timer.
-        if !did_work {
-            compio::runtime::time::sleep(Duration::from_micros(10)).await;
-            match cmd_rx.recv_timeout(drain_timeout) {
+        // 4. Drain commands (from Db).
+        loop {
+            match cmd_rx.try_recv() {
                 Ok(CoordCmd::Op(op)) => {
+                    eprintln!(
+                        "N{}C{}: Received {op:?}",
+                        state.node_id().0,
+                        state.core_id()
+                    );
                     state.handle_client_op(op);
+                    did_work = true;
                 }
                 Ok(CoordCmd::Shutdown) => return,
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return,
             }
+        }
+
+        // 5. If no work, await doorbell (blocks task, releases OS thread)
+        if !did_work {
+            doorbell.wait().await;
         }
     }
 }
