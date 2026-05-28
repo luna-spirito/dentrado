@@ -270,6 +270,10 @@ impl<R: Runtime> Core<R> {
                 .into_iter()
                 .map(|&idx| events[idx as usize].clone())
                 .collect();
+            let global_core_ids = seed_indices
+                .into_iter()
+                .map(|&idx| global_core_ids[idx as usize])
+                .collect();
             self.forward_to_peers(wire_ctx, events, global_core_ids, timestamp);
         }
         Ok(())
@@ -415,7 +419,7 @@ impl<R: Runtime> Core<R> {
         &self,
         wire_ctx: Arc<WireLocCtx<R>>,
         events: Vec<WireEventBody<R::Group, R::Body>>,
-        global_core_ids: &Arc<[GlobalCoreId]>,
+        global_core_ids: Vec<GlobalCoreId>,
         timestamp: u32,
     ) {
         for (peer_idx, (_node_id, remote_num_cores, sender_opt)) in
