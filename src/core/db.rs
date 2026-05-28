@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     core::{
-        core_ctx::{ClientOp, CoordCmd, Core, InterCoreMsg, InterNodeMsg, RerouteMsg},
+        core_ctx::{CoordCmd, Core, CoreCmd, InterCoreMsg, InterNodeMsg, RerouteMsg},
         gear::Runtime,
     },
     types::{GlobalCoreId, NodeId},
@@ -119,6 +119,7 @@ pub(crate) fn route_gear<R: Runtime>(
 }
 
 pub struct Db<R: Runtime> {
+    node_id: NodeId,
     handles: Vec<CoreHandle<R>>,
     join_handles: Vec<thread::JoinHandle<()>>,
 }
@@ -268,6 +269,7 @@ impl<R: Runtime> Db<R> {
         }
 
         Ok(Self {
+            node_id,
             handles,
             join_handles,
         })
@@ -287,13 +289,14 @@ impl<R: Runtime> Db<R> {
             let (reply_tx, reply_rx) = flume::bounded(1);
             handle
                 .cmd_tx
-                .send(CoordCmd::Op(ClientOp::PostEvents {
+                .send(CoordCmd::Op(CoreCmd::PostEvents {
                     wire_ctx: routed.wire_ctx.clone(),
                     events: routed.events.clone(),
                     global_core_ids: routed.global_core_ids.clone(),
                     timestamp,
                     seed_indices,
-                    reply: reply_tx,
+                    forwarded_from: None,
+                    reply: Some(reply_tx),
                 }))
                 .expect("core channel closed");
             handle.doorbell.ring();
@@ -317,7 +320,7 @@ impl<R: Runtime> Db<R> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         handle
             .cmd_tx
-            .send(CoordCmd::Op(ClientOp::RunGear {
+            .send(CoordCmd::Op(CoreCmd::RunGear {
                 gear,
                 wire_ctx,
                 reply: reply_tx,

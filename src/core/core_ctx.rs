@@ -26,14 +26,15 @@ use crate::{
 /// Shared between `CoordCmd` (arrives via `cmd_rx`) and `InterCoreMsg`
 /// (arrives via SPSC inter-core channels) to avoid duplicating handler logic.
 #[derive(Debug)]
-pub(crate) enum ClientOp<R: Runtime> {
+pub(crate) enum CoreCmd<R: Runtime> {
     PostEvents {
         wire_ctx: Arc<WireLocCtx<R>>,
         events: Arc<[WireEventBody<R::Group, R::Body>]>,
         global_core_ids: Arc<[GlobalCoreId]>,
         timestamp: u32,
         seed_indices: Vec<u32>,
-        reply: flume::Sender<Result<(), MergeError>>,
+        forwarded_from: Option<NodeId>,
+        reply: Option<flume::Sender<Result<(), MergeError>>>,
     },
     RunGear {
         gear: R::GearId,
@@ -44,7 +45,7 @@ pub(crate) enum ClientOp<R: Runtime> {
 
 /// Command sent from the DBMS's coordinator, i. e. from the caller of `Db::start`.
 pub(crate) enum CoordCmd<R: Runtime> {
-    Op(ClientOp<R>),
+    Op(CoreCmd<R>),
     Shutdown,
 }
 
@@ -52,9 +53,8 @@ pub(crate) enum CoordCmd<R: Runtime> {
 #[derive(Debug)]
 pub(crate) enum InterNodeMsg<R: Runtime> {
     ForwardEvents {
-        wire_ctx: Arc<WireLocCtx<R>>,
-        events: Arc<[WireEventBody<R::Group, R::Body>]>,
-        global_core_ids: Arc<[GlobalCoreId]>,
+        wire_ctx: WireLocCtx<R>,
+        events: Vec<WireEventBody<R::Group, R::Body>>,
         timestamp: u32,
     },
 }
@@ -63,16 +63,15 @@ pub(crate) enum InterNodeMsg<R: Runtime> {
 pub(crate) enum RerouteMsg<R: Runtime> {
     ForwardToPeer {
         peer_idx: usize,
-        wire_ctx: Arc<WireLocCtx<R>>,
-        events: Arc<[WireEventBody<R::Group, R::Body>]>,
-        global_core_ids: Arc<[GlobalCoreId]>,
+        wire_ctx: WireLocCtx<R>,
+        events: Vec<WireEventBody<R::Group, R::Body>>,
         timestamp: u32,
     },
 }
 
 #[derive(Debug)]
 pub(crate) enum InterCoreMsg<R: Runtime> {
-    Op(ClientOp<R>),
+    Op(CoreCmd<R>),
     SecondaryRequest {
         gear: R::GearId,
         wire_ctx: Arc<WireLocCtx<R>>,
@@ -82,13 +81,6 @@ pub(crate) enum InterCoreMsg<R: Runtime> {
         gear: R::GearId,
         output: R::GearOut,
         wire_ctx: Arc<WireLocCtx<R>>,
-    },
-    NodeForwardedEvents {
-        wire_ctx: Arc<WireLocCtx<R>>,
-        events: Arc<[WireEventBody<R::Group, R::Body>]>,
-        global_core_ids: Arc<[GlobalCoreId]>,
-        timestamp: u32,
-        source_node: NodeId,
     },
 }
 
@@ -256,33 +248,35 @@ impl<R: Runtime> Core<R> {
     }
 
     /// Handle a `PostEvents` operation directly.
-    pub(crate) fn handle_client_post(
+    /// Import events into this core, optionally forwarding to inter-node peers.
+    fn post_events(
         &self,
-        wire_ctx: &Arc<WireLocCtx<R>>,
-        events: &Arc<[WireEventBody<R::Group, R::Body>]>,
+        wire_ctx: Arc<WireLocCtx<R>>,
+        events: Arc<[WireEventBody<R::Group, R::Body>]>,
         global_core_ids: &Arc<[GlobalCoreId]>,
         timestamp: u32,
-        seed_indices: Vec<u32>,
+        seed_indices: &[u32],
+        source_node: Option<NodeId>,
     ) -> Result<(), MergeError> {
-        eprintln!(
-            "N{}C{}: handle_client_post seed_indices={seed_indices:?} num_events={}",
-            self.node_id.0,
-            self.core_id,
-            events.len()
-        );
-        let node_id = self.node_id;
-        let merger = WireLocCtxMerger::new(wire_ctx, self);
-        for &idx in &seed_indices {
+        let merger = WireLocCtxMerger::new(&wire_ctx, self);
+        for &idx in seed_indices {
             let event = &events[idx as usize];
             let gcid = global_core_ids[idx as usize];
-            merger.import_new_event(event, gcid, timestamp, node_id)?;
+            merger.import_new_event(event, gcid, timestamp, source_node.unwrap_or(self.node_id))?;
         }
-        self.forward_to_peers(wire_ctx, events, global_core_ids, timestamp);
+        if source_node.is_none() {
+            // TODO: Don't pass wire_ctx, pass only the relevant subpart of it. I. e. update WireLocCtxMereger to regenerate
+            let events = seed_indices
+                .into_iter()
+                .map(|&idx| events[idx as usize].clone())
+                .collect();
+            self.forward_to_peers(wire_ctx, events, global_core_ids, timestamp);
+        }
         Ok(())
     }
 
     /// Handle a `RunGear` operation directly.
-    pub(crate) fn handle_run_gear(
+    pub(crate) fn run_gear(
         &self,
         gear: R::GearId,
         wire_ctx: &WireLocCtx<R>,
@@ -294,33 +288,37 @@ impl<R: Runtime> Core<R> {
     }
 
     /// Handle a `ClientOp` (received from a channel that is).
-    pub(crate) fn handle_client_op(&self, op: ClientOp<R>) {
+    pub(crate) fn handle_client_op(&self, op: CoreCmd<R>) {
         match op {
-            ClientOp::PostEvents {
+            CoreCmd::PostEvents {
                 wire_ctx,
                 events,
                 global_core_ids,
                 timestamp,
                 seed_indices,
+                forwarded_from,
                 reply,
             } => {
-                let result = self.handle_client_post(
-                    &wire_ctx,
-                    &events,
+                let result = self.post_events(
+                    wire_ctx,
+                    events,
                     &global_core_ids,
                     timestamp,
-                    seed_indices,
+                    &seed_indices,
+                    forwarded_from,
                 );
-                reply
-                    .send(result)
-                    .expect("PostEvents: reply channel closed");
+                if let Some(reply) = reply {
+                    reply
+                        .send(result)
+                        .expect("PostEvents: reply channel closed");
+                }
             }
-            ClientOp::RunGear {
+            CoreCmd::RunGear {
                 gear,
                 wire_ctx,
                 reply,
             } => {
-                let result = self.handle_run_gear(gear, &wire_ctx);
+                let result = self.run_gear(gear, &wire_ctx);
                 reply.send(result).expect("RunGear: reply channel closed");
             }
         }
@@ -374,87 +372,19 @@ impl<R: Runtime> Core<R> {
 
                 self.inner.borrow_mut().secondary_cache.insert(gear, output);
             }
-            InterCoreMsg::NodeForwardedEvents {
-                wire_ctx,
-                events,
-                global_core_ids,
-                timestamp,
-                source_node,
-            } => {
-                let core_id = self.core_id;
-                let merger = WireLocCtxMerger::new(&wire_ctx, self);
-                for (i, event) in events.iter().enumerate() {
-                    let gcid = global_core_ids[i];
-                    if let Err(e) = merger.import_new_event(event, gcid, timestamp, source_node) {
-                        eprintln!("CORE {core_id}: NodeForwardedEvents import error: {e:?}");
-                    }
-                }
-            }
         }
     }
 
     pub(crate) fn handle_inter_node_msg(&self, peer_idx: usize, msg: InterNodeMsg<R>) {
+        let source_node = self.inter_node_peers[peer_idx].0;
         match msg {
             InterNodeMsg::ForwardEvents {
                 wire_ctx,
                 events,
-                global_core_ids,
                 timestamp,
-            } => {
-                let source_node = self.inter_node_peers[peer_idx].0;
-                let core_id = self.core_id;
-
-                let mut local_indices: Vec<u32> = Vec::new();
-                let mut forwarded: HashMap<u32, Vec<u32>> = HashMap::new();
-
-                for (i, gcid) in global_core_ids.iter().enumerate() {
-                    let target_core = gcid.route(self.num_cores);
-                    if target_core == core_id {
-                        local_indices.push(i as u32);
-                    } else {
-                        forwarded.entry(target_core).or_default().push(i as u32);
-                    }
-                }
-
-                eprintln!(
-                    "N{}C{}: ForwardEvents local_indices={local_indices:?} forwarded={forwarded:?}",
-                    self.node_id.0, self.core_id
-                );
-
-                let merger = WireLocCtxMerger::new(&wire_ctx, self);
-                for &idx in &local_indices {
-                    if let Err(e) = merger.import_new_event(
-                        &events[idx as usize],
-                        global_core_ids[idx as usize],
-                        timestamp,
-                        source_node,
-                    ) {
-                        eprintln!("CORE {core_id}: inter-node ForwardEvents import error: {e:?}");
-                    }
-                }
-
-                for (target_core, indices) in forwarded {
-                    let fw_events: Arc<[WireEventBody<_, _>]> = indices
-                        .iter()
-                        .map(|&idx| events[idx as usize].clone())
-                        .collect();
-                    let fw_gcids: Arc<[GlobalCoreId]> = indices
-                        .iter()
-                        .map(|&idx| global_core_ids[idx as usize])
-                        .collect();
-
-                    let _ = self.intercore_tx[target_core as usize].send(
-                        InterCoreMsg::NodeForwardedEvents {
-                            wire_ctx: Arc::clone(&wire_ctx),
-                            events: fw_events,
-                            global_core_ids: fw_gcids,
-                            timestamp,
-                            source_node,
-                        },
-                    );
-                    self.doorbells[target_core as usize].ring();
-                }
-            }
+            } => self
+                .db_post_events(wire_ctx, events, timestamp, (Some(source_node), || None))
+                .expect("Received invalid push from server of the cluster"), // TODO: Don't fail.
         }
     }
 
@@ -464,7 +394,6 @@ impl<R: Runtime> Core<R> {
                 peer_idx,
                 wire_ctx,
                 events,
-                global_core_ids,
                 timestamp,
             } => {
                 let (sender, doorbell) = self
@@ -475,7 +404,6 @@ impl<R: Runtime> Core<R> {
                 let _ = sender.send(InterNodeMsg::ForwardEvents {
                     wire_ctx,
                     events,
-                    global_core_ids,
                     timestamp,
                 });
                 doorbell.ring();
@@ -485,8 +413,8 @@ impl<R: Runtime> Core<R> {
 
     fn forward_to_peers(
         &self,
-        wire_ctx: &Arc<WireLocCtx<R>>,
-        events: &Arc<[WireEventBody<R::Group, R::Body>]>,
+        wire_ctx: Arc<WireLocCtx<R>>,
+        events: Vec<WireEventBody<R::Group, R::Body>>,
         global_core_ids: &Arc<[GlobalCoreId]>,
         timestamp: u32,
     ) {
@@ -504,9 +432,8 @@ impl<R: Runtime> Core<R> {
             if let Some((sender, doorbell)) = sender_opt {
                 eprintln!("... and we do it directly.");
                 let _ = sender.send(InterNodeMsg::ForwardEvents {
-                    wire_ctx: Arc::clone(wire_ctx),
-                    events: Arc::clone(events),
-                    global_core_ids: Arc::clone(global_core_ids),
+                    wire_ctx: (*wire_ctx).clone(),
+                    events: events.clone(),
                     timestamp,
                 });
                 doorbell.ring();
@@ -526,16 +453,11 @@ impl<R: Runtime> Core<R> {
                         .iter()
                         .map(|&idx| events[idx as usize].clone())
                         .collect();
-                    let proxy_gcids: Vec<_> = seed_indices
-                        .iter()
-                        .map(|&idx| global_core_ids[idx as usize])
-                        .collect();
 
                     let _ = self.reroute_tx[proxy_core as usize].send(RerouteMsg::ForwardToPeer {
                         peer_idx,
-                        wire_ctx: Arc::clone(wire_ctx),
-                        events: Arc::from(proxy_events),
-                        global_core_ids: Arc::from(proxy_gcids),
+                        wire_ctx: (*wire_ctx).clone(),
+                        events: proxy_events,
                         timestamp,
                     });
                     self.doorbells[proxy_core as usize].ring();
@@ -558,20 +480,23 @@ impl<R: Runtime> Core<R> {
             .map(|eg| f(&eg.added[since.0..], &eg.removed[since.1..]))
     }
 
-    // Send commands to cluster via this Core
+    // Send commands to db via this Core
 
     /// Post events, routing each to the correct core.
     /// Self-targeting events call `Core::do_post_events` directly.
     /// Remote events go through SPSC `intercore_tx`.
-    pub async fn post_events(
+    pub fn db_post_events(
         &self,
         wire_ctx: WireLocCtx<R>,
         events: Vec<WireEventBody<R::Group, R::Body>>,
         timestamp: u32,
+        (forwarded_from, mut mk_reply): (
+            Option<NodeId>,
+            impl FnMut() -> Option<flume::Sender<Result<(), MergeError>>>,
+        ),
     ) -> Result<(), MergeError> {
         let routed = db::route_events(wire_ctx, events, self.num_cores())?;
 
-        let mut reply_rxs = Vec::with_capacity(routed.core_seeds.len());
         let mut our_task = None;
         for (target_core, seed_indices) in routed.core_seeds {
             if target_core == self.core_id() {
@@ -579,43 +504,39 @@ impl<R: Runtime> Core<R> {
                 our_task = Some(seed_indices);
             } else {
                 // Remote: send through SPSC intercore channel
-                let (reply_tx, reply_rx) = flume::bounded(1);
-                let op = ClientOp::PostEvents {
+                let op = CoreCmd::PostEvents {
                     wire_ctx: Arc::clone(&routed.wire_ctx),
                     events: Arc::clone(&routed.events),
                     global_core_ids: Arc::clone(&routed.global_core_ids),
                     timestamp,
                     seed_indices,
-                    reply: reply_tx,
+                    forwarded_from,
+                    reply: mk_reply(),
                 };
                 self.intercore_tx[target_core as usize]
                     .send(InterCoreMsg::Op(op))
                     .expect("post_events: intercore channel closed");
                 self.doorbells[target_core as usize].ring();
-                reply_rxs.push(reply_rx);
             }
         }
 
         if let Some(seed_indices) = our_task {
-            self.handle_client_post(
-                &routed.wire_ctx,
-                &routed.events,
+            self.post_events(
+                routed.wire_ctx,
+                routed.events,
                 &routed.global_core_ids,
                 timestamp,
-                seed_indices,
+                &seed_indices,
+                forwarded_from,
             )?;
         }
-        for reply_rx in reply_rxs {
-            reply_rx.recv_async().await.expect("channel closed")?;
-        }
-
         Ok(())
     }
 
     /// Run a gear on the core that owns it.
     /// Self-targeting: calls `Core::do_run_gear` directly.
     /// Remote: sends through SPSC `intercore_tx`.
-    pub async fn run_gear(
+    pub async fn db_run_gear(
         &self,
         gear: R::GearId,
         wire_ctx: WireLocCtx<R>,
@@ -624,11 +545,11 @@ impl<R: Runtime> Core<R> {
 
         if target_core == self.core_id {
             // Direct call: synchronous, no channel overhead
-            self.handle_run_gear(gear, &wire_ctx)
+            self.run_gear(gear, &wire_ctx)
         } else {
             // Remote: send through SPSC intercore channel
             let (reply_tx, reply_rx) = flume::bounded(1);
-            let op = ClientOp::RunGear {
+            let op = CoreCmd::RunGear {
                 gear,
                 wire_ctx,
                 reply: reply_tx,
