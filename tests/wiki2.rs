@@ -382,8 +382,6 @@ fn doc_content_cross_core_e2e() {
         "first run: no text expected (placeholder invited, cross-core deps not yet resolved)"
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(10));
-
     let output2 = tc.run_gear_on(0, doc_gear);
     let text2 = extract_doc_text(&output2, &tags, b0);
     assert_eq!(

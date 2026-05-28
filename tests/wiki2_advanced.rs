@@ -305,8 +305,6 @@ fn retroactive_invite_cross_core_e2e() {
         "run 1: no text expected (placeholder invited, cross-core deps not yet resolved)"
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
     let output2 = tc.run_gear_on(0, doc_gear.clone());
     let sg2 = extract_text_sg(&output2, &tags);
     let text2 = extract_doc_text(&output2, &tags, b0);
@@ -639,8 +637,6 @@ fn multi_user_doc_assembly_cross_core_e2e() {
         Some("Hello".to_string()),
         "run 1: Alice (creator) edit present with placeholder invited"
     );
-
-    std::thread::sleep(std::time::Duration::from_millis(50));
 
     let output2 = tc.run_gear_on(0, doc_gear.clone());
     let sg2 = extract_text_sg(&output2, &tags);
