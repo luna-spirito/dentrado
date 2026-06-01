@@ -4,6 +4,7 @@ The broad list of functionality we want in theory, not necessarily something we 
 
 * Version-Control-System-like collaborative functionality.
   * It would be nice to be able to "fork" a page (or entire website!), perform edits, maybe merge the edits back.
+  * Should support ratings & forumchat as well probably.
 * Real-time edits.
 * Simple-stupid filesystem backend.
   * I find it interesting to make follow the ideas of Obsidian's vault, making everything compatible with the plain old stupid directory of .md files.
@@ -25,7 +26,7 @@ The broad list of functionality we want in theory, not necessarily something we 
 * Support for automatically pushing data to external tools such as webhooks, push notifications, translation, etc.
 * Automatic lists. ListPages, basically.
 * Rating systems for pages.
-* Invite-based system with multiple permission levels.
+* External permission system (that guides multiple branches). With support for multiple owners with voting.
 
 # Pluggable structure
 
