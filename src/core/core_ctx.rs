@@ -268,11 +268,11 @@ impl<R: Runtime> Core<R> {
         if source_node.is_none() {
             // TODO: Don't pass wire_ctx, pass only the relevant subpart of it. I. e. update WireLocCtxMereger to regenerate
             let events = seed_indices
-                .into_iter()
+                .iter()
                 .map(|&idx| events[idx as usize].clone())
                 .collect();
             let global_core_ids = seed_indices
-                .into_iter()
+                .iter()
                 .map(|&idx| global_core_ids[idx as usize])
                 .collect();
             self.forward_to_peers(wire_ctx, events, global_core_ids, timestamp);

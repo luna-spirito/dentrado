@@ -1025,32 +1025,6 @@ impl Vm<'_> {
                 }
             }
 
-            BuiltinT::KolListNew => Ok(LocValue::List(Arc::new(Vec::new()))),
-
-            BuiltinT::KolListPush => {
-                if args.len() >= 2 {
-                    let elem = args[0].clone();
-                    let list = match &args[1] {
-                        LocValue::List(vs) => Arc::clone(vs),
-                        other => {
-                            return Err(VmError::TypeError {
-                                op: "list_push",
-                                expected: "List",
-                                got: format!("{other}"),
-                            })
-                        }
-                    };
-                    let mut new_list = vec![elem];
-                    new_list.extend(list.iter().cloned());
-                    Ok(LocValue::List(Arc::new(new_list)))
-                } else {
-                    Err(VmError::InvalidArgCount {
-                        expected: 2,
-                        got: args.len(),
-                    })
-                }
-            }
-
             BuiltinT::KolMkQuery => Ok(LocValue::KolQuery(0, 0)),
             BuiltinT::KolMkStateGraph => Ok(LocValue::KolStateGraph(Box::default())),
 
@@ -1804,6 +1778,10 @@ impl Vm<'_> {
             | BuiltinT::KolTextUpdT
             | BuiltinT::KolAnchorAggT
             | BuiltinT::KolTextAggT
+            | BuiltinT::KolUnEventType
+            | BuiltinT::KolPrimaryT
+            | BuiltinT::KolSecondaryT
+            | BuiltinT::KolPropQueryEvents
             | BuiltinT::KolResolveData => Ok(LocValue::Panic),
         }
     }
@@ -1894,8 +1872,6 @@ impl Vm<'_> {
             "Gear" => Ok(BuiltinT::KolGear),
             "mk_gear" => Ok(BuiltinT::KolMkGear),
             "Query" => Ok(BuiltinT::KolQuery),
-            "list_new" => Ok(BuiltinT::KolListNew),
-            "list_push" => Ok(BuiltinT::KolListPush),
             "Id" => Ok(BuiltinT::KolId),
             "query_delta" => Ok(BuiltinT::KolQueryDelta),
             "sender-to>user" => Ok(BuiltinT::KolSenderToUser),
@@ -1923,6 +1899,11 @@ impl Vm<'_> {
             "secondary_get" => Ok(BuiltinT::KolSecondaryGet),
             "loop_iter" => Ok(BuiltinT::KolLoopIter),
             "iter_list" => Ok(BuiltinT::KolIterList),
+            "un_event_type" => Ok(BuiltinT::KolUnEventType),
+            "Primary" => Ok(BuiltinT::KolPrimaryT),
+            "Secondary" => Ok(BuiltinT::KolSecondaryT),
+            "~query_events" => Ok(BuiltinT::KolPropQueryEvents),
+            "SenderId" => Ok(BuiltinT::KolSenderId),
             _ => Err(VmError::Panic("unknown builtin")),
         }
     }

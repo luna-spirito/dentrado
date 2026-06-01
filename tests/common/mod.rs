@@ -330,6 +330,10 @@ impl WikiTestCluster {
     }
 
     #[must_use]
+    pub(crate) fn register_group(&self, event_type: LocMsgTypeId, group: LocValue) {
+        self.0.loc_ctx.mk_loc_group(event_type, group);
+    }
+
     pub(crate) fn empty_record() -> LocValue {
         LocValue::Record {
             tag_set: Arc::new(vec![0]),

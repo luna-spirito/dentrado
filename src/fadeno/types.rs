@@ -89,13 +89,15 @@ pub enum BuiltinT {
     KolSecondaryGet,
     KolLoopIter,
     KolIterList,
-    KolListNew,
-    KolListPush,
     KolSenderId,
     KolLocalUserId,
     KolTextUpdT,
     KolAnchorAggT,
     KolTextAggT,
+    KolUnEventType,
+    KolPrimaryT,
+    KolSecondaryT,
+    KolPropQueryEvents,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

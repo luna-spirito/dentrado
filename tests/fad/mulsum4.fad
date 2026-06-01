@@ -1,0 +1,134 @@
+// (begin core library)
+
+unpack ./std. Int+ Type Kind Opt _=>_ _+_ _-_ _*_ unit loop_iter iter_list opt_unwrap
+unpack fadeno.
+  Tag Int Bool if Eq List refl Any
+  ~query_events
+  Primary Secondary
+  EventTypeId mk_event_type un_event_type
+  LocEventId resolve_event
+  Id DataId resolve_data
+  UserId sender-to>user user_eq
+  Gear mk_gear
+  Query mk_query query_delta
+  StateGraph StateGraphOut mk_stategraph stategraph_apply stategraph_out
+    sgctx_query sgctx_update sgctx_dep_query
+  secondary_get
+  TextUpd
+    AnchorAgg mk_anchor_agg anchor_agg_apply
+    TextAgg mk_text_agg text_agg_apply text_agg_merge
+  Timestamp
+
+// "core"
+
+// Events are defined by listing their "group" (fields) and body.
+/: Kind
+EventDef =
+ {(.key = Tag | .group = Type | .body = Type)}
+
+/: Fun {t} {Acc} ({( .removed = List t | .added = List t )}) (Fun (t) (Acc) -> Acc) (Fun (t) (Acc) -> Acc) (Acc) -> Acc
+query_apply_diff = \delta f b x.
+  loop_iter
+    (iter_list delta.added)
+    f
+    (loop_iter
+      (iter_list delta.removed)
+      b
+      x
+    )
+
+/: Fun {id : EventTypeId} {Acc} (Query id) (Fun (LocEventId id) (Acc) -> Acc) (Acc) -> Acc
+~query_apply_full = \query f x.
+  loop_iter
+    (iter_list (~query_events query))
+    f x
+
+/: Fun {id : EventTypeId} (f : Fun (LocEventId id) -> Int) (q : Query id) (p : Primary) (init : Int) -> Eq
+  (query_apply_diff (query_delta q p).delta (\v agg. agg + f v) (\v agg. agg - f v)
+    (~query_apply_full q (\v agg. agg + f v) init))
+  (~query_apply_full (query_delta q p).query (\v agg. agg + f v) init)
+~fold_p~fold_p_fold_m = SORRY
+
+/: Fun {id : EventTypeId} (q1 : Query id) (q2 : Query id) (p : Primary) -> Eq (query_delta q1 p).query (query_delta q2 p).query
+~query_delta_same = SORRY
+
+// "end core"
+
+/: EventTypeId
+MulSumEntry = mk_event_type
+  { .key = .MulSumEntry
+  | .group = Int+
+  | .body = {( .a = Int | .b = Int )}
+  }
+
+// `ValidGear Cache f` is a proof that, given ANY
+// cache of type `Cache`, `f` over that cache satisfies the
+// cache-irrelevance property
+/: Fun {u} {Out} (Cache : fadeno.Type^ u) (s : Fun (Cache) (Primary) (Secondary) -> {( .cache = Cache | .out = Out )}) -> fadeno.Type^ u
+ValidGear = \Cache f.
+  Fun (cache1 : Cache) (cache2 : Cache) (primary : Primary) (secondary : Secondary)
+    -> Eq (f cache1 primary secondary).out (f cache2 primary secondary).out
+
+/: Fun (Query MulSumEntry) -> Int
+mulsum_pure = \query. loop_iter
+  (iter_list (~query_events query))
+  (\v agg.
+    v = (resolve_event v).body
+    in agg + (v.a * v.b))
+  0
+
+/: Type
+MSCache =
+  {(.query = Query MulSumEntry
+  | .agg = Int
+  )} \./ {( .is_pure = Eq ..agg (mulsum_pure ..query) )}
+
+/: MSCache
+initial_cache = { .query = mk_query | .agg = 0 } \/ { .is_pure = refl }
+
+/: Fun (MSCache) (Primary) (Secondary) -> {( .cache = MSCache | .out = Int )}
+step = \cache primary _secondary.
+  res = query_delta cache.query primary
+  /: Int
+  agg =
+    loop_iter
+      (iter_list res.delta.added)
+      (\v agg.
+        v = (resolve_event v).body
+        in agg + (v.a * v.b))
+      (loop_iter
+        (iter_list res.delta.removed)
+        (\v agg.
+          v = (resolve_event v).body
+          in agg - (v.a * v.b))
+        cache.agg
+      )
+  /: Eq agg (mulsum_pure res.query)
+  ~identical =
+    rewrite cache.is_pure
+    rewrite ~fold_p~fold_p_fold_m @MulSumEntry (\v. v = (resolve_event v).body in v.a * v.b) cache.query primary 0
+    in refl
+  /: MSCache
+  cache = { .query = res.query | .agg = agg } \/ { .is_pure = ~identical }
+  in { .cache = cache | .out = agg }
+
+/: ValidGear MSCache step
+valid = \cache1 cache2 primary secondary.
+  res1 = step cache1 primary secondary
+  res2 = step cache2 primary secondary
+  rewrite ~query_delta_same @MulSumEntry cache1.query cache2.query primary
+  rewrite res1.cache.is_pure
+  rewrite res2.cache.is_pure
+  in refl
+
+/: Fun (Int+) -> Gear Int
+mulsum = \bucket. mk_gear
+  { .primary = { .type = MulSumEntry | .group = bucket }
+  | .initial_cache = initial_cache
+  | .step = step
+  }
+
+in
+  { .MulSumEntry = MulSumEntry
+  | .mulsum = mulsum
+  }

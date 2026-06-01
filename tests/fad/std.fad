@@ -7,6 +7,7 @@ unpack fadeno. Type^ Int Tag List Bool Eq refl Row^ list_length list_indexl list
 /: Fun (Int) (Int) -> Int
 _+_ = fadeno.int_add
 _-_ = \a b. a + (int_neg b)
+_*_ = fadeno.int_mul
 
 // Comparison operators derived from int_>=0 function.
 /: Fun (Int) (Int) -> Bool
@@ -168,6 +169,7 @@ Church = \u F. Fun {X : Type^ u} (Fun (F X) -> X) -> X
 in
   { ._+_ = _+_
   | ._-_ = _-_
+  | ._*_ = _*_
   | ._>=_ = _>=_
   | ._>_ = _>_
   | ._<=_ = _<=_
