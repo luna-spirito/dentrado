@@ -385,6 +385,8 @@ fn read_builtin(cur: &mut Cursor) -> Result<BuiltinT, DeError> {
         70 => Ok(BuiltinT::KolPrimaryT),
         71 => Ok(BuiltinT::KolSecondaryT),
         72 => Ok(BuiltinT::KolPropQueryEvents),
+        73 => Ok(BuiltinT::KolPropMkPrimary),
+        74 => Ok(BuiltinT::KolPropMkSecondary),
         tag => Err(DeError::UnknownTag {
             context: "BuiltinT",
             tag,

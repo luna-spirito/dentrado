@@ -98,6 +98,8 @@ pub enum BuiltinT {
     KolPrimaryT,
     KolSecondaryT,
     KolPropQueryEvents,
+    KolPropMkPrimary,
+    KolPropMkSecondary,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

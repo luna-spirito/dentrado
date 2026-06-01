@@ -1782,6 +1782,8 @@ impl Vm<'_> {
             | BuiltinT::KolPrimaryT
             | BuiltinT::KolSecondaryT
             | BuiltinT::KolPropQueryEvents
+            | BuiltinT::KolPropMkPrimary
+            | BuiltinT::KolPropMkSecondary
             | BuiltinT::KolResolveData => Ok(LocValue::Panic),
         }
     }

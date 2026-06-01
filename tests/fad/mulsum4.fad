@@ -1,9 +1,9 @@
 // (begin core library)
 
-unpack ./std. Int+ Type Kind Opt _=>_ _+_ _-_ _*_ unit loop_iter iter_list opt_unwrap
+unpack ./std. Int+ Type Kind Opt _=>_ _+_ _-_ _*_ unit loop_iter iter_list opt_unwrap Not
 unpack fadeno.
   Tag Int Bool if Eq List refl Any
-  ~query_events
+  ~query_events ~mk_primary ~mk_secondary
   Primary Secondary
   EventTypeId mk_event_type un_event_type
   LocEventId resolve_event
@@ -128,7 +128,47 @@ mulsum = \bucket. mk_gear
   | .step = step
   }
 
+// The same thing, but we've dropped a critical constraint on MSCache:
+
+/: Type
+MSCacheInvalid =
+  {(.query = Query MulSumEntry
+  | .agg = Int
+  )}
+
+/: MSCacheInvalid
+initial_cache_invalid = { .query = mk_query | .agg = 0 }
+
+/: Fun (MSCache) (Primary) (Secondary) -> {( .cache = MSCacheInvalid | .out = Int )}
+step_invalid = \cache primary _secondary.
+  res = query_delta cache.query primary
+  /: Int
+  agg =
+    loop_iter
+      (iter_list res.delta.added)
+      (\v agg.
+        v = (resolve_event v).body
+        in agg + (v.a * v.b))
+      (loop_iter
+        (iter_list res.delta.removed)
+        (\v agg.
+          v = (resolve_event v).body
+          in agg - (v.a * v.b))
+        cache.agg
+      )
+  /: MSCacheInvalid
+  cache = { .query = res.query | .agg = agg }
+  in { .cache = cache | .out = agg }
+
+/: Not (ValidGear MSCacheInvalid step_invalid)
+invalid = \impl.
+  /: Eq 0 1
+  absurd = impl { .query = mk_query | .agg = 0 } { .query = mk_query | .agg = 1 } ~mk_primary ~mk_secondary
+  in absurd
+
 in
   { .MulSumEntry = MulSumEntry
   | .mulsum = mulsum
+  | .valid = valid
+  | .invalid = invalid
   }
