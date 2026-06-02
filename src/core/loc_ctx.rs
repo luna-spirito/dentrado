@@ -219,10 +219,12 @@ impl<R: Runtime> EventContext<R> for LocCtx<R> {
 
         let old = if let Some(existing_eid) = self.find_event_by_sender_tx(sender_key) {
             let old_key = self
-                .get_stored_event(existing_eid, |ev| (ev.source_node, ev.timestamp))
+                .get_stored_event(existing_eid, |ev| (ev.timestamp, ev.source_node))
                 .expect("sender_tx_index points to valid event");
-            let new_key = (ev.source_node, ev.timestamp);
+            let new_key = (ev.timestamp, ev.source_node);
 
+            // (eid, ev.timestamp, ev.source_node) is unique in a network where source_node's are never duplicated.
+            // TODO: Make sure that "source_node is unique" is always the case.
             if old_key <= new_key {
                 return None; // Event isn't earlier, skip it
             }
