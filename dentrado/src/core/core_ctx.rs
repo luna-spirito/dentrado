@@ -2,7 +2,7 @@ use std::{
     any::Any,
     cell::RefCell,
     collections::{HashMap, HashSet},
-    sync::{mpsc, Arc},
+    sync::{Arc, mpsc},
 };
 
 use crate::{

@@ -1,7 +1,7 @@
 #![allow(clippy::pedantic)]
 
 use im::HashMap as ImHashMap;
-use similar::{capture_diff_slices, Algorithm, DiffOp};
+use similar::{Algorithm, DiffOp, capture_diff_slices};
 use std::collections::BTreeSet;
 
 use crate::{

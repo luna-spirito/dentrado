@@ -1,4 +1,4 @@
-use kolorinko::{
+use dentrado::{
     core::gear::Runtime,
     fadeno::{
         bridge::{FadenoModule, FadenoRuntime},
@@ -8,7 +8,7 @@ use kolorinko::{
     types::*,
     utils::{
         state_graph::StateGraphOut,
-        text::{AnchorPos, TextUpd, ROOT_ANCHOR},
+        text::{AnchorPos, ROOT_ANCHOR, TextUpd},
     },
     wire::WireLocCtxBuilder,
 };

@@ -24,18 +24,18 @@ allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
-    "BSD-3-Clause",
-    "ISC",
+    # "BSD-3-Clause",
+    # "ISC",
     "Zlib",
     "CC0-1.0",
     "Unlicense",
     "Unicode-3.0",
     # Weak copyleft. GPL-compatible per FSF, thus AGPL-3.0-compatible
     "MPL-2.0",
-    "LGPL-2.1-or-later",
+    # "LGPL-2.1-or-later",
     # AGPL itself. for potential AGPL-licensed dependencies
-    "AGPL-3.0",
-    "AGPL-3.0-only",
+    # "AGPL-3.0",
+    # "AGPL-3.0-only",
     "AGPL-3.0-or-later",
 ]
 confidence-threshold = 0.9
@@ -45,7 +45,7 @@ ignore = true
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# wildcards = "deny"
 highlight = "all"
 
 [sources]

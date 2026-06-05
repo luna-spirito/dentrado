@@ -452,7 +452,7 @@ impl Vm<'_> {
                             op: "RecordCat",
                             expected: "Record, Record",
                             got: format!("{record_a}, {record_b}"),
-                        })
+                        });
                     }
                 };
                 let (ts_b, fields_b) = match &record_b {
@@ -462,7 +462,7 @@ impl Vm<'_> {
                             op: "RecordCat",
                             expected: "Record, Record",
                             got: format!("{record_a}, {record_b}"),
-                        })
+                        });
                     }
                 };
 
@@ -773,9 +773,7 @@ impl Vm<'_> {
                 match (&list, &idx) {
                     (LocValue::List(vs), LocValue::Num(i)) => {
                         if *i < 0 || *i as usize >= vs.len() {
-                            {
-                                Err(VmError::Panic("ListIndexL"))
-                            }
+                            { Err(VmError::Panic("ListIndexL")) }
                         } else {
                             Ok(vs[*i as usize].clone())
                         }
@@ -805,9 +803,7 @@ impl Vm<'_> {
                 match &a {
                     LocValue::List(vs) => {
                         if vs.is_empty() {
-                            {
-                                Err(VmError::Panic("ListViewL empty"))
-                            }
+                            { Err(VmError::Panic("ListViewL empty")) }
                         } else {
                             let left = vs[0].clone();
                             let rest = LocValue::List(Arc::new(vs[1..].to_vec()));
@@ -974,13 +970,15 @@ impl Vm<'_> {
                                 expected: "record with .primary",
                                 got: format!("{first}"),
                             })?;
-                            let primary_msg_type =
-                                match self.tags.record_get_by_tag(&primary, self.common.r#type) {
-                                    Some(LocValue::KolEventTypeId(id)) => id,
-                                    other => panic!(
+                            let primary_msg_type = match self
+                                .tags
+                                .record_get_by_tag(&primary, self.common.r#type)
+                            {
+                                Some(LocValue::KolEventTypeId(id)) => id,
+                                other => panic!(
                                     "mk_gear: .primary.type expected KolEventTypeId, got {other:?}"
                                 ),
-                                };
+                            };
                             let primary_group = self
                                 .tags
                                 .record_get_by_tag(&primary, self.common.group)
@@ -1045,7 +1043,7 @@ impl Vm<'_> {
                             op: "stategraph_apply",
                             expected: "StateGraph",
                             got: format!("{other}"),
-                        })
+                        });
                     }
                 };
                 let handler_closure = args[1].clone();
@@ -1203,13 +1201,13 @@ impl Vm<'_> {
                             op: "query_delta",
                             expected: "KolQuery",
                             got: format!("{other:?}"),
-                        })
+                        });
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
                             expected: 1,
                             got: 0,
-                        })
+                        });
                     }
                 };
                 let (core, group) = match &self.stage {
@@ -1272,13 +1270,13 @@ impl Vm<'_> {
                             op: "sender-to>user",
                             expected: "KolSenderId",
                             got: format!("{other}"),
-                        })
+                        });
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
                             expected: 1,
                             got: 0,
-                        })
+                        });
                     }
                 };
                 let ctx = match self.stage {
@@ -1302,7 +1300,7 @@ impl Vm<'_> {
                         return Err(VmError::InvalidArgCount {
                             expected: 1,
                             got: 0,
-                        })
+                        });
                     }
                 };
 
@@ -1320,7 +1318,7 @@ impl Vm<'_> {
                         return Err(VmError::InvalidArgCount {
                             expected: 2,
                             got: 0,
-                        })
+                        });
                     }
                 };
                 let val = match args.get(1) {
@@ -1329,7 +1327,7 @@ impl Vm<'_> {
                         return Err(VmError::InvalidArgCount {
                             expected: 2,
                             got: 1,
-                        })
+                        });
                     }
                 };
 
@@ -1349,7 +1347,7 @@ impl Vm<'_> {
                         return Err(VmError::InvalidArgCount {
                             expected: 2,
                             got: 0,
-                        })
+                        });
                     }
                 };
                 let dep_key = match args.get(1) {
@@ -1358,7 +1356,7 @@ impl Vm<'_> {
                         return Err(VmError::InvalidArgCount {
                             expected: 2,
                             got: 1,
-                        })
+                        });
                     }
                 };
 
@@ -1377,13 +1375,13 @@ impl Vm<'_> {
                             op: "resolve_event",
                             expected: "KolEventId",
                             got: format!("{other:?}"),
-                        })
+                        });
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
                             expected: 1,
                             got: 0,
-                        })
+                        });
                     }
                 };
                 let ctx = match self.stage {
@@ -1412,13 +1410,13 @@ impl Vm<'_> {
                             op: "resolve_data",
                             expected: "KolDataId",
                             got: format!("{other:?}"),
-                        })
+                        });
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
                             expected: 1,
                             got: 0,
-                        })
+                        });
                     }
                 };
                 let ctx = match self.stage {
@@ -1485,13 +1483,13 @@ impl Vm<'_> {
                             op: "anchor_agg_apply",
                             expected: "AnchorAgg",
                             got: format!("{other}"),
-                        })
+                        });
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
                             expected: 3,
                             got: args.len(),
-                        })
+                        });
                     }
                 };
                 let event_id = match args.get(1) {
@@ -1501,13 +1499,13 @@ impl Vm<'_> {
                             op: "anchor_agg_apply",
                             expected: "KolEventId",
                             got: format!("{other}"),
-                        })
+                        });
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
                             expected: 3,
                             got: args.len(),
-                        })
+                        });
                     }
                 };
                 let upd = match args.get(2) {
@@ -1517,13 +1515,13 @@ impl Vm<'_> {
                             op: "anchor_agg_apply",
                             expected: "TextUpd",
                             got: format!("{other}"),
-                        })
+                        });
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
                             expected: 3,
                             got: args.len(),
-                        })
+                        });
                     }
                 };
                 let ctx = match &self.stage {
@@ -1559,13 +1557,13 @@ impl Vm<'_> {
                             op: "text_agg_apply",
                             expected: "TextAgg",
                             got: format!("{other}"),
-                        })
+                        });
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
                             expected: 3,
                             got: args.len(),
-                        })
+                        });
                     }
                 };
                 let event_id = match args.get(1) {
@@ -1575,13 +1573,13 @@ impl Vm<'_> {
                             op: "text_agg_apply",
                             expected: "KolEventId",
                             got: format!("{other}"),
-                        })
+                        });
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
                             expected: 3,
                             got: args.len(),
-                        })
+                        });
                     }
                 };
                 let upd = match args.get(2) {
@@ -1591,13 +1589,13 @@ impl Vm<'_> {
                             op: "text_agg_apply",
                             expected: "TextUpd",
                             got: format!("{other}"),
-                        })
+                        });
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
                             expected: 3,
                             got: args.len(),
-                        })
+                        });
                     }
                 };
                 let ctx = match &self.stage {
@@ -1631,13 +1629,13 @@ impl Vm<'_> {
                             op: "text_agg_merge",
                             expected: "TextAgg",
                             got: format!("{other}"),
-                        })
+                        });
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
                             expected: 2,
                             got: args.len(),
-                        })
+                        });
                     }
                 };
                 let rhs = match args.get(1) {
@@ -1650,13 +1648,13 @@ impl Vm<'_> {
                             op: "text_agg_merge",
                             expected: "TextAgg",
                             got: format!("{other}"),
-                        })
+                        });
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
                             expected: 2,
                             got: args.len(),
-                        })
+                        });
                     }
                 };
                 Ok(LocValue::KolTextAgg(lhs.merge(&rhs)))
@@ -1670,13 +1668,13 @@ impl Vm<'_> {
                             op: "secondary_get",
                             expected: "KolGear",
                             got: format!("{other}"),
-                        })
+                        });
                     }
                     None => {
                         return Err(VmError::InvalidArgCount {
                             expected: 1,
                             got: 0,
-                        })
+                        });
                     }
                 };
                 let core = match &self.stage {
@@ -1687,7 +1685,7 @@ impl Vm<'_> {
                     _ => {
                         return Err(VmError::OutsideGearStepContext {
                             op: "secondary_get",
-                        })
+                        });
                     }
                 };
 

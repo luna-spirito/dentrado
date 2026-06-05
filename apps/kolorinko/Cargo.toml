@@ -1,0 +1,9 @@
+[package]
+name = "kolorinko"
+version = "0.1.0"
+authors = ["Luna Spirito <guardspirit@protonmail.com>"]
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+dentrado = { path = "../../dentrado" }

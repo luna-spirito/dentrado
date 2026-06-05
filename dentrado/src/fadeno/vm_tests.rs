@@ -5,7 +5,7 @@ use crate::{
         loc_ctx::{EventContext, StoredEvent},
     },
     fadeno::{
-        compiler::{compile_file, find_binary, CompileOutput},
+        compiler::{CompileOutput, compile_file, find_binary},
         types::*,
         vm::{self, VmContext},
     },
@@ -295,8 +295,11 @@ fn sg_apply_preserves_stack() {
     );
 
     match result {
-        Ok(v) => assert_eq!(v, LocValue::Num(42),
-            "expected Num(42) from pre-apply stack slot, got {v:?} — stack corrupted by stategraph_apply"),
+        Ok(v) => assert_eq!(
+            v,
+            LocValue::Num(42),
+            "expected Num(42) from pre-apply stack slot, got {v:?} — stack corrupted by stategraph_apply"
+        ),
         Err(e) => panic!("step failed: {e:?}"),
     }
 }

@@ -6,9 +6,9 @@ use std::{
     time::Duration,
 };
 
-use kolorinko::{
+use dentrado::{
     core::{
-        db::{create_peer_channel_pair, Db, DbConfig, Doorbell, DoorbellHandle, PeerChannels},
+        db::{Db, DbConfig, Doorbell, DoorbellHandle, PeerChannels, create_peer_channel_pair},
         gear::Runtime,
         loc_ctx::{EventContext, LocCtx},
     },

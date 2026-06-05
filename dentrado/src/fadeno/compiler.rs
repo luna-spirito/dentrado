@@ -136,7 +136,7 @@ pub fn compile_file(binary: &str, path: &Path) -> CompileResult {
             return CompileResult::Failed(CompileError::ProcessFailed {
                 exit_code: -1,
                 stderr: format!("failed to execute {binary}: {e}"),
-            })
+            });
         }
     };
 

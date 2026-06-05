@@ -1,4 +1,4 @@
-use kolorinko::{
+use dentrado::{
     fadeno::{
         bridge::FadenoModule,
         compiler::{compile_file, find_binary},

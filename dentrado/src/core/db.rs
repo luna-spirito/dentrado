@@ -3,7 +3,7 @@ use std::{
     future::Future,
     io,
     rc::Rc,
-    sync::{mpsc, Arc},
+    sync::{Arc, mpsc},
     thread,
 };
 

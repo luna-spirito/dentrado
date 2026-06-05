@@ -92,7 +92,7 @@ fn oneshot(
     let mut sg = StateGraph::new();
     let store: BTreeMap<u64, (u32, SiteEvent)> = events
         .iter()
-        .map(|(eid, e)| (eid.1 .0, (eid.0.timestamp, e.clone())))
+        .map(|(eid, e)| (eid.1.0, (eid.0.timestamp, e.clone())))
         .collect();
 
     let r = |_: SGEventId| StateGraphOut::<(), ()> {
@@ -131,7 +131,7 @@ fn multishot(
     let mut sg = StateGraph::new();
     let store: BTreeMap<u64, (u32, SiteEvent)> = events
         .iter()
-        .map(|(eid, e)| (eid.1 .0, (eid.0.timestamp, e.clone())))
+        .map(|(eid, e)| (eid.1.0, (eid.0.timestamp, e.clone())))
         .collect();
 
     let r = |_: SGEventId| StateGraphOut::<(), ()> {

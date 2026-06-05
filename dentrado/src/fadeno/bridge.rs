@@ -115,13 +115,13 @@ pub fn hash_loc_value(
         }
 
         LocValue::KolPrimary | LocValue::KolSecondary => {
-            return Err(GroupRouteError::ContextPlaceholder)
+            return Err(GroupRouteError::ContextPlaceholder);
         }
 
         LocValue::KolGear(_) => return Err(GroupRouteError::DomainValue("KolGear")),
         LocValue::KolStateGraph(_) => return Err(GroupRouteError::DomainValue("KolStateGraph")),
         LocValue::KolStateGraphOut(_) => {
-            return Err(GroupRouteError::DomainValue("KolStateGraphOut"))
+            return Err(GroupRouteError::DomainValue("KolStateGraphOut"));
         }
         LocValue::KolAnchorAgg(_) => return Err(GroupRouteError::DomainValue("KolAnchorAgg")),
         LocValue::KolTextAgg(_) => return Err(GroupRouteError::DomainValue("KolTextAgg")),

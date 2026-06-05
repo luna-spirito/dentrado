@@ -1,4 +1,4 @@
-use kolorinko::{
+use dentrado::{
     core::{
         core_ctx::Core,
         db::{Db, DbConfig, Doorbell},
