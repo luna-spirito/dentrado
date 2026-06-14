@@ -1,7 +1,7 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use crate::{
-    core::{gear::Runtime, loc_ctx::LocCtx},
+    core::{gear::IsRuntime, loc_ctx::LocCtx},
     types::{LocDataId, LocSenderId, LocUserId, Localizable, SenderPk, UserId},
     wire::format::WireLocCtx,
 };
@@ -25,12 +25,12 @@ impl std::fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
-pub struct WireLocCtxBuilder<'a, R: Runtime> {
+pub struct WireLocCtxBuilder<'a, R: IsRuntime> {
     ctx: &'a LocCtx<R>,
     inner: RefCell<BuilderInner<R>>,
 }
 
-struct BuilderInner<R: Runtime> {
+struct BuilderInner<R: IsRuntime> {
     users: Vec<UserId>,
     senders: Vec<(SenderPk, u32)>,
     objects: Vec<(crate::types::DataId, R::Data)>,
@@ -40,7 +40,7 @@ struct BuilderInner<R: Runtime> {
     data_to_wire: HashMap<u64, u32>,
 }
 
-impl<'a, R: Runtime> WireLocCtxBuilder<'a, R> {
+impl<'a, R: IsRuntime> WireLocCtxBuilder<'a, R> {
     #[must_use]
     pub fn new(ctx: &'a LocCtx<R>) -> Self {
         Self {

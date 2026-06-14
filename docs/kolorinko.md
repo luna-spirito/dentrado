@@ -28,11 +28,11 @@ The broad list of functionality we want in theory, not necessarily something we 
 * Rating systems for pages.
 * External permission system (that guides multiple branches). With support for multiple owners with voting.
 
-# Pluggable structure
+## Pluggable structure
 
 As I've noted before, I believe that the fastest path to a deliverable is actually implementing all the functionality in Rust, and then eventually moving all this functionality to a plugin. However, nothing's stopping us from giving user a choice what pre-baked Rust plugins they want to use.
 
-# VCS
+## VCS
 
 The wiki2 test we currently have implements two axes: 1) document ids; 2) branches.
 This means that for each document has different content on different branches.
@@ -58,8 +58,9 @@ The alternatives I think'ed about and decided to un'think about:
 * Support for inter-document merges. Unrelated histories can't be reliably merged.
 * "Overlays" instead of branches: make a single canonical version of a page, and let users create overlays. The core difference is that overlays always, automatically track all the edits of the canonical page. However, this sounds like an inconvenient default, and I'd prefer to build it on top of VCS if anyone ever needs this.
 * Make "patches/edits" as units of merging instead of whole branches, just like in [Darcs](https://darcs.net/). Theoretically elegant, but probably only increases the complexity, and Darcs didn't even catch on.
+* Some kind of "hub"/"feed"/"algorithm" to find relevant content.
 
-# Real-time editing
+## Real-time editing
 
 Can be implemented via ephemeral branch overlays.
 On top of each branch, we place a new function that aggregates real-time edits.

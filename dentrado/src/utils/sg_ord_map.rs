@@ -1,7 +1,7 @@
 use im::OrdMap;
 use std::ops::Bound;
 
-use crate::core::gear::Runtime;
+use crate::core::gear::IsRuntime;
 use crate::core::loc_ctx::LocCtx;
 use crate::types::{AnyLocEventId, GlobalCoreId};
 
@@ -81,7 +81,7 @@ impl<X> SgDiffItem<X> {
     }
 }
 
-fn cmp_tx_sender<R: Runtime>(
+fn cmp_tx_sender<R: IsRuntime>(
     ctx: &LocCtx<R>,
     a: AnyLocEventId,
     b: AnyLocEventId,
@@ -106,7 +106,7 @@ fn cmp_tx_sender<R: Runtime>(
     }
 }
 
-fn bucket_binary_search<E, R: Runtime>(
+fn bucket_binary_search<E, R: IsRuntime>(
     entries: &[E],
     target_lid: AnyLocEventId,
     ctx: &LocCtx<R>,
@@ -125,7 +125,7 @@ fn bucket_binary_search<E, R: Runtime>(
     Err(left)
 }
 
-fn bucket_upper_bound<E, R: Runtime>(
+fn bucket_upper_bound<E, R: IsRuntime>(
     entries: &[E],
     target_lid: AnyLocEventId,
     ctx: &LocCtx<R>,
@@ -137,7 +137,7 @@ fn bucket_upper_bound<E, R: Runtime>(
     }
 }
 
-fn bucket_lower_bound_inclusive<E, R: Runtime>(
+fn bucket_lower_bound_inclusive<E, R: IsRuntime>(
     entries: &[E],
     target_lid: AnyLocEventId,
     ctx: &LocCtx<R>,
@@ -149,7 +149,7 @@ fn bucket_lower_bound_inclusive<E, R: Runtime>(
     }
 }
 
-fn bucket_lower_bound_exclusive<E, R: Runtime>(
+fn bucket_lower_bound_exclusive<E, R: IsRuntime>(
     entries: &[E],
     target_lid: AnyLocEventId,
     ctx: &LocCtx<R>,
@@ -206,7 +206,7 @@ impl<X: Clone> SgOrdMap<X> {
         self.buckets.iter().map(|(_, v)| v.len()).sum()
     }
 
-    pub fn insert<R: Runtime>(&mut self, key: SGEventId, value: X, ctx: &LocCtx<R>) -> Option<X> {
+    pub fn insert<R: IsRuntime>(&mut self, key: SGEventId, value: X, ctx: &LocCtx<R>) -> Option<X> {
         let bucket = key.0;
         let new_entry = SgEntry {
             local_id: key.1,
@@ -263,7 +263,7 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub fn latest_at<R: Runtime>(
+    pub fn latest_at<R: IsRuntime>(
         &self,
         at: &SGEventId,
         ctx: &LocCtx<R>,
@@ -288,7 +288,7 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub fn latest_before<R: Runtime>(
+    pub fn latest_before<R: IsRuntime>(
         &self,
         at: &SGEventId,
         ctx: &LocCtx<R>,
@@ -313,7 +313,7 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub fn next_after<R: Runtime>(&self, at: &SGEventId, ctx: &LocCtx<R>) -> Option<SGEventId> {
+    pub fn next_after<R: IsRuntime>(&self, at: &SGEventId, ctx: &LocCtx<R>) -> Option<SGEventId> {
         let bucket = at.0;
 
         if let Some(entries) = self.buckets.get(&bucket) {
@@ -355,7 +355,7 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub fn range_between<R: Runtime>(
+    pub fn range_between<R: IsRuntime>(
         &self,
         at: &SGEventId,
         upper: &SGEventId,
@@ -411,7 +411,7 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub fn range_after<R: Runtime>(&self, at: &SGEventId, ctx: &LocCtx<R>) -> Vec<SGEventId> {
+    pub fn range_after<R: IsRuntime>(&self, at: &SGEventId, ctx: &LocCtx<R>) -> Vec<SGEventId> {
         let bucket = at.0;
         let mut result = Vec::new();
 
@@ -529,7 +529,7 @@ impl<X: Clone + Ord> Ord for SgOrdMap<X> {
 
 impl<X: Clone + PartialEq> SgOrdMap<X> {
     #[must_use]
-    pub fn diff_cloned<R: Runtime>(&self, other: &Self, ctx: &LocCtx<R>) -> Vec<SgDiffItem<X>> {
+    pub fn diff_cloned<R: IsRuntime>(&self, other: &Self, ctx: &LocCtx<R>) -> Vec<SgDiffItem<X>> {
         use im::ordmap::DiffItem;
 
         let mut result = Vec::new();
@@ -634,7 +634,7 @@ impl SgOrdSet {
         self.0.is_empty()
     }
 
-    pub fn insert<R: Runtime>(&mut self, key: SGEventId, ctx: &LocCtx<R>) -> bool {
+    pub fn insert<R: IsRuntime>(&mut self, key: SGEventId, ctx: &LocCtx<R>) -> bool {
         self.0.insert(key, (), ctx).is_none()
     }
 
@@ -652,7 +652,7 @@ impl SgOrdSet {
     }
 
     #[must_use]
-    pub fn range_between<R: Runtime>(
+    pub fn range_between<R: IsRuntime>(
         &self,
         at: &SGEventId,
         upper: &SGEventId,
@@ -662,7 +662,7 @@ impl SgOrdSet {
     }
 
     #[must_use]
-    pub fn range_after<R: Runtime>(&self, at: &SGEventId, ctx: &LocCtx<R>) -> Vec<SGEventId> {
+    pub fn range_after<R: IsRuntime>(&self, at: &SGEventId, ctx: &LocCtx<R>) -> Vec<SGEventId> {
         self.0.range_after(at, ctx)
     }
 

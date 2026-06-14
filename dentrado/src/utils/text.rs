@@ -5,7 +5,7 @@ use similar::{Algorithm, DiffOp, capture_diff_slices};
 use std::collections::BTreeSet;
 
 use crate::{
-    core::{gear::Runtime, loc_ctx::LocCtx},
+    core::{gear::IsRuntime, loc_ctx::LocCtx},
     types::{GlobalCoreId, LocSenderEventId, LocSenderId},
 };
 
@@ -106,7 +106,7 @@ impl ChildEntry {
         Self { child_id, offset }
     }
 
-    fn cmp_rga<R: Runtime>(&self, other: &Self, ctx: &LocCtx<R>) -> std::cmp::Ordering {
+    fn cmp_rga<R: IsRuntime>(&self, other: &Self, ctx: &LocCtx<R>) -> std::cmp::Ordering {
         let LocSenderEventId(s_sender, s_core, s_tx) = self.child_id.0;
         let LocSenderEventId(o_sender, o_core, o_tx) = other.child_id.0;
         self.offset
@@ -155,7 +155,7 @@ impl AnchorAgg {
     }
 
     #[must_use]
-    pub(crate) fn apply<R: Runtime>(
+    pub(crate) fn apply<R: IsRuntime>(
         mut self,
         event_id: LocSenderEventId,
         upd: &TextUpd,

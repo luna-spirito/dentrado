@@ -2,14 +2,14 @@ use dentrado::{
     core::{
         core_ctx::Core,
         db::{Db, DbConfig, Doorbell},
-        gear::Runtime,
+        gear::IsRuntime,
         loc_ctx::EventContext,
     },
     fadeno::{hash_loc_value, types::LocValue},
     types::*,
     wire::{MergeError, WireEventBody, WireLocCtx},
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, num::NonZero, sync::Arc};
 
 mod common;
 use common::TestCluster;
@@ -135,7 +135,7 @@ impl Localizable for AnyGearId {
 #[derive(Clone, Debug)]
 struct CounterRuntime;
 
-impl Runtime for CounterRuntime {
+impl IsRuntime for CounterRuntime {
     type GearId = AnyGearId;
     type GearOut = i64;
     type Module = ();
@@ -347,7 +347,7 @@ fn malformed_wire_ctx_returns_error_not_panic() {
 
     let (doorbell, dbh) = Doorbell::new();
     let db: Db<CounterRuntime> = Db::start(DbConfig {
-        num_cores: 1,
+        num_cores: NonZero::new(1).unwrap(),
         node_id: NodeId(0),
         module: Arc::new(()),
         peers: HashMap::new(),

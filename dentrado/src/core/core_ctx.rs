@@ -2,6 +2,7 @@ use std::{
     any::Any,
     cell::RefCell,
     collections::{HashMap, HashSet},
+    num::NonZero,
     sync::{Arc, mpsc},
 };
 
@@ -9,7 +10,7 @@ use crate::{
     core::{
         db,
         doorbell::DoorbellHandle,
-        gear::Runtime,
+        gear::IsRuntime,
         loc_ctx::{EventContext, LocCtx, StoreResultSuccess, StoredEvent},
     },
     types::{
@@ -26,7 +27,7 @@ use crate::{
 /// Shared between `CoordCmd` (arrives via `cmd_rx`) and `InterCoreMsg`
 /// (arrives via SPSC inter-core channels) to avoid duplicating handler logic.
 #[derive(Debug)]
-pub(crate) enum CoreCmd<R: Runtime> {
+pub(crate) enum CoreCmd<R: IsRuntime> {
     PostEvents {
         wire_ctx: Arc<WireLocCtx<R>>,
         events: Arc<[WireEventBody<R::Group, R::Body>]>,
@@ -44,14 +45,14 @@ pub(crate) enum CoreCmd<R: Runtime> {
 }
 
 /// Command sent from the DBMS's coordinator, i. e. from the caller of `Db::start`.
-pub(crate) enum CoordCmd<R: Runtime> {
+pub(crate) enum CoordCmd<R: IsRuntime> {
     Op(CoreCmd<R>),
     Shutdown,
 }
 
 /// Inter-node singnals.
 #[derive(Debug)]
-pub(crate) enum InterNodeMsg<R: Runtime> {
+pub(crate) enum InterNodeMsg<R: IsRuntime> {
     ForwardEvents {
         wire_ctx: WireLocCtx<R>,
         events: Vec<WireEventBody<R::Group, R::Body>>,
@@ -60,7 +61,7 @@ pub(crate) enum InterNodeMsg<R: Runtime> {
 }
 
 #[derive(Debug)]
-pub(crate) enum RerouteMsg<R: Runtime> {
+pub(crate) enum RerouteMsg<R: IsRuntime> {
     ForwardToPeer {
         peer_idx: usize,
         wire_ctx: WireLocCtx<R>,
@@ -70,7 +71,7 @@ pub(crate) enum RerouteMsg<R: Runtime> {
 }
 
 #[derive(Debug)]
-pub(crate) enum InterCoreMsg<R: Runtime> {
+pub(crate) enum InterCoreMsg<R: IsRuntime> {
     Op(CoreCmd<R>),
     SecondaryRequest {
         gear: R::GearId,
@@ -85,7 +86,7 @@ pub(crate) enum InterCoreMsg<R: Runtime> {
 }
 
 #[derive(Debug)]
-struct CoreInner<R: Runtime> {
+struct CoreInner<R: IsRuntime> {
     gear_cache: HashMap<R::GearId, Box<dyn Any>>,
     gear_in_flight: HashSet<R::GearId>,
     secondary_cache: HashMap<R::GearId, R::GearOut>,
@@ -99,8 +100,8 @@ pub(crate) struct EventGroup {
 }
 
 #[derive(Debug)]
-pub struct Core<R: Runtime> {
-    num_cores: u32,
+pub struct Core<R: IsRuntime> {
+    num_cores: NonZero<u32>,
     core_id: u32,
     node_id: NodeId,
     module: Arc<R::Module>,
@@ -111,7 +112,7 @@ pub struct Core<R: Runtime> {
     doorbells: Vec<DoorbellHandle>,
     inter_node_peers: Vec<(
         NodeId,
-        u32,
+        NonZero<u32>,
         Option<(mpsc::Sender<InterNodeMsg<R>>, DoorbellHandle)>,
     )>,
 
@@ -119,9 +120,9 @@ pub struct Core<R: Runtime> {
     inner: RefCell<CoreInner<R>>,
 }
 
-impl<R: Runtime> Core<R> {
+impl<R: IsRuntime> Core<R> {
     pub(crate) fn new(
-        num_cores: u32,
+        num_cores: NonZero<u32>,
         core_id: u32,
         node_id: NodeId,
         module: Arc<R::Module>,
@@ -130,7 +131,7 @@ impl<R: Runtime> Core<R> {
         doorbells: Vec<DoorbellHandle>,
         inter_node_peers: Vec<(
             NodeId,
-            u32,
+            NonZero<u32>,
             Option<(mpsc::Sender<InterNodeMsg<R>>, DoorbellHandle)>,
         )>,
     ) -> Self {
@@ -169,7 +170,7 @@ impl<R: Runtime> Core<R> {
     }
 
     #[must_use]
-    pub(crate) fn num_cores(&self) -> u32 {
+    pub(crate) fn num_cores(&self) -> NonZero<u32> {
         self.num_cores
     }
 
@@ -555,7 +556,7 @@ impl<R: Runtime> Core<R> {
     }
 }
 
-impl<R: Runtime> EventContext<R> for Core<R> {
+impl<R: IsRuntime> EventContext<R> for Core<R> {
     fn mk_loc_user(&self, uid: UserId) -> LocUserId {
         self.loc_ctx.mk_loc_user(uid)
     }

@@ -1,5 +1,7 @@
+use std::num::NonZero;
+
 use dentrado::{
-    core::gear::Runtime,
+    core::gear::IsRuntime,
     fadeno::{
         bridge::{FadenoModule, FadenoRuntime},
         compiler::{compile_file, find_binary},
@@ -322,7 +324,7 @@ fn doc_content_cross_core_e2e() {
         let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear.clone());
         FadenoRuntime::route_group(invited_gear_wire.group(), &invited_wire_ctx)
             .unwrap()
-            .route(2)
+            .route(NonZero::new(2).unwrap())
     };
 
     let doc_id = tc.find_cross_core_doc_id(invited_core, 2);
@@ -369,7 +371,7 @@ fn doc_content_cross_core_e2e() {
 
     let doc_core = FadenoRuntime::route_group(doc_gear_wire.group(), &doc_wire_ctx)
         .unwrap()
-        .route(2);
+        .route(NonZero::new(2).unwrap());
     assert_ne!(
         invited_core, doc_core,
         "gears must be on different cores for cross-core test"

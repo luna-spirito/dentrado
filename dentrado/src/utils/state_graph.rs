@@ -2,7 +2,7 @@ use im::OrdMap;
 use std::cell::RefCell;
 use std::{collections::BTreeSet, hash::Hash};
 
-use crate::core::gear::Runtime;
+use crate::core::gear::IsRuntime;
 use crate::core::loc_ctx::LocCtx;
 use crate::types::AnyLocEventId;
 use crate::utils::sg_ord_map::{SgOrdMap, SgOrdSet};
@@ -24,7 +24,7 @@ where
     DepK: Ord + Clone + Hash,
     DepV: Clone + PartialEq + Hash + Ord,
 {
-    pub(crate) fn query_at<R: Runtime>(
+    pub(crate) fn query_at<R: IsRuntime>(
         &self,
         key: &DepK,
         at: SGEventId,
@@ -121,7 +121,7 @@ pub struct HandlerCtx<
     Dep: Ord + Clone + Hash,
     DepK: Ord + Clone + Hash,
     DepV: Clone + PartialEq + Hash + Ord,
-    R: Runtime,
+    R: IsRuntime,
     K: Ord + Clone + Hash,
     V: Clone + Hash,
 > {
@@ -134,7 +134,7 @@ pub struct HandlerCtx<
     ctx: &'a LocCtx<R>,
 }
 
-impl<Dep, DepK, DepV, R: Runtime, K, V> HandlerCtx<'_, Dep, DepK, DepV, R, K, V>
+impl<Dep, DepK, DepV, R: IsRuntime, K, V> HandlerCtx<'_, Dep, DepK, DepV, R, K, V>
 where
     Dep: Ord + Clone + Hash,
     DepK: Ord + Clone + Hash,
@@ -222,7 +222,7 @@ where
         }
     }
 
-    pub(crate) fn apply<R: Runtime, E, F>(
+    pub(crate) fn apply<R: IsRuntime, E, F>(
         &mut self,
         handler: &F,
         event_resolver: &impl Fn(AnyLocEventId) -> (SGEventId, E),
@@ -280,7 +280,7 @@ where
             .map(|(_, v)| v)
     }
 
-    pub(crate) fn query_at<R: Runtime>(
+    pub(crate) fn query_at<R: IsRuntime>(
         &self,
         k: &K,
         event_id: SGEventId,
@@ -299,7 +299,7 @@ where
         self.writes.get(k).into_iter().flat_map(SgOrdMap::iter)
     }
 
-    fn detect_dep_changes<R: Runtime>(
+    fn detect_dep_changes<R: IsRuntime>(
         &mut self,
         dep_resolver: &dyn Fn(Dep) -> StateGraphOut<DepK, DepV>,
         ctx: &LocCtx<R>,
@@ -366,7 +366,7 @@ where
         affected
     }
 
-    fn add_affected_readers<R: Runtime>(
+    fn add_affected_readers<R: IsRuntime>(
         new_timeline: &SgOrdMap<DepV>,
         changed_at: SGEventId,
         readers: &SgOrdSet,
@@ -399,7 +399,7 @@ where
         }
     }
 
-    fn add_to_reads<R: Runtime>(
+    fn add_to_reads<R: IsRuntime>(
         reads: &mut OrdMap<K, SgOrdSet>,
         k: K,
         event_id: SGEventId,
@@ -446,7 +446,7 @@ where
         }
     }
 
-    fn propagate_key_change<R: Runtime>(
+    fn propagate_key_change<R: IsRuntime>(
         reads: &OrdMap<K, SgOrdSet>,
         writes: &OrdMap<K, SgOrdMap<V>>,
         k: &K,
@@ -475,7 +475,7 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
-    fn process_queue<R: Runtime, E, F>(
+    fn process_queue<R: IsRuntime, E, F>(
         &mut self,
         handler: &F,
         event_resolver: &impl Fn(AnyLocEventId) -> (SGEventId, E),

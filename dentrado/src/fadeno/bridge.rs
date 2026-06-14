@@ -1,5 +1,5 @@
 use crate::{
-    core::{core_ctx::Core, gear::Runtime, loc_ctx::LocCtx},
+    core::{core_ctx::Core, gear::IsRuntime, loc_ctx::LocCtx},
     fadeno::{
         types::{Compiled, Instr, KolGear, LocValue, TagRegistry},
         vm,
@@ -10,7 +10,7 @@ use crate::{
 #[derive(Debug)]
 pub struct FadenoRuntime;
 
-impl Runtime for FadenoRuntime {
+impl IsRuntime for FadenoRuntime {
     type GearId = KolGear;
     type GearOut = LocValue;
     type Module = FadenoModule;

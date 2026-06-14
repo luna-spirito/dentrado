@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     io,
+    num::NonZero,
     rc::Rc,
     sync::{Arc, mpsc},
     thread,
@@ -10,7 +11,7 @@ use std::{
 use crate::{
     core::{
         core_ctx::{CoordCmd, Core, CoreCmd, InterCoreMsg, InterNodeMsg, RerouteMsg},
-        gear::Runtime,
+        gear::IsRuntime,
     },
     types::{GlobalCoreId, NodeId},
     wire::{MergeError, RunGearError, WireEventBody, WireLocCtx},
@@ -18,8 +19,8 @@ use crate::{
 
 pub use crate::core::doorbell::{Doorbell, DoorbellHandle};
 
-pub struct DbConfig<R: Runtime> {
-    pub num_cores: u32,
+pub struct DbConfig<R: IsRuntime> {
+    pub num_cores: NonZero<u32>,
     pub node_id: NodeId,
     pub module: Arc<R::Module>,
     pub peers: HashMap<NodeId, PeerChannels<R>>,
@@ -28,12 +29,12 @@ pub struct DbConfig<R: Runtime> {
     pub doorbells: Vec<(Doorbell, DoorbellHandle)>,
 }
 
-pub struct PeerChannels<R: Runtime> {
-    pub remote_num_cores: u32,
+pub struct PeerChannels<R: IsRuntime> {
+    pub remote_num_cores: NonZero<u32>,
     pub channels: Vec<PeerChannelHalf<R>>,
 }
 
-pub struct PeerChannelHalf<R: Runtime> {
+pub struct PeerChannelHalf<R: IsRuntime> {
     pub(crate) tx: mpsc::Sender<InterNodeMsg<R>>,
     /// Doorbell of the remote core that receives from this channel.
     pub(crate) remote_doorbell: DoorbellHandle,
@@ -41,7 +42,7 @@ pub struct PeerChannelHalf<R: Runtime> {
 }
 
 #[must_use]
-pub fn create_peer_channel_pair<R: Runtime>(
+pub fn create_peer_channel_pair<R: IsRuntime>(
     doorbell_a: DoorbellHandle,
     doorbell_b: DoorbellHandle,
 ) -> (PeerChannelHalf<R>, PeerChannelHalf<R>) {
@@ -63,13 +64,13 @@ pub fn create_peer_channel_pair<R: Runtime>(
 
 /// Used by `Db` to send commands to a core.
 #[derive(Clone)]
-struct CoreHandle<R: Runtime> {
+struct CoreHandle<R: IsRuntime> {
     cmd_tx: mpsc::Sender<CoordCmd<R>>,
     doorbell: DoorbellHandle,
 }
 
 /// Result of routing events to their target cores.
-pub(crate) struct RoutedEvents<R: Runtime> {
+pub(crate) struct RoutedEvents<R: IsRuntime> {
     pub(crate) wire_ctx: Arc<WireLocCtx<R>>,
     pub(crate) events: Arc<[WireEventBody<R::Group, R::Body>]>,
     pub(crate) global_core_ids: Arc<[GlobalCoreId]>,
@@ -78,10 +79,10 @@ pub(crate) struct RoutedEvents<R: Runtime> {
 }
 
 /// Shared function to route events
-pub(crate) fn route_events<R: Runtime>(
+pub(crate) fn route_events<R: IsRuntime>(
     wire_ctx: WireLocCtx<R>,
     events: Vec<WireEventBody<R::Group, R::Body>>,
-    num_cores: u32,
+    num_cores: NonZero<u32>,
 ) -> Result<RoutedEvents<R>, MergeError> {
     let global_core_ids: Vec<GlobalCoreId> = events
         .iter()
@@ -108,23 +109,23 @@ pub(crate) fn route_events<R: Runtime>(
 }
 
 /// Shared function to route gear to the target core
-pub(crate) fn route_gear<R: Runtime>(
+pub(crate) fn route_gear<R: IsRuntime>(
     gear: &R::GearId,
     wire_ctx: &WireLocCtx<R>,
-    num_cores: u32,
+    num_cores: NonZero<u32>,
 ) -> Result<u32, RunGearError> {
     let (_, group) = R::meta(gear);
     let global_core_id = R::route_group(&group, wire_ctx).map_err(RunGearError::Route)?;
     Ok(global_core_id.route(num_cores))
 }
 
-pub struct Db<R: Runtime> {
+pub struct Db<R: IsRuntime> {
     node_id: NodeId,
     handles: Vec<CoreHandle<R>>,
     join_handles: Vec<thread::JoinHandle<()>>,
 }
 
-impl<R: Runtime> Db<R> {
+impl<R: IsRuntime> Db<R> {
     /// Start the database with no user worker function.
     /// Cores run only the core event loop.
     pub fn start(config: DbConfig<R>) -> io::Result<Self> {
@@ -150,13 +151,14 @@ impl<R: Runtime> Db<R> {
         let mut core_inter_node_peers: Vec<
             Vec<(
                 NodeId,
-                u32,
+                NonZero<u32>,
                 Option<(mpsc::Sender<InterNodeMsg<R>>, DoorbellHandle)>,
             )>,
-        > = (0..num_cores)
+        > = (0..num_cores.get())
             .map(|_| Vec::with_capacity(peers_ordered.len()))
             .collect();
-        let mut inter_node_rxs: Vec<Vec<Option<mpsc::Receiver<InterNodeMsg<R>>>>> = (0..num_cores)
+        let mut inter_node_rxs: Vec<Vec<Option<mpsc::Receiver<InterNodeMsg<R>>>>> = (0..num_cores
+            .get())
             .map(|_| Vec::with_capacity(peers_ordered.len()))
             .collect();
 
@@ -171,7 +173,7 @@ impl<R: Runtime> Db<R> {
                 ));
                 inter_node_rxs[core_id].push(Some(half.rx));
             }
-            for core_id in num_channels as u32..num_cores {
+            for core_id in num_channels as u32..num_cores.get() {
                 core_inter_node_peers[core_id as usize].push((
                     peer_node_id,
                     remote_num_cores,
@@ -182,16 +184,16 @@ impl<R: Runtime> Db<R> {
         }
 
         // tx_from_to[i][j] = sender from core i to core j
-        let mut tx_from_to: Vec<Vec<mpsc::Sender<InterCoreMsg<R>>>> = (0..num_cores)
-            .map(|_| Vec::with_capacity(num_cores as usize))
+        let mut tx_from_to: Vec<Vec<mpsc::Sender<InterCoreMsg<R>>>> = (0..num_cores.get())
+            .map(|_| Vec::with_capacity(num_cores.get() as usize))
             .collect();
         // rx_on_from[j][i] = receiver on core j from core i
-        let mut rx_on_from: Vec<Vec<mpsc::Receiver<InterCoreMsg<R>>>> = (0..num_cores)
-            .map(|_| Vec::with_capacity(num_cores as usize))
+        let mut rx_on_from: Vec<Vec<mpsc::Receiver<InterCoreMsg<R>>>> = (0..num_cores.get())
+            .map(|_| Vec::with_capacity(num_cores.get() as usize))
             .collect();
 
-        for i in 0..num_cores as usize {
-            for j in 0..num_cores as usize {
+        for i in 0..num_cores.get() as usize {
+            for j in 0..num_cores.get() as usize {
                 let (tx, rx) = mpsc::channel::<InterCoreMsg<R>>();
                 tx_from_to[i].push(tx);
                 rx_on_from[j].push(rx);
@@ -199,20 +201,20 @@ impl<R: Runtime> Db<R> {
         }
 
         let mut reroute_txs: Vec<mpsc::Sender<RerouteMsg<R>>> =
-            Vec::with_capacity(num_cores as usize);
+            Vec::with_capacity(num_cores.get() as usize);
         let mut reroute_rxs: Vec<mpsc::Receiver<RerouteMsg<R>>> =
-            Vec::with_capacity(num_cores as usize);
-        for _ in 0..num_cores {
+            Vec::with_capacity(num_cores.get() as usize);
+        for _ in 0..num_cores.get() {
             let (tx, rx) = mpsc::channel::<RerouteMsg<R>>();
             reroute_txs.push(tx);
             reroute_rxs.push(rx);
         }
         let all_reroute_txs: Vec<mpsc::Sender<RerouteMsg<R>>> = reroute_txs.clone();
 
-        let mut handles = Vec::with_capacity(num_cores as usize);
-        let mut join_handles = Vec::with_capacity(num_cores as usize);
+        let mut handles = Vec::with_capacity(num_cores.get() as usize);
+        let mut join_handles = Vec::with_capacity(num_cores.get() as usize);
 
-        for (core_id, (doorbell, _dbh)) in (0..num_cores).zip(config.doorbells) {
+        for (core_id, (doorbell, _dbh)) in (0..num_cores.get()).zip(config.doorbells) {
             let (cmd_tx, cmd_rx) = mpsc::channel::<CoordCmd<R>>();
             let module = config.module.clone();
 
@@ -228,7 +230,7 @@ impl<R: Runtime> Db<R> {
             let worker_fn = worker_fn.clone();
 
             let join = thread::Builder::new()
-                .name(format!("kolorinko-core-{core_id}"))
+                .name(format!("dentrado-core-{core_id}"))
                 .spawn(move || {
                     let runtime = compio::runtime::RuntimeBuilder::new()
                         .thread_affinity(HashSet::from([core_id as usize]))
@@ -281,7 +283,11 @@ impl<R: Runtime> Db<R> {
         events: Vec<WireEventBody<R::Group, R::Body>>,
         timestamp: u32,
     ) -> Result<(), MergeError> {
-        let routed = route_events(wire_ctx, events, self.handles.len() as u32)?;
+        let routed = route_events(
+            wire_ctx,
+            events,
+            NonZero::new(self.handles.len() as u32).unwrap(),
+        )?;
 
         let mut reply_rxs = Vec::with_capacity(routed.core_seeds.len());
         for (target_core, seed_indices) in routed.core_seeds {
@@ -314,7 +320,11 @@ impl<R: Runtime> Db<R> {
         gear: R::GearId,
         wire_ctx: WireLocCtx<R>,
     ) -> Result<R::GearOut, RunGearError> {
-        let target_core = route_gear(&gear, &wire_ctx, self.handles.len() as u32)?;
+        let target_core = route_gear(
+            &gear,
+            &wire_ctx,
+            NonZero::new(self.handles.len() as u32).unwrap(),
+        )?;
         let handle = &self.handles[target_core as usize];
 
         let (reply_tx, reply_rx) = flume::bounded(1);
@@ -331,7 +341,7 @@ impl<R: Runtime> Db<R> {
     }
 }
 
-impl<R: Runtime> Drop for Db<R> {
+impl<R: IsRuntime> Drop for Db<R> {
     fn drop(&mut self) {
         for handle in &self.handles {
             let _ = handle.cmd_tx.send(CoordCmd::<R>::Shutdown);
@@ -343,7 +353,7 @@ impl<R: Runtime> Drop for Db<R> {
     }
 }
 
-async fn core_event_loop<R: Runtime>(
+async fn core_event_loop<R: IsRuntime>(
     state: Rc<Core<R>>,
     doorbell: Doorbell,
     cmd_rx: mpsc::Receiver<CoordCmd<R>>,

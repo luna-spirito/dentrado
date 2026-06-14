@@ -1,4 +1,4 @@
-use std::mem::size_of;
+use std::{mem::size_of, num::NonZero};
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -166,8 +166,8 @@ fn jump_consistent_hash(hash: u64, num_cores: i64) -> i32 {
 
 impl GlobalCoreId {
     #[must_use]
-    pub fn route(&self, num_cores: u32) -> u32 {
-        jump_consistent_hash(u64::from(self.0), i64::from(num_cores)) as u32
+    pub fn route(&self, num_cores: NonZero<u32>) -> u32 {
+        jump_consistent_hash(u64::from(self.0), i64::from(num_cores.get())) as u32
     }
 }
 

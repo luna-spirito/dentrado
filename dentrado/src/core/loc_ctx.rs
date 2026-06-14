@@ -1,7 +1,7 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use crate::{
-    core::gear::Runtime,
+    core::gear::IsRuntime,
     types::{
         AnyLocEventId, DataId, DataVerifyError, GlobalCoreId, GlobalResolver, GroupRouteError,
         LocDataId, LocGroupId, LocMsgTypeId, LocSenderEventId, LocSenderId, LocUserId, SenderPk,
@@ -21,7 +21,7 @@ pub struct StoredEvent<B> {
 }
 
 #[derive(Debug)]
-pub struct LocCtxInner<R: Runtime> {
+pub struct LocCtxInner<R: IsRuntime> {
     pk_to_sender: HashMap<SenderPk, LocSenderId>,
     sender_to_pk: HashMap<LocSenderId, SenderPk>,
     sender_to_user: HashMap<LocSenderId, LocUserId>,
@@ -40,9 +40,9 @@ pub struct LocCtxInner<R: Runtime> {
 }
 
 #[derive(Debug)]
-pub struct LocCtx<R: Runtime>(RefCell<LocCtxInner<R>>);
+pub struct LocCtx<R: IsRuntime>(RefCell<LocCtxInner<R>>);
 
-impl<R: Runtime> LocCtx<R> {
+impl<R: IsRuntime> LocCtx<R> {
     #[must_use]
     pub fn new() -> Self {
         Self(RefCell::new(LocCtxInner {
@@ -123,13 +123,13 @@ impl<R: Runtime> LocCtx<R> {
     }
 }
 
-impl<R: Runtime> Default for LocCtx<R> {
+impl<R: IsRuntime> Default for LocCtx<R> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<R: Runtime> GlobalResolver for LocCtx<R> {
+impl<R: IsRuntime> GlobalResolver for LocCtx<R> {
     fn resolve_user(&self, lid: LocUserId) -> Result<UserId, GroupRouteError> {
         let s = self.0.borrow();
         s.local_to_user_id.get(&lid).copied().ok_or({
@@ -156,7 +156,7 @@ pub struct StoreResultSuccess {
     pub new: AnyLocEventId,
 }
 
-pub trait EventContext<R: Runtime> {
+pub trait EventContext<R: IsRuntime> {
     fn mk_loc_user(&self, uid: UserId) -> LocUserId;
     fn mk_loc_sender(&self, pk: SenderPk, uid: Option<UserId>) -> LocSenderId;
     fn mk_loc_group(&self, msg_type: LocMsgTypeId, group: R::Group) -> LocGroupId;
@@ -166,7 +166,7 @@ pub trait EventContext<R: Runtime> {
     fn loc_ctx(&self) -> &LocCtx<R>;
 }
 
-impl<R: Runtime> EventContext<R> for LocCtx<R> {
+impl<R: IsRuntime> EventContext<R> for LocCtx<R> {
     fn mk_loc_user(&self, uid: UserId) -> LocUserId {
         let mut s = self.0.borrow_mut();
         if let Some(&luid) = s.user_id_to_local.get(&uid) {

@@ -2,14 +2,14 @@ use std::cell::RefCell;
 
 use crate::{
     core::{
-        gear::Runtime,
+        gear::IsRuntime,
         loc_ctx::{EventContext, StoreResultSuccess, StoredEvent},
     },
     types::{GlobalCoreId, LocDataId, LocSenderId, LocUserId, Localizable, NodeId},
     wire::format::{MergeError, WireEventBody, WireLocCtx},
 };
 
-pub(crate) struct WireLocCtxMerger<'a, R: Runtime, Target: EventContext<R>> {
+pub(crate) struct WireLocCtxMerger<'a, R: IsRuntime, Target: EventContext<R>> {
     source: &'a WireLocCtx<R>,
     inner: RefCell<MergerInner<'a, Target>>,
 }
@@ -21,7 +21,7 @@ struct MergerInner<'a, Target> {
     data_map: Vec<Option<LocDataId>>,
 }
 
-impl<'a, R: Runtime, Target: EventContext<R>> WireLocCtxMerger<'a, R, Target> {
+impl<'a, R: IsRuntime, Target: EventContext<R>> WireLocCtxMerger<'a, R, Target> {
     pub(crate) fn new(source: &'a WireLocCtx<R>, target: &'a Target) -> Self {
         Self {
             source,

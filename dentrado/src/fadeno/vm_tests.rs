@@ -1,7 +1,7 @@
 use crate::{
     core::{
         core_ctx::Core,
-        gear::{EmptyRuntime, Runtime},
+        gear::{EmptyRuntime, IsRuntime},
         loc_ctx::{EventContext, StoredEvent},
     },
     fadeno::{
@@ -12,7 +12,7 @@ use crate::{
     types::{IdentityServerPk, LocMsgTypeId, SenderPk, UserId},
     wire::WireLocCtx,
 };
-use std::sync::Arc;
+use std::{num::NonZero, sync::Arc};
 
 fn compile_test(name: &str) -> Option<CompileOutput> {
     let binary = find_binary()?;
@@ -168,7 +168,7 @@ fn sg_apply_preserves_stack() {
     let common = vm::CommonTags::ensure(&mut tags);
 
     let mut core: Core<crate::fadeno::bridge::FadenoRuntime> = Core::new(
-        1,
+        NonZero::new(1).unwrap(),
         0,
         crate::types::NodeId(0),
         Arc::new(crate::fadeno::bridge::FadenoModule::default()),

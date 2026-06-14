@@ -5,7 +5,7 @@ use crate::{
     types::{GlobalCoreId, GlobalResolver, GroupRouteError, LocGroupId, LocMsgTypeId, Localizable},
 };
 
-pub trait Runtime: Debug + Send + Sync + Sized + 'static {
+pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
     type GearId: Debug + Hash + Eq + Clone + Send + 'static + Localizable;
 
     type GearOut: Debug + Clone + Send + 'static + Localizable;
@@ -42,7 +42,7 @@ pub trait Runtime: Debug + Send + Sync + Sized + 'static {
 
 #[derive(Debug)]
 pub(crate) struct EmptyRuntime;
-impl Runtime for EmptyRuntime {
+impl IsRuntime for EmptyRuntime {
     type GearId = ();
     type GearOut = ();
     type Module = ();

@@ -1,6 +1,7 @@
 use std::{
     cell::Cell,
     collections::HashMap,
+    num::NonZero,
     ops::{Deref, DerefMut},
     sync::Arc,
     time::Duration,
@@ -9,7 +10,7 @@ use std::{
 use dentrado::{
     core::{
         db::{Db, DbConfig, Doorbell, DoorbellHandle, PeerChannels, create_peer_channel_pair},
-        gear::Runtime,
+        gear::IsRuntime,
         loc_ctx::{EventContext, LocCtx},
     },
     fadeno::{
@@ -41,11 +42,11 @@ impl XorShift64 {
     }
 }
 
-struct Node<R: Runtime> {
+struct Node<R: IsRuntime> {
     db: Db<R>,
 }
 
-pub(crate) struct TestCluster<R: Runtime> {
+pub(crate) struct TestCluster<R: IsRuntime> {
     module: Arc<R::Module>,
     nodes: Vec<Node<R>>,
     loc_ctx: LocCtx<R>,
@@ -54,7 +55,7 @@ pub(crate) struct TestCluster<R: Runtime> {
     rng: XorShift64,
 }
 
-impl<R: Runtime> TestCluster<R> {
+impl<R: IsRuntime> TestCluster<R> {
     pub(crate) fn start(core_counts: &[u32], module: R::Module) -> Self {
         let num_nodes = core_counts.len();
         assert!(num_nodes > 0, "TestCluster needs at least one node");
@@ -84,14 +85,14 @@ impl<R: Runtime> TestCluster<R> {
                 all_peers[i].insert(
                     NodeId(j as u32),
                     PeerChannels {
-                        remote_num_cores: core_counts[j],
+                        remote_num_cores: NonZero::new(core_counts[j]).unwrap(),
                         channels: halves_i,
                     },
                 );
                 all_peers[j].insert(
                     NodeId(i as u32),
                     PeerChannels {
-                        remote_num_cores: core_counts[i],
+                        remote_num_cores: NonZero::new(core_counts[i]).unwrap(),
                         channels: halves_j,
                     },
                 );
@@ -102,7 +103,7 @@ impl<R: Runtime> TestCluster<R> {
         for (i, &num_cores) in core_counts.iter().enumerate() {
             let doorbells = std::mem::take(&mut all_doorbells[i]);
             let config = DbConfig {
-                num_cores,
+                num_cores: NonZero::new(num_cores).unwrap(),
                 node_id: NodeId(i as u32),
                 module: module.clone(),
                 peers: std::mem::take(&mut all_peers[i]),
@@ -317,13 +318,13 @@ impl WikiTestCluster {
 
                 let gear_core = FadenoRuntime::route_group(doc_gear_wire.group(), &wc)
                     .unwrap()
-                    .route(num_cores);
+                    .route(NonZero::new(num_cores).unwrap());
                 if gear_core == invited_core {
                     return false;
                 }
                 let event_core = FadenoRuntime::route_group(&LocValue::Num(d as i64), &wc)
                     .unwrap()
-                    .route(num_cores);
+                    .route(NonZero::new(num_cores).unwrap());
                 event_core == gear_core
             })
             .expect("should find a suitable doc_id for cross-core routing")
