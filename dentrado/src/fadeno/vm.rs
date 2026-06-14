@@ -207,11 +207,7 @@ pub(crate) fn call_with_storage(
         constants,
         tags,
         imports,
-        stage: VmStage::Run {
-            ctx: storage,
-            impure_core: None,
-            impure_group: None,
-        },
+        stage: VmStage::Prepare,
         common: *common,
     };
     vm.call(&mut Vec::new(), func, args, None)
@@ -251,6 +247,7 @@ enum VmStage<'a> {
     Init {
         kol_id_counter_next: &'a Cell<u64>,
     },
+    Prepare,
     Run {
         ctx: &'a crate::core::loc_ctx::LocCtx<FadenoRuntime>,
         impure_core: Option<&'a Core<FadenoRuntime>>,
@@ -1093,7 +1090,7 @@ impl Vm<'_> {
                         .name_to_tag(b"body")
                         .expect("body tag not found in tag registry") as usize;
                 let event_resolver_core = match self.stage {
-                    VmStage::Init { .. } => {
+                    VmStage::Init { .. } | VmStage::Prepare => {
                         return Err(VmError::TypeError {
                             op: "stategraph_apply",
                             expected: "gear step context",
@@ -1210,7 +1207,7 @@ impl Vm<'_> {
                     }
                 };
                 let (core, group) = match &self.stage {
-                    VmStage::Init { .. } => {
+                    VmStage::Init { .. } | VmStage::Prepare => {
                         return Err(VmError::TypeError {
                             op: "query_delta",
                             expected: "gear step context",
@@ -1794,7 +1791,7 @@ impl Vm<'_> {
                 kol_id_counter_next.set(id + 1);
                 Ok(id)
             }
-            VmStage::Run { .. } => Err(VmError::TypeError {
+            VmStage::Run { .. } | VmStage::Prepare => Err(VmError::TypeError {
                 op: "kol_id",
                 expected: "init context",
                 got: "run context".into(),
