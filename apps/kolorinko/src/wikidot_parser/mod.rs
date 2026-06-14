@@ -51,7 +51,7 @@ pub mod types;
 /// closing terminator; everything else either self-closes (`[[image …]]`) or is
 /// inline.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Tag {
+pub enum ClosedTag {
     Div,
     Span,
     Size,
@@ -69,19 +69,19 @@ pub enum Tag {
     },
 }
 
-impl Tag {
+impl ClosedTag {
     /// The keyword/sequence after `[[` (and after `[[/` in the closer), used to
     /// recognize the matching closing tag.
     fn opener_str(&self) -> String {
         match self {
-            Tag::Div => "div".into(),
-            Tag::Span => "span".into(),
-            Tag::Size => "size".into(),
-            Tag::IfTags => "iftags".into(),
-            Tag::Module => "module".into(),
-            Tag::Tab => "tab".into(),
-            Tag::Tabview => "tabview".into(),
-            Tag::Align { floating, side } => {
+            ClosedTag::Div => "div".into(),
+            ClosedTag::Span => "span".into(),
+            ClosedTag::Size => "size".into(),
+            ClosedTag::IfTags => "iftags".into(),
+            ClosedTag::Module => "module".into(),
+            ClosedTag::Tab => "tab".into(),
+            ClosedTag::Tabview => "tabview".into(),
+            ClosedTag::Align { floating, side } => {
                 let f = if *floating { "f" } else { "" };
                 let s = match side {
                     AlignSide::Left => "<",
@@ -101,7 +101,7 @@ pub enum ContentExitReason {
     /// Reached end of input.
     Eof,
     /// Recognized and consumed the matching closing tag.
-    EndOfTag(Tag),
+    EndOfTag(ClosedTag),
 }
 
 // =========================================================================
@@ -261,11 +261,19 @@ fn read_until<'a>(delims: &'a [&'a str]) -> impl Parser<'a, In<'a>, &'a str, E<'
 /// Case-insensitive ASCII keyword (PureScript `slosxilVort`). Consumes the
 /// keyword on match.
 fn kw_ci<'a>(kw: String) -> impl Parser<'a, In<'a>, (), E<'a>> + Clone + 'a {
+    // All callers pass ASCII keywords, so `kw.len()` bytes == `kw.len()` chars
+    // and we can compare on raw bytes. Comparing on `&str` slices here would
+    // panic: `rest[..kw.len()]` requires `kw.len()` to land on a char boundary,
+    // which fails as soon as a multibyte char (e.g. `…`, Cyrillic) sits at the
+    // cursor before a would-be keyword.
+    debug_assert!(kw.is_ascii(), "kw_ci keywords must be ASCII");
     custom(move |inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
         let full = inp.full_slice();
         let off = *inp.cursor().inner();
-        let rest = &full[off..];
-        if rest.len() >= kw.len() && rest[..kw.len()].eq_ignore_ascii_case(&kw) {
+        let rest_bytes = full.as_bytes().get(off..).unwrap_or(&[]);
+        if rest_bytes.len() >= kw.len()
+            && rest_bytes[..kw.len()].eq_ignore_ascii_case(kw.as_bytes())
+        {
             for _ in 0..kw.len() {
                 inp.next();
             }
@@ -293,7 +301,7 @@ fn line_end<'a>() -> impl Parser<'a, In<'a>, (), E<'a>> + Clone + 'a {
 
 /// Recognize (without consuming) a closing tag `[[/KEYWORD]]` for `tag`,
 /// yielding the tag back. Whitespace around the inner tokens is permitted.
-fn closing_tag<'a>(tag: Tag) -> impl Parser<'a, In<'a>, Tag, E<'a>> + Clone + 'a {
+fn closing_tag<'a>(tag: ClosedTag) -> impl Parser<'a, In<'a>, ClosedTag, E<'a>> + Clone + 'a {
     let kw = tag.opener_str();
     just("[[")
         .ignore_then(spaces())
@@ -634,7 +642,7 @@ fn div_span_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
     let div = container_open("div")
         .then(content_until(
             element.clone(),
-            closing_tag(Tag::Div).to(ContentExitReason::EndOfTag(Tag::Div)),
+            closing_tag(ClosedTag::Div).to(ContentExitReason::EndOfTag(ClosedTag::Div)),
         ))
         .map(|(params, (content, _))| Node::Container {
             kind: ContainerKind::Div {
@@ -646,7 +654,7 @@ fn div_span_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
     let span = container_open("span")
         .then(content_until(
             element,
-            closing_tag(Tag::Span).to(ContentExitReason::EndOfTag(Tag::Span)),
+            closing_tag(ClosedTag::Span).to(ContentExitReason::EndOfTag(ClosedTag::Span)),
         ))
         .map(|(params, (content, _))| Node::Container {
             kind: ContainerKind::Div {
@@ -692,7 +700,7 @@ fn align_case<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
     floating: bool,
     side: AlignSide,
 ) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
-    let tag = Tag::Align { floating, side };
+    let tag = ClosedTag::Align { floating, side };
     just(opener)
         .ignore_then(just("]]"))
         .ignore_then(content_until(
@@ -715,7 +723,7 @@ fn size_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
         .then_ignore(just("]]"))
         .then(content_until(
             element,
-            closing_tag(Tag::Size).to(ContentExitReason::EndOfTag(Tag::Size)),
+            closing_tag(ClosedTag::Size).to(ContentExitReason::EndOfTag(ClosedTag::Size)),
         ))
         .map(|(arg, (content, _))| Node::Container {
             kind: ContainerKind::Size(arg),
@@ -733,7 +741,7 @@ fn iftags_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
         .then_ignore(just("]]"))
         .then(content_until(
             element,
-            closing_tag(Tag::IfTags).to(ContentExitReason::EndOfTag(Tag::IfTags)),
+            closing_tag(ClosedTag::IfTags).to(ContentExitReason::EndOfTag(ClosedTag::IfTags)),
         ))
         .map(|(tags_raw, (content, _))| {
             let (has_all, has_none) = parse_tag_filter(&tags_raw);
@@ -774,8 +782,8 @@ fn module_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
 fn listpages_body<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
     element: P,
 ) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
-    let term = closing_tag(Tag::Module)
-        .to(ContentExitReason::EndOfTag(Tag::Module))
+    let term = closing_tag(ClosedTag::Module)
+        .to(ContentExitReason::EndOfTag(ClosedTag::Module))
         .or(end().to(ContentExitReason::Eof));
     content_until(element, term).map(|(repeat, _)| {
         Node::ListPages(ListPages {
@@ -810,7 +818,7 @@ fn tabview_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
         .ignore_then(kw_ci("tab".into()))
         .ignore_then(spaces())
         .ignore_then(just("]]"))
-        .to(ContentExitReason::EndOfTag(Tag::Tab));
+        .to(ContentExitReason::EndOfTag(ClosedTag::Tab));
 
     let tab = just("[[")
         .ignore_then(spaces())
@@ -1562,6 +1570,20 @@ mod tests {
         // half-parsed block — it should fall through to a single text node.
         let c = parse("[[module Rate]]");
         assert_eq!(c, vec![txt("[[module Rate]]")]);
+    }
+
+    #[test]
+    fn multibyte_before_keyword_no_panic() {
+        // Regression for the `kw_ci` panic: a 3-byte char (`…`) immediately
+        // before a keyword whose byte length lands inside that char used to
+        // panic with "end byte index N is not a char boundary". The whole
+        // document must parse without panicking.
+        let src = "…module Rate]]";
+        let _ = parse(src); // must not panic
+        // And the keyword match itself: `…include foo` should still recognize
+        // the include directive through the multibyte prefix.
+        let c = parse("…[[include foo]]");
+        assert!(c.iter().any(|n| matches!(n, Node::Text(_))));
     }
 
     #[test]
