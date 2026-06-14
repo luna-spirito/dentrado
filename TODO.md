@@ -26,7 +26,7 @@
 * LocCtx::post_event — надо бы стереть подчистую, и разработать нормальный алгоритм тестов с полноценными клиентами СУБД.
 * Refactor record handling, it's fragile as hell right now.
 
-* Заменить placeholder с StateGraphOut
+* Заменить placeholder с Timeline
 * Нам при синхронизации разных реплик необходимо детектить tx_id. Это охренеть какой тяжёлый протокол, да.
 * cmp_rga fix erroneous ordering
 

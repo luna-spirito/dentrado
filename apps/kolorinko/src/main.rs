@@ -1,11 +1,12 @@
+#![feature(trait_alias)]
+
+mod evakuilo_import;
 mod runtime;
+mod wikidot_parser;
 
 use crate::runtime::KolorinkoRT;
 use dentrado::{
-    core::{
-        db::{Db, DbConfig, Doorbell},
-        gear::IsRuntime,
-    },
+    core::db::{Db, DbConfig, Doorbell},
     types::NodeId,
 };
 use log::warn;
@@ -40,7 +41,7 @@ fn main() -> anyhow::Result<()> {
         node_id: NodeId(0),
         module: Arc::new(()),
         peers: HashMap::new(),
-        doorbells: iter::repeat_with(|| Doorbell::new())
+        doorbells: iter::repeat_with(Doorbell::new)
             .take(cores.get() as usize)
             .collect(),
     };
