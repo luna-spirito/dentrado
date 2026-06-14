@@ -1,4 +1,4 @@
-use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, StateGraphOut};
+use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, Timeline};
 use crate::core::gear::EmptyRuntime;
 use crate::core::loc_ctx::{EventContext, LocCtx, StoredEvent};
 use crate::types::{AnyLocEventId, GlobalCoreId, LocGroupId, SenderPk};
@@ -62,8 +62,8 @@ fn make_resolver<E: Clone>(
     }
 }
 
-fn invite_resolver() -> &'static dyn Fn(u64) -> StateGraphOut<u64, bool> {
-    &|_| StateGraphOut {
+fn invite_resolver() -> &'static dyn Fn(u64) -> Timeline<u64, bool> {
+    &|_| Timeline {
         writes: OrdMap::new(),
     }
 }
@@ -237,11 +237,11 @@ fn dep_isolation_between_branches() {
     let mut w10 = invite_10.as_writes();
     let mut w20 = invite_20.as_writes();
     {
-        let dr = |dep: u64| -> StateGraphOut<u64, bool> {
+        let dr = |dep: u64| -> Timeline<u64, bool> {
             match dep {
                 10 => w10.clone(),
                 20 => w20.clone(),
-                _ => StateGraphOut {
+                _ => Timeline {
                     writes: OrdMap::new(),
                 },
             }
@@ -276,11 +276,11 @@ fn dep_isolation_between_branches() {
 
     w10 = invite_10.as_writes();
     w20 = invite_20.as_writes();
-    let dr = |dep: u64| -> StateGraphOut<u64, bool> {
+    let dr = |dep: u64| -> Timeline<u64, bool> {
         match dep {
             10 => w10.clone(),
             20 => w20.clone(),
-            _ => StateGraphOut {
+            _ => Timeline {
                 writes: OrdMap::new(),
             },
         }

@@ -9,7 +9,7 @@ use dentrado::{
     },
     types::*,
     utils::{
-        state_graph::StateGraphOut,
+        state_graph::Timeline,
         text::{AnchorPos, ROOT_ANCHOR, TextUpd},
     },
     wire::WireLocCtxBuilder,
@@ -38,8 +38,8 @@ fn setup_wiki2() -> Option<FadenoModule> {
 
 fn extract_invited_pairs(output: LocValue) -> Vec<(LocUserId, bool)> {
     let sg = match output {
-        LocValue::KolStateGraphOut(sg) => sg,
-        other => panic!("expected KolStateGraphOut, got {other:?}"),
+        LocValue::KolTimeline(sg) => sg,
+        other => panic!("expected KolTimeline, got {other:?}"),
     };
     let mut result = Vec::new();
     for (key, timeline) in sg.iter() {
@@ -56,14 +56,11 @@ fn extract_invited_pairs(output: LocValue) -> Vec<(LocUserId, bool)> {
     result
 }
 
-fn extract_text_sg(
-    output: &LocValue,
-    tags: &TagRegistry,
-) -> Box<StateGraphOut<LocValue, LocValue>> {
+fn extract_text_sg(output: &LocValue, tags: &TagRegistry) -> Box<Timeline<LocValue, LocValue>> {
     let text_out = tags.record_get(output, b"text").expect("missing .text");
     match text_out {
-        LocValue::KolStateGraphOut(sg) => sg,
-        other => panic!("expected KolStateGraphOut for .text, got {other:?}"),
+        LocValue::KolTimeline(sg) => sg,
+        other => panic!("expected KolTimeline for .text, got {other:?}"),
     }
 }
 

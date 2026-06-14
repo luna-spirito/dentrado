@@ -13,7 +13,7 @@ use crate::{
         },
     },
     types::{AnyLocEventId, LocGroupId, LocMsgTypeId, LocSenderEventId, LocUserId},
-    utils::state_graph::StateGraphOut,
+    utils::state_graph::Timeline,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -1130,18 +1130,19 @@ impl Vm<'_> {
 
                 let dep_resolver = {
                     let dep_resolver_closure = dep_resolver_closure.clone();
-                    move |dep: LocValue| -> crate::utils::state_graph::StateGraphOut<LocValue, LocValue> {
-                        let result = self.call(&mut Vec::new(), dep_resolver_closure.clone(), vec![dep.clone()], None);
+                    move |dep: LocValue| -> crate::utils::state_graph::Timeline<LocValue, LocValue> {
+                        let result = self.call(
+                            &mut Vec::new(),
+                            dep_resolver_closure.clone(),
+                            vec![dep.clone()],
+                            None,
+                        );
                         match result {
-                            Ok(LocValue::KolStateGraphOut(sg)) => {
-                                *sg
-                            }
+                            Ok(LocValue::KolTimeline(sg)) => *sg,
                             Ok(other) => panic!(
-                                "stategraph_apply dep_resolver: expected KolStateGraphOut, got: {other}"
+                                "stategraph_apply dep_resolver: expected KolTimeline, got: {other}"
                             ),
-                            Err(e) => panic!(
-                                "stategraph_apply dep_resolver: call failed: {e:?}"
-                            ),
+                            Err(e) => panic!("stategraph_apply dep_resolver: call failed: {e:?}"),
                         }
                     }
                 };
@@ -1175,12 +1176,10 @@ impl Vm<'_> {
                 Ok(LocValue::KolStateGraph(Box::new(sg)))
             }
 
-            BuiltinT::KolStateGraphOut => match args.first() {
-                Some(LocValue::KolStateGraph(b)) => {
-                    Ok(LocValue::KolStateGraphOut(Box::new(StateGraphOut {
-                        writes: b.writes.clone(),
-                    })))
-                }
+            BuiltinT::KolTimeline => match args.first() {
+                Some(LocValue::KolStateGraph(b)) => Ok(LocValue::KolTimeline(Box::new(Timeline {
+                    writes: b.writes.clone(),
+                }))),
                 Some(other) => Err(VmError::TypeError {
                     op: "stategraph_out",
                     expected: "StateGraph",
@@ -1456,7 +1455,7 @@ impl Vm<'_> {
             | BuiltinT::KolTimestamp
             | BuiltinT::KolUserId
             | BuiltinT::KolStateGraphT
-            | BuiltinT::KolStateGraphOutT
+            | BuiltinT::KolTimelineT
             | BuiltinT::KolDataId => {
                 if let Some(first) = args.first() {
                     Ok(first.clone())
@@ -1878,7 +1877,7 @@ impl Vm<'_> {
             "mk_query" => Ok(BuiltinT::KolMkQuery),
             "mk_stategraph" => Ok(BuiltinT::KolMkStateGraph),
             "stategraph_apply" => Ok(BuiltinT::KolStateGraphApply),
-            "stategraph_out" => Ok(BuiltinT::KolStateGraphOut),
+            "stategraph_out" => Ok(BuiltinT::KolTimeline),
             "sgctx_query" => Ok(BuiltinT::KolSgCtxQuery),
             "sgctx_update" => Ok(BuiltinT::KolSgCtxUpdate),
             "sgctx_dep_query" => Ok(BuiltinT::KolSgCtxDepQuery),
@@ -1890,7 +1889,7 @@ impl Vm<'_> {
             "Timestamp" => Ok(BuiltinT::KolTimestamp),
             "LocalUserId" => Ok(BuiltinT::KolUserId),
             "StateGraph" => Ok(BuiltinT::KolStateGraphT),
-            "StateGraphOut" => Ok(BuiltinT::KolStateGraphOutT),
+            "Timeline" => Ok(BuiltinT::KolTimelineT),
             "mk_anchor_agg" => Ok(BuiltinT::KolMkAnchorAgg),
             "anchor_agg_apply" => Ok(BuiltinT::KolAnchorAggApply),
             "mk_text_agg" => Ok(BuiltinT::KolMkTextAgg),

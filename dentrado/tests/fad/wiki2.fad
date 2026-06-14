@@ -9,7 +9,7 @@ unpack fadeno.
   UserId sender-to>user user_eq
   Gear mk_gear
   Query mk_query query_delta
-  StateGraph StateGraphOut mk_stategraph stategraph_apply stategraph_out
+  StateGraph Timeline mk_stategraph stategraph_apply stategraph_out
     sgctx_query sgctx_update sgctx_dep_query
   secondary_get
   TextUpd
@@ -54,7 +54,7 @@ Attach = mk_event_type
 
 // Logic
 
-/: Fun (Branch) -> Gear (StateGraphOut UserId Bool) // is user invited?
+/: Fun (Branch) -> Gear (Timeline UserId Bool) // is user invited?
 invited = \branch.
   creator = (resolve_data branch).creator
   in mk_gear
@@ -82,7 +82,7 @@ invited = \branch.
       in { .cache = { .query = q_res.query | .sg = sg } | .out = stategraph_out sg }
     }
 
-/: Fun (Doc) -> Gear {( .anchors = AnchorAgg | .text = StateGraphOut Branch TextAgg )}
+/: Fun (Doc) -> Gear {( .anchors = AnchorAgg | .text = Timeline Branch TextAgg )}
 doc_content = \doc. mk_gear
   { .primary = { .tag = .event_table | .type = Attach | .group = doc }
   | .initial_cache = { .query = mk_query | .anchors = mk_anchor_agg | .sg = mk_stategraph }

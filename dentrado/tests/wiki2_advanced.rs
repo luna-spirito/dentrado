@@ -9,7 +9,7 @@ use dentrado::{
     },
     types::*,
     utils::{
-        state_graph::StateGraphOut,
+        state_graph::Timeline,
         text::{AnchorPos, ROOT_ANCHOR, TextUpd},
     },
     wire::WireEventBody,
@@ -125,18 +125,15 @@ fn extract_doc_text(
     Some(text_agg.get_text(&anchor_agg))
 }
 
-fn count_branches(sg: &StateGraphOut<LocValue, LocValue>) -> usize {
+fn count_branches(sg: &Timeline<LocValue, LocValue>) -> usize {
     sg.iter().count()
 }
 
-fn extract_text_sg(
-    output: &LocValue,
-    tags: &TagRegistry,
-) -> Box<StateGraphOut<LocValue, LocValue>> {
+fn extract_text_sg(output: &LocValue, tags: &TagRegistry) -> Box<Timeline<LocValue, LocValue>> {
     let text_out = tags.record_get(output, b"text").expect("missing .text");
     match text_out {
-        LocValue::KolStateGraphOut(sg) => sg,
-        other => panic!("expected KolStateGraphOut for .text, got {other:?}"),
+        LocValue::KolTimeline(sg) => sg,
+        other => panic!("expected KolTimeline for .text, got {other:?}"),
     }
 }
 

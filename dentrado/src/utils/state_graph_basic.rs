@@ -1,4 +1,4 @@
-use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, StateGraphOut};
+use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, Timeline};
 use crate::core::gear::EmptyRuntime;
 use crate::core::loc_ctx::{EventContext, LocCtx, StoredEvent};
 use crate::types::{AnyLocEventId, GlobalCoreId, LocGroupId, SenderPk};
@@ -84,8 +84,8 @@ fn make_resolver<E: Clone>(
     }
 }
 
-fn nr() -> &'static dyn Fn(()) -> StateGraphOut<(), ()> {
-    &|_| StateGraphOut {
+fn nr() -> &'static dyn Fn(()) -> Timeline<(), ()> {
+    &|_| Timeline {
         writes: OrdMap::new(),
     }
 }
@@ -94,7 +94,7 @@ fn apply_added<E: Clone, H>(
     sg: &mut SG<&'static str, i32>,
     events: &mut EventStore<E>,
     handler: &H,
-    r: &dyn Fn(()) -> StateGraphOut<(), ()>,
+    r: &dyn Fn(()) -> Timeline<(), ()>,
     ctx: &LocCtx<EmptyRuntime>,
     added: &[(u64, u32, E)],
 ) where
@@ -119,7 +119,7 @@ fn apply_removed<E: Clone, H>(
     sg: &mut SG<&'static str, i32>,
     events: &mut EventStore<E>,
     handler: &H,
-    r: &dyn Fn(()) -> StateGraphOut<(), ()>,
+    r: &dyn Fn(()) -> Timeline<(), ()>,
     ctx: &LocCtx<EmptyRuntime>,
     removed: &[u64],
 ) where

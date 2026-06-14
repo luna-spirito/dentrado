@@ -5,7 +5,7 @@ use crate::{
     types::{AnyLocEventId, LocDataId, LocMsgTypeId, LocSenderId, LocUserId, Localizable},
     utils::{
         self,
-        state_graph::{HandlerCtx, StateGraph, StateGraphOut},
+        state_graph::{HandlerCtx, StateGraph, Timeline},
     },
 };
 
@@ -72,8 +72,8 @@ pub enum BuiltinT {
     KolSgCtxQuery,      // 43
     KolSgCtxUpdate,     // 44
     KolStateGraphApply, // 45
-    KolStateGraphOut,   // 46
-    KolStateGraphOutT,  // 47
+    KolTimeline,        // 46
+    KolTimelineT,       // 47
     KolStateGraphT,     // 48
     KolTimestamp,       // 49
     KolResolveData,     // 50
@@ -173,7 +173,7 @@ pub enum LocValue {
     KolPrimary,
     KolGear(Box<KolGear>),
     KolStateGraph(Box<StateGraph<LocValue, LocValue, LocValue, LocValue, LocValue>>),
-    KolStateGraphOut(Box<StateGraphOut<LocValue, LocValue>>),
+    KolTimeline(Box<Timeline<LocValue, LocValue>>),
     KolAnchorAgg(utils::text::AnchorAgg),
     KolTextAgg(utils::text::TextAgg),
     KolTextUpd(utils::text::TextUpd),
@@ -339,7 +339,7 @@ impl Localizable for LocValue {
                 .localize(remap_user, remap_sender, remap_data)?
                 .map(|gear| LocValue::KolGear(Box::new(gear)))),
             LocValue::KolStateGraph(_) => todo!(),
-            LocValue::KolStateGraphOut(sg) => {
+            LocValue::KolTimeline(sg) => {
                 let mut any_changed = false;
                 let mut new_writes = im::OrdMap::new();
                 for (k, timeline) in &sg.writes {
@@ -364,7 +364,7 @@ impl Localizable for LocValue {
                     new_writes.insert(new_k, new_timeline);
                 }
                 if any_changed {
-                    Ok(Some(LocValue::KolStateGraphOut(Box::new(StateGraphOut {
+                    Ok(Some(LocValue::KolTimeline(Box::new(Timeline {
                         writes: new_writes,
                     }))))
                 } else {
@@ -718,7 +718,7 @@ impl fmt::Display for LocValue {
             LocValue::KolQuery(n, m) => write!(f, "Query({n}, {m})"),
             LocValue::KolGear(g) => write!(f, "Gear({:?})", g.primary_group),
             LocValue::KolStateGraph(_) => write!(f, "StateGraph"),
-            LocValue::KolStateGraphOut(_) => write!(f, "StateGraphOut"),
+            LocValue::KolTimeline(_) => write!(f, "Timeline"),
             LocValue::KolAnchorAgg(_) => write!(f, "AnchorAgg"),
             LocValue::KolTextAgg(_) => write!(f, "TextAgg"),
             LocValue::KolTextUpd(_) => write!(f, "TextUpd"),

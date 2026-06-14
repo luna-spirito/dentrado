@@ -120,8 +120,8 @@ pub fn hash_loc_value(
 
         LocValue::KolGear(_) => return Err(GroupRouteError::DomainValue("KolGear")),
         LocValue::KolStateGraph(_) => return Err(GroupRouteError::DomainValue("KolStateGraph")),
-        LocValue::KolStateGraphOut(_) => {
-            return Err(GroupRouteError::DomainValue("KolStateGraphOut"));
+        LocValue::KolTimeline(_) => {
+            return Err(GroupRouteError::DomainValue("KolTimeline"));
         }
         LocValue::KolAnchorAgg(_) => return Err(GroupRouteError::DomainValue("KolAnchorAgg")),
         LocValue::KolTextAgg(_) => return Err(GroupRouteError::DomainValue("KolTextAgg")),

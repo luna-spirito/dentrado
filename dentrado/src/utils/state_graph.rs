@@ -15,11 +15,11 @@ pub struct DeltaList<Id> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct StateGraphOut<DepK: Ord + Clone + Hash, DepV: Clone + PartialEq + Hash + Ord> {
+pub struct Timeline<DepK: Ord + Clone + Hash, DepV: Clone + PartialEq + Hash + Ord> {
     pub(crate) writes: OrdMap<DepK, SgOrdMap<DepV>>,
 }
 
-impl<DepK, DepV> StateGraphOut<DepK, DepV>
+impl<DepK, DepV> Timeline<DepK, DepV>
 where
     DepK: Ord + Clone + Hash,
     DepV: Clone + PartialEq + Hash + Ord,
@@ -40,7 +40,7 @@ where
     }
 
     #[must_use]
-    pub(crate) fn diff_from(&self, old: &Self) -> StateGraphOutDelta<DepK, DepV> {
+    pub(crate) fn diff_from(&self, old: &Self) -> TimelineDelta<DepK, DepV> {
         use im::ordmap::DiffItem;
 
         let mut added_keys: OrdMap<DepK, SgOrdMap<DepV>> = OrdMap::new();
@@ -64,7 +64,7 @@ where
             }
         }
 
-        StateGraphOutDelta {
+        TimelineDelta {
             added_keys,
             removed_keys,
             changed_keys,
@@ -72,7 +72,7 @@ where
     }
 
     #[must_use]
-    pub(crate) fn apply_delta(&self, delta: &StateGraphOutDelta<DepK, DepV>) -> Self {
+    pub(crate) fn apply_delta(&self, delta: &TimelineDelta<DepK, DepV>) -> Self {
         let mut writes = self.writes.clone();
 
         for k in &delta.removed_keys {
@@ -91,8 +91,7 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct StateGraphOutDelta<DepK: Ord + Clone + Hash, DepV: Clone + PartialEq + Hash + Ord>
-{
+pub(crate) struct TimelineDelta<DepK: Ord + Clone + Hash, DepV: Clone + PartialEq + Hash + Ord> {
     pub(crate) added_keys: OrdMap<DepK, SgOrdMap<DepV>>,
     pub(crate) removed_keys: im::OrdSet<DepK>,
     pub(crate) changed_keys: OrdMap<DepK, SgOrdMap<DepV>>,
@@ -100,7 +99,7 @@ pub(crate) struct StateGraphOutDelta<DepK: Ord + Clone + Hash, DepV: Clone + Par
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct ExtDep<DepK: Ord + Clone + Hash, DepV: Clone + PartialEq + Hash + Ord> {
-    pub(crate) cached: StateGraphOut<DepK, DepV>,
+    pub(crate) cached: Timeline<DepK, DepV>,
     pub(crate) reads: OrdMap<DepK, SgOrdSet>,
 }
 
@@ -130,7 +129,7 @@ pub struct HandlerCtx<
     writes: RefCell<&'a mut OrdMap<K, V>>,
     pub(crate) self_writes: &'a OrdMap<K, SgOrdMap<V>>,
     ext: RefCell<&'a mut OrdMap<Dep, ExtDep<DepK, DepV>>>,
-    dep_resolver: &'a dyn Fn(Dep) -> StateGraphOut<DepK, DepV>,
+    dep_resolver: &'a dyn Fn(Dep) -> Timeline<DepK, DepV>,
     ctx: &'a LocCtx<R>,
 }
 
@@ -216,8 +215,8 @@ where
     }
 
     #[must_use]
-    pub(crate) fn as_writes(&self) -> StateGraphOut<K, V> {
-        StateGraphOut {
+    pub(crate) fn as_writes(&self) -> Timeline<K, V> {
+        Timeline {
             writes: self.writes.clone(),
         }
     }
@@ -226,7 +225,7 @@ where
         &mut self,
         handler: &F,
         event_resolver: &impl Fn(AnyLocEventId) -> (SGEventId, E),
-        dep_resolver: &dyn Fn(Dep) -> StateGraphOut<DepK, DepV>,
+        dep_resolver: &dyn Fn(Dep) -> Timeline<DepK, DepV>,
         ctx: &LocCtx<R>,
         delta: &DeltaList<AnyLocEventId>,
     ) where
@@ -301,7 +300,7 @@ where
 
     fn detect_dep_changes<R: IsRuntime>(
         &mut self,
-        dep_resolver: &dyn Fn(Dep) -> StateGraphOut<DepK, DepV>,
+        dep_resolver: &dyn Fn(Dep) -> Timeline<DepK, DepV>,
         ctx: &LocCtx<R>,
     ) -> BTreeSet<SGEventId> {
         use im::ordmap::DiffItem;
@@ -479,7 +478,7 @@ where
         &mut self,
         handler: &F,
         event_resolver: &impl Fn(AnyLocEventId) -> (SGEventId, E),
-        dep_resolver: &dyn Fn(Dep) -> StateGraphOut<DepK, DepV>,
+        dep_resolver: &dyn Fn(Dep) -> Timeline<DepK, DepV>,
         ctx: &LocCtx<R>,
         queue: &mut BTreeSet<SGEventId>,
     ) where

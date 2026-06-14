@@ -1,4 +1,4 @@
-use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, StateGraphOut};
+use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, Timeline};
 use crate::core::gear::EmptyRuntime;
 use crate::core::loc_ctx::{EventContext, LocCtx, StoredEvent};
 use crate::types::{AnyLocEventId, GlobalCoreId, LocGroupId, SenderPk};
@@ -95,7 +95,7 @@ fn oneshot(
         .map(|(eid, e)| (eid.1.0, (eid.0.timestamp, e.clone())))
         .collect();
 
-    let r = |_: SGEventId| StateGraphOut::<(), ()> {
+    let r = |_: SGEventId| Timeline::<(), ()> {
         writes: OrdMap::new(),
     };
     let added: Vec<AnyLocEventId> = events.iter().map(|(eid, _)| eid.1).collect();
@@ -134,7 +134,7 @@ fn multishot(
         .map(|(eid, e)| (eid.1.0, (eid.0.timestamp, e.clone())))
         .collect();
 
-    let r = |_: SGEventId| StateGraphOut::<(), ()> {
+    let r = |_: SGEventId| Timeline::<(), ()> {
         writes: OrdMap::new(),
     };
     let resolver = |local_id: AnyLocEventId| {

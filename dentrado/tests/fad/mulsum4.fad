@@ -11,7 +11,7 @@ unpack fadeno.
   UserId sender-to>user user_eq
   Gear mk_gear
   Query mk_query query_delta
-  StateGraph StateGraphOut mk_stategraph stategraph_apply stategraph_out
+  StateGraph Timeline mk_stategraph stategraph_apply stategraph_out
     sgctx_query sgctx_update sgctx_dep_query
   secondary_get
   TextUpd
