@@ -26,7 +26,7 @@ pub type Content = Vec<Node>;
 /// Corresponds to PureScript `Arangx` / `Arangx'`. Covers the `[[<]]`,
 /// `[[f<]]`, `[[=]]`, `[[>]]`, `[[f>]]`, `[[==]]` constructs as well as the
 /// `[[image …]]` and table-cell alignment prefixes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Align {
     /// `true` for the floating forms (`f<`, `f>`) that wrap text around the
     /// block.
@@ -34,7 +34,7 @@ pub struct Align {
     pub side: AlignSide,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AlignSide {
     /// `<`
     Left,
