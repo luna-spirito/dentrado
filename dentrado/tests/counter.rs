@@ -65,49 +65,49 @@ impl<I: Clone, C: Clone> Clone for IC<I, C> {
 
 impl Localizable for AttachGroup {
     fn localize<U, S, D, E>(
-        &self,
+        self,
         _remap_user: &mut U,
         _remap_sender: &mut S,
         _remap_data: &mut D,
-    ) -> Result<Option<Self>, E>
+    ) -> Result<Self, E>
     where
         U: FnMut(LocUserId) -> Result<LocUserId, E>,
         S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
         D: FnMut(LocDataId) -> Result<LocDataId, E>,
     {
-        Ok(None)
+        Ok(self)
     }
 }
 
 impl Localizable for AttachBody {
     fn localize<U, S, D, E>(
-        &self,
+        self,
         _remap_user: &mut U,
         _remap_sender: &mut S,
         _remap_data: &mut D,
-    ) -> Result<Option<Self>, E>
+    ) -> Result<Self, E>
     where
         U: FnMut(LocUserId) -> Result<LocUserId, E>,
         S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
         D: FnMut(LocDataId) -> Result<LocDataId, E>,
     {
-        Ok(None)
+        Ok(self)
     }
 }
 
 impl Localizable for Branch {
     fn localize<U, S, D, E>(
-        &self,
+        self,
         _remap_user: &mut U,
         _remap_sender: &mut S,
         _remap_data: &mut D,
-    ) -> Result<Option<Self>, E>
+    ) -> Result<Self, E>
     where
         U: FnMut(LocUserId) -> Result<LocUserId, E>,
         S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
         D: FnMut(LocDataId) -> Result<LocDataId, E>,
     {
-        Ok(None)
+        Ok(self)
     }
 }
 
@@ -118,17 +118,17 @@ enum AnyGearId {
 
 impl Localizable for AnyGearId {
     fn localize<U, S, D, E>(
-        &self,
+        self,
         _remap_user: &mut U,
         _remap_sender: &mut S,
         _remap_data: &mut D,
-    ) -> Result<Option<Self>, E>
+    ) -> Result<Self, E>
     where
         U: FnMut(LocUserId) -> Result<LocUserId, E>,
         S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
         D: FnMut(LocDataId) -> Result<LocDataId, E>,
     {
-        Ok(None)
+        Ok(self)
     }
 }
 

@@ -1,3 +1,4 @@
+#![feature(box_take)]
 #![warn(clippy::pedantic)]
 #![deny(unsafe_code)]
 

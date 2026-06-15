@@ -57,12 +57,11 @@ impl<'a, R: IsRuntime> WireLocCtxBuilder<'a, R> {
     }
 
     pub fn remap<L: Localizable + Clone>(&self, obj: L) -> Result<L, BuildError> {
-        let result = obj.localize(
+        obj.localize(
             &mut |lid| self.remap_user(lid),
             &mut |sid| self.remap_sender(sid),
             &mut |did| self.remap_data(did),
-        )?;
-        Ok(result.unwrap_or(obj))
+        )
     }
 
     #[must_use]
@@ -107,13 +106,7 @@ impl<'a, R: IsRuntime> WireLocCtxBuilder<'a, R> {
             .get_data(did, Clone::clone)
             .ok_or(BuildError::DataNotFound { did })?;
 
-        let localized = content
-            .localize(
-                &mut |lid| self.remap_user(lid),
-                &mut |sid| self.remap_sender(sid),
-                &mut |d| self.remap_data(d),
-            )?
-            .unwrap_or_else(|| content.clone());
+        let localized = self.remap(content)?;
 
         let wire_idx = {
             let mut inner = self.inner.borrow_mut();

@@ -264,7 +264,12 @@ impl<R: IsRuntime> Core<R> {
         for &idx in seed_indices {
             let event = &events[idx as usize];
             let gcid = global_core_ids[idx as usize];
-            merger.import_new_event(event, gcid, timestamp, source_node.unwrap_or(self.node_id))?;
+            merger.import_new_event(
+                event.clone(),
+                gcid,
+                timestamp,
+                source_node.unwrap_or(self.node_id),
+            )?;
         }
         if source_node.is_none() {
             // TODO: Don't pass wire_ctx, pass only the relevant subpart of it. I. e. update WireLocCtxMereger to regenerate

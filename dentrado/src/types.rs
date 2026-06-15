@@ -341,11 +341,11 @@ pub(crate) const SEGMENT_SIZE_BYTES: usize = 256 * 1024 * 1024;
 
 pub trait Localizable: Sized {
     fn localize<U, S, D, E>(
-        &self,
+        self,
         remap_user: &mut U,
         remap_sender: &mut S,
         remap_data: &mut D,
-    ) -> Result<Option<Self>, E>
+    ) -> Result<Self, E>
     where
         U: FnMut(LocUserId) -> Result<LocUserId, E>,
         S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
@@ -356,17 +356,17 @@ macro_rules! impl_localizable_trivial {
     ($t:ty) => {
         impl Localizable for $t {
             fn localize<U, S, D, E>(
-                &self,
+                self,
                 _remap_user: &mut U,
                 _remap_sender: &mut S,
                 _remap_data: &mut D,
-            ) -> Result<Option<Self>, E>
+            ) -> Result<Self, E>
             where
                 U: FnMut(LocUserId) -> Result<LocUserId, E>,
                 S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
                 D: FnMut(LocDataId) -> Result<LocDataId, E>,
             {
-                Ok(None)
+                Ok(self)
             }
         }
     };
@@ -378,18 +378,21 @@ impl_localizable_trivial!(());
 
 impl<T: Localizable> Localizable for Box<T> {
     fn localize<U, S, D, E>(
-        &self,
+        self,
         remap_user: &mut U,
         remap_sender: &mut S,
         remap_data: &mut D,
-    ) -> Result<Option<Self>, E>
+    ) -> Result<Self, E>
     where
         U: FnMut(LocUserId) -> Result<LocUserId, E>,
         S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
         D: FnMut(LocDataId) -> Result<LocDataId, E>,
     {
-        let inner = (**self).localize(remap_user, remap_sender, remap_data)?;
-        Ok(inner.map(Box::new))
+        let (inner, b) = Box::take(self);
+        Ok(Box::write(
+            b,
+            inner.localize(remap_user, remap_sender, remap_data)?,
+        ))
     }
 }
 

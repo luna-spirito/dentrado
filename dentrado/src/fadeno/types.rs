@@ -181,233 +181,255 @@ pub enum LocValue {
     KolSenderId(LocSenderId),
 }
 
+fn localize_gear<U, S, D, E>(
+    se: &KolGear,
+    remap_user: &mut U,
+    remap_sender: &mut S,
+    remap_data: &mut D,
+) -> Result<Option<KolGear>, E>
+where
+    U: FnMut(LocUserId) -> Result<LocUserId, E>,
+    S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
+    D: FnMut(LocDataId) -> Result<LocDataId, E>,
+{
+    let group = localize_value(&se.primary_group, remap_user, remap_sender, remap_data)?;
+    let cache = localize_value(&se.initial_cache, remap_user, remap_sender, remap_data)?;
+    let step = localize_value(&se.step, remap_user, remap_sender, remap_data)?;
+
+    if group.is_none() && cache.is_none() && step.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(KolGear {
+        primary_msg_type: se.primary_msg_type,
+        primary_group: group.unwrap_or_else(|| se.primary_group.clone()),
+        initial_cache: cache.unwrap_or_else(|| se.initial_cache.clone()),
+        step: step.unwrap_or_else(|| se.step.clone()),
+    }))
+}
+
+fn localize_value<U, S, D, E>(
+    se: &LocValue,
+    remap_user: &mut U,
+    remap_sender: &mut S,
+    remap_data: &mut D,
+) -> Result<Option<LocValue>, E>
+where
+    U: FnMut(LocUserId) -> Result<LocUserId, E>,
+    S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
+    D: FnMut(LocDataId) -> Result<LocDataId, E>,
+{
+    match se {
+        LocValue::KolUserId(lid) => {
+            let new_lid = remap_user(*lid)?;
+            Ok(if new_lid == *lid {
+                None
+            } else {
+                Some(LocValue::KolUserId(new_lid))
+            })
+        }
+        LocValue::KolSenderId(sid) => {
+            let new_sid = remap_sender(*sid)?;
+            Ok(if new_sid == *sid {
+                None
+            } else {
+                Some(LocValue::KolSenderId(new_sid))
+            })
+        }
+        LocValue::KolDataId(did) => {
+            let new_did = remap_data(*did)?;
+            Ok(if new_did == *did {
+                None
+            } else {
+                Some(LocValue::KolDataId(new_did))
+            })
+        }
+        LocValue::KolEventId(_) => {
+            panic!("KolEventId must not cross context boundaries — events are mutable")
+        }
+
+        LocValue::Num(_)
+        | LocValue::Tag(_)
+        | LocValue::Bool(_)
+        | LocValue::BuiltinsVar
+        | LocValue::Builtin(_)
+        | LocValue::Panic
+        | LocValue::Import(_)
+        | LocValue::KolQuery(_, _)
+        | LocValue::KolEventTypeId(_) => Ok(None),
+
+        LocValue::KolPrimary | LocValue::KolSecondary => {
+            todo!("Don't localize those")
+        }
+
+        LocValue::List(vs) => {
+            for (i, x) in vs.iter().enumerate() {
+                if let Some(remapped) = localize_value(x, remap_user, remap_sender, remap_data)? {
+                    let mut new = Vec::with_capacity(vs.len());
+                    new.extend(vs[..i].iter().cloned());
+                    new.push(remapped);
+                    for y in &vs[i + 1..] {
+                        new.push(
+                            localize_value(y, remap_user, remap_sender, remap_data)?
+                                .unwrap_or_else(|| y.clone()),
+                        );
+                    }
+                    return Ok(Some(LocValue::List(Arc::new(new))));
+                }
+            }
+            Ok(None)
+        }
+        LocValue::Record { tag_set, fields } => {
+            for (i, x) in fields.iter().enumerate() {
+                if let Some(remapped) = localize_value(x, remap_user, remap_sender, remap_data)? {
+                    let mut new = Vec::with_capacity(fields.len());
+                    new.extend(fields[..i].iter().cloned());
+                    new.push(remapped);
+                    for y in &fields[i + 1..] {
+                        new.push(
+                            localize_value(y, remap_user, remap_sender, remap_data)?
+                                .unwrap_or_else(|| y.clone()),
+                        );
+                    }
+                    return Ok(Some(LocValue::Record {
+                        tag_set: tag_set.clone(),
+                        fields: Arc::new(new),
+                    }));
+                }
+            }
+            Ok(None)
+        }
+        LocValue::Closure(Closure {
+            captures,
+            args,
+            body,
+        }) => {
+            for (i, x) in captures.iter().enumerate() {
+                if let Some(remapped) = localize_value(x, remap_user, remap_sender, remap_data)? {
+                    let mut new = Vec::with_capacity(captures.len());
+                    new.extend(captures[..i].iter().cloned());
+                    new.push(remapped);
+                    for y in &captures[i + 1..] {
+                        new.push(
+                            localize_value(y, remap_user, remap_sender, remap_data)?
+                                .unwrap_or_else(|| y.clone()),
+                        );
+                    }
+                    return Ok(Some(LocValue::Closure(Closure {
+                        captures: Arc::new(new),
+                        args: *args,
+                        body: *body,
+                    })));
+                }
+            }
+            Ok(None)
+        }
+        LocValue::Partial { func, applied } => {
+            if let Some(remapped_func) = localize_value(func, remap_user, remap_sender, remap_data)?
+            {
+                let mut new_applied: Vec<LocValue> = Vec::with_capacity(applied.len());
+                for y in applied.iter() {
+                    new_applied.push(
+                        localize_value(y, remap_user, remap_sender, remap_data)?
+                            .unwrap_or_else(|| y.clone()),
+                    );
+                }
+                return Ok(Some(LocValue::Partial {
+                    func: Arc::new(remapped_func),
+                    applied: Arc::new(new_applied),
+                }));
+            }
+            for (i, x) in applied.iter().enumerate() {
+                if let Some(remapped) = localize_value(x, remap_user, remap_sender, remap_data)? {
+                    let mut new = Vec::with_capacity(applied.len());
+                    new.extend(applied[..i].iter().cloned());
+                    new.push(remapped);
+                    for y in &applied[i + 1..] {
+                        new.push(
+                            localize_value(y, remap_user, remap_sender, remap_data)?
+                                .unwrap_or_else(|| y.clone()),
+                        );
+                    }
+                    return Ok(Some(LocValue::Partial {
+                        func: Arc::clone(func),
+                        applied: Arc::new(new),
+                    }));
+                }
+            }
+            Ok(None)
+        }
+        LocValue::LoopCont { step } => {
+            Ok(localize_value(step, remap_user, remap_sender, remap_data)?
+                .map(|s| LocValue::LoopCont { step: Arc::new(s) }))
+        }
+
+        LocValue::KolGear(g) => Ok(localize_gear(&**g, remap_user, remap_sender, remap_data)?
+            .map(|gear| LocValue::KolGear(Box::new(gear)))),
+        LocValue::KolStateGraph(_) => todo!(),
+        LocValue::KolTimeline(sg) => {
+            let mut any_changed = false;
+            let mut new_writes = im::OrdMap::new();
+            for (k, timeline) in &sg.writes {
+                let new_k = localize_value(k, remap_user, remap_sender, remap_data)?
+                    .unwrap_or_else(|| k.clone());
+                if new_k != *k {
+                    any_changed = true;
+                }
+
+                let mut new_timeline = timeline.clone();
+
+                new_timeline.try_remap_values(&mut |v: LocValue| {
+                    localize_value(&v, remap_user, remap_sender, remap_data).map(|opt| {
+                        if opt.is_some() {
+                            any_changed = true;
+                        }
+                        opt.unwrap_or(v)
+                    })
+                })?;
+
+                new_writes.insert(new_k, new_timeline);
+            }
+            if any_changed {
+                Ok(Some(LocValue::KolTimeline(Box::new(Timeline {
+                    writes: new_writes,
+                }))))
+            } else {
+                Ok(None)
+            }
+        }
+        LocValue::KolAnchorAgg(_) | LocValue::KolTextAgg(_) | LocValue::KolTextUpd(_) => Ok(None),
+    }
+}
+
 impl Localizable for LocValue {
     fn localize<U, S, D, E>(
-        &self,
+        self,
         remap_user: &mut U,
         remap_sender: &mut S,
         remap_data: &mut D,
-    ) -> Result<Option<Self>, E>
+    ) -> Result<Self, E>
     where
         U: FnMut(LocUserId) -> Result<LocUserId, E>,
         S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
         D: FnMut(LocDataId) -> Result<LocDataId, E>,
     {
-        match self {
-            LocValue::KolUserId(lid) => {
-                let new_lid = remap_user(*lid)?;
-                Ok(if new_lid == *lid {
-                    None
-                } else {
-                    Some(LocValue::KolUserId(new_lid))
-                })
-            }
-            LocValue::KolSenderId(sid) => {
-                let new_sid = remap_sender(*sid)?;
-                Ok(if new_sid == *sid {
-                    None
-                } else {
-                    Some(LocValue::KolSenderId(new_sid))
-                })
-            }
-            LocValue::KolDataId(did) => {
-                let new_did = remap_data(*did)?;
-                Ok(if new_did == *did {
-                    None
-                } else {
-                    Some(LocValue::KolDataId(new_did))
-                })
-            }
-            LocValue::KolEventId(_) => {
-                panic!("KolEventId must not cross context boundaries — events are mutable")
-            }
-
-            LocValue::Num(_)
-            | LocValue::Tag(_)
-            | LocValue::Bool(_)
-            | LocValue::BuiltinsVar
-            | LocValue::Builtin(_)
-            | LocValue::Panic
-            | LocValue::Import(_)
-            | LocValue::KolQuery(_, _)
-            | LocValue::KolEventTypeId(_) => Ok(None),
-
-            LocValue::KolPrimary | LocValue::KolSecondary => {
-                todo!("Don't localize those")
-            }
-
-            LocValue::List(vs) => {
-                for (i, x) in vs.iter().enumerate() {
-                    if let Some(remapped) = x.localize(remap_user, remap_sender, remap_data)? {
-                        let mut new = Vec::with_capacity(vs.len());
-                        new.extend(vs[..i].iter().cloned());
-                        new.push(remapped);
-                        for y in &vs[i + 1..] {
-                            new.push(
-                                y.localize(remap_user, remap_sender, remap_data)?
-                                    .unwrap_or_else(|| y.clone()),
-                            );
-                        }
-                        return Ok(Some(LocValue::List(Arc::new(new))));
-                    }
-                }
-                Ok(None)
-            }
-            LocValue::Record { tag_set, fields } => {
-                for (i, x) in fields.iter().enumerate() {
-                    if let Some(remapped) = x.localize(remap_user, remap_sender, remap_data)? {
-                        let mut new = Vec::with_capacity(fields.len());
-                        new.extend(fields[..i].iter().cloned());
-                        new.push(remapped);
-                        for y in &fields[i + 1..] {
-                            new.push(
-                                y.localize(remap_user, remap_sender, remap_data)?
-                                    .unwrap_or_else(|| y.clone()),
-                            );
-                        }
-                        return Ok(Some(LocValue::Record {
-                            tag_set: tag_set.clone(),
-                            fields: Arc::new(new),
-                        }));
-                    }
-                }
-                Ok(None)
-            }
-            LocValue::Closure(Closure {
-                captures,
-                args,
-                body,
-            }) => {
-                for (i, x) in captures.iter().enumerate() {
-                    if let Some(remapped) = x.localize(remap_user, remap_sender, remap_data)? {
-                        let mut new = Vec::with_capacity(captures.len());
-                        new.extend(captures[..i].iter().cloned());
-                        new.push(remapped);
-                        for y in &captures[i + 1..] {
-                            new.push(
-                                y.localize(remap_user, remap_sender, remap_data)?
-                                    .unwrap_or_else(|| y.clone()),
-                            );
-                        }
-                        return Ok(Some(LocValue::Closure(Closure {
-                            captures: Arc::new(new),
-                            args: *args,
-                            body: *body,
-                        })));
-                    }
-                }
-                Ok(None)
-            }
-            LocValue::Partial { func, applied } => {
-                if let Some(remapped_func) = func.localize(remap_user, remap_sender, remap_data)? {
-                    let mut new_applied: Vec<LocValue> = Vec::with_capacity(applied.len());
-                    for y in applied.iter() {
-                        new_applied.push(
-                            y.localize(remap_user, remap_sender, remap_data)?
-                                .unwrap_or_else(|| y.clone()),
-                        );
-                    }
-                    return Ok(Some(LocValue::Partial {
-                        func: Arc::new(remapped_func),
-                        applied: Arc::new(new_applied),
-                    }));
-                }
-                for (i, x) in applied.iter().enumerate() {
-                    if let Some(remapped) = x.localize(remap_user, remap_sender, remap_data)? {
-                        let mut new = Vec::with_capacity(applied.len());
-                        new.extend(applied[..i].iter().cloned());
-                        new.push(remapped);
-                        for y in &applied[i + 1..] {
-                            new.push(
-                                y.localize(remap_user, remap_sender, remap_data)?
-                                    .unwrap_or_else(|| y.clone()),
-                            );
-                        }
-                        return Ok(Some(LocValue::Partial {
-                            func: Arc::clone(func),
-                            applied: Arc::new(new),
-                        }));
-                    }
-                }
-                Ok(None)
-            }
-            LocValue::LoopCont { step } => Ok(step
-                .localize(remap_user, remap_sender, remap_data)?
-                .map(|s| LocValue::LoopCont { step: Arc::new(s) })),
-
-            LocValue::KolGear(g) => Ok((**g)
-                .localize(remap_user, remap_sender, remap_data)?
-                .map(|gear| LocValue::KolGear(Box::new(gear)))),
-            LocValue::KolStateGraph(_) => todo!(),
-            LocValue::KolTimeline(sg) => {
-                let mut any_changed = false;
-                let mut new_writes = im::OrdMap::new();
-                for (k, timeline) in &sg.writes {
-                    let new_k = k
-                        .localize(remap_user, remap_sender, remap_data)?
-                        .unwrap_or_else(|| k.clone());
-                    if new_k != *k {
-                        any_changed = true;
-                    }
-
-                    let mut new_timeline = timeline.clone();
-
-                    new_timeline.try_remap_values(&mut |v: LocValue| {
-                        v.localize(remap_user, remap_sender, remap_data).map(|opt| {
-                            if opt.is_some() {
-                                any_changed = true;
-                            }
-                            opt.unwrap_or(v)
-                        })
-                    })?;
-
-                    new_writes.insert(new_k, new_timeline);
-                }
-                if any_changed {
-                    Ok(Some(LocValue::KolTimeline(Box::new(Timeline {
-                        writes: new_writes,
-                    }))))
-                } else {
-                    Ok(None)
-                }
-            }
-            LocValue::KolAnchorAgg(_) | LocValue::KolTextAgg(_) | LocValue::KolTextUpd(_) => {
-                Ok(None)
-            }
-        }
+        Ok(localize_value(&self, remap_user, remap_sender, remap_data)?.unwrap_or(self))
     }
 }
 
 impl Localizable for KolGear {
     fn localize<U, S, D, E>(
-        &self,
+        self,
         remap_user: &mut U,
         remap_sender: &mut S,
         remap_data: &mut D,
-    ) -> Result<Option<Self>, E>
+    ) -> Result<Self, E>
     where
         U: FnMut(LocUserId) -> Result<LocUserId, E>,
         S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
         D: FnMut(LocDataId) -> Result<LocDataId, E>,
     {
-        let group = self
-            .primary_group
-            .localize(remap_user, remap_sender, remap_data)?;
-        let cache = self
-            .initial_cache
-            .localize(remap_user, remap_sender, remap_data)?;
-        let step = self.step.localize(remap_user, remap_sender, remap_data)?;
-
-        if group.is_none() && cache.is_none() && step.is_none() {
-            return Ok(None);
-        }
-
-        Ok(Some(KolGear {
-            primary_msg_type: self.primary_msg_type,
-            primary_group: group.unwrap_or_else(|| self.primary_group.clone()),
-            initial_cache: cache.unwrap_or_else(|| self.initial_cache.clone()),
-            step: step.unwrap_or_else(|| self.step.clone()),
-        }))
+        Ok(localize_gear(&self, remap_user, remap_sender, remap_data)?.unwrap_or(self))
     }
 }
 

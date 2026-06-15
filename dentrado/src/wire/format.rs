@@ -20,11 +20,11 @@ pub struct WireEventBody<K, B> {
 
 impl<K: Localizable + Clone, B: Localizable + Clone> Localizable for WireEventBody<K, B> {
     fn localize<U, S, D, E>(
-        &self,
+        self,
         remap_user: &mut U,
         remap_sender: &mut S,
         remap_data: &mut D,
-    ) -> Result<Option<Self>, E>
+    ) -> Result<Self, E>
     where
         U: FnMut(LocUserId) -> Result<LocUserId, E>,
         S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
@@ -36,18 +36,13 @@ impl<K: Localizable + Clone, B: Localizable + Clone> Localizable for WireEventBo
                 .localize(&mut *remap_user, &mut *remap_sender, &mut *remap_data)?;
         let new_body = self.body.localize(remap_user, remap_sender, remap_data)?;
 
-        let changed = new_sender != self.sender || new_group.is_some() || new_body.is_some();
-        if changed {
-            Ok(Some(WireEventBody {
-                sender: new_sender,
-                tx_id: self.tx_id,
-                msg_type: self.msg_type,
-                group: new_group.unwrap_or_else(|| self.group.clone()),
-                body: new_body.unwrap_or_else(|| self.body.clone()),
-            }))
-        } else {
-            Ok(None)
-        }
+        Ok(WireEventBody {
+            sender: new_sender,
+            tx_id: self.tx_id,
+            msg_type: self.msg_type,
+            group: new_group,
+            body: new_body,
+        })
     }
 }
 

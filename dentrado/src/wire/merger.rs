@@ -36,24 +36,23 @@ impl<'a, R: IsRuntime, Target: EventContext<R>> WireLocCtxMerger<'a, R, Target> 
 
     pub(crate) fn remap<L: Localizable + Clone>(&self, obj: L) -> Result<L, MergeError> {
         let max_data = self.source.data.len();
-        let result = obj.localize(
+        obj.localize(
             &mut |lid| self.remap_user(lid),
             &mut |sid| self.remap_sender(sid),
             &mut |did| self.remap_data(did, max_data),
-        )?;
-        Ok(result.unwrap_or(obj))
+        )
     }
 
     pub(crate) fn import_new_event(
         &self,
-        event: &WireEventBody<R::Group, R::Body>,
+        event: WireEventBody<R::Group, R::Body>,
         global_core_id: GlobalCoreId,
         timestamp: u32,
         source_node: NodeId,
     ) -> Result<Option<StoreResultSuccess>, MergeError> {
         let sender = self.remap_sender(event.sender)?;
-        let group = self.remap_value(&event.group)?;
-        let body = self.remap_value(&event.body)?;
+        let group = self.remap_value(event.group)?;
+        let body = self.remap_value(event.body)?;
 
         let inner = self.inner.borrow_mut();
         let group_id = inner.target.mk_loc_group(event.msg_type, group);
@@ -164,13 +163,11 @@ impl<'a, R: IsRuntime, Target: EventContext<R>> WireLocCtxMerger<'a, R, Target> 
         }
 
         let next_max = idx; // data[i]'s content may only reference data[0..i)
-        let localized = content
-            .localize(
-                &mut |lid| self.remap_user(lid),
-                &mut |sid| self.remap_sender(sid),
-                &mut |d| self.remap_data(d, next_max),
-            )?
-            .unwrap_or_else(|| content.clone());
+        let localized = content.clone().localize(
+            &mut |lid| self.remap_user(lid),
+            &mut |sid| self.remap_sender(sid),
+            &mut |d| self.remap_data(d, next_max),
+        )?;
 
         let new_did = self
             .inner
@@ -183,13 +180,12 @@ impl<'a, R: IsRuntime, Target: EventContext<R>> WireLocCtxMerger<'a, R, Target> 
         Ok(new_did)
     }
 
-    fn remap_value<V: Localizable + Clone>(&self, value: &V) -> Result<V, MergeError> {
+    fn remap_value<V: Localizable + Clone>(&self, value: V) -> Result<V, MergeError> {
         let max_data = self.source.data.len();
-        let result = value.localize(
+        value.localize(
             &mut |lid| self.remap_user(lid),
             &mut |sid| self.remap_sender(sid),
             &mut |did| self.remap_data(did, max_data),
-        )?;
-        Ok(result.unwrap_or_else(|| value.clone()))
+        )
     }
 }
