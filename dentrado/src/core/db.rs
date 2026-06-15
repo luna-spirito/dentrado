@@ -128,14 +128,16 @@ pub struct Db<R: IsRuntime> {
 impl<R: IsRuntime> Db<R> {
     /// Start the database with no user worker function.
     /// Cores run only the core event loop.
+    #[must_use]
     pub fn start(config: DbConfig<R>) -> io::Result<Self> {
         Self::start_with_worker(config, |_| std::future::pending::<()>())
     }
 
     /// Start the database with a user-provided worker function per core.
+    #[must_use]
     pub fn start_with_worker<W, F>(mut config: DbConfig<R>, worker_fn: W) -> io::Result<Self>
     where
-        W: Fn(&Core<R>) -> F + Clone + Send + 'static,
+        W: Fn(Rc<Core<R>>) -> F + Clone + Send + 'static,
         F: Future<Output = ()> + 'static,
     {
         let num_cores = config.num_cores;
@@ -237,7 +239,7 @@ impl<R: IsRuntime> Db<R> {
                         .build()
                         .expect("compio runtime build failed");
 
-                    runtime.block_on(async {
+                    runtime.block_on(async move {
                         let state = Rc::new(Core::new(
                             num_cores,
                             core_id,
@@ -249,7 +251,7 @@ impl<R: IsRuntime> Db<R> {
                             inter_node_peers,
                         ));
 
-                        compio::runtime::spawn(worker_fn(&state)).detach();
+                        compio::runtime::spawn(worker_fn(state.clone())).detach();
 
                         core_event_loop(
                             state,

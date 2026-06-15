@@ -46,25 +46,25 @@ impl std::error::Error for CompileError {}
 
 #[must_use]
 pub fn find_binary() -> Option<String> {
-    if let Ok(s) = std::env::var("FADENO_LANG") {
-        if Path::new(&s).exists() {
-            return Some(s);
-        }
+    if let Ok(s) = std::env::var("FADENO_LANG")
+        && Path::new(&s).exists()
+    {
+        return Some(s);
     }
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
         let fadeno_root = Path::new(&manifest).join("fadeno-lang");
-        if let Ok(entries) = std::fs::read_dir(fadeno_root.join("dist-newstyle/build")) {
-            if let Some(path) = search_cabal_output(entries) {
-                return Some(path);
-            }
+        if let Ok(entries) = std::fs::read_dir(fadeno_root.join("dist-newstyle/build"))
+            && let Some(path) = search_cabal_output(entries)
+        {
+            return Some(path);
         }
     }
-    if let Ok(output) = Command::new("which").arg("fadeno-lang").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(path);
-            }
+    if let Ok(output) = Command::new("which").arg("fadeno-lang").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(path);
         }
     }
     None
@@ -76,28 +76,23 @@ fn search_cabal_output(entries: std::fs::ReadDir) -> Option<String> {
         let path = entry.path();
         if path.is_dir() {
             let candidate = path.join("x/fadeno-lang/build/fadeno-lang/fadeno-lang");
-            if candidate.is_file() {
-                if let Ok(meta) = std::fs::metadata(&candidate) {
-                    if let Ok(modified) = meta.modified() {
-                        let is_better = best.as_ref().is_none_or(|(_, t)| modified > *t);
-                        if is_better {
-                            if let Some(s) = candidate.to_str().map(String::from) {
-                                best = Some((s, modified));
-                            }
-                        }
-                    }
+            if candidate.is_file()
+                && let Ok(meta) = std::fs::metadata(&candidate)
+                && let Ok(modified) = meta.modified()
+            {
+                let is_better = best.as_ref().is_none_or(|(_, t)| modified > *t);
+                if is_better && let Some(s) = candidate.to_str().map(String::from) {
+                    best = Some((s, modified));
                 }
             }
-            if let Ok(sub) = std::fs::read_dir(&path) {
-                if let Some(found) = search_cabal_output(sub) {
-                    if let Ok(meta) = std::fs::metadata(&found) {
-                        if let Ok(modified) = meta.modified() {
-                            let is_better = best.as_ref().is_none_or(|(_, t)| modified > *t);
-                            if is_better {
-                                best = Some((found, modified));
-                            }
-                        }
-                    }
+            if let Ok(sub) = std::fs::read_dir(&path)
+                && let Some(found) = search_cabal_output(sub)
+                && let Ok(meta) = std::fs::metadata(&found)
+                && let Ok(modified) = meta.modified()
+            {
+                let is_better = best.as_ref().is_none_or(|(_, t)| modified > *t);
+                if is_better {
+                    best = Some((found, modified));
                 }
             }
         }

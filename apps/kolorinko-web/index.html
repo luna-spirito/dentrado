@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>kolorinko</title>
+    <!--
+      Minimal base styling that mirrors the structure of Wikidot's base theme
+      (enough to read pages) without attempting to reproduce any site's custom
+      theme. User-authored themes would be layered on top via <style> / CSS
+      files served by the wiki.
+    -->
+    <style>
+      body {
+        font:
+          15px/1.6 "Helvetica Neue",
+          Arial,
+          sans-serif;
+        color: #333;
+        background: #fff;
+        margin: 0;
+      }
+      #container {
+        max-width: 56rem;
+        margin: 0 auto;
+        padding: 1.5rem;
+      }
+      #page-title {
+        font-size: 1.6rem;
+        font-weight: 700;
+        border-bottom: 1px solid #ddd;
+        padding-bottom: 0.3em;
+        margin: 0 0 1rem;
+      }
+      #page-content p {
+        margin: 0 0 1em;
+      }
+      #page-content h1,
+      #page-content h2,
+      #page-content h3,
+      #page-content h4,
+      #page-content h5,
+      #page-content h6 {
+        margin: 1.2em 0 0.5em;
+        font-weight: 700;
+      }
+      #page-content h1 {
+        font-size: 1.5rem;
+      }
+      #page-content h2 {
+        font-size: 1.3rem;
+      }
+      #page-content h3 {
+        font-size: 1.15rem;
+      }
+      #page-content a {
+        color: #b01;
+      }
+      /* Wikidot structural classes we emit in render.rs. */
+      .wiki-content-table {
+        border-collapse: collapse;
+        margin: 0 0 1em;
+      }
+      .wiki-content-table th,
+      .wiki-content-table td {
+        border: 1px solid #bbb;
+        padding: 0.3em 0.6em;
+        vertical-align: top;
+      }
+      .wiki-content-table th {
+        background: #f2f2f2;
+        font-weight: 700;
+      }
+      .image-container {
+        margin: 0.5em 0;
+      }
+      .image-container img.image {
+        max-width: 100%;
+      }
+      .floatleft {
+        float: left;
+        margin: 0 1em 0.5em 0;
+      }
+      .floatright {
+        float: right;
+        margin: 0 0 0.5em 1em;
+      }
+      .aligncenter {
+        text-align: center;
+      }
+      .yui-navset {
+        border: 1px solid #ccc;
+        margin: 0 0 1em;
+      }
+      .yui-nav {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        background: #eee;
+        display: flex;
+      }
+      .yui-nav li {
+        padding: 0.3em 0.8em;
+        cursor: pointer;
+        border-right: 1px solid #ccc;
+      }
+      .yui-nav li.selected {
+        background: #fff;
+      }
+      .yui-content > div {
+        padding: 0.6em;
+      }
+      blockquote {
+        margin: 0 0 1em 1.5em;
+        padding-left: 0.8em;
+        border-left: 3px solid #ccc;
+        color: #555;
+      }
+      .footnoteref {
+        vertical-align: super;
+        font-size: 0.75em;
+      }
+      hr {
+        border: none;
+        border-top: 1px solid #ccc;
+        margin: 1.2em 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="container"></div>
+    <!-- Trunk builds the `kolorinko-web` bin to wasm and mounts it into #container. -->
+    <link
+      data-trunk
+      rel="rust"
+      data-bin="kolorinko-web"
+      data-type-name="kolorinko_web"
+      data-wasm-opt="z"
+    />
+  </body>
+</html>

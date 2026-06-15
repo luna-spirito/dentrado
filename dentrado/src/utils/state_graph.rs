@@ -319,20 +319,20 @@ where
                 for outer_item in ext_dep.cached.writes.diff(&current.writes) {
                     match outer_item {
                         DiffItem::Add(dep_key, new_timeline) => {
-                            if let Some(readers) = ext_dep.reads.get(dep_key) {
-                                if let Some((first_write, _)) = new_timeline.first() {
-                                    for reader in readers.range_after(&first_write, ctx) {
-                                        affected.insert(reader);
-                                    }
+                            if let Some(readers) = ext_dep.reads.get(dep_key)
+                                && let Some((first_write, _)) = new_timeline.first()
+                            {
+                                for reader in readers.range_after(&first_write, ctx) {
+                                    affected.insert(reader);
                                 }
                             }
                         }
                         DiffItem::Remove(dep_key, old_timeline) => {
-                            if let Some(readers) = ext_dep.reads.get(dep_key) {
-                                if let Some((first_write, _)) = old_timeline.first() {
-                                    for reader in readers.range_after(&first_write, ctx) {
-                                        affected.insert(reader);
-                                    }
+                            if let Some(readers) = ext_dep.reads.get(dep_key)
+                                && let Some((first_write, _)) = old_timeline.first()
+                            {
+                                for reader in readers.range_after(&first_write, ctx) {
+                                    affected.insert(reader);
                                 }
                             }
                         }

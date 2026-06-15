@@ -1,0 +1,13 @@
+[package]
+name = "kolorinko-wikitext"
+version = "0.1.0"
+authors = ["Luna Spirito <guardspirit@protonmail.com>"]
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Wikidot page AST types shared by the kolorinko server and web client"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+# Member of the dentrado workspace, but buildable for wasm32 as a path
+# dependency of the standalone kolorinko-web client (serde is wasm-safe).

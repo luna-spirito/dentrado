@@ -363,7 +363,7 @@ where
                 .map(|s| LocValue::LoopCont { step: Arc::new(s) }))
         }
 
-        LocValue::KolGear(g) => Ok(localize_gear(&**g, remap_user, remap_sender, remap_data)?
+        LocValue::KolGear(g) => Ok(localize_gear(g, remap_user, remap_sender, remap_data)?
             .map(|gear| LocValue::KolGear(Box::new(gear)))),
         LocValue::KolStateGraph(_) => todo!(),
         LocValue::KolTimeline(sg) => {
@@ -586,27 +586,27 @@ impl TagRegistry {
             .filter_map(|(name, _)| self.name_to_tag(name))
             .collect();
 
-        if tag_ids.len() == pairs.len() {
-            if let Some(ts_id) = self.find_tag_set_for_tags(&tag_ids) {
-                let idx = self.id_to_ts_idx.get(&ts_id).expect("tag_set idx");
-                let (entries, _) = &self.tag_sets[*idx];
-                let max_idx = entries.len();
-                let mut fields = vec![LocValue::Panic; max_idx];
-                for (i, (tid, _width)) in entries.iter().enumerate() {
-                    for (name, val) in pairs {
-                        if let Some(tid2) = self.name_to_tag(name) {
-                            if tid2 == *tid {
-                                fields[i] = val.clone();
-                                break;
-                            }
-                        }
+        if tag_ids.len() == pairs.len()
+            && let Some(ts_id) = self.find_tag_set_for_tags(&tag_ids)
+        {
+            let idx = self.id_to_ts_idx.get(&ts_id).expect("tag_set idx");
+            let (entries, _) = &self.tag_sets[*idx];
+            let max_idx = entries.len();
+            let mut fields = vec![LocValue::Panic; max_idx];
+            for (i, (tid, _width)) in entries.iter().enumerate() {
+                for (name, val) in pairs {
+                    if let Some(tid2) = self.name_to_tag(name)
+                        && tid2 == *tid
+                    {
+                        fields[i] = val.clone();
+                        break;
                     }
                 }
-                return LocValue::Record {
-                    tag_set: Arc::new(vec![ts_id]),
-                    fields: Arc::new(fields),
-                };
             }
+            return LocValue::Record {
+                tag_set: Arc::new(vec![ts_id]),
+                fields: Arc::new(fields),
+            };
         }
 
         panic!(

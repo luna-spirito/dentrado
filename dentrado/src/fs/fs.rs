@@ -120,8 +120,10 @@ impl AlignedPageBuf {
     }
 
     unsafe fn take_mut(&mut self, idx: u32) -> OwnedPage {
-        self.taken += 1;
-        OwnedPage::new(self.ptr.add(idx as usize).cast().as_mut())
+        unsafe {
+            self.taken += 1;
+            OwnedPage::new(self.ptr.add(idx as usize).cast().as_mut())
+        }
     }
 
     unsafe fn ret_mut(&mut self, _page: OwnedPage) {
@@ -129,17 +131,21 @@ impl AlignedPageBuf {
     }
 
     unsafe fn borrow(&self, idx: u32) -> &AlignedPage {
-        self.ptr.add(idx as usize).as_ref()
+        unsafe { self.ptr.add(idx as usize).as_ref() }
     }
 
     unsafe fn fill(&mut self, idx: u32, data: &[u8; PAGE_SIZE]) {
-        let dst = self.ptr.add(idx as usize);
-        ptr::copy_nonoverlapping::<u8>(data.as_ptr(), dst.cast().as_ptr(), PAGE_SIZE);
+        unsafe {
+            let dst = self.ptr.add(idx as usize);
+            ptr::copy_nonoverlapping::<u8>(data.as_ptr(), dst.cast().as_ptr(), PAGE_SIZE);
+        }
     }
 
     unsafe fn overwrite_take(&mut self, idx: u32) -> &'static AlignedPage {
-        self.taken += 1;
-        self.ptr.add(idx as usize).as_ref()
+        unsafe {
+            self.taken += 1;
+            self.ptr.add(idx as usize).as_ref()
+        }
     }
 
     unsafe fn ret(&mut self, _page: &'static AlignedPage) {

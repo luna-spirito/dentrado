@@ -773,7 +773,7 @@ impl Vm<'_> {
                 match (&list, &idx) {
                     (LocValue::List(vs), LocValue::Num(i)) => {
                         if *i < 0 || *i as usize >= vs.len() {
-                            { Err(VmError::Panic("ListIndexL")) }
+                            Err(VmError::Panic("ListIndexL"))
                         } else {
                             Ok(vs[*i as usize].clone())
                         }
@@ -803,7 +803,7 @@ impl Vm<'_> {
                 match &a {
                     LocValue::List(vs) => {
                         if vs.is_empty() {
-                            { Err(VmError::Panic("ListViewL empty")) }
+                            Err(VmError::Panic("ListViewL empty"))
                         } else {
                             let left = vs[0].clone();
                             let rest = LocValue::List(Arc::new(vs[1..].to_vec()));

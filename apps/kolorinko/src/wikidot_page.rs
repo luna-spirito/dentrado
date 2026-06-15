@@ -19,11 +19,33 @@ use crate::runtime::{GearId, GearOut, KolorinkoRT};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RepoPath(&'static Path);
 
+impl RepoPath {
+    #[must_use]
+    pub(crate) const fn as_path(&self) -> &'static Path {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RepoMeta {
     url: &'static str,
     path: RepoPath,
     interval: u32,
+}
+
+impl RepoMeta {
+    /// Construct a new `RepoMeta`.
+    ///
+    /// `url` and `path` must live for `'static`; for a path read at runtime
+    /// (e.g. from an env var), leak the backing storage with `Box::leak`.
+    #[must_use]
+    pub(crate) const fn new(url: &'static str, path: &'static Path, interval: u32) -> Self {
+        Self {
+            url,
+            path: RepoPath(path),
+            interval,
+        }
+    }
 }
 
 #[derive(Default)]

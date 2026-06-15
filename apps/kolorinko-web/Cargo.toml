@@ -1,0 +1,27 @@
+[package]
+name = "kolorinko-web"
+version = "0.1.0"
+authors = ["Luna Spirito <guardspirit@protonmail.com>"]
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Leptos CSR frontend for the kolorinko server"
+
+[dependencies]
+console_error_panic_hook = "0.1"
+kolorinko-wikitext = { path = "../kolorinko-wikitext" }
+leptos = { version = "0.8", features = ["csr"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+  "Event",
+  "Location",
+  "MessageEvent",
+  "WebSocket",
+  "Window",
+] }
+
+# Standalone crate, built to wasm32-unknown-unknown via Trunk.
+# It is intentionally NOT a member of the dentrado workspace, whose other
+# crates target the host.
+[workspace]

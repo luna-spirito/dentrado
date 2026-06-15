@@ -89,6 +89,25 @@
               pkgs.typst
             ];
           };
+
+          devShells.kolorinko = pkgs.mkShell {
+            name = "rust-nightly";
+
+            shellHook = config.pre-commit.shellHook;
+
+            packages = config.pre-commit.settings.enabledPackages ++ [
+              rustToolchain
+              pkgs.cargo-nextest
+              pkgs.cargo-watch
+              pkgs.cargo-deny
+
+              haskPkgs.ghc
+              haskPkgs.cabal-install
+              haskPkgs.haskell-language-server
+
+              pkgs.trunk
+            ];
+          };
         };
     };
 }

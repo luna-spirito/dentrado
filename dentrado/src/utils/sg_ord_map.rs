@@ -270,12 +270,11 @@ impl<X: Clone> SgOrdMap<X> {
     ) -> Option<(SGEventId, &X)> {
         let bucket = at.0;
 
-        if let Some(entries) = self.buckets.get(&bucket) {
-            if let Some(idx) = bucket_lower_bound_inclusive(entries, at.1, ctx, |e| e.local_id) {
-                if let Some(entry) = entries.get(idx) {
-                    return Some((entry.to_event_id(&bucket), &entry.value));
-                }
-            }
+        if let Some(entries) = self.buckets.get(&bucket)
+            && let Some(idx) = bucket_lower_bound_inclusive(entries, at.1, ctx, |e| e.local_id)
+            && let Some(entry) = entries.get(idx)
+        {
+            return Some((entry.to_event_id(&bucket), &entry.value));
         }
 
         self.buckets
@@ -295,12 +294,11 @@ impl<X: Clone> SgOrdMap<X> {
     ) -> Option<(SGEventId, &X)> {
         let bucket = at.0;
 
-        if let Some(entries) = self.buckets.get(&bucket) {
-            if let Some(idx) = bucket_lower_bound_exclusive(entries, at.1, ctx, |e| e.local_id) {
-                if let Some(entry) = entries.get(idx) {
-                    return Some((entry.to_event_id(&bucket), &entry.value));
-                }
-            }
+        if let Some(entries) = self.buckets.get(&bucket)
+            && let Some(idx) = bucket_lower_bound_exclusive(entries, at.1, ctx, |e| e.local_id)
+            && let Some(entry) = entries.get(idx)
+        {
+            return Some((entry.to_event_id(&bucket), &entry.value));
         }
 
         self.buckets
