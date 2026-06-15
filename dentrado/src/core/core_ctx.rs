@@ -212,7 +212,7 @@ impl<R: IsRuntime> Core<R> {
         output
     }
 
-    pub(crate) fn secondary_get(&self, gear: R::GearId) -> R::GearOut {
+    pub fn secondary_get(&self, gear: R::GearId) -> R::GearOut {
         let (msg_type, group) = R::meta(&gear);
         let builder = WireLocCtxBuilder::new(&self.loc_ctx);
         let group_wire = builder
