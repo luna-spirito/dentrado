@@ -106,6 +106,8 @@
               haskPkgs.haskell-language-server
 
               pkgs.trunk
+              pkgs.just
+              pkgs.xdg-utils
             ];
           };
         };

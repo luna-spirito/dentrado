@@ -71,9 +71,14 @@ pub fn main() -> anyhow::Result<()> {
     };
 
     let repo_meta = make_repo_meta();
-    let bind_addr = var("KOLORINKO_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-    let web_dist =
-        PathBuf::from(var("KOLORINKO_WEB_DIST").unwrap_or_else(|_| "../kolorinko-web/dist".into()));
+    // Default to loopback so a bare `cargo run` never exposes the dev server
+    // to the LAN; deployments set `KOLORINKO_BIND` explicitly.
+    let bind_addr = var("KOLORINKO_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    let web_dist = PathBuf::from(var("KOLORINKO_WEB_DIST").unwrap_or_else(|_| {
+        // Resolve against the crate directory so the default is correct no
+        // matter which CWD the binary is launched from.
+        format!("{}/../kolorinko-web/dist", env!("CARGO_MANIFEST_DIR"))
+    }));
 
     // One web worker per core. Each binds the same `(addr, port)` with
     // SO_REUSEPORT; the kernel hashes each incoming connection to a single
@@ -108,7 +113,9 @@ pub fn main() -> anyhow::Result<()> {
 /// `RepoMeta` holds `&'static` fields, so a runtime-configured path is leaked
 /// once at startup (it lives for the whole process anyway).
 fn make_repo_meta() -> wikidot_page::RepoMeta {
-    let dir = var("REPO_DIR").unwrap_or_else(|_| "kolorinko-repo".to_string());
+    // Default to a project-local clone (gitignored via `.*`); the server
+    // auto-clones it from `REPO_URL` on first use if absent.
+    let dir = var("REPO_DIR").unwrap_or_else(|_| ".kolorinko/repo".to_string());
     let repo_dir: &'static Path = Box::leak(PathBuf::from(dir).into_boxed_path());
     let interval = var("REPO_INTERVAL")
         .ok()
