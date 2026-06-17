@@ -1,7 +1,7 @@
 use std::{
-    any::Any,
     cell::RefCell,
     collections::{HashMap, HashSet},
+    fmt::Debug,
     num::NonZero,
     sync::{Arc, mpsc},
 };
@@ -87,7 +87,7 @@ pub(crate) enum InterCoreMsg<R: IsRuntime> {
 
 #[derive(Debug)]
 struct CoreInner<R: IsRuntime> {
-    gear_cache: HashMap<R::GearId, Box<dyn Any>>,
+    gear_cache: HashMap<R::GearId, R::GearCache>,
     gear_in_flight: HashSet<R::GearId>,
     secondary_cache: HashMap<R::GearId, R::GearOut>,
     events_by_group: HashMap<LocGroupId, EventGroup>,
@@ -201,7 +201,7 @@ impl<R: IsRuntime> Core<R> {
             }
         };
 
-        let output = R::run_step(&key, self, group, &mut *cache);
+        let output = R::run_step(&key, self, group, &mut cache);
 
         {
             let mut inner = self.inner.borrow_mut();

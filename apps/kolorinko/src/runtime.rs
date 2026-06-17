@@ -115,6 +115,8 @@ impl IsRuntime for KolorinkoRT {
 
     type Data = ();
 
+    type GearCache = Box<dyn std::any::Any>;
+
     fn hash_data(
         _data: &Self::Data,
         _resolver: &dyn dentrado::types::GlobalResolver,
@@ -148,8 +150,9 @@ impl IsRuntime for KolorinkoRT {
         }
     }
 
-    // TODO: remove boxing?
-    fn make_cache(gear: &Self::GearId) -> Box<dyn std::any::Any> {
+    // Heterogeneous per-gear cache payloads are erased behind `Box<dyn Any>`;
+    // each gear variant downcasts to its own cache type inside `run_step`.
+    fn make_cache(gear: &Self::GearId) -> Self::GearCache {
         match gear {
             GearId::Repo(_) => Box::new(RepoCache::default()),
             GearId::Load { .. } => Box::new(LoadCache::default()),
@@ -160,7 +163,7 @@ impl IsRuntime for KolorinkoRT {
         gear: &Self::GearId,
         core: &dentrado::core::core_ctx::Core<Self>,
         group: Option<dentrado::types::LocGroupId>,
-        cache: &mut dyn std::any::Any,
+        cache: &mut Self::GearCache,
     ) -> Self::GearOut {
         match gear {
             GearId::Repo(repo_meta) => {

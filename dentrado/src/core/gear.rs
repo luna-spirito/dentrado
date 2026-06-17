@@ -1,4 +1,4 @@
-use std::{any::Any, fmt::Debug, hash::Hash};
+use std::{fmt::Debug, hash::Hash};
 
 use crate::{
     core::core_ctx::Core,
@@ -18,6 +18,14 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
 
     type Data: Debug + Clone + Hash + Eq + Send + Sync + 'static + Localizable;
 
+    /// Per-gear working state carried across `run_step` invocations.
+    ///
+    /// A concrete runtime (e.g. `FadenoRuntime`) may set this to a single concrete
+    /// type and skip all type erasure. A runtime whose gears need heterogeneous
+    /// cache payloads can instead erase them, e.g. `type GearCache = Box<dyn Any>`
+    /// (or a tagged pointer) and downcast inside `run_step`.
+    type GearCache: Debug + 'static;
+
     fn hash_data(
         data: &Self::Data,
         resolver: &dyn GlobalResolver,
@@ -30,13 +38,13 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
 
     fn meta(gear: &Self::GearId) -> (LocMsgTypeId, Self::Group);
 
-    fn make_cache(gear: &Self::GearId) -> Box<dyn Any>;
+    fn make_cache(gear: &Self::GearId) -> Self::GearCache;
 
     fn run_step(
         gear: &Self::GearId,
         core: &Core<Self>,
         group: Option<LocGroupId>,
-        cache: &mut dyn Any,
+        cache: &mut Self::GearCache,
     ) -> Self::GearOut;
 }
 
@@ -49,6 +57,7 @@ impl IsRuntime for EmptyRuntime {
     type Group = ();
     type Body = ();
     type Data = ();
+    type GearCache = ();
 
     fn route_group(
         _key: &Self::Group,
@@ -61,15 +70,13 @@ impl IsRuntime for EmptyRuntime {
         (LocMsgTypeId(0), ())
     }
 
-    fn make_cache(_gear: &Self::GearId) -> Box<dyn std::any::Any> {
-        Box::new(())
-    }
+    fn make_cache(_gear: &Self::GearId) -> Self::GearCache {}
 
     fn run_step(
         _gear: &Self::GearId,
         _core: &crate::core::core_ctx::Core<Self>,
         _group: Option<LocGroupId>,
-        _cache: &mut dyn std::any::Any,
+        _cache: &mut Self::GearCache,
     ) -> Self::GearOut {
     }
 

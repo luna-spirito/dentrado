@@ -17,6 +17,7 @@ impl IsRuntime for FadenoRuntime {
     type Group = LocValue;
     type Body = LocValue;
     type Data = LocValue;
+    type GearCache = LocValue;
 
     fn hash_data(
         data: &LocValue,
@@ -42,19 +43,16 @@ impl IsRuntime for FadenoRuntime {
         (gear.primary_msg_type, gear.primary_group.clone())
     }
 
-    fn make_cache(gear: &KolGear) -> Box<dyn std::any::Any> {
-        Box::new(gear.initial_cache.clone())
+    fn make_cache(gear: &KolGear) -> Self::GearCache {
+        gear.initial_cache.clone()
     }
 
     fn run_step(
         gear: &KolGear,
         core: &Core<Self>,
         group: Option<LocGroupId>,
-        cache: &mut dyn std::any::Any,
+        cache: &mut LocValue,
     ) -> LocValue {
-        let cache = cache
-            .downcast_mut::<LocValue>()
-            .expect("KolGear cache type mismatch: expected LocValue");
         fadeno_gear_step(core.module(), gear.step.clone(), group, core, cache)
     }
 }

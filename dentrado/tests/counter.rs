@@ -49,6 +49,7 @@ impl Query {
     }
 }
 
+#[derive(Debug)]
 struct IC<I, C> {
     input: I,
     cache: C,
@@ -142,6 +143,7 @@ impl IsRuntime for CounterRuntime {
     type Group = LocValue;
     type Body = LocValue;
     type Data = LocValue;
+    type GearCache = IC<Query, i64>;
 
     fn hash_data(
         data: &LocValue,
@@ -175,22 +177,19 @@ impl IsRuntime for CounterRuntime {
         }
     }
 
-    fn make_cache(_gear: &AnyGearId) -> Box<dyn std::any::Any> {
-        Box::new(IC {
+    fn make_cache(_gear: &AnyGearId) -> Self::GearCache {
+        IC {
             input: Query::new(),
             cache: 0i64,
-        })
+        }
     }
 
     fn run_step(
         gear: &AnyGearId,
         core: &Core<Self>,
         group: Option<LocGroupId>,
-        cache: &mut dyn std::any::Any,
+        cache: &mut Self::GearCache,
     ) -> i64 {
-        let cache = cache
-            .downcast_mut::<IC<Query, i64>>()
-            .expect("AnyGearId cache type mismatch: expected IC<Query, i64>");
         let Some(group) = group else {
             return cache.cache;
         };
