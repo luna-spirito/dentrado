@@ -124,29 +124,19 @@ fn invited_simple_e2e() {
     let alice_loc_uid = tc.mk_loc_user(alice_uid);
     let b0 = tc.add_seed_branch(invite_mt, alice_loc_uid);
 
+    let bob_user_id = tc.kol_user_id(bob_uid);
+    let carol_user_id = tc.kol_user_id(carol_uid);
     tc.post_events(
         vec![
-            wire_event(
-                alice,
-                0,
-                invite_mt,
-                LocValue::KolDataId(b0),
-                tc.kol_user_id(bob_uid),
-            ),
+            wire_event(alice, 0, invite_mt, LocValue::KolDataId(b0), bob_user_id),
             wire_event(
                 alice,
                 1,
                 invite_mt,
                 LocValue::KolDataId(b0),
-                tc.kol_user_id(carol_uid),
+                carol_user_id.clone(),
             ),
-            wire_event(
-                bob,
-                2,
-                invite_mt,
-                LocValue::KolDataId(b0),
-                tc.kol_user_id(carol_uid),
-            ),
+            wire_event(bob, 2, invite_mt, LocValue::KolDataId(b0), carol_user_id),
         ],
         1,
     );
@@ -207,13 +197,14 @@ fn doc_content_same_core_e2e() {
     let alice_loc_uid = tc.mk_loc_user(alice_uid);
     let b0 = tc.add_seed_branch(invite_mt, alice_loc_uid);
 
+    let bob_user_id = tc.kol_user_id(bob_uid);
     tc.post_events(
         vec![wire_event(
             alice,
             0,
             invite_mt,
             LocValue::KolDataId(b0),
-            tc.kol_user_id(bob_uid),
+            bob_user_id,
         )],
         1,
     );
@@ -327,13 +318,14 @@ fn doc_content_cross_core_e2e() {
     let doc_id = tc.find_cross_core_doc_id(invited_core, 2);
     eprintln!("found doc_id={doc_id} (invited → core {invited_core})");
 
+    let bob_user_id = tc.kol_user_id(bob_uid);
     tc.post_events(
         vec![wire_event(
             alice,
             0,
             invite_mt,
             LocValue::KolDataId(b0),
-            tc.kol_user_id(bob_uid),
+            bob_user_id,
         )],
         5,
     );

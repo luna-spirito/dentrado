@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::{collections::BTreeSet, hash::Hash};
 
 use crate::core::gear::IsRuntime;
-use crate::core::loc_ctx::LocCtx;
+use crate::core::loc_ctx::EventStore;
 use crate::types::AnyLocEventId;
 use crate::utils::sg_ord_map::{SgOrdMap, SgOrdSet};
 
@@ -28,7 +28,7 @@ where
         &self,
         key: &DepK,
         at: SGEventId,
-        ctx: &LocCtx<R>,
+        ctx: &dyn EventStore<R>,
     ) -> Option<DepV> {
         self.writes
             .get(key)
@@ -130,7 +130,7 @@ pub struct HandlerCtx<
     pub(crate) self_writes: &'a OrdMap<K, SgOrdMap<V>>,
     ext: RefCell<&'a mut OrdMap<Dep, ExtDep<DepK, DepV>>>,
     dep_resolver: &'a dyn Fn(Dep) -> Timeline<DepK, DepV>,
-    ctx: &'a LocCtx<R>,
+    ctx: &'a dyn EventStore<R>,
 }
 
 impl<Dep, DepK, DepV, R: IsRuntime, K, V> HandlerCtx<'_, Dep, DepK, DepV, R, K, V>
@@ -226,7 +226,7 @@ where
         handler: &F,
         event_resolver: &impl Fn(AnyLocEventId) -> (SGEventId, E),
         dep_resolver: &dyn Fn(Dep) -> Timeline<DepK, DepV>,
-        ctx: &LocCtx<R>,
+        ctx: &dyn EventStore<R>,
         delta: &DeltaList<AnyLocEventId>,
     ) where
         E: Clone,
@@ -283,7 +283,7 @@ where
         &self,
         k: &K,
         event_id: SGEventId,
-        ctx: &LocCtx<R>,
+        ctx: &dyn EventStore<R>,
     ) -> Option<&V> {
         self.writes
             .get(k)
@@ -301,7 +301,7 @@ where
     fn detect_dep_changes<R: IsRuntime>(
         &mut self,
         dep_resolver: &dyn Fn(Dep) -> Timeline<DepK, DepV>,
-        ctx: &LocCtx<R>,
+        ctx: &dyn EventStore<R>,
     ) -> BTreeSet<SGEventId> {
         use im::ordmap::DiffItem;
 
@@ -370,7 +370,7 @@ where
         changed_at: SGEventId,
         readers: &SgOrdSet,
         affected: &mut BTreeSet<SGEventId>,
-        ctx: &LocCtx<R>,
+        ctx: &dyn EventStore<R>,
     ) {
         match new_timeline.next_after(&changed_at, ctx) {
             Some(next_write) => {
@@ -402,7 +402,7 @@ where
         reads: &mut OrdMap<K, SgOrdSet>,
         k: K,
         event_id: SGEventId,
-        ctx: &LocCtx<R>,
+        ctx: &dyn EventStore<R>,
     ) {
         match reads.entry(k) {
             im::ordmap::Entry::Occupied(mut entry) => {
@@ -451,7 +451,7 @@ where
         k: &K,
         event_id: SGEventId,
         queue: &mut BTreeSet<SGEventId>,
-        ctx: &LocCtx<R>,
+        ctx: &dyn EventStore<R>,
     ) {
         if let Some(read_set) = reads.get(k) {
             let upper = writes
@@ -479,7 +479,7 @@ where
         handler: &F,
         event_resolver: &impl Fn(AnyLocEventId) -> (SGEventId, E),
         dep_resolver: &dyn Fn(Dep) -> Timeline<DepK, DepV>,
-        ctx: &LocCtx<R>,
+        ctx: &dyn EventStore<R>,
         queue: &mut BTreeSet<SGEventId>,
     ) where
         E: Clone,

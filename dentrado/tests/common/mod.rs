@@ -149,7 +149,7 @@ impl<R: IsRuntime> TestCluster<R> {
         events: Vec<WireEventBody<R::Group, R::Body>>,
         timestamp: u32,
     ) {
-        let builder = WireLocCtxBuilder::new(&self.loc_ctx);
+        let mut builder = WireLocCtxBuilder::new(&self.loc_ctx);
         let wire_events: Vec<_> = events
             .into_iter()
             .map(|e| builder.remap(e).expect("WireLocCtxBuilder: remap event"))
@@ -188,7 +188,7 @@ impl<R: IsRuntime> TestCluster<R> {
     }
 
     pub(crate) fn remap_gear(&self, gear: R::GearId) -> (R::GearId, WireLocCtx<R>) {
-        let builder = WireLocCtxBuilder::new(&self.loc_ctx);
+        let mut builder = WireLocCtxBuilder::new(&self.loc_ctx);
         let wire_gear = builder.remap(gear).expect("WireLocCtxBuilder: remap gear");
         let wire_ctx = builder.build();
         (wire_gear, wire_ctx)
@@ -245,11 +245,11 @@ impl WikiTestCluster {
         did
     }
 
-    pub(crate) fn mk_loc_user(&self, uid: UserId) -> LocUserId {
-        EventContext::mk_loc_user(&self.loc_ctx, uid)
+    pub(crate) fn mk_loc_user(&mut self, uid: UserId) -> LocUserId {
+        EventContext::mk_loc_user(&mut self.loc_ctx, uid)
     }
 
-    pub(crate) fn kol_user_id(&self, uid: UserId) -> LocValue {
+    pub(crate) fn kol_user_id(&mut self, uid: UserId) -> LocValue {
         LocValue::KolUserId(self.mk_loc_user(uid))
     }
 
@@ -330,8 +330,7 @@ impl WikiTestCluster {
             .expect("should find a suitable doc_id for cross-core routing")
     }
 
-    #[must_use]
-    pub(crate) fn register_group(&self, event_type: LocMsgTypeId, group: LocValue) {
+    pub(crate) fn register_group(&mut self, event_type: LocMsgTypeId, group: LocValue) {
         self.0.loc_ctx.mk_loc_group(event_type, group);
     }
 

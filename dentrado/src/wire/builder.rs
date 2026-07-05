@@ -1,8 +1,8 @@
-use std::{cell::RefCell, collections::HashMap};
+use std::collections::HashMap;
 
 use crate::{
     core::{gear::IsRuntime, loc_ctx::LocCtx},
-    types::{LocDataId, LocSenderId, LocUserId, Localizable, SenderPk, UserId},
+    types::{LocDataId, LocSenderId, LocUserId, Localizable, Remapper, SenderPk, UserId},
     wire::format::WireLocCtx,
 };
 
@@ -25,12 +25,10 @@ impl std::fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
-pub struct WireLocCtxBuilder<'a, R: IsRuntime> {
-    ctx: &'a LocCtx<R>,
-    inner: RefCell<BuilderInner<R>>,
-}
+pub struct WireLocCtxBuilder<'a, R: IsRuntime>(BuilderInner<'a, R>);
 
-struct BuilderInner<R: IsRuntime> {
+pub struct BuilderInner<'a, R: IsRuntime> {
+    ctx: &'a LocCtx<R>,
     users: Vec<UserId>,
     senders: Vec<(SenderPk, u32)>,
     objects: Vec<(crate::types::DataId, R::Data)>,
@@ -43,41 +41,34 @@ struct BuilderInner<R: IsRuntime> {
 impl<'a, R: IsRuntime> WireLocCtxBuilder<'a, R> {
     #[must_use]
     pub fn new(ctx: &'a LocCtx<R>) -> Self {
-        Self {
+        WireLocCtxBuilder(BuilderInner {
             ctx,
-            inner: RefCell::new(BuilderInner {
-                users: Vec::new(),
-                senders: Vec::new(),
-                objects: Vec::new(),
-                user_to_wire: HashMap::new(),
-                sender_to_wire: HashMap::new(),
-                data_to_wire: HashMap::new(),
-            }),
-        }
+            users: Vec::new(),
+            senders: Vec::new(),
+            objects: Vec::new(),
+            user_to_wire: HashMap::new(),
+            sender_to_wire: HashMap::new(),
+            data_to_wire: HashMap::new(),
+        })
     }
-
-    pub fn remap<L: Localizable + Clone>(&self, obj: L) -> Result<L, BuildError> {
-        obj.localize(
-            &mut |lid| self.remap_user(lid),
-            &mut |sid| self.remap_sender(sid),
-            &mut |did| self.remap_data(did),
-        )
+    #[must_use]
+    pub fn remap<L: Localizable>(&mut self, l: L) -> Result<L, BuildError> {
+        l.localize(&mut self.0)
     }
-
     #[must_use]
     pub fn build(self) -> WireLocCtx<R> {
-        let inner = self.inner.into_inner();
         WireLocCtx {
-            users: inner.users,
-            senders: inner.senders,
-            data: inner.objects,
+            users: self.0.users,
+            senders: self.0.senders,
+            data: self.0.objects,
         }
     }
+}
 
-    fn remap_user(&self, lid: LocUserId) -> Result<LocUserId, BuildError> {
-        let mut inner = self.inner.borrow_mut();
-
-        if let Some(&wire_idx) = inner.user_to_wire.get(&lid.0) {
+impl<R: IsRuntime> Remapper for BuilderInner<'_, R> {
+    type Err = BuildError;
+    fn remap_user(&mut self, lid: LocUserId) -> Result<LocUserId, BuildError> {
+        if let Some(&wire_idx) = self.user_to_wire.get(&lid.0) {
             return Ok(LocUserId(u64::from(wire_idx)));
         }
 
@@ -86,19 +77,16 @@ impl<'a, R: IsRuntime> WireLocCtxBuilder<'a, R> {
             .user_by_local(lid)
             .ok_or(BuildError::UserNotFound { lid })?;
 
-        let wire_idx = inner.users.len() as u32;
-        inner.users.push(uid);
+        let wire_idx = self.users.len() as u32;
+        self.users.push(uid);
 
-        inner.user_to_wire.insert(lid.0, wire_idx);
+        self.user_to_wire.insert(lid.0, wire_idx);
         Ok(LocUserId(u64::from(wire_idx)))
     }
 
-    fn remap_data(&self, did: LocDataId) -> Result<LocDataId, BuildError> {
-        {
-            let inner = self.inner.borrow();
-            if let Some(&wire_idx) = inner.data_to_wire.get(&did.0) {
-                return Ok(LocDataId(u64::from(wire_idx)));
-            }
+    fn remap_data(&mut self, did: LocDataId) -> Result<LocDataId, BuildError> {
+        if let Some(&wire_idx) = self.data_to_wire.get(&did.0) {
+            return Ok(LocDataId(u64::from(wire_idx)));
         }
 
         let (data_id, content) = self
@@ -106,25 +94,18 @@ impl<'a, R: IsRuntime> WireLocCtxBuilder<'a, R> {
             .get_data(did, Clone::clone)
             .ok_or(BuildError::DataNotFound { did })?;
 
-        let localized = self.remap(content)?;
+        let localized = content.localize(self)?;
 
-        let wire_idx = {
-            let mut inner = self.inner.borrow_mut();
-            let wire_idx = inner.objects.len() as u32;
-            inner.objects.push((data_id, localized));
-            inner.data_to_wire.insert(did.0, wire_idx);
-            wire_idx
-        };
+        let wire_idx = self.objects.len() as u32;
+        self.objects.push((data_id, localized));
+        self.data_to_wire.insert(did.0, wire_idx);
 
         Ok(LocDataId(u64::from(wire_idx)))
     }
 
-    fn remap_sender(&self, sid: crate::types::LocSenderId) -> Result<LocSenderId, BuildError> {
-        {
-            let inner = self.inner.borrow();
-            if let Some(&wire_idx) = inner.sender_to_wire.get(&sid.0) {
-                return Ok(LocSenderId(u64::from(wire_idx)));
-            }
+    fn remap_sender(&mut self, sid: crate::types::LocSenderId) -> Result<LocSenderId, BuildError> {
+        if let Some(&wire_idx) = self.sender_to_wire.get(&sid.0) {
+            return Ok(LocSenderId(u64::from(wire_idx)));
         }
 
         let lid = self
@@ -138,13 +119,9 @@ impl<'a, R: IsRuntime> WireLocCtxBuilder<'a, R> {
             .sender_pk(sid)
             .ok_or(BuildError::SenderNotFound { sid })?;
 
-        let wire_idx = {
-            let mut inner = self.inner.borrow_mut();
-            let wire_idx = inner.senders.len() as u32;
-            inner.senders.push((pk, user_wire_idx));
-            inner.sender_to_wire.insert(sid.0, wire_idx);
-            wire_idx
-        };
+        let wire_idx = self.senders.len() as u32;
+        self.senders.push((pk, user_wire_idx));
+        self.sender_to_wire.insert(sid.0, wire_idx);
 
         Ok(LocSenderId(u64::from(wire_idx)))
     }

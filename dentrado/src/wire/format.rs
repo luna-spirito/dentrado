@@ -1,8 +1,6 @@
 use crate::{
     core::gear::IsRuntime,
-    types::{
-        DataId, LocDataId, LocMsgTypeId, LocSenderId, LocUserId, Localizable, SenderPk, UserId,
-    },
+    types::{DataId, LocMsgTypeId, LocSenderId, Localizable, Remapper, SenderPk, UserId},
 };
 
 #[derive(Clone, Debug)]
@@ -19,22 +17,10 @@ pub struct WireEventBody<K, B> {
 }
 
 impl<K: Localizable + Clone, B: Localizable + Clone> Localizable for WireEventBody<K, B> {
-    fn localize<U, S, D, E>(
-        self,
-        remap_user: &mut U,
-        remap_sender: &mut S,
-        remap_data: &mut D,
-    ) -> Result<Self, E>
-    where
-        U: FnMut(LocUserId) -> Result<LocUserId, E>,
-        S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
-        D: FnMut(LocDataId) -> Result<LocDataId, E>,
-    {
-        let new_sender = remap_sender(self.sender)?;
-        let new_group =
-            self.group
-                .localize(&mut *remap_user, &mut *remap_sender, &mut *remap_data)?;
-        let new_body = self.body.localize(remap_user, remap_sender, remap_data)?;
+    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+        let new_sender = r.remap_sender(self.sender)?;
+        let new_group = self.group.localize(r)?;
+        let new_body = self.body.localize(r)?;
 
         Ok(WireEventBody {
             sender: new_sender,
@@ -128,7 +114,7 @@ pub enum MergeError {
     },
     DataForwardReference {
         idx: u64,
-        max_allowed: u64,
+        allowed_before: u64,
     },
     DataVerify(crate::types::DataVerifyError),
     Route(crate::types::GroupRouteError),
@@ -155,7 +141,10 @@ impl std::fmt::Display for MergeError {
             Self::DataOutOfBounds { idx, len } => {
                 write!(f, "LocDataId({idx}) out of bounds (objects.len={len})")
             }
-            Self::DataForwardReference { idx, max_allowed } => write!(
+            Self::DataForwardReference {
+                idx,
+                allowed_before: max_allowed,
+            } => write!(
                 f,
                 "data[{idx}] forward-references data[{idx}] or later (max_allowed={max_allowed})"
             ),

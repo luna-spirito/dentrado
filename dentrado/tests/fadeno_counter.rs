@@ -86,22 +86,12 @@ fn wiki_engine() {
     let b0 = tc.add_seed_branch(invite_mt, alice_loc_uid);
     let gear_0 = tc.build_gear(invites_count.clone(), vec![LocValue::KolDataId(b0)]);
 
+    let bob_user_id = tc.kol_user_id(bob_uid);
+    let carol_user_id = tc.kol_user_id(carol_uid);
     tc.post_events(
         vec![
-            wire_event(
-                alice,
-                0,
-                invite_mt,
-                LocValue::KolDataId(b0),
-                tc.kol_user_id(bob_uid),
-            ),
-            wire_event(
-                alice,
-                1,
-                invite_mt,
-                LocValue::KolDataId(b0),
-                tc.kol_user_id(carol_uid),
-            ),
+            wire_event(alice, 0, invite_mt, LocValue::KolDataId(b0), bob_user_id),
+            wire_event(alice, 1, invite_mt, LocValue::KolDataId(b0), carol_user_id),
         ],
         1,
     );
@@ -113,13 +103,14 @@ fn wiki_engine() {
     };
     assert_eq!(count, 2);
 
+    let dave_user_id = tc.kol_user_id(dave_uid);
     tc.post_events(
         vec![wire_event(
             alice,
             2,
             invite_mt,
             LocValue::KolDataId(b0),
-            tc.kol_user_id(dave_uid),
+            dave_user_id,
         )],
         2,
     );
@@ -134,13 +125,14 @@ fn wiki_engine() {
     let b1 = tc.add_seed_branch(invite_mt, alice_loc_uid);
     let gear_1 = tc.build_gear(invites_count, vec![LocValue::KolDataId(b1)]);
 
+    let dave_user_id = tc.kol_user_id(dave_uid);
     tc.post_events(
         vec![wire_event(
             alice,
             3,
             invite_mt,
             LocValue::KolDataId(b1),
-            tc.kol_user_id(dave_uid),
+            dave_user_id,
         )],
         4,
     );

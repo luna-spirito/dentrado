@@ -44,17 +44,7 @@ pub(crate) enum Group {
 const PHANTOM_MSG: LocMsgTypeId = LocMsgTypeId(0);
 
 impl Localizable for GearId {
-    fn localize<U, S, D, E>(
-        self,
-        _remap_user: &mut U,
-        _remap_sender: &mut S,
-        _remap_data: &mut D,
-    ) -> Result<Self, E>
-    where
-        U: FnMut(dentrado::types::LocUserId) -> Result<dentrado::types::LocUserId, E>,
-        S: FnMut(dentrado::types::LocSenderId) -> Result<dentrado::types::LocSenderId, E>,
-        D: FnMut(dentrado::types::LocDataId) -> Result<dentrado::types::LocDataId, E>,
-    {
+    fn localize<Rm: dentrado::types::Remapper>(self, _remapper: &mut Rm) -> Result<Self, Rm::Err> {
         use GearId::*;
         match self {
             Repo { .. } => Ok(self),
@@ -64,17 +54,7 @@ impl Localizable for GearId {
 }
 
 impl Localizable for GearOut {
-    fn localize<U, S, D, E>(
-        self,
-        _remap_user: &mut U,
-        _remap_sender: &mut S,
-        _remap_data: &mut D,
-    ) -> Result<Self, E>
-    where
-        U: FnMut(dentrado::types::LocUserId) -> Result<dentrado::types::LocUserId, E>,
-        S: FnMut(dentrado::types::LocSenderId) -> Result<dentrado::types::LocSenderId, E>,
-        D: FnMut(dentrado::types::LocDataId) -> Result<dentrado::types::LocDataId, E>,
-    {
+    fn localize<Rm: dentrado::types::Remapper>(self, _remapper: &mut Rm) -> Result<Self, Rm::Err> {
         use GearOut::*;
         match self {
             RepoOut { .. } => Ok(self),
@@ -84,17 +64,7 @@ impl Localizable for GearOut {
 }
 
 impl Localizable for Group {
-    fn localize<U, S, D, E>(
-        self,
-        _remap_user: &mut U,
-        _remap_sender: &mut S,
-        _remap_data: &mut D,
-    ) -> Result<Self, E>
-    where
-        U: FnMut(dentrado::types::LocUserId) -> Result<dentrado::types::LocUserId, E>,
-        S: FnMut(dentrado::types::LocSenderId) -> Result<dentrado::types::LocSenderId, E>,
-        D: FnMut(dentrado::types::LocDataId) -> Result<dentrado::types::LocDataId, E>,
-    {
+    fn localize<Rm: dentrado::types::Remapper>(self, _remapper: &mut Rm) -> Result<Self, Rm::Err> {
         use Group::*;
         match self {
             Phantom(_) => Ok(self),

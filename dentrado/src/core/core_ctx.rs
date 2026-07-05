@@ -11,7 +11,7 @@ use crate::{
         db,
         doorbell::DoorbellHandle,
         gear::IsRuntime,
-        loc_ctx::{EventContext, LocCtx, StoreResultSuccess, StoredEvent},
+        loc_ctx::{EventContext, EventStore, LocCtx, StoreResultSuccess, StoredEvent},
     },
     types::{
         AnyLocEventId, DataId, DataVerifyError, GlobalCoreId, LocDataId, LocGroupId, LocMsgTypeId,
@@ -86,11 +86,12 @@ pub(crate) enum InterCoreMsg<R: IsRuntime> {
 }
 
 #[derive(Debug)]
-struct CoreInner<R: IsRuntime> {
+struct CoreLocCtx<R: IsRuntime> {
     gear_cache: HashMap<R::GearId, R::GearCache>,
     gear_in_flight: HashSet<R::GearId>,
     secondary_cache: HashMap<R::GearId, R::GearOut>,
     events_by_group: HashMap<LocGroupId, EventGroup>,
+    loc_ctx: LocCtx<R>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -116,8 +117,7 @@ pub struct Core<R: IsRuntime> {
         Option<(mpsc::Sender<InterNodeMsg<R>>, DoorbellHandle)>,
     )>,
 
-    loc_ctx: LocCtx<R>,
-    inner: RefCell<CoreInner<R>>,
+    inner: RefCell<CoreLocCtx<R>>,
 }
 
 impl<R: IsRuntime> Core<R> {
@@ -135,21 +135,21 @@ impl<R: IsRuntime> Core<R> {
             Option<(mpsc::Sender<InterNodeMsg<R>>, DoorbellHandle)>,
         )>,
     ) -> Self {
-        Self {
+        Core {
             num_cores,
             core_id,
             node_id,
-            loc_ctx: LocCtx::new(),
             module,
             intercore_tx,
             reroute_tx,
             doorbells,
             inter_node_peers,
-            inner: RefCell::new(CoreInner {
+            inner: RefCell::new(CoreLocCtx {
                 gear_cache: HashMap::new(),
                 gear_in_flight: HashSet::new(),
                 secondary_cache: HashMap::new(),
                 events_by_group: HashMap::new(),
+                loc_ctx: LocCtx::new(),
             }),
         }
     }
@@ -174,13 +174,23 @@ impl<R: IsRuntime> Core<R> {
         self.num_cores
     }
 
+    #[must_use]
+    /// Panics if `Fn` accesses `Core`.
+    pub fn get_stored_event<F>(
+        &self,
+        eid: AnyLocEventId,
+        f: impl Fn(&StoredEvent<R::Body>) -> F,
+    ) -> Option<F> {
+        self.inner.borrow().loc_ctx.get_stored_event(eid, f)
+    }
+
     pub(crate) fn run_any_gear(
         &self,
         gear: R::GearId,
         msg_type: LocMsgTypeId,
         group: &R::Group,
     ) -> R::GearOut {
-        let group = self.loc_ctx().find_group(msg_type, group);
+        let group = self.inner.borrow().loc_ctx.find_group(msg_type, group);
 
         {
             let mut inner = self.inner.borrow_mut();
@@ -214,11 +224,14 @@ impl<R: IsRuntime> Core<R> {
 
     pub fn secondary_get(&self, gear: R::GearId) -> R::GearOut {
         let (msg_type, group) = R::meta(&gear);
-        let builder = WireLocCtxBuilder::new(&self.loc_ctx);
-        let group_wire = builder
-            .remap(group.clone())
-            .expect("secondary_get: group remap");
-        let wire_ctx = builder.build();
+        let (group_wire, wire_ctx) = {
+            let inner = self.inner.borrow_mut();
+            let mut builder = WireLocCtxBuilder::new(&inner.loc_ctx);
+            let group_wire = builder
+                .remap(group.clone())
+                .expect("secondary_get: group remap");
+            (group_wire, builder.build())
+        };
         println!(
             "SECONDARY REQUEST TO {:?}, WHICH IS {:?}",
             group_wire,
@@ -231,11 +244,12 @@ impl<R: IsRuntime> Core<R> {
         if target_core == self.core_id {
             self.run_any_gear(gear.clone(), msg_type, &group)
         } else {
-            let cached = self.inner.borrow().secondary_cache.get(&gear).cloned();
+            let inner = self.inner.borrow_mut();
+            let cached = inner.secondary_cache.get(&gear).cloned();
             let output =
                 cached.unwrap_or_else(|| self.run_any_gear(gear.clone(), msg_type, &group));
 
-            let req_builder = WireLocCtxBuilder::new(&self.loc_ctx);
+            let mut req_builder = WireLocCtxBuilder::new(&inner.loc_ctx);
             let gear_wire = req_builder.remap(gear).expect("secondary_get: gear remap");
             let req_wire_ctx = Arc::new(req_builder.build());
             let _ = self.intercore_tx[target_core as usize].send(InterCoreMsg::SecondaryRequest {
@@ -260,16 +274,20 @@ impl<R: IsRuntime> Core<R> {
         seed_indices: &[u32],
         source_node: Option<NodeId>,
     ) -> Result<(), MergeError> {
-        let merger = WireLocCtxMerger::new(&wire_ctx, self);
-        for &idx in seed_indices {
-            let event = &events[idx as usize];
-            let gcid = global_core_ids[idx as usize];
-            merger.import_new_event(
-                event.clone(),
-                gcid,
-                timestamp,
-                source_node.unwrap_or(self.node_id),
-            )?;
+        let node_id = self.node_id;
+        {
+            let mut inner = self.inner.borrow_mut();
+            let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
+            for &idx in seed_indices {
+                let event = &events[idx as usize];
+                let gcid = global_core_ids[idx as usize];
+                merger.import_new_event(
+                    event.clone(),
+                    gcid,
+                    timestamp,
+                    source_node.unwrap_or(node_id),
+                )?;
+            }
         }
         if source_node.is_none() {
             // TODO: Don't pass wire_ctx, pass only the relevant subpart of it. I. e. update WireLocCtxMereger to regenerate
@@ -292,7 +310,8 @@ impl<R: IsRuntime> Core<R> {
         gear: R::GearId,
         wire_ctx: &WireLocCtx<R>,
     ) -> Result<R::GearOut, RunGearError> {
-        let merger = WireLocCtxMerger::new(wire_ctx, self);
+        let mut inner = self.inner.borrow_mut();
+        let mut merger = WireLocCtxMerger::new(wire_ctx, &mut *inner);
         let gear = merger.remap(gear).map_err(RunGearError::Merge)?;
         let (msg_type, localized_group) = R::meta(&gear);
         Ok(self.run_any_gear(gear, msg_type, &localized_group))
@@ -343,15 +362,19 @@ impl<R: IsRuntime> Core<R> {
                 wire_ctx,
                 from_core,
             } => {
-                let merger = WireLocCtxMerger::new(&wire_ctx, self);
-                let gear = merger
-                    .remap(gear)
-                    .expect("SecondaryRequest: failed to localize gear");
+                let gear = {
+                    let mut inner = self.inner.borrow_mut();
+                    let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
+                    merger
+                        .remap(gear)
+                        .expect("SecondaryRequest: failed to localize gear")
+                };
 
                 let (msg_type, group) = R::meta(&gear);
                 let output = self.run_any_gear(gear.clone(), msg_type, &group);
 
-                let builder = WireLocCtxBuilder::new(self.loc_ctx());
+                let inner = self.inner.borrow();
+                let mut builder = WireLocCtxBuilder::new(&inner.loc_ctx);
                 let gear_wire = builder
                     .remap(gear)
                     .expect("SecondaryRequest: failed to remap gear");
@@ -373,7 +396,8 @@ impl<R: IsRuntime> Core<R> {
                 output,
                 wire_ctx,
             } => {
-                let merger = WireLocCtxMerger::new(&wire_ctx, self);
+                let mut inner = self.inner.borrow_mut();
+                let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
                 let gear = merger
                     .remap(gear)
                     .expect("SecondaryResponse: failed to localize gear");
@@ -561,26 +585,46 @@ impl<R: IsRuntime> Core<R> {
     }
 }
 
-impl<R: IsRuntime> EventContext<R> for Core<R> {
-    fn mk_loc_user(&self, uid: UserId) -> LocUserId {
+impl<R: IsRuntime> EventStore<R> for Core<R> {
+    fn stored_event(&self, eid: AnyLocEventId) -> Option<StoredEvent<R::Body>> {
+        self.inner
+            .borrow()
+            .loc_ctx
+            .get_stored_event(eid, std::clone::Clone::clone)
+    }
+
+    fn sender_user(&self, sid: LocSenderId) -> Option<LocUserId> {
+        self.inner.borrow().loc_ctx.sender_user(sid)
+    }
+
+    fn sender_pk(&self, sid: LocSenderId) -> Option<SenderPk> {
+        self.inner.borrow().loc_ctx.sender_pk(sid)
+    }
+
+    fn data(&self, did: LocDataId) -> Option<(DataId, R::Data)> {
+        self.inner.borrow().loc_ctx.get_data(did, Clone::clone)
+    }
+}
+
+impl<R: IsRuntime> EventContext<R> for CoreLocCtx<R> {
+    fn mk_loc_user(&mut self, uid: UserId) -> LocUserId {
         self.loc_ctx.mk_loc_user(uid)
     }
 
-    fn mk_loc_sender(&self, pk: SenderPk, uid: Option<UserId>) -> LocSenderId {
+    fn mk_loc_sender(&mut self, pk: SenderPk, uid: Option<UserId>) -> LocSenderId {
         self.loc_ctx.mk_loc_sender(pk, uid)
     }
 
-    fn mk_loc_group(&self, msg_type: LocMsgTypeId, group: R::Group) -> LocGroupId {
+    fn mk_loc_group(&mut self, msg_type: LocMsgTypeId, group: R::Group) -> LocGroupId {
         self.loc_ctx.mk_loc_group(msg_type, group)
     }
 
-    fn store_event(&self, ev: StoredEvent<R::Body>) -> Option<StoreResultSuccess> {
+    fn store_event(&mut self, ev: StoredEvent<R::Body>) -> Option<StoreResultSuccess> {
         let group_id = ev.group;
 
         let res = self.loc_ctx.store_event(ev);
         if let Some(StoreResultSuccess { old, new }) = res {
-            let mut s = self.inner.borrow_mut();
-            let group = s.events_by_group.entry(group_id).or_default();
+            let group = self.events_by_group.entry(group_id).or_default();
             group.added.push(new);
             if let Some(old) = old {
                 group.removed.push(old);
@@ -589,11 +633,37 @@ impl<R: IsRuntime> EventContext<R> for Core<R> {
         res
     }
 
-    fn loc_ctx(&self) -> &LocCtx<R> {
-        &self.loc_ctx
+    fn mk_data(&mut self, data_id: DataId, content: R::Data) -> Result<LocDataId, DataVerifyError> {
+        self.loc_ctx.mk_data(data_id, content)
     }
 
-    fn mk_data(&self, data_id: DataId, content: R::Data) -> Result<LocDataId, DataVerifyError> {
-        self.loc_ctx.mk_data(data_id, content)
+    fn find_data_by_data_id(&self, data_id: &DataId) -> Option<LocDataId> {
+        self.loc_ctx.find_data_by_data_id(data_id)
+    }
+}
+
+impl<R: IsRuntime> EventContext<R> for Core<R> {
+    fn mk_loc_user(&mut self, uid: UserId) -> LocUserId {
+        self.inner.get_mut().mk_loc_user(uid)
+    }
+
+    fn mk_loc_sender(&mut self, pk: SenderPk, uid: Option<UserId>) -> LocSenderId {
+        self.inner.get_mut().mk_loc_sender(pk, uid)
+    }
+
+    fn mk_loc_group(&mut self, msg_type: LocMsgTypeId, group: R::Group) -> LocGroupId {
+        self.inner.get_mut().mk_loc_group(msg_type, group)
+    }
+
+    fn store_event(&mut self, event: StoredEvent<R::Body>) -> Option<StoreResultSuccess> {
+        self.inner.get_mut().store_event(event)
+    }
+
+    fn mk_data(&mut self, data_id: DataId, content: R::Data) -> Result<LocDataId, DataVerifyError> {
+        self.inner.get_mut().mk_data(data_id, content)
+    }
+
+    fn find_data_by_data_id(&self, data_id: &DataId) -> Option<LocDataId> {
+        self.inner.borrow().find_data_by_data_id(data_id)
     }
 }

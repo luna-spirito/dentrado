@@ -3,7 +3,7 @@ use std::{cell::Cell, sync::Arc};
 use crate::{
     core::{
         core_ctx::Core,
-        loc_ctx::{EventContext, LocCtx},
+        loc_ctx::{EventStore, LocCtx},
     },
     fadeno::{
         bridge::FadenoRuntime,
@@ -207,11 +207,7 @@ pub(crate) fn call_with_storage(
         constants,
         tags,
         imports,
-        stage: VmStage::Run {
-            ctx: storage,
-            impure_core: None,
-            impure_group: None,
-        },
+        stage: VmStage::RunLoc { ctx: storage },
         common: *common,
     };
     vm.call(&mut Vec::new(), func, args, None)
@@ -237,9 +233,8 @@ pub(crate) fn call_gear_step(
         constants: ctx.constants,
         tags: ctx.tags,
         imports: ctx.imports,
-        stage: VmStage::Run {
-            ctx: core.loc_ctx(),
-            impure_core: Some(core),
+        stage: VmStage::RunGear {
+            impure_core: core,
             impure_group: group,
         },
         common: *ctx.common,
@@ -251,9 +246,14 @@ enum VmStage<'a> {
     Init {
         kol_id_counter_next: &'a Cell<u64>,
     },
-    Run {
+    /// Gear-construction mode: a bare `&LocCtx` is on hand (no live `Core`).
+    RunLoc {
         ctx: &'a crate::core::loc_ctx::LocCtx<FadenoRuntime>,
-        impure_core: Option<&'a Core<FadenoRuntime>>,
+    },
+    /// Gear-step mode: reads go through the live `Core` (short `inner` borrows),
+    /// which is also what `secondary_get` / `query_events` need.
+    RunGear {
+        impure_core: &'a Core<FadenoRuntime>,
         impure_group: Option<LocGroupId>,
     },
 }
@@ -265,6 +265,23 @@ struct Vm<'a> {
     imports: &'a [LocValue],
     stage: VmStage<'a>,
     common: CommonTags,
+}
+
+impl<'a> Vm<'a> {
+    /// Read-only event/data/sender access, valid for the Vm's lifetime `'a`.
+    ///
+    /// The returned reference is decoupled from the `&self` borrow (it copies a
+    /// `&'a` out of the stage), so callers can use it while also passing
+    /// `&mut self` into closures — e.g. `stategraph_apply`'s `dep_resolver`,
+    /// which calls `self.call`, and whose `handler` does the same. A `&self`
+    /// borrow tied to `store()`'s receiver would conflict with those.
+    fn store(&self) -> &'a dyn EventStore<FadenoRuntime> {
+        match &self.stage {
+            VmStage::RunLoc { ctx } => *ctx,
+            VmStage::RunGear { impure_core, .. } => *impure_core,
+            VmStage::Init { .. } => panic!("EventStore access in Init context"),
+        }
+    }
 }
 
 impl Vm<'_> {
@@ -1092,21 +1109,12 @@ impl Vm<'_> {
                     self.tags
                         .name_to_tag(b"body")
                         .expect("body tag not found in tag registry") as usize;
-                let event_resolver_core = match self.stage {
-                    VmStage::Init { .. } => {
-                        return Err(VmError::TypeError {
-                            op: "stategraph_apply",
-                            expected: "gear step context",
-                            got: "init context".into(),
-                        });
-                    }
-                    VmStage::Run { ctx, .. } => ctx,
-                };
+                let event_resolver_core = self.store();
 
                 let event_resolver =
                     |lid: AnyLocEventId| -> (crate::utils::sg_ord_map::SGEventId, LocValue) {
                         let stored = event_resolver_core
-                            .get_stored_event(lid, std::clone::Clone::clone)
+                            .stored_event(lid)
                             .expect("event_resolver: event not found in core");
 
                         let sg_event_id = crate::utils::sg_ord_map::SGEventId::new(
@@ -1217,14 +1225,11 @@ impl Vm<'_> {
                             got: "init context".into(),
                         });
                     }
-                    VmStage::Run {
-                        impure_core: Some(core),
+                    VmStage::RunGear {
+                        impure_core,
                         impure_group,
-                        ..
-                    } => (*core, *impure_group),
-                    VmStage::Run {
-                        impure_core: None, ..
-                    } => {
+                    } => (*impure_core, *impure_group),
+                    VmStage::RunLoc { .. } => {
                         return Err(VmError::TypeError {
                             op: "query_delta",
                             expected: "gear step context with core",
@@ -1278,15 +1283,8 @@ impl Vm<'_> {
                         });
                     }
                 };
-                let ctx = match self.stage {
-                    VmStage::Run { ctx, .. } => ctx,
-                    _ => {
-                        return Err(VmError::OutsideGearStepContext {
-                            op: "sender-to>user",
-                        });
-                    }
-                };
-                let luid = ctx.sender_user(sid).unwrap_or_else(|| {
+                let store = self.store();
+                let luid = store.sender_user(sid).unwrap_or_else(|| {
                     panic!("sender-to>user: no user mapping for sender {sid:?}")
                 });
                 Ok(LocValue::KolUserId(luid))
@@ -1383,17 +1381,11 @@ impl Vm<'_> {
                         });
                     }
                 };
-                let ctx = match self.stage {
-                    VmStage::Run { ctx, .. } => ctx,
-                    _ => {
-                        return Err(VmError::OutsideGearStepContext {
-                            op: "resolve_event",
-                        });
-                    }
-                };
-                let (sender, body) = ctx
-                    .get_stored_event(event_id, |s| (s.sender, s.body.clone()))
+                let store = self.store();
+                let ev = store
+                    .stored_event(event_id)
                     .expect("resolve_event: event not found in core");
+                let (sender, body) = (ev.sender, ev.body);
 
                 Ok(LocValue::Record {
                     tag_set: Arc::new(vec![self.common.event_rec_tag_set]),
@@ -1418,13 +1410,10 @@ impl Vm<'_> {
                         });
                     }
                 };
-                let ctx = match self.stage {
-                    VmStage::Run { ctx, .. } => ctx,
-                    _ => {
-                        return Err(VmError::OutsideGearStepContext { op: "resolve_data" });
-                    }
-                };
-                ctx.get_data(did, |(_data_id, content)| content.clone())
+                let store = self.store();
+                store
+                    .data(did)
+                    .map(|(_, content)| content)
                     .ok_or(VmError::WireError {
                         op: "resolve_data",
                         detail: format!("data not found for LocDataId({})", did.0),
@@ -1523,24 +1512,16 @@ impl Vm<'_> {
                         });
                     }
                 };
-                let ctx = match &self.stage {
-                    VmStage::Run {
-                        ctx,
-                        impure_core: Some(_),
-                        ..
-                    } => ctx,
-                    _ => {
-                        return Err(VmError::OutsideGearStepContext {
-                            op: "anchor_agg_apply",
-                        });
-                    }
-                };
-                let loc_sender_eid = ctx
-                    .get_stored_event(event_id, |s| {
-                        crate::types::LocSenderEventId(s.sender, s.global_core_id, s.tx_id)
-                    })
+                let store = self.store();
+                let loc_sender_eid = store
+                    .stored_event(event_id)
+                    .map(|s| crate::types::LocSenderEventId(s.sender, s.global_core_id, s.tx_id))
                     .expect("anchor_agg_apply: event not found in ctx");
-                Ok(LocValue::KolAnchorAgg(agg.apply(loc_sender_eid, upd, ctx)))
+                Ok(LocValue::KolAnchorAgg(agg.apply(
+                    loc_sender_eid,
+                    upd,
+                    store,
+                )))
             }
 
             BuiltinT::KolMkTextAgg => Ok(LocValue::KolTextAgg(crate::utils::text::TextAgg::new())),
@@ -1597,22 +1578,10 @@ impl Vm<'_> {
                         });
                     }
                 };
-                let ctx = match &self.stage {
-                    VmStage::Run {
-                        ctx,
-                        impure_core: Some(_),
-                        ..
-                    } => ctx,
-                    _ => {
-                        return Err(VmError::OutsideGearStepContext {
-                            op: "text_agg_apply",
-                        });
-                    }
-                };
-                let loc_sender_eid = ctx
-                    .get_stored_event(event_id, |s| {
-                        LocSenderEventId(s.sender, s.global_core_id, s.tx_id)
-                    })
+                let store = self.store();
+                let loc_sender_eid = store
+                    .stored_event(event_id)
+                    .map(|s| LocSenderEventId(s.sender, s.global_core_id, s.tx_id))
                     .expect("text_agg_apply: event not found");
                 Ok(LocValue::KolTextAgg(agg.apply(loc_sender_eid, &upd)))
             }
@@ -1677,10 +1646,7 @@ impl Vm<'_> {
                     }
                 };
                 let core = match &self.stage {
-                    VmStage::Run {
-                        impure_core: Some(core),
-                        ..
-                    } => *core,
+                    VmStage::RunGear { impure_core, .. } => *impure_core,
                     _ => {
                         return Err(VmError::OutsideGearStepContext {
                             op: "secondary_get",
@@ -1794,7 +1760,7 @@ impl Vm<'_> {
                 kol_id_counter_next.set(id + 1);
                 Ok(id)
             }
-            VmStage::Run { .. } => Err(VmError::TypeError {
+            VmStage::RunLoc { .. } | VmStage::RunGear { .. } => Err(VmError::TypeError {
                 op: "kol_id",
                 expected: "init context",
                 got: "run context".into(),

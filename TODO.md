@@ -62,3 +62,5 @@ bridge.rs:
 * And get rid of reply channel? A bad practice I feel.
 * Deduplicate post_events (core<~>db)
 * self-doorbell is funny. but maybe not.
+
+* CRITICAL: decide what to do with NodeId and how to make u32 enough. Is this possible even?

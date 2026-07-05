@@ -199,7 +199,7 @@ impl std::error::Error for GroupRouteError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DataId {
-    pub timestamp: u32,
+    pub timestamp: u32, // To ensure on-drive ordering instead of random writes
     pub hash: [u8; 32],
 }
 
@@ -339,33 +339,37 @@ const _: () = assert!(size_of::<MetaGroupHeader>() == 12);
 #[allow(dead_code)]
 pub(crate) const SEGMENT_SIZE_BYTES: usize = 256 * 1024 * 1024;
 
+pub trait Remapper {
+    type Err;
+    fn remap_user(&mut self, uid: LocUserId) -> Result<LocUserId, Self::Err>;
+    fn remap_sender(&mut self, sid: LocSenderId) -> Result<LocSenderId, Self::Err>;
+    fn remap_data(&mut self, did: LocDataId) -> Result<LocDataId, Self::Err>;
+}
+
 pub trait Localizable: Sized {
-    fn localize<U, S, D, E>(
-        self,
-        remap_user: &mut U,
-        remap_sender: &mut S,
-        remap_data: &mut D,
-    ) -> Result<Self, E>
-    where
-        U: FnMut(LocUserId) -> Result<LocUserId, E>,
-        S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
-        D: FnMut(LocDataId) -> Result<LocDataId, E>;
+    fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err>;
+}
+
+impl Localizable for LocUserId {
+    fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
+        remapper.remap_user(self)
+    }
+}
+impl Localizable for LocSenderId {
+    fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
+        remapper.remap_sender(self)
+    }
+}
+impl Localizable for LocDataId {
+    fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
+        remapper.remap_data(self)
+    }
 }
 
 macro_rules! impl_localizable_trivial {
     ($t:ty) => {
         impl Localizable for $t {
-            fn localize<U, S, D, E>(
-                self,
-                _remap_user: &mut U,
-                _remap_sender: &mut S,
-                _remap_data: &mut D,
-            ) -> Result<Self, E>
-            where
-                U: FnMut(LocUserId) -> Result<LocUserId, E>,
-                S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
-                D: FnMut(LocDataId) -> Result<LocDataId, E>,
-            {
+            fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
                 Ok(self)
             }
         }
@@ -377,22 +381,9 @@ impl_localizable_trivial!(bool);
 impl_localizable_trivial!(());
 
 impl<T: Localizable> Localizable for Box<T> {
-    fn localize<U, S, D, E>(
-        self,
-        remap_user: &mut U,
-        remap_sender: &mut S,
-        remap_data: &mut D,
-    ) -> Result<Self, E>
-    where
-        U: FnMut(LocUserId) -> Result<LocUserId, E>,
-        S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
-        D: FnMut(LocDataId) -> Result<LocDataId, E>,
-    {
+    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
         let (inner, b) = Box::take(self);
-        Ok(Box::write(
-            b,
-            inner.localize(remap_user, remap_sender, remap_data)?,
-        ))
+        Ok(Box::write(b, inner.localize(r)?))
     }
 }
 

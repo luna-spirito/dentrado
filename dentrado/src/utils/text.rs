@@ -4,8 +4,10 @@ use im::HashMap as ImHashMap;
 use similar::{Algorithm, DiffOp, capture_diff_slices};
 use std::collections::BTreeSet;
 
+#[cfg(test)]
+use crate::core::loc_ctx::LocCtx;
 use crate::{
-    core::{gear::IsRuntime, loc_ctx::LocCtx},
+    core::{gear::IsRuntime, loc_ctx::EventStore},
     types::{GlobalCoreId, LocSenderEventId, LocSenderId},
 };
 
@@ -106,7 +108,7 @@ impl ChildEntry {
         Self { child_id, offset }
     }
 
-    fn cmp_rga<R: IsRuntime>(&self, other: &Self, ctx: &LocCtx<R>) -> std::cmp::Ordering {
+    fn cmp_rga<R: IsRuntime>(&self, other: &Self, ctx: &dyn EventStore<R>) -> std::cmp::Ordering {
         let LocSenderEventId(s_sender, s_core, s_tx) = self.child_id.0;
         let LocSenderEventId(o_sender, o_core, o_tx) = other.child_id.0;
         self.offset
@@ -159,7 +161,7 @@ impl AnchorAgg {
         mut self,
         event_id: LocSenderEventId,
         upd: &TextUpd,
-        ctx: &LocCtx<R>,
+        ctx: &dyn EventStore<R>,
     ) -> Self {
         for (i, pos) in upd.new_anchors.iter().enumerate() {
             let id = AnchorId(event_id, i as u32);

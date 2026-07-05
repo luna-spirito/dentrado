@@ -3,7 +3,7 @@ use dentrado::{
         core_ctx::Core,
         db::{Db, DbConfig, Doorbell},
         gear::IsRuntime,
-        loc_ctx::EventContext,
+        loc_ctx::EventStore,
     },
     fadeno::{hash_loc_value, types::LocValue},
     types::*,
@@ -65,49 +65,28 @@ impl<I: Clone, C: Clone> Clone for IC<I, C> {
 }
 
 impl Localizable for AttachGroup {
-    fn localize<U, S, D, E>(
+    fn localize<Rm: ::dentrado::types::Remapper>(
         self,
-        _remap_user: &mut U,
-        _remap_sender: &mut S,
-        _remap_data: &mut D,
-    ) -> Result<Self, E>
-    where
-        U: FnMut(LocUserId) -> Result<LocUserId, E>,
-        S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
-        D: FnMut(LocDataId) -> Result<LocDataId, E>,
-    {
+        _remapper: &mut Rm,
+    ) -> Result<Self, Rm::Err> {
         Ok(self)
     }
 }
 
 impl Localizable for AttachBody {
-    fn localize<U, S, D, E>(
+    fn localize<Rm: ::dentrado::types::Remapper>(
         self,
-        _remap_user: &mut U,
-        _remap_sender: &mut S,
-        _remap_data: &mut D,
-    ) -> Result<Self, E>
-    where
-        U: FnMut(LocUserId) -> Result<LocUserId, E>,
-        S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
-        D: FnMut(LocDataId) -> Result<LocDataId, E>,
-    {
+        _remapper: &mut Rm,
+    ) -> Result<Self, Rm::Err> {
         Ok(self)
     }
 }
 
 impl Localizable for Branch {
-    fn localize<U, S, D, E>(
+    fn localize<Rm: ::dentrado::types::Remapper>(
         self,
-        _remap_user: &mut U,
-        _remap_sender: &mut S,
-        _remap_data: &mut D,
-    ) -> Result<Self, E>
-    where
-        U: FnMut(LocUserId) -> Result<LocUserId, E>,
-        S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
-        D: FnMut(LocDataId) -> Result<LocDataId, E>,
-    {
+        _remapper: &mut Rm,
+    ) -> Result<Self, Rm::Err> {
         Ok(self)
     }
 }
@@ -118,17 +97,10 @@ enum AnyGearId {
 }
 
 impl Localizable for AnyGearId {
-    fn localize<U, S, D, E>(
+    fn localize<Rm: ::dentrado::types::Remapper>(
         self,
-        _remap_user: &mut U,
-        _remap_sender: &mut S,
-        _remap_data: &mut D,
-    ) -> Result<Self, E>
-    where
-        U: FnMut(LocUserId) -> Result<LocUserId, E>,
-        S: FnMut(LocSenderId) -> Result<LocSenderId, E>,
-        D: FnMut(LocDataId) -> Result<LocDataId, E>,
-    {
+        _remapper: &mut Rm,
+    ) -> Result<Self, Rm::Err> {
         Ok(self)
     }
 }
@@ -202,8 +174,8 @@ impl IsRuntime for CounterRuntime {
         };
         for eid in &added_ids {
             let body = core
-                .loc_ctx()
-                .get_stored_event(*eid, |e| e.body.clone())
+                .stored_event(*eid)
+                .map(|e| e.body)
                 .expect("counter gear: event not found");
             if let LocValue::Num(delta) = &body {
                 cache.cache += delta;
@@ -211,8 +183,8 @@ impl IsRuntime for CounterRuntime {
         }
         for eid in &removed_ids {
             let body = core
-                .loc_ctx()
-                .get_stored_event(*eid, |e| e.body.clone())
+                .stored_event(*eid)
+                .map(|e| e.body)
                 .expect("counter gear: removed event not found");
             if let LocValue::Num(delta) = &body {
                 cache.cache -= delta;
