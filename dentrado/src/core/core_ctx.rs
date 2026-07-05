@@ -1,10 +1,14 @@
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
+    hash::Hash,
     num::NonZero,
+    rc::Rc,
     sync::{Arc, mpsc},
 };
+
+use synchrony::unsync::watch;
 
 use crate::{
     core::{
@@ -92,12 +96,111 @@ struct CoreLocCtx<R: IsRuntime> {
     secondary_cache: HashMap<R::GearId, R::GearOut>,
     events_by_group: HashMap<LocGroupId, EventGroup>,
     loc_ctx: LocCtx<R>,
+    // --- subscription state ---
+    /// Gears with active external interest (dependents / remote cores /
+    /// direct subscribers). Entry present ⟺ `has_interest()`.
+    gear_subscriptions: HashMap<R::GearId, GearSub<R>>,
+    /// Limbo: gears with no current interest, kept hot until LRU eviction.
+    unref_gear: LruCache<R::GearId, GearSub<R>>,
+    /// Reverse index: which gears care about a given event input.
+    event_subscriptions: HashMap<LocGroupId, HashSet<R::GearId>>,
+    /// Forward index: a gear's event inputs (for O(deps) cleanup on evict).
+    event_deps: HashMap<R::GearId, HashSet<LocGroupId>>,
+    /// `SubId` → gear owning that direct subscription (for O(1) teardown).
+    subscriptions_by_id: HashMap<SubId, R::GearId>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventGroup {
     pub(crate) added: Vec<AnyLocEventId>,
     pub(crate) removed: Vec<AnyLocEventId>,
+}
+
+/// Soft cap on the number of gears kept hot in limbo. Beyond this, the
+/// least-recently-demoted gear is evicted (its subscription is torn down and
+/// its dependencies may cascade-evict).
+const LIMBO_CAPACITY: usize = 64;
+
+/// Identifier for a single direct (worker-side) subscription. Unique per core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SubId(u64);
+
+/// Per-gear subscription state. Lives in `gear_subscriptions` while the gear has
+/// any external interest (dependents, remote cores, or direct subscribers), and
+/// is moved to the `unref_gear` limbo when interest drops to zero. While in limbo
+/// the gear **keeps** running on events (stays hot) — only LRU eviction tears
+/// its subscription down (see `evict_gear`).
+#[derive(Debug)]
+pub(crate) struct GearSub<R: IsRuntime> {
+    pub(crate) output: R::GearOut,
+    /// Gears this one depends on (discovered via `secondary_get`).
+    pub(crate) dep_set: HashSet<R::GearId>,
+    /// Gears that depend on this one (forward gear-dep index).
+    pub(crate) local_dependents: HashSet<R::GearId>,
+    /// Remote cores subscribed to this gear's output.
+    pub(crate) remote_subscribers: HashSet<u32>,
+    /// Direct worker-side subscribers, keyed by `SubId`.
+    pub(crate) direct_subscribers: HashMap<SubId, watch::Sender<R::GearOut>>,
+}
+
+impl<R: IsRuntime> GearSub<R> {
+    /// Whether anything still cares about this gear's output.
+    fn has_interest(&self) -> bool {
+        !self.local_dependents.is_empty()
+            || !self.remote_subscribers.is_empty()
+            || !self.direct_subscribers.is_empty()
+    }
+}
+
+/// Minimal LRU: insertion order = recency (front = oldest). Used for the limbo
+/// cache; capacity is enforced by the caller draining `pop_lru` after insert.
+#[derive(Debug)]
+struct LruCache<K: Hash + Eq + Clone, V> {
+    order: VecDeque<K>,
+    entries: HashMap<K, V>,
+    capacity: usize,
+}
+
+impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+            capacity,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        if self.entries.contains_key(&key) {
+            self.order.retain(|k| k != &key);
+        }
+        self.entries.insert(key.clone(), value);
+        self.order.push_back(key);
+    }
+
+    fn remove(&mut self, key: &K) -> Option<V> {
+        let v = self.entries.remove(key)?;
+        self.order.retain(|k| k != key);
+        Some(v)
+    }
+
+    /// Pop the least-recently-inserted entry.
+    fn pop_lru(&mut self) -> Option<(K, V)> {
+        loop {
+            let key = self.order.pop_front()?;
+            if let Some(v) = self.entries.remove(&key) {
+                return Some((key, v));
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -150,6 +253,11 @@ impl<R: IsRuntime> Core<R> {
                 secondary_cache: HashMap::new(),
                 events_by_group: HashMap::new(),
                 loc_ctx: LocCtx::new(),
+                gear_subscriptions: HashMap::new(),
+                unref_gear: LruCache::new(LIMBO_CAPACITY),
+                event_subscriptions: HashMap::new(),
+                event_deps: HashMap::new(),
+                subscriptions_by_id: HashMap::new(),
             }),
         }
     }
@@ -244,14 +352,18 @@ impl<R: IsRuntime> Core<R> {
         if target_core == self.core_id {
             self.run_any_gear(gear.clone(), msg_type, &group)
         } else {
-            let inner = self.inner.borrow_mut();
-            let cached = inner.secondary_cache.get(&gear).cloned();
+            // Snapshot any cached output first, releasing the borrow before
+            // `run_any_gear` (which borrows `inner` itself).
+            let cached = self.inner.borrow().secondary_cache.get(&gear).cloned();
             let output =
                 cached.unwrap_or_else(|| self.run_any_gear(gear.clone(), msg_type, &group));
 
-            let mut req_builder = WireLocCtxBuilder::new(&inner.loc_ctx);
-            let gear_wire = req_builder.remap(gear).expect("secondary_get: gear remap");
-            let req_wire_ctx = Arc::new(req_builder.build());
+            let (gear_wire, req_wire_ctx) = {
+                let inner = self.inner.borrow();
+                let mut req_builder = WireLocCtxBuilder::new(&inner.loc_ctx);
+                let gear_wire = req_builder.remap(gear).expect("secondary_get: gear remap");
+                (gear_wire, Arc::new(req_builder.build()))
+            };
             let _ = self.intercore_tx[target_core as usize].send(InterCoreMsg::SecondaryRequest {
                 gear: gear_wire,
                 wire_ctx: req_wire_ctx,
@@ -310,10 +422,15 @@ impl<R: IsRuntime> Core<R> {
         gear: R::GearId,
         wire_ctx: &WireLocCtx<R>,
     ) -> Result<R::GearOut, RunGearError> {
-        let mut inner = self.inner.borrow_mut();
-        let mut merger = WireLocCtxMerger::new(wire_ctx, &mut *inner);
-        let gear = merger.remap(gear).map_err(RunGearError::Merge)?;
-        let (msg_type, localized_group) = R::meta(&gear);
+        // Scope the merger's `borrow_mut` so it is released before `run_any_gear`
+        // (which borrows `inner` again) — otherwise RefCell panics.
+        let (gear, msg_type, localized_group) = {
+            let mut inner = self.inner.borrow_mut();
+            let mut merger = WireLocCtxMerger::new(wire_ctx, &mut *inner);
+            let gear = merger.remap(gear).map_err(RunGearError::Merge)?;
+            let (msg_type, localized_group) = R::meta(&gear);
+            (gear, msg_type, localized_group)
+        };
         Ok(self.run_any_gear(gear, msg_type, &localized_group))
     }
 
@@ -396,15 +513,17 @@ impl<R: IsRuntime> Core<R> {
                 output,
                 wire_ctx,
             } => {
-                let mut inner = self.inner.borrow_mut();
-                let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
-                let gear = merger
-                    .remap(gear)
-                    .expect("SecondaryResponse: failed to localize gear");
-                let output = merger
-                    .remap(output)
-                    .expect("SecondaryResponse: failed to localize output");
-
+                let (gear, output) = {
+                    let mut inner = self.inner.borrow_mut();
+                    let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
+                    let gear = merger
+                        .remap(gear)
+                        .expect("SecondaryResponse: failed to localize gear");
+                    let output = merger
+                        .remap(output)
+                        .expect("SecondaryResponse: failed to localize output");
+                    (gear, output)
+                };
                 self.inner.borrow_mut().secondary_cache.insert(gear, output);
             }
         }
@@ -582,6 +701,100 @@ impl<R: IsRuntime> Core<R> {
             self.doorbells[target_core as usize].ring();
             reply_rx.recv_async().await.expect("channel closed")
         }
+    }
+}
+
+/// RAII handle for a direct, worker-side subscription to a gear's output.
+///
+/// Dropping it removes the subscription from its core and rebalances the gear
+/// (demoting it to limbo, or evicting it under LRU pressure). Naturally `!Sync`
+/// via `Rc<Core>`: it must live on the owning core's thread.
+///
+/// Value access (`next`/borrow) lands in Phase 2 alongside `subscribe_gear`.
+#[must_use]
+pub struct Subscription<R: IsRuntime> {
+    core: Rc<Core<R>>,
+    sub_id: SubId,
+}
+
+impl<R: IsRuntime> Drop for Subscription<R> {
+    fn drop(&mut self) {
+        self.core.inner.borrow_mut().drop_direct_sub(self.sub_id);
+    }
+}
+
+impl<R: IsRuntime> CoreLocCtx<R> {
+    /// Remove a direct subscriber; if its gear loses all interest, demote it to
+    /// limbo (and possibly LRU-evict, cascading to dependencies).
+    fn drop_direct_sub(&mut self, sub_id: SubId) {
+        let Some(gear) = self.subscriptions_by_id.remove(&sub_id) else {
+            return;
+        };
+        let still_active = self.gear_subscriptions.get_mut(&gear).is_some_and(|g| {
+            g.direct_subscribers.remove(&sub_id);
+            g.has_interest()
+        });
+        if !still_active {
+            self.rebalance_gear(&gear);
+        }
+    }
+
+    /// If `gear` has no external interest, move it from the active set to limbo.
+    /// LRU over-capacity then evicts the least-recently-demoted entry, cascading
+    /// to its dependencies.
+    fn rebalance_gear(&mut self, gear: &R::GearId) {
+        let has_interest = self
+            .gear_subscriptions
+            .get(gear)
+            .is_some_and(GearSub::has_interest);
+        if has_interest {
+            return;
+        }
+        let Some(gsub) = self.gear_subscriptions.remove(gear) else {
+            // Already in limbo or fully absent: nothing to demote.
+            return;
+        };
+        self.unref_gear.insert(gear.clone(), gsub);
+        while self.unref_gear.len() >= self.unref_gear.capacity() {
+            let Some((evicted_id, evicted_sub)) = self.unref_gear.pop_lru() else {
+                break;
+            };
+            self.evict_gear(evicted_id, evicted_sub);
+        }
+    }
+
+    /// Fully tear down a gear: drop its event-input edges (reverse + forward
+    /// index), remove ourselves from each dependency's `local_dependents`, and
+    /// cascade-rebalance dependencies that lose their last dependent. The
+    /// dependency graph is acyclic by construction, so this terminates.
+    ///
+    /// Remote (`remote_subscribers`) teardown lands in Phase 4.
+    fn evict_gear(&mut self, gear: R::GearId, gsub: GearSub<R>) {
+        // 1. Event-input edges.
+        if let Some(keys) = self.event_deps.remove(&gear) {
+            for key in keys {
+                if let Some(set) = self.event_subscriptions.get_mut(&key) {
+                    set.remove(&gear);
+                    if set.is_empty() {
+                        self.event_subscriptions.remove(&key);
+                    }
+                }
+            }
+        }
+        // 2. Gear-dep edges: drop ourselves from each dependency, then rebalance
+        //    any dependency that loses its last dependent. `gsub` is owned and
+        //    disjoint from `self`, so we can mutate `self` mid-iteration.
+        for dep in &gsub.dep_set {
+            let dep_lost_interest = self.gear_subscriptions.get_mut(dep).is_some_and(|dg| {
+                dg.local_dependents.remove(&gear);
+                !dg.has_interest()
+            });
+            if dep_lost_interest {
+                self.rebalance_gear(dep);
+            }
+        }
+        // 3. Drop cached computation state for this gear.
+        self.gear_cache.remove(&gear);
     }
 }
 
