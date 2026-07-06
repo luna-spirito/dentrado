@@ -5,7 +5,6 @@ use dentrado::{
         gear::IsRuntime,
         loc_ctx::EventStore,
     },
-    fadeno::{hash_loc_value, types::LocValue},
     types::*,
     wire::{MergeError, WireEventBody, WireLocCtx},
 };
@@ -23,15 +22,16 @@ struct Branch {
     name: String,
 }
 
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug)]
-struct AttachGroup {
-    branch: Id,
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
+struct CounterGroup {
     doc: Id,
+    branch: Id,
 }
 
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug)]
-struct AttachBody {
-    delta: i64,
+impl Localizable for CounterGroup {
+    fn localize<Rm: Remapper>(self, _remapper: &mut Rm) -> Result<Self, Rm::Err> {
+        Ok(self)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -64,43 +64,13 @@ impl<I: Clone, C: Clone> Clone for IC<I, C> {
     }
 }
 
-impl Localizable for AttachGroup {
-    fn localize<Rm: ::dentrado::types::Remapper>(
-        self,
-        _remapper: &mut Rm,
-    ) -> Result<Self, Rm::Err> {
-        Ok(self)
-    }
-}
-
-impl Localizable for AttachBody {
-    fn localize<Rm: ::dentrado::types::Remapper>(
-        self,
-        _remapper: &mut Rm,
-    ) -> Result<Self, Rm::Err> {
-        Ok(self)
-    }
-}
-
-impl Localizable for Branch {
-    fn localize<Rm: ::dentrado::types::Remapper>(
-        self,
-        _remapper: &mut Rm,
-    ) -> Result<Self, Rm::Err> {
-        Ok(self)
-    }
-}
-
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum AnyGearId {
     Doc { branch: Id, doc: Id },
 }
 
 impl Localizable for AnyGearId {
-    fn localize<Rm: ::dentrado::types::Remapper>(
-        self,
-        _remapper: &mut Rm,
-    ) -> Result<Self, Rm::Err> {
+    fn localize<Rm: Remapper>(self, _remapper: &mut Rm) -> Result<Self, Rm::Err> {
         Ok(self)
     }
 }
@@ -112,40 +82,40 @@ impl IsRuntime for CounterRuntime {
     type GearId = AnyGearId;
     type GearOut = i64;
     type Module = ();
-    type Group = LocValue;
-    type Body = LocValue;
-    type Data = LocValue;
+    type Group = CounterGroup;
+    type Body = i64;
+    type Data = ();
     type GearCache = IC<Query, i64>;
 
     fn hash_data(
-        data: &LocValue,
-        resolver: &dyn GlobalResolver,
+        _data: &Self::Data,
+        _resolver: &dyn GlobalResolver,
     ) -> Result<[u8; 32], GroupRouteError> {
-        let mut hasher = blake3::Hasher::new();
-        hash_loc_value(data, resolver, &mut hasher)?;
-        Ok(*hasher.finalize().as_bytes())
+        let hash = *blake3::Hasher::new().finalize().as_bytes();
+        Ok(hash)
     }
 
     fn route_group(
-        group: &LocValue,
-        wire_ctx: &dyn GlobalResolver,
+        group: &Self::Group,
+        _wire_ctx: &dyn GlobalResolver,
     ) -> Result<GlobalCoreId, GroupRouteError> {
         let mut hasher = blake3::Hasher::new();
-        hash_loc_value(group, wire_ctx, &mut hasher)?;
+        hasher.update(&group.doc.0.to_le_bytes());
+        hasher.update(&group.branch.0.to_le_bytes());
         Ok(GlobalCoreId(u32::from_le_bytes(
             hasher.finalize().as_bytes()[..4].try_into().unwrap(),
         )))
     }
 
-    fn meta(gear: &AnyGearId) -> (LocMsgTypeId, LocValue) {
+    fn meta(gear: &AnyGearId) -> (LocMsgTypeId, Self::Group) {
         match gear {
-            AnyGearId::Doc { branch, doc } => {
-                let group = LocValue::List(Arc::new(vec![
-                    LocValue::Num(doc.0 as i64),
-                    LocValue::Num(branch.0 as i64),
-                ]));
-                (MSG_ATTACH, group)
-            }
+            AnyGearId::Doc { branch, doc } => (
+                MSG_ATTACH,
+                CounterGroup {
+                    doc: *doc,
+                    branch: *branch,
+                },
+            ),
         }
     }
 
@@ -157,7 +127,7 @@ impl IsRuntime for CounterRuntime {
     }
 
     fn run_step(
-        gear: &AnyGearId,
+        _gear: &AnyGearId,
         core: &Core<Self>,
         group: Option<LocGroupId>,
         cache: &mut Self::GearCache,
@@ -177,44 +147,18 @@ impl IsRuntime for CounterRuntime {
                 .stored_event(*eid)
                 .map(|e| e.body)
                 .expect("counter gear: event not found");
-            if let LocValue::Num(delta) = &body {
-                cache.cache += delta;
-            }
+            cache.cache += body;
         }
         for eid in &removed_ids {
             let body = core
                 .stored_event(*eid)
                 .map(|e| e.body)
                 .expect("counter gear: removed event not found");
-            if let LocValue::Num(delta) = &body {
-                cache.cache -= delta;
-            }
+            cache.cache -= body;
         }
         cache.input.processed_added += added_ids.len();
         cache.input.processed_removed += removed_ids.len();
-        let _ = gear;
         cache.cache
-    }
-}
-
-fn empty_record() -> LocValue {
-    LocValue::Record {
-        tag_set: Arc::new(vec![0]),
-        fields: Arc::new(Vec::new()),
-    }
-}
-
-fn branch_create_wire_event(
-    sender: LocSenderId,
-    tx_id: u32,
-    msg_type: LocMsgTypeId,
-) -> WireEventBody<LocValue, LocValue> {
-    WireEventBody {
-        sender,
-        tx_id,
-        msg_type,
-        group: empty_record(),
-        body: empty_record(),
     }
 }
 
@@ -230,17 +174,11 @@ fn doc_counter() {
 
     let alice_sid = tc.add_user(alice_pk, alice_uid);
 
-    tc.post_events(
-        vec![branch_create_wire_event(alice_sid, 0, MSG_BRANCH_CREATE)],
-        1,
-    );
-
     let branch_0_id = Id(0);
-
-    let attach_group_42 = LocValue::List(Arc::new(vec![
-        LocValue::Num(42),
-        LocValue::Num(branch_0_id.0 as i64),
-    ]));
+    let attach_group_42 = CounterGroup {
+        doc: Id(42),
+        branch: branch_0_id,
+    };
 
     tc.post_events(
         vec![
@@ -249,14 +187,14 @@ fn doc_counter() {
                 tx_id: 1,
                 msg_type: MSG_ATTACH,
                 group: attach_group_42.clone(),
-                body: LocValue::Num(5),
+                body: 5,
             },
             WireEventBody {
                 sender: alice_sid,
                 tx_id: 2,
                 msg_type: MSG_ATTACH,
                 group: attach_group_42.clone(),
-                body: LocValue::Num(-2),
+                body: -2,
             },
         ],
         2,
@@ -274,7 +212,7 @@ fn doc_counter() {
             tx_id: 3,
             msg_type: MSG_ATTACH,
             group: attach_group_42.clone(),
-            body: LocValue::Num(7),
+            body: 7,
         }],
         3,
     );
@@ -285,10 +223,10 @@ fn doc_counter() {
     });
     assert_eq!(output, 10);
 
-    let attach_group_99 = LocValue::List(Arc::new(vec![
-        LocValue::Num(99),
-        LocValue::Num(branch_0_id.0 as i64),
-    ]));
+    let attach_group_99 = CounterGroup {
+        doc: Id(99),
+        branch: branch_0_id,
+    };
 
     tc.post_events(
         vec![WireEventBody {
@@ -296,7 +234,7 @@ fn doc_counter() {
             tx_id: 4,
             msg_type: MSG_ATTACH,
             group: attach_group_99,
-            body: LocValue::Num(42),
+            body: 42,
         }],
         4,
     );
@@ -308,6 +246,57 @@ fn doc_counter() {
     assert_eq!(output, 42);
 }
 
+#[derive(Clone, Debug)]
+enum TestRefBody {
+    User(LocUserId),
+    Data(LocDataId),
+}
+
+impl Localizable for TestRefBody {
+    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+        match self {
+            Self::User(u) => Ok(Self::User(u.localize(remapper)?)),
+            Self::Data(d) => Ok(Self::Data(d.localize(remapper)?)),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TestRefRuntime;
+impl IsRuntime for TestRefRuntime {
+    type GearId = ();
+    type GearOut = ();
+    type Module = ();
+    type Group = ();
+    type Body = TestRefBody;
+    type Data = LocDataId;
+    type GearCache = ();
+
+    fn hash_data(
+        _data: &Self::Data,
+        _resolver: &dyn GlobalResolver,
+    ) -> Result<[u8; 32], GroupRouteError> {
+        Ok([0; 32])
+    }
+    fn route_group(
+        _key: &Self::Group,
+        _resolver: &dyn GlobalResolver,
+    ) -> Result<GlobalCoreId, GroupRouteError> {
+        Ok(GlobalCoreId(0))
+    }
+    fn meta(_gear: &Self::GearId) -> (LocMsgTypeId, Self::Group) {
+        (LocMsgTypeId(0), ())
+    }
+    fn make_cache(_gear: &Self::GearId) -> Self::GearCache {}
+    fn run_step(
+        _gear: &Self::GearId,
+        _core: &Core<Self>,
+        _group: Option<LocGroupId>,
+        _cache: &mut Self::GearCache,
+    ) -> Self::GearOut {
+    }
+}
+
 #[test]
 fn malformed_wire_ctx_returns_error_not_panic() {
     let alice_pk = SenderPk([42u8; 32]);
@@ -317,7 +306,7 @@ fn malformed_wire_ctx_returns_error_not_panic() {
     };
 
     let (doorbell, dbh) = Doorbell::new();
-    let db: Db<CounterRuntime> = Db::start(DbConfig {
+    let db: Db<TestRefRuntime> = Db::start(DbConfig {
         num_cores: NonZero::new(1).unwrap(),
         node_id: NodeId(0),
         module: Arc::new(()),
@@ -339,8 +328,8 @@ fn malformed_wire_ctx_returns_error_not_panic() {
                     sender: LocSenderId::new_debug(0),
                     tx_id: 0,
                     msg_type: LocMsgTypeId(0),
-                    group: LocValue::Num(0),
-                    body: LocValue::Num(0),
+                    group: (),
+                    body: TestRefBody::User(LocUserId::new_debug(0)),
                 }],
                 0,
             )
@@ -361,8 +350,8 @@ fn malformed_wire_ctx_returns_error_not_panic() {
                     sender: LocSenderId::new_debug(5),
                     tx_id: 0,
                     msg_type: LocMsgTypeId(0),
-                    group: LocValue::Num(0),
-                    body: LocValue::Num(0),
+                    group: (),
+                    body: TestRefBody::User(LocUserId::new_debug(0)),
                 }],
                 0,
             )
@@ -383,8 +372,8 @@ fn malformed_wire_ctx_returns_error_not_panic() {
                     sender: LocSenderId::new_debug(0),
                     tx_id: 0,
                     msg_type: LocMsgTypeId(0),
-                    group: LocValue::Num(0),
-                    body: LocValue::KolUserId(LocUserId::new_debug(50)),
+                    group: (),
+                    body: TestRefBody::User(LocUserId::new_debug(50)),
                 }],
                 0,
             )
@@ -393,17 +382,22 @@ fn malformed_wire_ctx_returns_error_not_panic() {
     }
 
     {
-        let self_referencing_content = LocValue::List(Arc::new(vec![
-            LocValue::KolDataId(LocDataId::new_debug(0)), // self-reference = forward ref
-        ]));
+        let self_referencing_content = LocDataId::new_debug(1); // self-reference = forward ref
         let dummy_data_id = DataId {
             timestamp: 0,
             hash: [0u8; 32],
         };
+        let dummy_data_id2 = DataId {
+            timestamp: 0,
+            hash: [1u8; 32],
+        };
         let wire_ctx = WireLocCtx {
             users: vec![alice_uid],
             senders: vec![(alice_pk, 0)],
-            data: vec![(dummy_data_id, self_referencing_content)],
+            data: vec![
+                (dummy_data_id, self_referencing_content),
+                (dummy_data_id2, LocDataId::new_debug(0)),
+            ],
         };
         let err = db
             .post_events(
@@ -412,8 +406,8 @@ fn malformed_wire_ctx_returns_error_not_panic() {
                     sender: LocSenderId::new_debug(0),
                     tx_id: 0,
                     msg_type: LocMsgTypeId(0),
-                    group: LocValue::Num(0),
-                    body: LocValue::KolDataId(LocDataId::new_debug(0)),
+                    group: (),
+                    body: TestRefBody::Data(LocDataId::new_debug(0)),
                 }],
                 0,
             )

@@ -120,7 +120,19 @@ impl LocSenderId {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct LocUserId(pub(crate) u64);
 
 impl LocUserId {
@@ -243,7 +255,19 @@ impl std::error::Error for DataVerifyError {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct LocDataId(pub(crate) u64);
 
 impl LocDataId {
@@ -296,6 +320,12 @@ pub(crate) struct Attestation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LocSenderEventId(pub LocSenderId, pub GlobalCoreId, pub u32);
+
+impl Localizable for LocSenderEventId {
+    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+        Ok(LocSenderEventId(self.0.localize(r)?, self.1, self.2))
+    }
+}
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]

@@ -4,7 +4,7 @@ use std::{collections::BTreeSet, hash::Hash};
 
 use crate::core::gear::IsRuntime;
 use crate::core::loc_ctx::EventStore;
-use crate::types::AnyLocEventId;
+use crate::types::{AnyLocEventId, Localizable, Remapper};
 use crate::utils::sg_ord_map::{SgOrdMap, SgOrdSet};
 
 pub use crate::utils::sg_ord_map::{SGBucketId, SGEventId, Timestamp};
@@ -24,6 +24,13 @@ where
     DepK: Ord + Clone + Hash,
     DepV: Clone + PartialEq + Hash + Ord,
 {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            writes: OrdMap::new(),
+        }
+    }
+
     pub(crate) fn query_at<R: IsRuntime>(
         &self,
         key: &DepK,
@@ -124,7 +131,7 @@ pub struct HandlerCtx<
     K: Ord + Clone + Hash,
     V: Clone + Hash,
 > {
-    pub(crate) event_id: SGEventId,
+    pub event_id: SGEventId,
     reads: RefCell<&'a mut im::OrdSet<K>>,
     writes: RefCell<&'a mut OrdMap<K, V>>,
     pub(crate) self_writes: &'a OrdMap<K, SgOrdMap<V>>,
@@ -141,7 +148,7 @@ where
     K: Ord + Clone + Hash,
     V: Clone + Hash,
 {
-    pub(crate) fn query(&self, k: &K) -> Option<V> {
+    pub fn query(&self, k: &K) -> Option<V> {
         self.reads.borrow_mut().insert(k.clone());
         self.self_writes.get(k).and_then(|timeline| {
             timeline
@@ -150,11 +157,11 @@ where
         })
     }
 
-    pub(crate) fn update(&self, k: K, v: V) {
+    pub fn update(&self, k: K, v: V) {
         self.writes.borrow_mut().insert(k, v);
     }
 
-    pub(crate) fn dep_query(&self, dep: &Dep, dep_key: &DepK) -> Option<DepV> {
+    pub fn dep_query(&self, dep: &Dep, dep_key: &DepK) -> Option<DepV> {
         let writes = (self.dep_resolver)(dep.clone());
 
         match self.ext.borrow_mut().entry(dep.clone()) {
@@ -205,7 +212,7 @@ where
     V: Clone + PartialEq + Hash + Ord,
 {
     #[must_use]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             writes: OrdMap::new(),
             reads: OrdMap::new(),
@@ -215,13 +222,13 @@ where
     }
 
     #[must_use]
-    pub(crate) fn as_writes(&self) -> Timeline<K, V> {
+    pub fn as_writes(&self) -> Timeline<K, V> {
         Timeline {
             writes: self.writes.clone(),
         }
     }
 
-    pub(crate) fn apply<R: IsRuntime, E, F>(
+    pub fn apply<R: IsRuntime, E, F>(
         &mut self,
         handler: &F,
         event_resolver: &impl Fn(AnyLocEventId) -> (SGEventId, E),
@@ -621,3 +628,19 @@ mod deps;
 #[cfg(test)]
 #[path = "state_graph_poc.rs"]
 mod poc;
+
+impl<DepK, DepV> Localizable for Timeline<DepK, DepV>
+where
+    DepK: Ord + Clone + Hash + Localizable,
+    DepV: Clone + PartialEq + Hash + Ord + Localizable,
+{
+    fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
+        let mut writes = OrdMap::new();
+        for (k, mut sg_map) in self.writes {
+            let new_k = k.localize(remapper)?;
+            sg_map.try_remap_values(&mut |v| v.localize(remapper))?;
+            writes.insert(new_k, sg_map);
+        }
+        Ok(Timeline { writes })
+    }
+}

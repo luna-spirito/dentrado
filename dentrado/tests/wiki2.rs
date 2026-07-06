@@ -1,108 +1,596 @@
 use std::num::NonZero;
 
 use dentrado::{
-    core::gear::IsRuntime,
-    fadeno::{
-        bridge::{FadenoModule, FadenoRuntime},
-        compiler::{compile_file, find_binary},
-        types::*,
+    core::{
+        core_ctx::Core,
+        gear::IsRuntime,
+        loc_ctx::{EventContext, EventStore},
     },
     types::*,
     utils::{
-        state_graph::Timeline,
-        text::{AnchorPos, ROOT_ANCHOR, TextUpd},
+        state_graph::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, Timeline},
+        text::{AnchorAgg, AnchorPos, ROOT_ANCHOR, TextAgg, TextUpd},
     },
-    wire::WireLocCtxBuilder,
+    wire::WireEventBody,
 };
+use im::OrdMap;
 
 mod common;
-use common::wire_event;
+use common::TestCluster;
 
-use crate::common::WikiTestCluster;
+pub const MSG_INVITE: LocMsgTypeId = LocMsgTypeId(1);
+pub const MSG_ATTACH: LocMsgTypeId = LocMsgTypeId(2);
 
-fn setup_wiki2() -> Option<FadenoModule> {
-    let binary = find_binary()?;
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fad/wiki2");
-    let output = compile_file(&binary, &path)
-        .ignore_type_error()
-        .expect("wiki2 compilation failed");
-    let module = match FadenoModule::new(output.bytecode) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("wiki2 bootstrap failed: {e:?}");
-            return None;
-        }
-    };
-    Some(module)
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub enum Wiki2Gear {
+    Invited { branch: LocDataId },
+    DocContent { doc: Id },
 }
 
-fn extract_invited_pairs(output: LocValue) -> Vec<(LocUserId, bool)> {
-    let sg = match output {
-        LocValue::KolTimeline(sg) => sg,
-        other => panic!("expected KolTimeline, got {other:?}"),
+impl Localizable for Wiki2Gear {
+    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+        match self {
+            Self::Invited { branch } => Ok(Self::Invited {
+                branch: branch.localize(remapper)?,
+            }),
+            Self::DocContent { doc } => Ok(Self::DocContent { doc }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Wiki2GearOut {
+    Invited(Timeline<LocUserId, bool>),
+    DocContent {
+        anchors: AnchorAgg,
+        text: Timeline<LocDataId, TextAgg>,
+    },
+}
+
+impl Localizable for Wiki2GearOut {
+    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+        match self {
+            Self::Invited(timeline) => Ok(Self::Invited(timeline.localize(remapper)?)),
+            Self::DocContent { anchors, text } => Ok(Self::DocContent {
+                anchors: anchors.localize(remapper)?,
+                text: text.localize(remapper)?,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Wiki2Body {
+    Invite(LocUserId),
+    Attach(AttachBody),
+}
+
+#[derive(Clone, Debug)]
+pub struct AttachBody {
+    pub branch: LocDataId,
+    pub payload: UpdatePayload,
+}
+
+#[derive(Clone, Debug)]
+pub enum UpdatePayload {
+    Edit { edit: TextUpd },
+    Merge { from: LocDataId },
+}
+
+impl Localizable for Wiki2Body {
+    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+        match self {
+            Self::Invite(uid) => Ok(Self::Invite(uid.localize(remapper)?)),
+            Self::Attach(body) => Ok(Self::Attach(body.localize(remapper)?)),
+        }
+    }
+}
+
+impl Localizable for AttachBody {
+    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+        Ok(AttachBody {
+            branch: self.branch.localize(remapper)?,
+            payload: self.payload.localize(remapper)?,
+        })
+    }
+}
+
+impl Localizable for UpdatePayload {
+    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+        match self {
+            Self::Edit { edit } => Ok(Self::Edit {
+                edit: edit.localize(remapper)?,
+            }),
+            Self::Merge { from } => Ok(Self::Merge {
+                from: from.localize(remapper)?,
+            }),
+        }
+    }
+}
+
+impl Wiki2Body {
+    pub fn unwrap_invite(&self) -> LocUserId {
+        match self {
+            Self::Invite(uid) => *uid,
+            _ => panic!("Expected Invite"),
+        }
+    }
+
+    pub fn unwrap_attach(&self) -> &AttachBody {
+        match self {
+            Self::Attach(body) => body,
+            _ => panic!("Expected Attach"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct BranchData {
+    pub creator: LocUserId,
+    pub created_at: i64,
+}
+
+impl Localizable for BranchData {
+    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+        Ok(BranchData {
+            creator: self.creator.localize(remapper)?,
+            created_at: self.created_at,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InvitedCache {
+    pub processed_added: usize,
+    pub processed_removed: usize,
+    pub sg: StateGraph<(), (), (), LocUserId, bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DocContentCache {
+    pub processed_added: usize,
+    pub processed_removed: usize,
+    pub anchors: AnchorAgg,
+    pub sg: StateGraph<LocDataId, LocUserId, bool, LocDataId, TextAgg>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Wiki2Cache {
+    Invited(InvitedCache),
+    DocContent(DocContentCache),
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub enum Wiki2Group {
+    Branch(LocDataId),
+    Doc(Id),
+}
+
+impl Localizable for Wiki2Group {
+    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+        match self {
+            Self::Branch(b) => Ok(Self::Branch(b.localize(remapper)?)),
+            Self::Doc(d) => Ok(Self::Doc(d)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Wiki2Runtime;
+
+impl IsRuntime for Wiki2Runtime {
+    type GearId = Wiki2Gear;
+    type GearOut = Wiki2GearOut;
+    type Module = ();
+    type Group = Wiki2Group;
+    type Body = Wiki2Body;
+    type Data = BranchData;
+    type GearCache = Wiki2Cache;
+
+    fn hash_data(
+        data: &Self::Data,
+        resolver: &dyn GlobalResolver,
+    ) -> Result<[u8; 32], GroupRouteError> {
+        let resolved_creator = resolver.resolve_user(data.creator)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&resolved_creator.id.to_le_bytes());
+        hasher.update(&resolved_creator.identity_server_pk.0);
+        hasher.update(&data.created_at.to_le_bytes());
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    fn route_group(
+        group: &Self::Group,
+        resolver: &dyn GlobalResolver,
+    ) -> Result<GlobalCoreId, GroupRouteError> {
+        let mut hasher = blake3::Hasher::new();
+        match group {
+            Wiki2Group::Branch(did) => {
+                let resolved = resolver.resolve_data(*did)?;
+                hasher.update(&resolved.timestamp.to_le_bytes());
+                hasher.update(&resolved.hash);
+            }
+            Wiki2Group::Doc(doc_id) => {
+                hasher.update(&doc_id.0.to_le_bytes());
+            }
+        }
+        Ok(GlobalCoreId(u32::from_le_bytes(
+            hasher.finalize().as_bytes()[..4].try_into().unwrap(),
+        )))
+    }
+
+    fn meta(gear: &Self::GearId) -> (LocMsgTypeId, Self::Group) {
+        match gear {
+            Wiki2Gear::Invited { branch } => (MSG_INVITE, Wiki2Group::Branch(*branch)),
+            Wiki2Gear::DocContent { doc } => (MSG_ATTACH, Wiki2Group::Doc(*doc)),
+        }
+    }
+
+    fn make_cache(gear: &Self::GearId) -> Self::GearCache {
+        match gear {
+            Wiki2Gear::Invited { .. } => Wiki2Cache::Invited(InvitedCache {
+                processed_added: 0,
+                processed_removed: 0,
+                sg: StateGraph::new(),
+            }),
+            Wiki2Gear::DocContent { .. } => Wiki2Cache::DocContent(DocContentCache {
+                processed_added: 0,
+                processed_removed: 0,
+                anchors: AnchorAgg::new(),
+                sg: StateGraph::new(),
+            }),
+        }
+    }
+
+    fn run_step(
+        gear: &Self::GearId,
+        core: &Core<Self>,
+        group: Option<LocGroupId>,
+        cache: &mut Self::GearCache,
+    ) -> Self::GearOut {
+        match (gear, cache) {
+            (Wiki2Gear::Invited { branch }, Wiki2Cache::Invited(c)) => {
+                let Some(group) = group else {
+                    return Wiki2GearOut::Invited(c.sg.as_writes());
+                };
+                let Some((added_ids, removed_ids)) =
+                    core.query_events(group, (c.processed_added, c.processed_removed), |a, r| {
+                        (a.to_vec(), r.to_vec())
+                    })
+                else {
+                    return Wiki2GearOut::Invited(c.sg.as_writes());
+                };
+
+                let (_, branch_data) = core.data(*branch).expect("Branch data not found");
+                let creator = branch_data.creator;
+
+                let handler =
+                    |invitee: &LocUserId, ctx: &HandlerCtx<(), (), (), Self, LocUserId, bool>| {
+                        let event_id = ctx.event_id;
+                        let stored = core
+                            .stored_event(event_id.local_id())
+                            .expect("stored event not found");
+                        let sender_sid = stored.sender;
+                        let sender_uid =
+                            core.sender_user(sender_sid).expect("sender user not found");
+
+                        let sender_invited = if sender_uid == creator {
+                            true
+                        } else {
+                            ctx.query(&sender_uid).unwrap_or(false)
+                        };
+
+                        if sender_invited {
+                            ctx.update(*invitee, true);
+                        }
+                    };
+
+                let event_resolver = |local_id: AnyLocEventId| {
+                    let stored = core.stored_event(local_id).expect("stored event not found");
+                    let sg_id = SGEventId::new(
+                        SGBucketId {
+                            timestamp: stored.timestamp,
+                            global_core_id: stored.global_core_id,
+                        },
+                        local_id,
+                    );
+                    (sg_id, stored.body.unwrap_invite())
+                };
+
+                let dep_resolver = |_: ()| -> Timeline<(), ()> { Timeline::new() };
+
+                let added_len = added_ids.len();
+                let removed_len = removed_ids.len();
+
+                c.sg.apply(
+                    &handler,
+                    &event_resolver,
+                    &dep_resolver,
+                    core,
+                    &DeltaList {
+                        removed: removed_ids,
+                        added: added_ids,
+                    },
+                );
+
+                c.processed_added += added_len;
+                c.processed_removed += removed_len;
+
+                Wiki2GearOut::Invited(c.sg.as_writes())
+            }
+            (Wiki2Gear::DocContent { .. }, Wiki2Cache::DocContent(c)) => {
+                let Some(group) = group else {
+                    return Wiki2GearOut::DocContent {
+                        anchors: c.anchors.clone(),
+                        text: c.sg.as_writes(),
+                    };
+                };
+                let Some((added_ids, removed_ids)) =
+                    core.query_events(group, (c.processed_added, c.processed_removed), |a, r| {
+                        (a.to_vec(), r.to_vec())
+                    })
+                else {
+                    return Wiki2GearOut::DocContent {
+                        anchors: c.anchors.clone(),
+                        text: c.sg.as_writes(),
+                    };
+                };
+
+                // Update anchors
+                for &eid in &added_ids {
+                    let stored = core.stored_event(eid).expect("event not found");
+                    let attach_body = stored.body.unwrap_attach();
+                    match &attach_body.payload {
+                        UpdatePayload::Edit { edit } => {
+                            let sender_event_id = LocSenderEventId(
+                                stored.sender,
+                                stored.global_core_id,
+                                stored.tx_id,
+                            );
+                            c.anchors = c.anchors.clone().apply(sender_event_id, edit, core);
+                        }
+                        UpdatePayload::Merge { .. } => {}
+                    }
+                }
+
+                let dep_resolver = |branch: LocDataId| -> Timeline<LocUserId, bool> {
+                    match core.secondary_get(Wiki2Gear::Invited { branch }) {
+                        Wiki2GearOut::Invited(timeline) => timeline,
+                        _ => panic!("Expected Invited output"),
+                    }
+                };
+
+                let handler = |event_body: &AttachBody,
+                               ctx: &HandlerCtx<
+                    LocDataId,
+                    LocUserId,
+                    bool,
+                    Self,
+                    LocDataId,
+                    TextAgg,
+                >| {
+                    let event_id = ctx.event_id;
+                    let stored = core
+                        .stored_event(event_id.local_id())
+                        .expect("stored event not found");
+                    let sender_sid = stored.sender;
+                    let sender_uid = core.sender_user(sender_sid).expect("sender user not found");
+
+                    let branch = event_body.branch;
+                    let (_, branch_data) = core.data(branch).expect("Branch data not found");
+                    let creator = branch_data.creator;
+
+                    let is_invited = if sender_uid == creator {
+                        true
+                    } else {
+                        ctx.dep_query(&branch, &sender_uid).unwrap_or(false)
+                    };
+
+                    if is_invited {
+                        let curr_text_agg = ctx.query(&branch).unwrap_or_default();
+                        let next_text_agg = match &event_body.payload {
+                            UpdatePayload::Merge { from } => {
+                                let from_text_agg = ctx.query(from).unwrap_or_default();
+                                curr_text_agg.merge(&from_text_agg)
+                            }
+                            UpdatePayload::Edit { edit } => {
+                                let sender_event_id = LocSenderEventId(
+                                    stored.sender,
+                                    stored.global_core_id,
+                                    stored.tx_id,
+                                );
+                                curr_text_agg.apply(sender_event_id, edit)
+                            }
+                        };
+                        ctx.update(branch, next_text_agg);
+                    }
+                };
+
+                let event_resolver = |local_id: AnyLocEventId| {
+                    let stored = core.stored_event(local_id).expect("stored event not found");
+                    let sg_id = SGEventId::new(
+                        SGBucketId {
+                            timestamp: stored.timestamp,
+                            global_core_id: stored.global_core_id,
+                        },
+                        local_id,
+                    );
+                    (sg_id, stored.body.unwrap_attach().clone())
+                };
+
+                let added_len = added_ids.len();
+                let removed_len = removed_ids.len();
+
+                c.sg.apply(
+                    &handler,
+                    &event_resolver,
+                    &dep_resolver,
+                    core,
+                    &DeltaList {
+                        removed: removed_ids,
+                        added: added_ids,
+                    },
+                );
+
+                c.processed_added += added_len;
+                c.processed_removed += removed_len;
+
+                Wiki2GearOut::DocContent {
+                    anchors: c.anchors.clone(),
+                    text: c.sg.as_writes(),
+                }
+            }
+            _ => panic!("Mismatched gear and cache"),
+        }
+    }
+}
+
+fn add_seed_branch(tc: &mut TestCluster<Wiki2Runtime>, creator_uid: LocUserId) -> LocDataId {
+    let b0 = tc.add_data(BranchData {
+        creator: creator_uid,
+        created_at: 1,
+    });
+    tc.loc_ctx.mk_loc_group(MSG_INVITE, Wiki2Group::Branch(b0));
+    b0
+}
+
+fn make_invite_event(
+    sender: LocSenderId,
+    tx_id: u32,
+    branch_did: LocDataId,
+    invitee_uid: LocUserId,
+) -> WireEventBody<Wiki2Group, Wiki2Body> {
+    WireEventBody {
+        sender,
+        tx_id,
+        msg_type: MSG_INVITE,
+        group: Wiki2Group::Branch(branch_did),
+        body: Wiki2Body::Invite(invitee_uid),
+    }
+}
+
+fn make_attach_edit_event(
+    sender: LocSenderId,
+    tx_id: u32,
+    doc_id: u64,
+    branch_did: LocDataId,
+    text_upd: TextUpd,
+) -> WireEventBody<Wiki2Group, Wiki2Body> {
+    WireEventBody {
+        sender,
+        tx_id,
+        msg_type: MSG_ATTACH,
+        group: Wiki2Group::Doc(Id(doc_id)),
+        body: Wiki2Body::Attach(AttachBody {
+            branch: branch_did,
+            payload: UpdatePayload::Edit { edit: text_upd },
+        }),
+    }
+}
+
+fn make_attach_fork_event(
+    sender: LocSenderId,
+    tx_id: u32,
+    doc_id: u64,
+    child_branch_did: LocDataId,
+    parent_branch_did: LocDataId,
+) -> WireEventBody<Wiki2Group, Wiki2Body> {
+    WireEventBody {
+        sender,
+        tx_id,
+        msg_type: MSG_ATTACH,
+        group: Wiki2Group::Doc(Id(doc_id)),
+        body: Wiki2Body::Attach(AttachBody {
+            branch: child_branch_did,
+            payload: UpdatePayload::Merge {
+                from: parent_branch_did,
+            },
+        }),
+    }
+}
+
+fn extract_invited_pairs(output: Wiki2GearOut) -> Vec<(LocUserId, bool)> {
+    let timeline = match output {
+        Wiki2GearOut::Invited(tl) => tl,
+        other => panic!("expected Invited timeline, got {other:?}"),
     };
     let mut result = Vec::new();
-    for (key, timeline) in sg.iter() {
-        let uid = match key {
-            LocValue::KolUserId(id) => *id,
-            other => panic!("expected KolUserId key, got {other:?}"),
-        };
-        if let Some((_, b_val)) = timeline.last() {
-            if let LocValue::Bool(b) = b_val {
-                result.push((uid, *b));
-            }
+    for (key, sg_map) in timeline.iter() {
+        if let Some((_, b)) = sg_map.last() {
+            result.push((*key, *b));
         }
     }
     result
 }
 
-fn extract_text_sg(output: &LocValue, tags: &TagRegistry) -> Box<Timeline<LocValue, LocValue>> {
-    let text_out = tags.record_get(output, b"text").expect("missing .text");
-    match text_out {
-        LocValue::KolTimeline(sg) => sg,
-        other => panic!("expected KolTimeline for .text, got {other:?}"),
+fn extract_text_sg(output: &Wiki2GearOut) -> Box<Timeline<LocDataId, TextAgg>> {
+    match output {
+        Wiki2GearOut::DocContent { text, .. } => Box::new(text.clone()),
+        other => panic!("expected DocContent, got {other:?}"),
     }
 }
 
-fn extract_doc_text(
-    output: &LocValue,
-    tags: &TagRegistry,
-    branch_did: LocDataId,
-) -> Option<String> {
-    let anchor_agg = match tags
-        .record_get(output, b"anchors")
-        .expect("missing .anchors")
-    {
-        LocValue::KolAnchorAgg(a) => a,
-        other => panic!("expected KolAnchorAgg, got {other:?}"),
+fn extract_doc_text(output: &Wiki2GearOut, branch_did: LocDataId) -> Option<String> {
+    let (anchors, text) = match output {
+        Wiki2GearOut::DocContent { anchors, text } => (anchors, text),
+        other => panic!("expected DocContent, got {other:?}"),
     };
-    let sg = extract_text_sg(output, tags);
-    let branch_key = LocValue::KolDataId(branch_did);
-    let timeline = sg.iter().find(|(k, _)| **k == branch_key);
-    let (_, val) = match timeline.and_then(|(_, tl)| tl.last()) {
-        Some(v) => v,
-        None => return None,
-    };
-    let text_agg = match val {
-        LocValue::KolTextAgg(ta) => ta,
-        other => panic!("expected KolTextAgg, got {other:?}"),
-    };
-    Some(text_agg.get_text(&anchor_agg))
+    let timeline = text.iter().find(|(k, _)| **k == branch_did);
+    let (_, text_agg) = timeline.and_then(|(_, tl)| tl.last())?;
+    Some(text_agg.get_text(anchors))
+}
+
+fn count_branches(sg: &Timeline<LocDataId, TextAgg>) -> usize {
+    sg.iter().count()
+}
+
+fn find_cross_core_doc_id(
+    tc: &TestCluster<Wiki2Runtime>,
+    invited_core: u32,
+    num_cores: u32,
+) -> u64 {
+    (1..10_000)
+        .find(|&d| {
+            let doc_gear = Wiki2Gear::DocContent { doc: Id(d) };
+            let (doc_gear_wire, wc) = tc.remap_gear(doc_gear);
+
+            let gear_core = Wiki2Runtime::route_group(&Wiki2Runtime::meta(&doc_gear_wire).1, &wc)
+                .unwrap()
+                .route(NonZero::new(num_cores).unwrap());
+            if gear_core == invited_core {
+                return false;
+            }
+            let event_core = Wiki2Runtime::route_group(&Wiki2Group::Doc(Id(d)), &wc)
+                .unwrap()
+                .route(NonZero::new(num_cores).unwrap());
+            event_core == gear_core
+        })
+        .expect("should find a suitable doc_id for cross-core routing")
+}
+
+fn find_same_core_doc_id(tc: &TestCluster<Wiki2Runtime>, invited_core: u32, num_cores: u32) -> u64 {
+    (1..10_000)
+        .find(|&d| {
+            let doc_gear = Wiki2Gear::DocContent { doc: Id(d) };
+            let (doc_gear_wire, wc) = tc.remap_gear(doc_gear);
+
+            let gear_core = Wiki2Runtime::route_group(&Wiki2Runtime::meta(&doc_gear_wire).1, &wc)
+                .unwrap()
+                .route(NonZero::new(num_cores).unwrap());
+            if gear_core != invited_core {
+                return false;
+            }
+            let event_core = Wiki2Runtime::route_group(&Wiki2Group::Doc(Id(d)), &wc)
+                .unwrap()
+                .route(NonZero::new(num_cores).unwrap());
+            event_core == gear_core
+        })
+        .expect("should find a suitable doc_id for same-core routing")
 }
 
 #[test]
 fn invited_simple_e2e() {
-    let module = if let Some(m) = setup_wiki2() {
-        m
-    } else {
-        eprintln!("skipping: fadeno-lang not found");
-        return;
-    };
-
-    let mut tc = WikiTestCluster::start(&[2, 3, 4], module);
-    let invite_mt = tc.msg_type(b"Invite");
-    let tags = tc.tags().clone();
-    let exports = tc.module().exports().clone();
+    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -121,31 +609,22 @@ fn invited_simple_e2e() {
     let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
     let carol = tc.add_user(SenderPk([3u8; 32]), carol_uid);
 
-    let alice_loc_uid = tc.mk_loc_user(alice_uid);
-    let b0 = tc.add_seed_branch(invite_mt, alice_loc_uid);
+    let alice_loc_uid = tc.loc_ctx.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.loc_ctx.mk_loc_user(bob_uid);
+    let carol_loc_uid = tc.loc_ctx.mk_loc_user(carol_uid);
 
-    let bob_user_id = tc.kol_user_id(bob_uid);
-    let carol_user_id = tc.kol_user_id(carol_uid);
+    let b0 = add_seed_branch(&mut tc, alice_loc_uid);
+
     tc.post_events(
         vec![
-            wire_event(alice, 0, invite_mt, LocValue::KolDataId(b0), bob_user_id),
-            wire_event(
-                alice,
-                1,
-                invite_mt,
-                LocValue::KolDataId(b0),
-                carol_user_id.clone(),
-            ),
-            wire_event(bob, 2, invite_mt, LocValue::KolDataId(b0), carol_user_id),
+            make_invite_event(alice, 0, b0, bob_loc_uid),
+            make_invite_event(alice, 1, b0, carol_loc_uid),
+            make_invite_event(bob, 2, b0, carol_loc_uid),
         ],
         1,
     );
 
-    let invited_closure = tags
-        .record_get(&exports, b"invited")
-        .expect("missing invited export")
-        .clone();
-    let gear = tc.build_gear(invited_closure, vec![LocValue::KolDataId(b0)]);
+    let gear = Wiki2Gear::Invited { branch: b0 };
     let output = tc.run_gear(gear);
     let pairs = extract_invited_pairs(output);
     let invited_count = pairs.iter().filter(|(_, b)| *b).count();
@@ -164,18 +643,7 @@ fn invited_simple_e2e() {
 
 #[test]
 fn doc_content_same_core_e2e() {
-    let module = if let Some(m) = setup_wiki2() {
-        m
-    } else {
-        eprintln!("skipping: fadeno-lang not found");
-        return;
-    };
-
-    let mut tc = WikiTestCluster::start(&[2, 3, 4], module);
-    let invite_mt = tc.msg_type(b"Invite");
-    let attach_mt = tc.msg_type(b"Attach");
-    let tags = tc.tags().clone();
-    let exports = tc.module().exports().clone();
+    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -194,41 +662,31 @@ fn doc_content_same_core_e2e() {
     let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
     let eve = tc.add_user(SenderPk([3u8; 32]), eve_uid);
 
-    let alice_loc_uid = tc.mk_loc_user(alice_uid);
-    let b0 = tc.add_seed_branch(invite_mt, alice_loc_uid);
+    let alice_loc_uid = tc.loc_ctx.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.loc_ctx.mk_loc_user(bob_uid);
 
-    let bob_user_id = tc.kol_user_id(bob_uid);
-    tc.post_events(
-        vec![wire_event(
-            alice,
-            0,
-            invite_mt,
-            LocValue::KolDataId(b0),
-            bob_user_id,
-        )],
-        1,
-    );
+    let b0 = add_seed_branch(&mut tc, alice_loc_uid);
 
-    let doc_id: u64 = 1;
+    tc.post_events(vec![make_invite_event(alice, 0, b0, bob_loc_uid)], 1);
+
+    let invited_gear = Wiki2Gear::Invited { branch: b0 };
+    let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear);
+    let invited_core =
+        Wiki2Runtime::route_group(&Wiki2Runtime::meta(&invited_gear_wire).1, &invited_wire_ctx)
+            .unwrap()
+            .route(NonZero::new(2).unwrap());
+
+    let doc_id = find_same_core_doc_id(&tc, invited_core, 2);
+    tc.loc_ctx
+        .mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
 
     let text_upd = TextUpd::new(
         vec![AnchorPos::new(ROOT_ANCHOR, 0)],
         vec!["Hello from Bob".to_string()],
     );
-    let bob_attach_body = tags.make_record(&[
-        (b"branch", LocValue::KolDataId(b0)),
-        (b"is_merge", LocValue::Bool(false)),
-        (b"edit", LocValue::KolTextUpd(text_upd)),
-    ]);
 
     tc.post_events(
-        vec![wire_event(
-            bob,
-            1,
-            attach_mt,
-            LocValue::Num(doc_id as i64),
-            bob_attach_body,
-        )],
+        vec![make_attach_edit_event(bob, 1, doc_id, b0, text_upd)],
         2,
     );
 
@@ -236,36 +694,20 @@ fn doc_content_same_core_e2e() {
         vec![AnchorPos::new(ROOT_ANCHOR, 0)],
         vec!["Eve was here".to_string()],
     );
-    let eve_attach_body = tags.make_record(&[
-        (b"branch", LocValue::KolDataId(b0)),
-        (b"is_merge", LocValue::Bool(false)),
-        (b"edit", LocValue::KolTextUpd(eve_text_upd)),
-    ]);
 
     tc.post_events(
-        vec![wire_event(
-            eve,
-            2,
-            attach_mt,
-            LocValue::Num(doc_id as i64),
-            eve_attach_body,
-        )],
+        vec![make_attach_edit_event(eve, 2, doc_id, b0, eve_text_upd)],
         3,
     );
 
-    let invited_closure = tags
-        .record_get(&exports, b"invited")
-        .expect("missing invited export")
-        .clone();
-    let _invited_output = tc.build_and_run_gear(invited_closure, vec![LocValue::KolDataId(b0)]);
+    // Run invited first to make sure secondary dep is resolved when needed
+    let invited_gear = Wiki2Gear::Invited { branch: b0 };
+    let _invited_output = tc.run_gear_on(0, invited_gear);
 
-    let doc_content_closure = tags
-        .record_get(&exports, b"doc_content")
-        .expect("missing doc_content export")
-        .clone();
-    let output = tc.build_and_run_gear(doc_content_closure, vec![LocValue::Num(doc_id as i64)]);
+    let doc_content_gear = Wiki2Gear::DocContent { doc: Id(doc_id) };
+    let output = tc.run_gear_on(0, doc_content_gear);
 
-    let text = extract_doc_text(&output, &tags, b0);
+    let text = extract_doc_text(&output, b0);
     assert_eq!(
         text,
         Some("Hello from Bob".to_string()),
@@ -275,18 +717,7 @@ fn doc_content_same_core_e2e() {
 
 #[test]
 fn doc_content_cross_core_e2e() {
-    let module = if let Some(m) = setup_wiki2() {
-        m
-    } else {
-        eprintln!("skipping: fadeno-lang not found");
-        return;
-    };
-
-    let mut tc = WikiTestCluster::start(&[2, 3, 4], module);
-    let invite_mt = tc.msg_type(b"Invite");
-    let attach_mt = tc.msg_type(b"Attach");
-    let tags = tc.tags().clone();
-    let exports = tc.module().exports().clone();
+    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -300,65 +731,38 @@ fn doc_content_cross_core_e2e() {
     let alice = tc.add_user(SenderPk([1u8; 32]), alice_uid);
     let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
 
-    let alice_loc_uid = tc.mk_loc_user(alice_uid);
-    let b0 = tc.add_seed_branch(invite_mt, alice_loc_uid);
+    let alice_loc_uid = tc.loc_ctx.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.loc_ctx.mk_loc_user(bob_uid);
 
-    let invited_closure = tags
-        .record_get(&exports, b"invited")
-        .expect("missing invited export")
-        .clone();
-    let invited_gear = tc.build_gear(invited_closure, vec![LocValue::KolDataId(b0)]);
-    let invited_core = {
-        let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear.clone());
-        FadenoRuntime::route_group(invited_gear_wire.group(), &invited_wire_ctx)
+    let b0 = add_seed_branch(&mut tc, alice_loc_uid);
+
+    let invited_gear = Wiki2Gear::Invited { branch: b0 };
+    let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear);
+    let invited_core =
+        Wiki2Runtime::route_group(&Wiki2Runtime::meta(&invited_gear_wire).1, &invited_wire_ctx)
             .unwrap()
-            .route(NonZero::new(2).unwrap())
-    };
+            .route(NonZero::new(2).unwrap());
 
-    let doc_id = tc.find_cross_core_doc_id(invited_core, 2);
+    let doc_id = find_cross_core_doc_id(&tc, invited_core, 2);
+    tc.loc_ctx
+        .mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
     eprintln!("found doc_id={doc_id} (invited → core {invited_core})");
 
-    let bob_user_id = tc.kol_user_id(bob_uid);
-    tc.post_events(
-        vec![wire_event(
-            alice,
-            0,
-            invite_mt,
-            LocValue::KolDataId(b0),
-            bob_user_id,
-        )],
-        5,
-    );
+    tc.post_events(vec![make_invite_event(alice, 0, b0, bob_loc_uid)], 1);
 
     let text_upd = TextUpd::new(
         vec![AnchorPos::new(ROOT_ANCHOR, 0)],
         vec!["Hello from Bob".to_string()],
     );
-    let bob_attach_body = tags.make_record(&[
-        (b"branch", LocValue::KolDataId(b0)),
-        (b"is_merge", LocValue::Bool(false)),
-        (b"edit", LocValue::KolTextUpd(text_upd)),
-    ]);
 
     tc.post_events(
-        vec![wire_event(
-            bob,
-            1,
-            attach_mt,
-            LocValue::Num(doc_id as i64),
-            bob_attach_body,
-        )],
-        6,
+        vec![make_attach_edit_event(bob, 1, doc_id, b0, text_upd)],
+        2,
     );
 
-    let doc_content_closure = tags
-        .record_get(&exports, b"doc_content")
-        .expect("missing doc_content export")
-        .clone();
-    let doc_gear = tc.build_gear(doc_content_closure, vec![LocValue::Num(doc_id as i64)]);
+    let doc_gear = Wiki2Gear::DocContent { doc: Id(doc_id) };
     let (doc_gear_wire, doc_wire_ctx) = tc.remap_gear(doc_gear.clone());
-
-    let doc_core = FadenoRuntime::route_group(doc_gear_wire.group(), &doc_wire_ctx)
+    let doc_core = Wiki2Runtime::route_group(&Wiki2Runtime::meta(&doc_gear_wire).1, &doc_wire_ctx)
         .unwrap()
         .route(NonZero::new(2).unwrap());
     assert_ne!(
@@ -367,17 +771,432 @@ fn doc_content_cross_core_e2e() {
     );
 
     let output1 = tc.run_gear_on(0, doc_gear.clone());
-    let text1 = extract_doc_text(&output1, &tags, b0);
+    let text1 = extract_doc_text(&output1, b0);
     assert_eq!(
         text1, None,
         "first run: no text expected (placeholder invited, cross-core deps not yet resolved)"
     );
 
     let output2 = tc.run_gear_on(0, doc_gear);
-    let text2 = extract_doc_text(&output2, &tags, b0);
+    let text2 = extract_doc_text(&output2, b0);
     assert_eq!(
         text2,
         Some("Hello from Bob".to_string()),
         "second run: Bob's text should appear after secondary cache resolves invited dep"
+    );
+}
+
+#[test]
+fn retroactive_invite_cross_core_e2e() {
+    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
+
+    let alice_uid = UserId {
+        id: 1,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let bob_uid = UserId {
+        id: 2,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let carol_uid = UserId {
+        id: 3,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let dave_uid = UserId {
+        id: 4,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let eve_uid = UserId {
+        id: 5,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+
+    let alice = tc.add_user(SenderPk([1u8; 32]), alice_uid);
+    let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
+    let carol = tc.add_user(SenderPk([3u8; 32]), carol_uid);
+    let dave = tc.add_user(SenderPk([4u8; 32]), dave_uid);
+    let eve = tc.add_user(SenderPk([5u8; 32]), eve_uid);
+
+    let alice_loc_uid = tc.loc_ctx.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.loc_ctx.mk_loc_user(bob_uid);
+    let carol_loc_uid = tc.loc_ctx.mk_loc_user(carol_uid);
+    let dave_loc_uid = tc.loc_ctx.mk_loc_user(dave_uid);
+
+    let b0 = add_seed_branch(&mut tc, alice_loc_uid);
+
+    let invited_gear = Wiki2Gear::Invited { branch: b0 };
+    let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear);
+    let invited_core =
+        Wiki2Runtime::route_group(&Wiki2Runtime::meta(&invited_gear_wire).1, &invited_wire_ctx)
+            .unwrap()
+            .route(NonZero::new(2).unwrap());
+
+    let doc_id = find_cross_core_doc_id(&tc, invited_core, 2);
+    tc.loc_ctx
+        .mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
+
+    tc.post_events(vec![make_invite_event(alice, 1, b0, bob_loc_uid)], 2);
+
+    let bob_text_upd = TextUpd::new(
+        vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+        vec!["Hello from Bob".to_string()],
+    );
+    tc.post_events(
+        vec![make_attach_edit_event(bob, 2, doc_id, b0, bob_text_upd)],
+        3,
+    );
+
+    let carol_text_upd = TextUpd::new(
+        vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+        vec!["Carol was here".to_string()],
+    );
+    tc.post_events(
+        vec![make_attach_edit_event(carol, 3, doc_id, b0, carol_text_upd)],
+        4,
+    );
+
+    tc.post_events(vec![make_invite_event(alice, 4, b0, carol_loc_uid)], 5);
+
+    tc.post_events(vec![make_invite_event(bob, 5, b0, dave_loc_uid)], 6);
+
+    let dave_text_upd = TextUpd::new(
+        vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+        vec!["Dave says hi".to_string()],
+    );
+    tc.post_events(
+        vec![make_attach_edit_event(dave, 6, doc_id, b0, dave_text_upd)],
+        7,
+    );
+
+    let eve_text_upd = TextUpd::new(
+        vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+        vec!["Eve snoops".to_string()],
+    );
+    tc.post_events(
+        vec![make_attach_edit_event(eve, 7, doc_id, b0, eve_text_upd)],
+        8,
+    );
+
+    let doc_gear = Wiki2Gear::DocContent { doc: Id(doc_id) };
+    let (doc_gear_wire, doc_wire_ctx) = tc.remap_gear(doc_gear.clone());
+    let doc_core = Wiki2Runtime::route_group(&Wiki2Runtime::meta(&doc_gear_wire).1, &doc_wire_ctx)
+        .unwrap()
+        .route(NonZero::new(2).unwrap());
+    assert_ne!(invited_core, doc_core, "gears must be on different cores");
+
+    let output1 = tc.run_gear_on(0, doc_gear.clone());
+    let text1 = extract_doc_text(&output1, b0);
+    assert_eq!(
+        text1, None,
+        "run 1: no text expected (placeholder invited, cross-core deps not yet resolved)"
+    );
+
+    let output2 = tc.run_gear_on(0, doc_gear.clone());
+    let text2 = extract_doc_text(&output2, b0);
+    assert_eq!(
+        text2,
+        Some("Dave says hiHello from Bob".to_string()),
+        "run 2: invited users' edits appear (RGA: higher tx_id first)"
+    );
+
+    let output3 = tc.run_gear_on(0, doc_gear);
+    let text3 = extract_doc_text(&output3, b0);
+    assert_eq!(text3, text2, "run 3: output should be stable");
+}
+
+#[test]
+fn text_agg_merge_cross_core_e2e() {
+    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
+
+    let alice_uid = UserId {
+        id: 1,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let carol_uid = UserId {
+        id: 2,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let eve_uid = UserId {
+        id: 3,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+
+    let alice = tc.add_user(SenderPk([1u8; 32]), alice_uid);
+    let carol = tc.add_user(SenderPk([2u8; 32]), carol_uid);
+    let eve = tc.add_user(SenderPk([3u8; 32]), eve_uid);
+
+    let alice_loc_uid = tc.loc_ctx.mk_loc_user(alice_uid);
+    let carol_loc_uid = tc.loc_ctx.mk_loc_user(carol_uid);
+
+    let b0 = add_seed_branch(&mut tc, alice_loc_uid);
+    let b1 = add_seed_branch(&mut tc, carol_loc_uid);
+
+    let invited_gear = Wiki2Gear::Invited { branch: b0 };
+    let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear);
+    let invited_core =
+        Wiki2Runtime::route_group(&Wiki2Runtime::meta(&invited_gear_wire).1, &invited_wire_ctx)
+            .unwrap()
+            .route(NonZero::new(2).unwrap());
+
+    let doc_id = find_cross_core_doc_id(&tc, invited_core, 2);
+    tc.loc_ctx
+        .mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
+
+    let alice_text_upd = TextUpd::new(
+        vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+        vec!["AAA".to_string()],
+    );
+    tc.post_events(
+        vec![make_attach_edit_event(alice, 2, doc_id, b0, alice_text_upd)],
+        11,
+    );
+
+    let carol_text_upd = TextUpd::new(
+        vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+        vec!["BBB".to_string()],
+    );
+    tc.post_events(
+        vec![make_attach_edit_event(carol, 3, doc_id, b1, carol_text_upd)],
+        12,
+    );
+
+    tc.post_events(vec![make_attach_fork_event(alice, 4, doc_id, b0, b1)], 13);
+
+    let eve_text_upd = TextUpd::new(
+        vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+        vec!["Eve ignored".to_string()],
+    );
+    tc.post_events(
+        vec![make_attach_edit_event(eve, 5, doc_id, b1, eve_text_upd)],
+        14,
+    );
+
+    // Warm up the dependency cache by running invited for both branches
+    let invited_gear_b0 = Wiki2Gear::Invited { branch: b0 };
+    let _invited_output_b0 = tc.run_gear(invited_gear_b0);
+    let invited_gear_b1 = Wiki2Gear::Invited { branch: b1 };
+    let _invited_output_b1 = tc.run_gear(invited_gear_b1);
+
+    let doc_gear = Wiki2Gear::DocContent { doc: Id(doc_id) };
+    let (doc_gear_wire, doc_wire_ctx) = tc.remap_gear(doc_gear.clone());
+    let doc_core = Wiki2Runtime::route_group(&Wiki2Runtime::meta(&doc_gear_wire).1, &doc_wire_ctx)
+        .unwrap()
+        .route(NonZero::new(2).unwrap());
+    assert_ne!(invited_core, doc_core, "gears must be on different cores");
+
+    let output1 = tc.run_gear_on(0, doc_gear);
+    let text1_b0 = extract_doc_text(&output1, b0);
+    let text1_b1 = extract_doc_text(&output1, b1);
+    assert_eq!(
+        text1_b0,
+        Some("BBBAAA".to_string()),
+        "run 1 B0: Alice (creator) edit present, Carol's BBB merged via fork"
+    );
+    assert_eq!(
+        text1_b1,
+        Some("BBB".to_string()),
+        "run 1 B1: placeholder invited, but Carol (creator) edit visible"
+    );
+}
+
+#[test]
+fn multi_user_doc_assembly_cross_core_e2e() {
+    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
+
+    let alice_uid = UserId {
+        id: 1,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let bob_uid = UserId {
+        id: 2,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let carol_uid = UserId {
+        id: 3,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let dave_uid = UserId {
+        id: 4,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let eve_uid = UserId {
+        id: 5,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+
+    let alice = tc.add_user(SenderPk([1u8; 32]), alice_uid);
+    let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
+    let carol = tc.add_user(SenderPk([3u8; 32]), carol_uid);
+    let dave = tc.add_user(SenderPk([4u8; 32]), dave_uid);
+    let eve = tc.add_user(SenderPk([5u8; 32]), eve_uid);
+
+    let alice_loc_uid = tc.loc_ctx.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.loc_ctx.mk_loc_user(bob_uid);
+    let carol_loc_uid = tc.loc_ctx.mk_loc_user(carol_uid);
+    let dave_loc_uid = tc.loc_ctx.mk_loc_user(dave_uid);
+
+    let b0 = add_seed_branch(&mut tc, alice_loc_uid);
+
+    let invited_gear = Wiki2Gear::Invited { branch: b0 };
+    let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear);
+    let invited_core =
+        Wiki2Runtime::route_group(&Wiki2Runtime::meta(&invited_gear_wire).1, &invited_wire_ctx)
+            .unwrap()
+            .route(NonZero::new(2).unwrap());
+
+    let doc_id = find_cross_core_doc_id(&tc, invited_core, 2);
+    tc.loc_ctx
+        .mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
+
+    tc.post_events(
+        vec![
+            make_invite_event(alice, 1, b0, bob_loc_uid),
+            make_invite_event(alice, 2, b0, carol_loc_uid),
+            make_invite_event(alice, 3, b0, dave_loc_uid),
+        ],
+        16,
+    );
+
+    let alice_text_upd = TextUpd::new(
+        vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+        vec!["Hello".to_string()],
+    );
+    tc.post_events(
+        vec![make_attach_edit_event(alice, 3, doc_id, b0, alice_text_upd)],
+        17,
+    );
+
+    let bob_text_upd = TextUpd::new(
+        vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+        vec!["World".to_string()],
+    );
+    tc.post_events(
+        vec![make_attach_edit_event(bob, 4, doc_id, b0, bob_text_upd)],
+        18,
+    );
+
+    let carol_text_upd = TextUpd::new(vec![AnchorPos::new(ROOT_ANCHOR, 0)], vec!["!".to_string()]);
+    tc.post_events(
+        vec![make_attach_edit_event(carol, 5, doc_id, b0, carol_text_upd)],
+        19,
+    );
+
+    let dave_text_upd = TextUpd::new(
+        vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+        vec![" [Dave]".to_string()],
+    );
+    tc.post_events(
+        vec![make_attach_edit_event(dave, 6, doc_id, b0, dave_text_upd)],
+        20,
+    );
+
+    let eve_text_upd = TextUpd::new(
+        vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+        vec!["[ignored]".to_string()],
+    );
+    tc.post_events(
+        vec![make_attach_edit_event(eve, 7, doc_id, b0, eve_text_upd)],
+        21,
+    );
+
+    let doc_gear = Wiki2Gear::DocContent { doc: Id(doc_id) };
+    let (doc_gear_wire, doc_wire_ctx) = tc.remap_gear(doc_gear.clone());
+    let doc_core = Wiki2Runtime::route_group(&Wiki2Runtime::meta(&doc_gear_wire).1, &doc_wire_ctx)
+        .unwrap()
+        .route(NonZero::new(2).unwrap());
+    assert_ne!(invited_core, doc_core, "gears must be on different cores");
+
+    let output1 = tc.run_gear_on(0, doc_gear.clone());
+    let text1 = extract_doc_text(&output1, b0);
+    assert_eq!(
+        text1,
+        Some("Hello".to_string()),
+        "run 1: Alice (creator) edit present with placeholder invited"
+    );
+
+    let output2 = tc.run_gear_on(0, doc_gear.clone());
+    let sg2 = extract_text_sg(&output2);
+    assert_eq!(
+        count_branches(&sg2),
+        1,
+        "run 2: exactly one branch should have entries"
+    );
+
+    let text2 = extract_doc_text(&output2, b0);
+    assert_eq!(
+        text2,
+        Some(" [Dave]!WorldHello".to_string()),
+        "run 2: all invited users' edits (RGA: higher tx_id first), Eve excluded"
+    );
+
+    let output3 = tc.run_gear_on(0, doc_gear);
+    let text3 = extract_doc_text(&output3, b0);
+    assert_eq!(text3, text2, "run 3: output should be stable");
+}
+
+#[test]
+fn retroactive_invite_point_in_time_same_core_e2e() {
+    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
+
+    let alice_uid = UserId {
+        id: 1,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let bob_uid = UserId {
+        id: 2,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+
+    let alice = tc.add_user(SenderPk([1u8; 32]), alice_uid);
+    let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
+
+    let alice_loc_uid = tc.loc_ctx.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.loc_ctx.mk_loc_user(bob_uid);
+
+    let b0 = add_seed_branch(&mut tc, alice_loc_uid);
+
+    let invited_gear = Wiki2Gear::Invited { branch: b0 };
+    let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear);
+    let invited_core =
+        Wiki2Runtime::route_group(&Wiki2Runtime::meta(&invited_gear_wire).1, &invited_wire_ctx)
+            .unwrap()
+            .route(NonZero::new(2).unwrap());
+
+    let doc_id = find_same_core_doc_id(&tc, invited_core, 2);
+    tc.loc_ctx
+        .mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
+
+    let bob_text_upd_1 = TextUpd::new(
+        vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+        vec!["Bob before invite".to_string()],
+    );
+    tc.post_events(
+        vec![make_attach_edit_event(bob, 1, doc_id, b0, bob_text_upd_1)],
+        23,
+    );
+
+    tc.post_events(vec![make_invite_event(alice, 2, b0, bob_loc_uid)], 24);
+
+    let bob_text_upd_2 = TextUpd::new(
+        vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+        vec!["Bob after invite".to_string()],
+    );
+    tc.post_events(
+        vec![make_attach_edit_event(bob, 3, doc_id, b0, bob_text_upd_2)],
+        25,
+    );
+
+    // Warm up the dependency cache
+    let invited_gear = Wiki2Gear::Invited { branch: b0 };
+    let _invited_output = tc.run_gear_on(0, invited_gear);
+
+    let doc_content_gear = Wiki2Gear::DocContent { doc: Id(doc_id) };
+    let output = tc.run_gear_on(0, doc_content_gear);
+
+    let text = extract_doc_text(&output, b0);
+    assert_eq!(
+        text,
+        Some("Bob after invite".to_string()),
+        "only Bob's post-invite edit should appear; pre-invite edit excluded"
     );
 }

@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use crate::core::loc_ctx::LocCtx;
 use crate::{
     core::{gear::IsRuntime, loc_ctx::EventStore},
-    types::{GlobalCoreId, LocSenderEventId, LocSenderId},
+    types::{GlobalCoreId, LocSenderEventId, LocSenderId, Localizable, Remapper},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -152,12 +152,12 @@ impl Ord for AnchorAgg {
 
 impl AnchorAgg {
     #[must_use]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
     #[must_use]
-    pub(crate) fn apply<R: IsRuntime>(
+    pub fn apply<R: IsRuntime>(
         mut self,
         event_id: LocSenderEventId,
         upd: &TextUpd,
@@ -259,7 +259,7 @@ impl Ord for TextUpd {
 
 impl TextAgg {
     #[must_use]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -269,7 +269,7 @@ impl TextAgg {
     }
 
     #[must_use]
-    pub(crate) fn apply(mut self, event_id: LocSenderEventId, upd: &TextUpd) -> Self {
+    pub fn apply(mut self, event_id: LocSenderEventId, upd: &TextUpd) -> Self {
         for (i, text) in upd.new_strings.iter().enumerate() {
             let id = AnchorId(event_id, i as u32);
             if !text.is_empty() {
@@ -288,7 +288,7 @@ impl TextAgg {
     }
 
     #[must_use]
-    pub(crate) fn merge(self, rhs: &Self) -> Self {
+    pub fn merge(self, rhs: &Self) -> Self {
         Self {
             content: rhs.content.clone().union(self.content),
         }
@@ -952,5 +952,79 @@ mod tests {
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
         assert_diff_roundtrip(&agg, &text, "Привет прекрасный мир", eid(S1, 2));
+    }
+}
+
+impl Localizable for AnchorId {
+    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+        if self == ROOT_ANCHOR {
+            Ok(self)
+        } else {
+            Ok(AnchorId(self.0.localize(r)?, self.1))
+        }
+    }
+}
+
+impl Localizable for AnchorPos {
+    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+        Ok(AnchorPos {
+            parent: self.parent.localize(r)?,
+            offset: self.offset,
+        })
+    }
+}
+
+impl Localizable for ChildEntry {
+    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+        Ok(ChildEntry {
+            child_id: self.child_id.localize(r)?,
+            offset: self.offset,
+        })
+    }
+}
+
+impl Localizable for AnchorAgg {
+    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+        let mut children = ImHashMap::new();
+        for (k, v) in self.children {
+            let k_new = k.localize(r)?;
+            let mut v_new = Vec::with_capacity(v.len());
+            for e in v {
+                v_new.push(e.localize(r)?);
+            }
+            children.insert(k_new, v_new);
+        }
+        Ok(AnchorAgg { children })
+    }
+}
+
+impl Localizable for TextAgg {
+    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+        let mut content = ImHashMap::new();
+        for (k, v) in self.content {
+            content.insert(k.localize(r)?, v);
+        }
+        Ok(TextAgg { content })
+    }
+}
+
+impl Localizable for TextUpd {
+    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+        let mut new_anchors = Vec::with_capacity(self.new_anchors.len());
+        for a in &self.new_anchors {
+            new_anchors.push(AnchorPos {
+                parent: a.parent.localize(r)?,
+                offset: a.offset,
+            });
+        }
+        let mut deletions = Vec::with_capacity(self.deletions.len());
+        for d in &self.deletions {
+            deletions.push(d.localize(r)?);
+        }
+        Ok(TextUpd {
+            new_anchors,
+            new_strings: self.new_strings.clone(),
+            deletions,
+        })
     }
 }

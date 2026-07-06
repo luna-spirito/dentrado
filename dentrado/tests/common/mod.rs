@@ -13,10 +13,6 @@ use dentrado::{
         gear::IsRuntime,
         loc_ctx::{EventContext, LocCtx},
     },
-    fadeno::{
-        bridge::{FadenoModule, FadenoRuntime},
-        types::{KolGear, LocValue, TagRegistry},
-    },
     types::*,
     wire::{WireEventBody, WireLocCtx, WireLocCtxBuilder},
 };
@@ -49,7 +45,7 @@ struct Node<R: IsRuntime> {
 pub(crate) struct TestCluster<R: IsRuntime> {
     module: Arc<R::Module>,
     nodes: Vec<Node<R>>,
-    loc_ctx: LocCtx<R>,
+    pub(crate) loc_ctx: LocCtx<R>,
     next_data_ts: u32,
     drain_duration: Duration,
     rng: XorShift64,
@@ -203,157 +199,5 @@ impl<R: IsRuntime> TestCluster<R> {
         if !self.drain_duration.is_zero() {
             std::thread::sleep(self.drain_duration);
         }
-    }
-}
-
-pub(crate) struct WikiTestCluster(TestCluster<FadenoRuntime>);
-
-impl Deref for WikiTestCluster {
-    type Target = TestCluster<FadenoRuntime>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl DerefMut for WikiTestCluster {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl WikiTestCluster {
-    pub(crate) fn start(core_counts: &[u32], mut module: FadenoModule) -> Self {
-        let creator = module.ensure_tag_id(b"creator");
-        let created_at = module.ensure_tag_id(b"created_at");
-        let _ = module.ensure_tag_set(&[creator, created_at]);
-        Self(TestCluster::start(core_counts, module))
-    }
-
-    pub(crate) fn add_seed_branch(
-        &mut self,
-        invite_mt: LocMsgTypeId,
-        creator_uid: LocUserId,
-    ) -> LocDataId {
-        let content = self.tags().make_record(&[
-            (b"creator", LocValue::KolUserId(creator_uid)),
-            (b"created_at", LocValue::Num(1i64)),
-        ]);
-        let did = self.add_data(content.clone());
-
-        self.loc_ctx
-            .mk_loc_group(invite_mt, LocValue::KolDataId(did));
-        did
-    }
-
-    pub(crate) fn mk_loc_user(&mut self, uid: UserId) -> LocUserId {
-        EventContext::mk_loc_user(&mut self.loc_ctx, uid)
-    }
-
-    pub(crate) fn kol_user_id(&mut self, uid: UserId) -> LocValue {
-        LocValue::KolUserId(self.mk_loc_user(uid))
-    }
-
-    pub(crate) fn build_gear(&self, closure: LocValue, args: Vec<LocValue>) -> KolGear {
-        let result = self
-            .module
-            .call_with_storage(closure, args, &self.loc_ctx)
-            .expect("gear construction failed");
-        match result {
-            LocValue::KolGear(g) => *g,
-            other => panic!("expected KolGear, got {other:?}"),
-        }
-    }
-
-    pub(crate) fn build_and_run_gear(&self, closure: LocValue, args: Vec<LocValue>) -> LocValue {
-        let gear = self.build_gear(closure, args);
-        self.run_gear(gear)
-    }
-
-    #[must_use]
-    pub(crate) fn module(&self) -> &FadenoModule {
-        &self.module
-    }
-
-    #[must_use]
-    pub(crate) fn tags(&self) -> &TagRegistry {
-        self.module.tags()
-    }
-
-    pub(crate) fn msg_type(&self, name: &[u8]) -> LocMsgTypeId {
-        match self.tags().record_get(self.module().exports(), name) {
-            Some(LocValue::KolEventTypeId(id)) => id,
-            other => panic!(
-                "msg_type({}): expected KolEventTypeId, got {other:?}",
-                std::str::from_utf8(name).unwrap_or("?")
-            ),
-        }
-    }
-
-    pub(crate) fn branch_core_id(&self, did: LocDataId) -> GlobalCoreId {
-        FadenoRuntime::route_group(&LocValue::KolDataId(did), &self.loc_ctx)
-            .expect("route_group failed")
-    }
-
-    pub(crate) fn find_cross_core_doc_id(&self, invited_core: u32, num_cores: u32) -> u64 {
-        let doc_content_closure = self
-            .tags()
-            .record_get(self.module().exports(), b"doc_content")
-            .expect("missing doc_content export")
-            .clone();
-
-        (1..10_000)
-            .find(|&d| {
-                let doc_result = self
-                    .module
-                    .call_with_storage(
-                        doc_content_closure.clone(),
-                        vec![LocValue::Num(d as i64)],
-                        &self.loc_ctx,
-                    )
-                    .expect("gear call failed");
-                let LocValue::KolGear(doc_gear) = doc_result else {
-                    panic!("expected KolGear");
-                };
-                let (doc_gear_wire, wc) = self.remap_gear(*doc_gear);
-
-                let gear_core = FadenoRuntime::route_group(doc_gear_wire.group(), &wc)
-                    .unwrap()
-                    .route(NonZero::new(num_cores).unwrap());
-                if gear_core == invited_core {
-                    return false;
-                }
-                let event_core = FadenoRuntime::route_group(&LocValue::Num(d as i64), &wc)
-                    .unwrap()
-                    .route(NonZero::new(num_cores).unwrap());
-                event_core == gear_core
-            })
-            .expect("should find a suitable doc_id for cross-core routing")
-    }
-
-    pub(crate) fn register_group(&mut self, event_type: LocMsgTypeId, group: LocValue) {
-        self.0.loc_ctx.mk_loc_group(event_type, group);
-    }
-
-    pub(crate) fn empty_record() -> LocValue {
-        LocValue::Record {
-            tag_set: Arc::new(vec![0]),
-            fields: Arc::new(Vec::new()),
-        }
-    }
-}
-
-pub(crate) fn wire_event(
-    sender: LocSenderId,
-    tx_id: u32,
-    msg_type: LocMsgTypeId,
-    group: LocValue,
-    body: LocValue,
-) -> WireEventBody<LocValue, LocValue> {
-    WireEventBody {
-        sender,
-        tx_id,
-        msg_type,
-        group,
-        body,
     }
 }
