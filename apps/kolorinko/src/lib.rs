@@ -15,7 +15,6 @@ use std::{
     rc::Rc,
     sync::Arc,
     thread::available_parallelism,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::runtime::KolorinkoRT;
@@ -25,22 +24,10 @@ mod web;
 mod wikidot_page;
 pub mod wikidot_parser;
 
-#[derive(Clone, Copy)]
-pub struct Timestamp(pub u32);
-
-pub fn impure_now() -> Timestamp {
-    Timestamp(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u32,
-    )
-}
-
 /// The export repo served by [`runtime::GearId::Repo`].
 const REPO_URL: &str = "https://github.com/luna-spirito/wikidot-kolorinko-export.git";
-/// Default seconds between forced `git pull`s of the repo.
-const DEFAULT_REPO_INTERVAL: u32 = 300;
+/// Default seconds between forced `git pull`s of the repo (15 minutes).
+const DEFAULT_REPO_INTERVAL: u32 = 900;
 
 pub fn main() -> anyhow::Result<()> {
     env_logger::init();

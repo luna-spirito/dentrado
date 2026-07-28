@@ -28,6 +28,10 @@ use compio::{
     ws::{Config, WebSocketStream, tungstenite},
 };
 use dentrado::{core::core_ctx::Core, wire::WireLocCtx};
+use futures::channel::mpsc;
+use futures::future::FutureExt;
+use futures::select;
+use futures::stream::StreamExt;
 use kolorinko_wikitext::Content;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -204,9 +208,9 @@ enum Reply {
     /// A page was loaded; `content` is the parsed Wikidot AST.
     #[serde(rename = "page")]
     Page { content: Content },
-    /// `GearId::Repo` resolved to this filesystem path.
+    /// `GearId::Repo` ran and loaded this many pages from the repository.
     #[serde(rename = "repo")]
-    Repo { path: String },
+    Repo { pages: usize },
     #[serde(rename = "error")]
     Error { error: String },
 }
@@ -217,100 +221,162 @@ impl Reply {
     }
 }
 
-/// WebSocket message loop: parse a JSON [`Request`], run the matching gear via
-/// [`Core::db_run_gear`] (which routes to the owning core), and reply.
+/// WebSocket message loop: keeps one direct subscription per page the
+/// client has asked for, for the lifetime of the connection. The client's
+/// `load` request opens (or refreshes) a subscription; a background push task
+/// per subscription forwards every new output to a single outbound channel,
+/// which is drained here alongside incoming WS messages. Dropping the
+/// connection (or a WS close/error) drops every push-task handle, which
+/// cancels the task (compio `JoinHandle` drop = cancel) and drops its
+/// `Subscription`, so the gear rebalances / evicts as interest goes away —
+/// i.e. a page is only kept hot while a client is actually viewing it.
 async fn ws_loop(
     ws: &mut WebSocketStream<TcpStream>,
     core: &Rc<Core<KolorinkoRT>>,
     repo_meta: RepoMeta,
 ) -> io::Result<()> {
+    let (tx, mut rx) = mpsc::unbounded::<Reply>();
+    // One push-task handle per subscribed page. Stored (not detached) so that
+    // dropping it on disconnect cancels the task and releases its subscription.
+    let mut subs: HashMap<PageKey, runtime::JoinHandle<()>> = HashMap::new();
+
     loop {
-        let msg = match ws.read().await {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("ws read: {e}");
-                return Ok(());
-            }
+        let close = select! {
+            msg = ws.read().fuse() => match msg {
+                Ok(tungstenite::Message::Text(t)) => {
+                    handle_text(&t, &tx, &mut subs, core, &repo_meta).await;
+                    false
+                }
+                Ok(tungstenite::Message::Close(_))
+                | Ok(tungstenite::Message::Ping(_))
+                | Err(_) => true,
+                Ok(_) => false,
+            },
+            reply = rx.next() => match reply {
+                Some(r) => {
+                    send(ws, r).await;
+                    false
+                }
+                None => true,
+            },
         };
-        let text = match msg {
-            tungstenite::Message::Text(t) => t,
-            tungstenite::Message::Close(_) | tungstenite::Message::Ping(_) => return Ok(()),
-            _ => continue,
-        };
-        let req: Request = match serde_json::from_str(text.as_str()) {
-            Ok(r) => r,
-            Err(e) => {
-                send(
-                    ws,
-                    Reply::Error {
-                        error: format!("bad request: {e}"),
-                    },
-                )
-                .await;
-                continue;
-            }
-        };
-        let reply = handle_request(core, &repo_meta, req).await;
-        send(ws, reply).await;
+        if close {
+            return Ok(());
+        }
     }
 }
 
-/// Dispatch a [`Request`] to a gear and turn the [`GearOut`] into a [`Reply`].
-async fn handle_request(core: &Rc<Core<KolorinkoRT>>, repo_meta: &RepoMeta, req: Request) -> Reply {
-    let ctx = WireLocCtx::default();
+/// Identity of a subscribed page, used to dedup push tasks per connection.
+type PageKey = (
+    SafePathComponent,
+    Option<SafePathComponent>,
+    SafePathComponent,
+);
+
+/// Parse one WS text frame and act on it. Replies are never written directly to
+/// the socket here — they go through `tx` so they serialize with push-task
+/// updates on the `ws_loop` write side. `load` opens (or refreshes) a direct
+/// subscription and spawns a push task that forwards every new output; `repo`
+/// is a one-shot diagnostic run.
+async fn handle_text(
+    text: &str,
+    tx: &mpsc::UnboundedSender<Reply>,
+    subs: &mut HashMap<PageKey, runtime::JoinHandle<()>>,
+    core: &Rc<Core<KolorinkoRT>>,
+    repo_meta: &RepoMeta,
+) {
+    let req: Request = match serde_json::from_str(text) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.unbounded_send(Reply::Error {
+                error: format!("bad request: {e}"),
+            });
+            return;
+        }
+    };
     match req {
-        Request::Repo => match core.db_run_gear(GearId::Repo(repo_meta.clone()), ctx).await {
-            Ok(GearOut::RepoOut(path)) => Reply::Repo {
-                path: path.as_path().display().to_string(),
-            },
-            Ok(_) => Reply::Error {
-                error: "unexpected gear output".into(),
-            },
-            Err(e) => Reply::Error {
-                error: format!("gear error: {e:?}"),
-            },
-        },
+        Request::Repo => {
+            match core
+                .db_run_gear(GearId::Repo(repo_meta.clone()), WireLocCtx::default())
+                .await
+            {
+                Ok(GearOut::RepoOut(data)) => {
+                    let _ = tx.unbounded_send(Reply::Repo {
+                        pages: data.page_count(),
+                    });
+                }
+                Ok(_) => {
+                    let _ = tx.unbounded_send(Reply::Error {
+                        error: "unexpected gear output".into(),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.unbounded_send(Reply::Error {
+                        error: format!("gear error: {e:?}"),
+                    });
+                }
+            }
+        }
         Request::Load {
             site,
             category,
             page,
         } => {
             let Some(site) = SafePathComponent::new(site) else {
-                return Reply::Error {
+                let _ = tx.unbounded_send(Reply::Error {
                     error: "invalid site".into(),
-                };
+                });
+                return;
             };
             let Some(page) = SafePathComponent::new(page) else {
-                return Reply::Error {
+                let _ = tx.unbounded_send(Reply::Error {
                     error: "invalid page".into(),
-                };
+                });
+                return;
             };
             let category = match category {
                 None => None,
                 Some(c) => match SafePathComponent::new(c) {
                     Some(sp) => Some(sp),
                     None => {
-                        return Reply::Error {
+                        let _ = tx.unbounded_send(Reply::Error {
                             error: "invalid category".into(),
-                        };
+                        });
+                        return;
                     }
                 },
             };
+            let key: PageKey = (site.clone(), category.clone(), page.clone());
             let gear = GearId::Load {
                 repo: repo_meta.clone(),
                 site,
                 slug: (category, page),
             };
-            match core.db_run_gear(gear, ctx).await {
-                Ok(GearOut::LoadOut(content)) => Reply::Page {
+            // Subscribe fresh (replacing any prior push task for this page, so
+            // a duplicate `load` request revives a subscription whose push task
+            // died because the gear was evicted). `subscribe_gear` awaits the
+            // first output, so `current()` is always present.
+            let sub = core.subscribe_gear(gear).await;
+            let initial = sub.current();
+            if let GearOut::LoadOut(content) = initial {
+                let _ = tx.unbounded_send(Reply::Page {
                     content: (*content).clone(),
-                },
-                Ok(_) => Reply::Error {
-                    error: "unexpected gear output".into(),
-                },
-                Err(e) => Reply::Error {
-                    error: format!("gear error: {e:?}"),
-                },
+                });
+            }
+            let tx = tx.clone();
+            let handle = runtime::spawn(async move {
+                while let Some(out) = sub.next().await {
+                    if let GearOut::LoadOut(content) = out {
+                        let _ = tx.unbounded_send(Reply::Page {
+                            content: (*content).clone(),
+                        });
+                    }
+                }
+            });
+            if let Some(old) = subs.insert(key, handle) {
+                // Cancel the previous push task; its subscription drops and
+                // rebalances (the new subscription keeps the gear hot).
+                drop(old);
             }
         }
     }

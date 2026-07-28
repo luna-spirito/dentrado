@@ -87,6 +87,11 @@
               haskPkgs.haskell-language-server
 
               pkgs.typst
+
+              # libgit2 TLS backend: `git2`'s `https` feature links against
+              # system OpenSSL, which it finds via pkg-config.
+              pkgs.openssl
+              pkgs.pkg-config
             ];
           };
 
@@ -108,6 +113,11 @@
               pkgs.trunk
               pkgs.just
               pkgs.xdg-utils
+
+              # libgit2 TLS backend: `git2`'s `https` feature links against
+              # system OpenSSL, which it finds via pkg-config.
+              pkgs.openssl
+              pkgs.pkg-config
             ];
           };
         };

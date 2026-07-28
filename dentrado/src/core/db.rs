@@ -233,6 +233,7 @@ impl<R: IsRuntime> Db<R> {
 
             let join = thread::Builder::new()
                 .name(format!("dentrado-core-{core_id}"))
+                // .stack_size(CORE_THREAD_STACK_SIZE)
                 .spawn(move || {
                     let runtime = compio::runtime::RuntimeBuilder::new()
                         .thread_affinity(HashSet::from([core_id as usize]))

@@ -29,6 +29,8 @@ use crate::{
 };
 
 // TODO: Crack down on clones?
+// TODO: Secondary input caching? Quite desirable to keep processing strictly local.
+// TODO: NO GODDAMN ARCs!
 
 // Maybe remove CoordCmd? I don't feel like it, it's more efficient this way.
 /// Represents an operation initiate by a direct client of the DBMS.
