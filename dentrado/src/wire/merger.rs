@@ -3,7 +3,9 @@ use crate::{
         gear::IsRuntime,
         loc_ctx::{EventContext, StoreResultSuccess, StoredEvent},
     },
-    types::{GlobalCoreId, LocDataId, LocSenderId, LocUserId, Localizable, NodeId, Remapper},
+    types::{
+        GlobalCoreId, LocDataId, LocGroupId, LocSenderId, LocUserId, Localizable, NodeId, Remapper,
+    },
     wire::format::{MergeError, WireEventBody, WireLocCtx},
 };
 
@@ -44,21 +46,24 @@ impl<'a, R: IsRuntime, Target: EventContext<R>> WireLocCtxMerger<'a, R, Target> 
         global_core_id: GlobalCoreId,
         timestamp: u32,
         source_node: NodeId,
-    ) -> Result<Option<StoreResultSuccess>, MergeError> {
+    ) -> Result<(LocGroupId, Option<StoreResultSuccess>), MergeError> {
         let sender = self.remap(event.sender)?;
         let group = self.remap(event.group)?;
         let body = self.remap(event.body)?;
 
         let group_id = self.target.mk_loc_group(event.msg_type, group);
-        Ok(self.target.store_event(StoredEvent {
-            group: group_id,
-            sender,
-            global_core_id,
-            tx_id: event.tx_id,
-            timestamp,
-            source_node,
-            body,
-        }))
+        Ok((
+            group_id,
+            self.target.store_event(StoredEvent {
+                group: group_id,
+                sender,
+                global_core_id,
+                tx_id: event.tx_id,
+                timestamp,
+                source_node,
+                body,
+            }),
+        ))
     }
 }
 

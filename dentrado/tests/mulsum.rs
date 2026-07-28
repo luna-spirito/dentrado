@@ -1,6 +1,6 @@
 use dentrado::{
     core::{
-        core_ctx::Core,
+        core_ctx::{Core, GearCtx},
         gear::IsRuntime,
         loc_ctx::{EventContext, EventStore},
     },
@@ -88,16 +88,15 @@ impl IsRuntime for MulSumRuntime {
         }
     }
 
-    fn run_step(
-        _gear: &Self::GearId,
-        core: &Core<Self>,
+    async fn run_step(
+        _ctx: &mut GearCtx<Self>,
         group: Option<LocGroupId>,
         cache: &mut Self::GearCache,
     ) -> i64 {
         let Some(group) = group else {
             return cache.agg;
         };
-        let Some((added_ids, removed_ids)) = core.query_events(
+        let Some((added_ids, removed_ids)) = _ctx.query_events(
             group,
             (cache.processed_added, cache.processed_removed),
             |a, r| (a.to_vec(), r.to_vec()),
@@ -105,11 +104,11 @@ impl IsRuntime for MulSumRuntime {
             return cache.agg;
         };
         for &eid in &added_ids {
-            let body = core.stored_event(eid).map(|e| e.body).unwrap();
+            let body = _ctx.stored_event(eid).map(|e| e.body).unwrap();
             cache.agg += body.a * body.b;
         }
         for &eid in &removed_ids {
-            let body = core.stored_event(eid).map(|e| e.body).unwrap();
+            let body = _ctx.stored_event(eid).map(|e| e.body).unwrap();
             cache.agg -= body.a * body.b;
         }
         cache.processed_added += added_ids.len();
@@ -175,4 +174,109 @@ fn mulsum_engine() {
 
     let sum = tc.run_gear(gear);
     assert_eq!(sum, 29);
+}
+
+// --- Phase 2: subscription API (local gears) ---------------------------------
+
+/// Commands a test worker can perform against its pinned `Rc<Core>`.
+enum WorkerCmd {
+    /// `read_gear` (subscribe + borrow + drop) and reply with the value.
+    Read(MulSumGear, flume::Sender<i64>),
+    /// `subscribe_gear`, hold the subscription, reply with the initial value.
+    Subscribe(MulSumGear, flume::Sender<i64>),
+    /// Drop the most recently held subscription (LIFO).
+    DropSub,
+}
+
+/// Exercises `subscribe_gear`/`read_gear` via the realistic worker_fn path.
+/// Single-core cluster ⟹ every gear is local to its querying worker.
+#[test]
+fn local_gear_read_and_subscribe_via_worker() {
+    let (cmd_tx, cmd_rx) = flume::unbounded::<WorkerCmd>();
+
+    let worker = move |core: std::rc::Rc<Core<MulSumRuntime>>| {
+        let cmd_rx = cmd_rx.clone();
+        let mut held: Vec<dentrado::core::core_ctx::Subscription<MulSumRuntime>> = Vec::new();
+        async move {
+            while let Ok(cmd) = cmd_rx.recv_async().await {
+                match cmd {
+                    WorkerCmd::Read(gear, reply) => {
+                        let v = core.read_gear(gear).await;
+                        let _ = reply.send(v);
+                    }
+                    WorkerCmd::Subscribe(gear, reply) => {
+                        let sub = core.subscribe_gear(gear).await;
+                        let v = sub.current();
+                        held.push(sub);
+                        let _ = reply.send(v);
+                    }
+                    WorkerCmd::DropSub => {
+                        held.pop();
+                    }
+                }
+            }
+        }
+    };
+
+    let mut tc: TestCluster<MulSumRuntime> = TestCluster::start_with_worker(&[1], (), worker);
+
+    let bucket: i64 = 0;
+    tc.loc_ctx.mk_loc_group(MSG_MULSUM, bucket);
+    let gear = MulSumGear::MulSum { bucket };
+
+    let alice_pk = SenderPk([42u8; 32]);
+    let alice_uid = UserId {
+        id: 1,
+        identity_server_pk: IdentityServerPk([0; 32]),
+    };
+    let alice = tc.add_user(alice_pk, alice_uid);
+
+    // agg += 3*4 = 12
+    tc.post_events(
+        vec![WireEventBody {
+            sender: alice,
+            tx_id: 0,
+            msg_type: MSG_MULSUM,
+            group: bucket,
+            body: MulSumBody { a: 3, b: 4 },
+        }],
+        1,
+    );
+
+    // read_gear recomputes fresh each call.
+    let (rtx, rrx) = flume::bounded(1);
+    cmd_tx.send(WorkerCmd::Read(gear.clone(), rtx)).unwrap();
+    assert_eq!(rrx.recv().unwrap(), 12);
+
+    // agg += 5*2 = 10 → 22
+    tc.post_events(
+        vec![WireEventBody {
+            sender: alice,
+            tx_id: 1,
+            msg_type: MSG_MULSUM,
+            group: bucket,
+            body: MulSumBody { a: 5, b: 2 },
+        }],
+        2,
+    );
+
+    let (rtx, rrx) = flume::bounded(1);
+    cmd_tx.send(WorkerCmd::Read(gear.clone(), rtx)).unwrap();
+    assert_eq!(rrx.recv().unwrap(), 22);
+
+    // subscribe once → initial value 22; hold it.
+    let (stx, srx) = flume::bounded(1);
+    cmd_tx
+        .send(WorkerCmd::Subscribe(gear.clone(), stx))
+        .unwrap();
+    assert_eq!(srx.recv().unwrap(), 22);
+
+    // Dropping the subscription must not panic and leaves the gear in limbo.
+    // A subsequent read re-activates it from limbo.
+    cmd_tx.send(WorkerCmd::DropSub).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let (rtx, rrx) = flume::bounded(1);
+    cmd_tx.send(WorkerCmd::Read(gear.clone(), rtx)).unwrap();
+    assert_eq!(rrx.recv().unwrap(), 22);
 }

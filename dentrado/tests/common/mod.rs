@@ -9,6 +9,7 @@ use std::{
 
 use dentrado::{
     core::{
+        core_ctx::Core,
         db::{Db, DbConfig, Doorbell, DoorbellHandle, PeerChannels, create_peer_channel_pair},
         gear::IsRuntime,
         loc_ctx::{EventContext, LocCtx},
@@ -53,6 +54,21 @@ pub(crate) struct TestCluster<R: IsRuntime> {
 
 impl<R: IsRuntime> TestCluster<R> {
     pub(crate) fn start(core_counts: &[u32], module: R::Module) -> Self {
+        Self::start_with_worker(core_counts, module, |_| std::future::pending::<()>())
+    }
+
+    /// Start the cluster with a user-supplied worker function per core. This is
+    /// the realistic access pattern: workers receive `Rc<Core>` and may call
+    /// `subscribe_gear`/`read_gear` directly on their pinned core.
+    pub(crate) fn start_with_worker<W, F>(
+        core_counts: &[u32],
+        module: R::Module,
+        worker_fn: W,
+    ) -> Self
+    where
+        W: Fn(std::rc::Rc<Core<R>>) -> F + Clone + Send + 'static,
+        F: std::future::Future<Output = ()> + 'static,
+    {
         let num_nodes = core_counts.len();
         assert!(num_nodes > 0, "TestCluster needs at least one node");
         let module = Arc::new(module);
@@ -105,7 +121,7 @@ impl<R: IsRuntime> TestCluster<R> {
                 peers: std::mem::take(&mut all_peers[i]),
                 doorbells,
             };
-            let db = Db::start(config).expect("Db::start failed");
+            let db = Db::start_with_worker(config, worker_fn.clone()).expect("Db::start failed");
             nodes.push(Node { db });
         }
 

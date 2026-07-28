@@ -3,7 +3,7 @@ use crate::{
     safe_path::SafePathComponent,
     wikidot_parser::{parse, types::Content},
 };
-use dentrado::{core::core_ctx::Core, types::LocGroupId};
+use dentrado::{core::core_ctx::GearCtx, types::LocGroupId};
 use git2::Repository;
 use log::error;
 use std::{
@@ -191,14 +191,14 @@ fn strip_quotes(s: &str) -> &str {
 #[derive(Default)]
 pub(crate) struct LoadCache(Option<(u64, Arc<Content>)>);
 
-pub(crate) fn load_page(
+pub(crate) async fn load_page(
     meta: &RepoMeta,
     site: &SafePathComponent,
     (category_, name): &(Option<SafePathComponent>, SafePathComponent),
-    core: &Core<KolorinkoRT>,
+    ctx: &mut GearCtx<KolorinkoRT>,
     cache: &mut LoadCache,
 ) -> Arc<Content> {
-    let GearOut::RepoOut(repo) = core.secondary_get(GearId::Repo(meta.clone())) else {
+    let GearOut::RepoOut(repo) = ctx.secondary_get(GearId::Repo(meta.clone())).await else {
         unreachable!()
     };
 

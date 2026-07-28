@@ -64,3 +64,4 @@ bridge.rs:
 * self-doorbell is funny. but maybe not.
 
 * CRITICAL: decide what to do with NodeId and how to make u32 enough. Is this possible even?
+* Swap Event: it has internal Rc, and I don't like that >_<

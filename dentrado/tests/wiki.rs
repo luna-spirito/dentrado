@@ -1,6 +1,6 @@
 use dentrado::{
     core::{
-        core_ctx::Core,
+        core_ctx::{Core, GearCtx},
         gear::IsRuntime,
         loc_ctx::{EventContext, EventStore},
     },
@@ -101,16 +101,15 @@ impl IsRuntime for WikiCounterRuntime {
         }
     }
 
-    fn run_step(
-        _gear: &Self::GearId,
-        core: &Core<Self>,
+    async fn run_step(
+        _ctx: &mut GearCtx<Self>,
         group: Option<LocGroupId>,
         cache: &mut Self::GearCache,
     ) -> i64 {
         let Some(group) = group else {
             return cache.out;
         };
-        let Some((added_ids, removed_ids)) = core.query_events(
+        let Some((added_ids, removed_ids)) = _ctx.query_events(
             group,
             (cache.processed_added, cache.processed_removed),
             |a, r| (a.to_vec(), r.to_vec()),

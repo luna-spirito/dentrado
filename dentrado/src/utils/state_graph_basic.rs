@@ -10,6 +10,14 @@ type SG<K, V> = StateGraph<(), (), (), K, V>;
 const PK_A: SenderPk = SenderPk([0u8; 32]);
 const GCI_0: GlobalCoreId = GlobalCoreId(0);
 
+/// Drive a future on a throwaway compio runtime (state_graph is async but I/O-free).
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    compio::runtime::RuntimeBuilder::new()
+        .build()
+        .expect("compio runtime build failed")
+        .block_on(fut)
+}
+
 fn eid(ts: u32, lid: u64) -> SGEventId {
     SGEventId::new(
         SGBucketId {
@@ -48,7 +56,10 @@ enum TestEvent {
     CopyYToZ,
 }
 
-fn test_handler(event: &TestEvent, ctx: &HandlerCtx<(), (), (), EmptyRuntime, &str, i32>) {
+async fn test_handler<R: async FnMut(&()) -> Timeline<(), ()>>(
+    event: &TestEvent,
+    ctx: &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &str, i32, R>,
+) {
     match event {
         TestEvent::SetX(val) => ctx.update("x", *val),
         TestEvent::CopyXToY => {
@@ -84,21 +95,16 @@ fn make_resolver<E: Clone>(
     }
 }
 
-fn nr() -> &'static dyn Fn(()) -> Timeline<(), ()> {
-    &|_| Timeline {
-        writes: OrdMap::new(),
-    }
-}
-
-fn apply_added<E: Clone, H>(
+async fn apply_added<E: Clone, H, R>(
     sg: &mut SG<&'static str, i32>,
     events: &mut EventStore<E>,
-    handler: &H,
-    r: &dyn Fn(()) -> Timeline<(), ()>,
+    handler: &mut H,
+    r: &mut R,
     ctx: &LocCtx<EmptyRuntime>,
     added: &[(u64, u32, E)],
 ) where
-    H: Fn(&E, &HandlerCtx<(), (), (), EmptyRuntime, &'static str, i32>),
+    H: async FnMut(&E, &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &'static str, i32, R>),
+    R: async FnMut(&()) -> Timeline<(), ()>,
 {
     for (local_id, ts, e) in added {
         events.insert(*local_id, (*ts, e.clone()));
@@ -112,18 +118,20 @@ fn apply_added<E: Clone, H>(
             removed: vec![],
             added: added.iter().map(|(l, _, _)| lid(*l)).collect(),
         },
-    );
+    )
+    .await;
 }
 
-fn apply_removed<E: Clone, H>(
+async fn apply_removed<E: Clone, H, R>(
     sg: &mut SG<&'static str, i32>,
     events: &mut EventStore<E>,
-    handler: &H,
-    r: &dyn Fn(()) -> Timeline<(), ()>,
+    handler: &mut H,
+    r: &mut R,
     ctx: &LocCtx<EmptyRuntime>,
     removed: &[u64],
 ) where
-    H: Fn(&E, &HandlerCtx<(), (), (), EmptyRuntime, &'static str, i32>),
+    H: async FnMut(&E, &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &'static str, i32, R>),
+    R: async FnMut(&()) -> Timeline<(), ()>,
 {
     sg.apply(
         handler,
@@ -134,128 +142,167 @@ fn apply_removed<E: Clone, H>(
             removed: removed.iter().map(|&id| lid(id)).collect(),
             added: vec![],
         },
-    );
+    )
+    .await;
 }
 
 #[test]
 fn single_event_update() {
-    let mut sg: SG<&str, i32> = SG::new();
-    let mut events = EventStore::new();
-    let ctx = make_test_ctx(10);
-    apply_added(
-        &mut sg,
-        &mut events,
-        &test_handler,
-        nr(),
-        &ctx,
-        &[(1, 0, TestEvent::SetX(42))],
-    );
-    assert_eq!(sg.query(&"x"), Some(&42));
+    block_on(async {
+        let mut sg: SG<&str, i32> = SG::new();
+        let mut events = EventStore::new();
+        let ctx = make_test_ctx(10);
+        let mut handler = test_handler;
+        let mut r = async |_: &()| Timeline::<(), ()> {
+            writes: OrdMap::new(),
+        };
+        apply_added(
+            &mut sg,
+            &mut events,
+            &mut handler,
+            &mut r,
+            &ctx,
+            &[(1, 0, TestEvent::SetX(42))],
+        )
+        .await;
+        assert_eq!(sg.query(&"x"), Some(&42));
+    });
 }
 
 #[test]
 fn query_and_propagation() {
-    let mut sg: SG<&str, i32> = SG::new();
-    let mut events = EventStore::new();
-    let ctx = make_test_ctx(10);
-    apply_added(
-        &mut sg,
-        &mut events,
-        &test_handler,
-        nr(),
-        &ctx,
-        &[(1, 0, TestEvent::SetX(10)), (2, 0, TestEvent::CopyXToY)],
-    );
-    assert_eq!(sg.query(&"y"), Some(&11));
-    events.insert(1, (0, TestEvent::SetX(20)));
-    sg.apply(
-        &test_handler,
-        &make_resolver(&events),
-        nr(),
-        &ctx,
-        &DeltaList {
-            removed: vec![],
-            added: vec![lid(1)],
-        },
-    );
-    assert_eq!(sg.query(&"y"), Some(&21));
+    block_on(async {
+        let mut sg: SG<&str, i32> = SG::new();
+        let mut events = EventStore::new();
+        let ctx = make_test_ctx(10);
+        let mut handler = test_handler;
+        let mut r = async |_: &()| Timeline::<(), ()> {
+            writes: OrdMap::new(),
+        };
+        apply_added(
+            &mut sg,
+            &mut events,
+            &mut handler,
+            &mut r,
+            &ctx,
+            &[(1, 0, TestEvent::SetX(10)), (2, 0, TestEvent::CopyXToY)],
+        )
+        .await;
+        assert_eq!(sg.query(&"y"), Some(&11));
+        events.insert(1, (0, TestEvent::SetX(20)));
+        sg.apply(
+            &mut handler,
+            &make_resolver(&events),
+            &mut r,
+            &ctx,
+            &DeltaList {
+                removed: vec![],
+                added: vec![lid(1)],
+            },
+        )
+        .await;
+        assert_eq!(sg.query(&"y"), Some(&21));
+    });
 }
 
 #[test]
 fn transitive_propagation() {
-    let mut sg: SG<&str, i32> = SG::new();
-    let mut events = EventStore::new();
-    let ctx = make_test_ctx(10);
-    apply_added(
-        &mut sg,
-        &mut events,
-        &test_handler,
-        nr(),
-        &ctx,
-        &[
-            (1, 0, TestEvent::SetX(10)),
-            (2, 0, TestEvent::CopyXToY),
-            (3, 0, TestEvent::CopyYToZ),
-        ],
-    );
-    assert_eq!(sg.query(&"z"), Some(&12));
-    events.insert(1, (0, TestEvent::SetX(20)));
-    sg.apply(
-        &test_handler,
-        &make_resolver(&events),
-        nr(),
-        &ctx,
-        &DeltaList {
-            removed: vec![],
-            added: vec![lid(1)],
-        },
-    );
-    assert_eq!(sg.query(&"z"), Some(&22));
+    block_on(async {
+        let mut sg: SG<&str, i32> = SG::new();
+        let mut events = EventStore::new();
+        let ctx = make_test_ctx(10);
+        let mut handler = test_handler;
+        let mut r = async |_: &()| Timeline::<(), ()> {
+            writes: OrdMap::new(),
+        };
+        apply_added(
+            &mut sg,
+            &mut events,
+            &mut handler,
+            &mut r,
+            &ctx,
+            &[
+                (1, 0, TestEvent::SetX(10)),
+                (2, 0, TestEvent::CopyXToY),
+                (3, 0, TestEvent::CopyYToZ),
+            ],
+        )
+        .await;
+        assert_eq!(sg.query(&"z"), Some(&12));
+        events.insert(1, (0, TestEvent::SetX(20)));
+        sg.apply(
+            &mut handler,
+            &make_resolver(&events),
+            &mut r,
+            &ctx,
+            &DeltaList {
+                removed: vec![],
+                added: vec![lid(1)],
+            },
+        )
+        .await;
+        assert_eq!(sg.query(&"z"), Some(&22));
+    });
 }
 
 #[test]
 fn no_propagation_when_value_unchanged() {
-    let mut sg: SG<&str, i32> = SG::new();
-    let mut events = EventStore::new();
-    let ctx = make_test_ctx(10);
-    apply_added(
-        &mut sg,
-        &mut events,
-        &test_handler,
-        nr(),
-        &ctx,
-        &[(1, 0, TestEvent::SetX(10)), (2, 0, TestEvent::CopyXToY)],
-    );
-    events.insert(1, (0, TestEvent::SetX(10)));
-    sg.apply(
-        &test_handler,
-        &make_resolver(&events),
-        nr(),
-        &ctx,
-        &DeltaList {
-            removed: vec![],
-            added: vec![lid(1)],
-        },
-    );
-    assert_eq!(sg.query(&"y"), Some(&11));
+    block_on(async {
+        let mut sg: SG<&str, i32> = SG::new();
+        let mut events = EventStore::new();
+        let ctx = make_test_ctx(10);
+        let mut handler = test_handler;
+        let mut r = async |_: &()| Timeline::<(), ()> {
+            writes: OrdMap::new(),
+        };
+        apply_added(
+            &mut sg,
+            &mut events,
+            &mut handler,
+            &mut r,
+            &ctx,
+            &[(1, 0, TestEvent::SetX(10)), (2, 0, TestEvent::CopyXToY)],
+        )
+        .await;
+        events.insert(1, (0, TestEvent::SetX(10)));
+        sg.apply(
+            &mut handler,
+            &make_resolver(&events),
+            &mut r,
+            &ctx,
+            &DeltaList {
+                removed: vec![],
+                added: vec![lid(1)],
+            },
+        )
+        .await;
+        assert_eq!(sg.query(&"y"), Some(&11));
+    });
 }
 
 #[test]
 fn remove_event_cascades() {
-    let mut sg: SG<&str, i32> = SG::new();
-    let mut events = EventStore::new();
-    let ctx = make_test_ctx(10);
-    apply_added(
-        &mut sg,
-        &mut events,
-        &test_handler,
-        nr(),
-        &ctx,
-        &[(1, 0, TestEvent::SetX(10)), (2, 0, TestEvent::CopyXToY)],
-    );
-    apply_removed(&mut sg, &mut events, &test_handler, nr(), &ctx, &[1]);
-    assert_eq!(sg.query(&"x"), None);
-    assert_eq!(sg.query(&"y"), None);
+    block_on(async {
+        let mut sg: SG<&str, i32> = SG::new();
+        let mut events = EventStore::new();
+        let ctx = make_test_ctx(10);
+        let mut handler = test_handler;
+        let mut r = async |_: &()| Timeline::<(), ()> {
+            writes: OrdMap::new(),
+        };
+        apply_added(
+            &mut sg,
+            &mut events,
+            &mut handler,
+            &mut r,
+            &ctx,
+            &[(1, 0, TestEvent::SetX(10)), (2, 0, TestEvent::CopyXToY)],
+        )
+        .await;
+        apply_removed(&mut sg, &mut events, &mut handler, &mut r, &ctx, &[1]).await;
+        assert_eq!(sg.query(&"x"), None);
+        assert_eq!(sg.query(&"y"), None);
+    });
 }
 
 #[test]
@@ -265,40 +312,51 @@ fn conditional_write_changes_on_re_evaluation() {
         SetX(i32),
         WriteYIfXPositive,
     }
-    let handler = |ev: &E, ctx: &HandlerCtx<(), (), (), EmptyRuntime, &str, i32>| match ev {
-        E::SetX(val) => ctx.update("x", *val),
-        E::WriteYIfXPositive => {
-            if let Some(x) = ctx.query(&"x") {
-                if x > 0 {
-                    ctx.update("y", x * 2);
+    block_on(async {
+        let handler =
+            async |ev: &E, ctx: &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &str, i32, _>| {
+                match ev {
+                    E::SetX(val) => ctx.update("x", *val),
+                    E::WriteYIfXPositive => {
+                        if let Some(x) = ctx.query(&"x") {
+                            if x > 0 {
+                                ctx.update("y", x * 2);
+                            }
+                        }
+                    }
                 }
-            }
-        }
-    };
-    let mut sg: SG<&str, i32> = SG::new();
-    let mut events: EventStore<E> = EventStore::new();
-    let ctx = make_test_ctx(10);
-    apply_added(
-        &mut sg,
-        &mut events,
-        &handler,
-        nr(),
-        &ctx,
-        &[(1, 0, E::SetX(5)), (2, 0, E::WriteYIfXPositive)],
-    );
-    assert_eq!(sg.query(&"y"), Some(&10));
-    events.insert(1, (0, E::SetX(-1)));
-    sg.apply(
-        &handler,
-        &make_resolver(&events),
-        nr(),
-        &ctx,
-        &DeltaList {
-            removed: vec![],
-            added: vec![lid(1)],
-        },
-    );
-    assert_eq!(sg.query(&"y"), None);
+            };
+        let mut sg: SG<&str, i32> = SG::new();
+        let mut events: EventStore<E> = EventStore::new();
+        let ctx = make_test_ctx(10);
+        let mut r = async |_: &()| Timeline::<(), ()> {
+            writes: OrdMap::new(),
+        };
+        let mut h = handler;
+        apply_added(
+            &mut sg,
+            &mut events,
+            &mut h,
+            &mut r,
+            &ctx,
+            &[(1, 0, E::SetX(5)), (2, 0, E::WriteYIfXPositive)],
+        )
+        .await;
+        assert_eq!(sg.query(&"y"), Some(&10));
+        events.insert(1, (0, E::SetX(-1)));
+        sg.apply(
+            &mut h,
+            &make_resolver(&events),
+            &mut r,
+            &ctx,
+            &DeltaList {
+                removed: vec![],
+                added: vec![lid(1)],
+            },
+        )
+        .await;
+        assert_eq!(sg.query(&"y"), None);
+    });
 }
 
 #[test]
@@ -309,46 +367,57 @@ fn bounded_propagation_skips_events_after_next_write() {
         OverwriteX(i32),
         ReadX(()),
     }
-    let handler = |ev: &E, ctx: &HandlerCtx<(), (), (), EmptyRuntime, &str, i32>| match ev {
-        E::SetX(val) => ctx.update("x", *val),
-        E::OverwriteX(val) => ctx.update("x", *val),
-        E::ReadX(_) => {
-            if let Some(x) = ctx.query(&"x") {
-                ctx.update("out", x);
-            }
-        }
-    };
-    let mut sg: SG<&str, i32> = SG::new();
-    let mut events: EventStore<E> = EventStore::new();
-    let ctx = make_test_ctx(10);
-    apply_added(
-        &mut sg,
-        &mut events,
-        &handler,
-        nr(),
-        &ctx,
-        &[
-            (1, 0, E::SetX(10)),
-            (2, 0, E::ReadX(())),
-            (3, 0, E::ReadX(())),
-            (5, 0, E::OverwriteX(99)),
-            (7, 0, E::ReadX(())),
-        ],
-    );
-    events.insert(1, (0, E::SetX(20)));
-    sg.apply(
-        &handler,
-        &make_resolver(&events),
-        nr(),
-        &ctx,
-        &DeltaList {
-            removed: vec![],
-            added: vec![lid(1)],
-        },
-    );
-    assert_eq!(sg.query_at(&"out", eid(0, 2), &ctx), Some(&20));
-    assert_eq!(sg.query_at(&"out", eid(0, 3), &ctx), Some(&20));
-    assert_eq!(sg.query_at(&"out", eid(0, 7), &ctx), Some(&99)); // NOT re-processed
+    block_on(async {
+        let handler =
+            async |ev: &E, ctx: &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &str, i32, _>| {
+                match ev {
+                    E::SetX(val) => ctx.update("x", *val),
+                    E::OverwriteX(val) => ctx.update("x", *val),
+                    E::ReadX(_) => {
+                        if let Some(x) = ctx.query(&"x") {
+                            ctx.update("out", x);
+                        }
+                    }
+                }
+            };
+        let mut sg: SG<&str, i32> = SG::new();
+        let mut events: EventStore<E> = EventStore::new();
+        let ctx = make_test_ctx(10);
+        let mut r = async |_: &()| Timeline::<(), ()> {
+            writes: OrdMap::new(),
+        };
+        let mut h = handler;
+        apply_added(
+            &mut sg,
+            &mut events,
+            &mut h,
+            &mut r,
+            &ctx,
+            &[
+                (1, 0, E::SetX(10)),
+                (2, 0, E::ReadX(())),
+                (3, 0, E::ReadX(())),
+                (5, 0, E::OverwriteX(99)),
+                (7, 0, E::ReadX(())),
+            ],
+        )
+        .await;
+        events.insert(1, (0, E::SetX(20)));
+        sg.apply(
+            &mut h,
+            &make_resolver(&events),
+            &mut r,
+            &ctx,
+            &DeltaList {
+                removed: vec![],
+                added: vec![lid(1)],
+            },
+        )
+        .await;
+        assert_eq!(sg.query_at(&"out", eid(0, 2), &ctx), Some(&20));
+        assert_eq!(sg.query_at(&"out", eid(0, 3), &ctx), Some(&20));
+        assert_eq!(sg.query_at(&"out", eid(0, 7), &ctx), Some(&99)); // NOT re-processed
+    });
 }
 
 #[test]
@@ -358,26 +427,36 @@ fn handler_query_excludes_own_write() {
         SetX(i32),
         WriteAndReadX(i32),
     }
-    let handler = |ev: &E, ctx: &HandlerCtx<(), (), (), EmptyRuntime, &str, i32>| match ev {
-        E::SetX(val) => ctx.update("x", *val),
-        E::WriteAndReadX(val) => {
-            ctx.update("x", *val);
-            if let Some(prev) = ctx.query(&"x") {
-                ctx.update("saw_prev", prev);
-            }
-        }
-    };
-    let mut sg: SG<&str, i32> = SG::new();
-    let mut events: EventStore<E> = EventStore::new();
-    let ctx = make_test_ctx(10);
-    apply_added(
-        &mut sg,
-        &mut events,
-        &handler,
-        nr(),
-        &ctx,
-        &[(1, 0, E::SetX(42)), (2, 0, E::WriteAndReadX(99))],
-    );
-    assert_eq!(sg.query(&"x"), Some(&99));
-    assert_eq!(sg.query(&"saw_prev"), Some(&42));
+    block_on(async {
+        let handler =
+            async |ev: &E, ctx: &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &str, i32, _>| {
+                match ev {
+                    E::SetX(val) => ctx.update("x", *val),
+                    E::WriteAndReadX(val) => {
+                        ctx.update("x", *val);
+                        if let Some(prev) = ctx.query(&"x") {
+                            ctx.update("saw_prev", prev);
+                        }
+                    }
+                }
+            };
+        let mut sg: SG<&str, i32> = SG::new();
+        let mut events: EventStore<E> = EventStore::new();
+        let ctx = make_test_ctx(10);
+        let mut r = async |_: &()| Timeline::<(), ()> {
+            writes: OrdMap::new(),
+        };
+        let mut h = handler;
+        apply_added(
+            &mut sg,
+            &mut events,
+            &mut h,
+            &mut r,
+            &ctx,
+            &[(1, 0, E::SetX(42)), (2, 0, E::WriteAndReadX(99))],
+        )
+        .await;
+        assert_eq!(sg.query(&"x"), Some(&99));
+        assert_eq!(sg.query(&"saw_prev"), Some(&42));
+    });
 }

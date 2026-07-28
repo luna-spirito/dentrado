@@ -1,7 +1,7 @@
 use std::{fmt::Debug, hash::Hash};
 
 use crate::{
-    core::core_ctx::Core,
+    core::core_ctx::GearCtx,
     types::{GlobalCoreId, GlobalResolver, GroupRouteError, LocGroupId, LocMsgTypeId, Localizable},
 };
 
@@ -24,7 +24,7 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
     /// type and skip all type erasure. A runtime whose gears need heterogeneous
     /// cache payloads can instead erase them, e.g. `type GearCache = Box<dyn Any>`
     /// (or a tagged pointer) and downcast inside `run_step`.
-    type GearCache: Debug + 'static;
+    type GearCache: Debug + Clone + 'static;
 
     fn hash_data(
         data: &Self::Data,
@@ -40,9 +40,14 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
 
     fn make_cache(gear: &Self::GearId) -> Self::GearCache;
 
-    fn run_step(
-        gear: &Self::GearId,
-        core: &Core<Self>,
+    /// Compute (or incrementally update) the gear's output.
+    ///
+    /// `ctx` carries the gear's id, the live `Core` (via `Deref`), and the
+    /// `secondary_get` entry point for declaring gear→gear dependencies.
+    /// Must not hold any `inner` borrow across `.await` (the core's `RefCell`
+    /// is shared between all concurrently-polled gears on this core).
+    async fn run_step(
+        ctx: &mut GearCtx<Self>,
         group: Option<LocGroupId>,
         cache: &mut Self::GearCache,
     ) -> Self::GearOut;
@@ -72,9 +77,8 @@ impl IsRuntime for EmptyRuntime {
 
     fn make_cache(_gear: &Self::GearId) -> Self::GearCache {}
 
-    fn run_step(
-        _gear: &Self::GearId,
-        _core: &crate::core::core_ctx::Core<Self>,
+    async fn run_step(
+        _ctx: &mut crate::core::core_ctx::GearCtx<Self>,
         _group: Option<LocGroupId>,
         _cache: &mut Self::GearCache,
     ) -> Self::GearOut {

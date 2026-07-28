@@ -130,23 +130,25 @@ pub struct HandlerCtx<
     R: IsRuntime,
     K: Ord + Clone + Hash,
     V: Clone + Hash,
+    D: ?Sized,
 > {
     pub event_id: SGEventId,
     reads: RefCell<&'a mut im::OrdSet<K>>,
     writes: RefCell<&'a mut OrdMap<K, V>>,
     pub(crate) self_writes: &'a OrdMap<K, SgOrdMap<V>>,
     ext: RefCell<&'a mut OrdMap<Dep, ExtDep<DepK, DepV>>>,
-    dep_resolver: &'a dyn Fn(Dep) -> Timeline<DepK, DepV>,
+    dep_resolver: &'a mut D,
     ctx: &'a dyn EventStore<R>,
 }
 
-impl<Dep, DepK, DepV, R: IsRuntime, K, V> HandlerCtx<'_, Dep, DepK, DepV, R, K, V>
+impl<Dep, DepK, DepV, R: IsRuntime, K, V, D> HandlerCtx<'_, Dep, DepK, DepV, R, K, V, D>
 where
     Dep: Ord + Clone + Hash,
     DepK: Ord + Clone + Hash,
     DepV: Clone + PartialEq + Hash + Ord,
     K: Ord + Clone + Hash,
     V: Clone + Hash,
+    D: async FnMut(&Dep) -> Timeline<DepK, DepV> + ?Sized,
 {
     pub fn query(&self, k: &K) -> Option<V> {
         self.reads.borrow_mut().insert(k.clone());
@@ -161,8 +163,13 @@ where
         self.writes.borrow_mut().insert(k, v);
     }
 
-    pub fn dep_query(&self, dep: &Dep, dep_key: &DepK) -> Option<DepV> {
-        let writes = (self.dep_resolver)(dep.clone());
+    /// The event store this handler runs against.
+    pub fn store(&self) -> &dyn EventStore<R> {
+        self.ctx
+    }
+
+    pub async fn dep_query(&mut self, dep: &Dep, dep_key: &DepK) -> Option<DepV> {
+        let writes = (self.dep_resolver)(dep).await;
 
         match self.ext.borrow_mut().entry(dep.clone()) {
             im::ordmap::Entry::Vacant(entry) => {
@@ -228,16 +235,17 @@ where
         }
     }
 
-    pub fn apply<R: IsRuntime, E, F>(
+    pub async fn apply<R: IsRuntime, E, H, D>(
         &mut self,
-        handler: &F,
+        handler: &mut H,
         event_resolver: &impl Fn(AnyLocEventId) -> (SGEventId, E),
-        dep_resolver: &dyn Fn(Dep) -> Timeline<DepK, DepV>,
+        dep_resolver: &mut D,
         ctx: &dyn EventStore<R>,
         delta: &DeltaList<AnyLocEventId>,
     ) where
         E: Clone,
-        F: Fn(&E, &HandlerCtx<Dep, DepK, DepV, R, K, V>),
+        H: async FnMut(&E, &mut HandlerCtx<'_, Dep, DepK, DepV, R, K, V, D>),
+        D: async FnMut(&Dep) -> Timeline<DepK, DepV>,
     {
         let mut queue: BTreeSet<SGEventId> = BTreeSet::new();
 
@@ -266,7 +274,7 @@ where
             }
         }
 
-        let dep_queue = self.detect_dep_changes(dep_resolver, ctx);
+        let dep_queue = self.detect_dep_changes(dep_resolver, ctx).await;
         for event_id in dep_queue {
             queue.insert(event_id);
         }
@@ -276,7 +284,8 @@ where
             queue.insert(event_id);
         }
 
-        self.process_queue(handler, event_resolver, dep_resolver, ctx, &mut queue);
+        self.process_queue(handler, event_resolver, dep_resolver, ctx, &mut queue)
+            .await;
     }
 
     pub(crate) fn query(&self, k: &K) -> Option<&V> {
@@ -305,18 +314,21 @@ where
         self.writes.get(k).into_iter().flat_map(SgOrdMap::iter)
     }
 
-    fn detect_dep_changes<R: IsRuntime>(
+    async fn detect_dep_changes<R: IsRuntime, D>(
         &mut self,
-        dep_resolver: &dyn Fn(Dep) -> Timeline<DepK, DepV>,
+        dep_resolver: &mut D,
         ctx: &dyn EventStore<R>,
-    ) -> BTreeSet<SGEventId> {
+    ) -> BTreeSet<SGEventId>
+    where
+        D: async FnMut(&Dep) -> Timeline<DepK, DepV>,
+    {
         use im::ordmap::DiffItem;
 
         let mut affected = BTreeSet::new();
         let dep_ids: Vec<Dep> = self.ext.keys().cloned().collect();
 
         for dep in dep_ids {
-            let current = dep_resolver(dep.clone());
+            let current = dep_resolver(&dep).await;
 
             {
                 let Some(ext_dep) = self.ext.get(&dep) else {
@@ -481,16 +493,18 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
-    fn process_queue<R: IsRuntime, E, F>(
+    #[allow(clippy::too_many_lines)]
+    async fn process_queue<R: IsRuntime, E, H, D>(
         &mut self,
-        handler: &F,
+        handler: &mut H,
         event_resolver: &impl Fn(AnyLocEventId) -> (SGEventId, E),
-        dep_resolver: &dyn Fn(Dep) -> Timeline<DepK, DepV>,
+        dep_resolver: &mut D,
         ctx: &dyn EventStore<R>,
         queue: &mut BTreeSet<SGEventId>,
     ) where
         E: Clone,
-        F: Fn(&E, &HandlerCtx<Dep, DepK, DepV, R, K, V>),
+        H: async FnMut(&E, &mut HandlerCtx<'_, Dep, DepK, DepV, R, K, V, D>),
+        D: async FnMut(&Dep) -> Timeline<DepK, DepV>,
     {
         while let Some(&event_id) = queue.first() {
             queue.remove(&event_id);
@@ -507,7 +521,7 @@ where
             let mut reads = im::OrdSet::new();
             let mut writes = OrdMap::new();
             {
-                let hctx = HandlerCtx {
+                let mut hctx = HandlerCtx {
                     event_id,
                     reads: RefCell::new(&mut reads),
                     writes: RefCell::new(&mut writes),
@@ -516,7 +530,7 @@ where
                     dep_resolver,
                     ctx,
                 };
-                handler(&event_data, &hctx);
+                handler(&event_data, &mut hctx).await;
             }
 
             for k in old_reads.iter().filter(|k| !reads.contains(k)) {

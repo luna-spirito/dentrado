@@ -2,13 +2,14 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
-    hash::Hash,
     num::NonZero,
     rc::Rc,
     sync::{Arc, mpsc},
 };
 
-use synchrony::unsync::watch;
+use compio::runtime::JoinHandle;
+use slotmap::{SlotMap, new_key_type};
+use synchrony::unsync::event::Event;
 
 use crate::{
     core::{
@@ -25,6 +26,8 @@ use crate::{
         MergeError, RunGearError, WireEventBody, WireLocCtx, WireLocCtxBuilder, WireLocCtxMerger,
     },
 };
+
+// TODO: Crack down on clones?
 
 // Maybe remove CoordCmd? I don't feel like it, it's more efficient this way.
 /// Represents an operation initiate by a direct client of the DBMS.
@@ -74,40 +77,62 @@ pub(crate) enum RerouteMsg<R: IsRuntime> {
     },
 }
 
+/// Cross-core subscription protocol (push-based, replacing the old
+/// request/response `SecondaryRequest`/`SecondaryResponse` pair).
+///
+/// - `StartSubscription`: "I (`from_core`) want push updates for `gear`."
+/// - `SubscriptionUpdate`: "Here is the current/new output for the gear you
+///   subscribed to." Sent on subscribe and on every recompute while subscribed.
+/// - `StopSubscription`: "I (`from_core`) no longer care; drop me."
 #[derive(Debug)]
 pub(crate) enum InterCoreMsg<R: IsRuntime> {
     Op(CoreCmd<R>),
-    SecondaryRequest {
+    StartSubscription {
         gear: R::GearId,
         wire_ctx: Arc<WireLocCtx<R>>,
         from_core: u32,
     },
-    SecondaryResponse {
+    SubscriptionUpdate {
         gear: R::GearId,
         output: R::GearOut,
         wire_ctx: Arc<WireLocCtx<R>>,
     },
+    StopSubscription {
+        gear: R::GearId,
+        wire_ctx: Arc<WireLocCtx<R>>,
+        from_core: u32,
+    },
+}
+
+new_key_type! {
+    /// Opaque, generational handle into [`CoreLocCtx::gears`]. Cheap to copy and
+    /// store in edge sets (no `R::GearId` cloning). The generation tag makes it safe to reuse.
+    /// Do we really need one, though? Maybe not necessarily.
+    pub(crate) struct GearKey;
 }
 
 #[derive(Debug)]
 struct CoreLocCtx<R: IsRuntime> {
-    gear_cache: HashMap<R::GearId, R::GearCache>,
-    gear_in_flight: HashSet<R::GearId>,
-    secondary_cache: HashMap<R::GearId, R::GearOut>,
+    gear_cache: HashMap<GearKey, R::GearCache>,
     events_by_group: HashMap<LocGroupId, EventGroup>,
     loc_ctx: LocCtx<R>,
     // --- subscription state ---
-    /// Gears with active external interest (dependents / remote cores /
-    /// direct subscribers). Entry present ⟺ `has_interest()`.
-    gear_subscriptions: HashMap<R::GearId, GearSub<R>>,
-    /// Limbo: gears with no current interest, kept hot until LRU eviction.
-    unref_gear: LruCache<R::GearId, GearSub<R>>,
+    /// Every gear this core knows about (active), stored in a generational
+    /// arena. A slot present ⟺ the gear has been touched by a
+    /// `subscribe/read/secondary_get`; it stays here while it has any interest
+    /// OR while it sits in `unref_gear` limbo (hot — still rerun on input
+    /// events). Removal happens only when popped from `unref_gear`.
+    gears: SlotMap<GearKey, ActiveGear<R>>,
+    /// Boundary index: `R::GearId` (the public, wire-facing identity) → the
+    /// arena [`GearKey`] backing the live gear. 1:1 with `gears`. All internal
+    /// edge sets and limbo hold `GearKey`; the `R::GearId` survives only at the
+    /// API/wire boundary and inside `ActiveGear::id` (for reverse lookup).
+    gear_index: HashMap<R::GearId, GearKey>,
+    /// Limbo: gears with no current subscribers, kept hot until popped (FIFO).
+    /// Holds `GearKey`s into `gears`; the `ActiveGear` data lives there.
+    unref_gear: VecDeque<GearKey>,
     /// Reverse index: which gears care about a given event input.
-    event_subscriptions: HashMap<LocGroupId, HashSet<R::GearId>>,
-    /// Forward index: a gear's event inputs (for O(deps) cleanup on evict).
-    event_deps: HashMap<R::GearId, HashSet<LocGroupId>>,
-    /// `SubId` → gear owning that direct subscription (for O(1) teardown).
-    subscriptions_by_id: HashMap<SubId, R::GearId>,
+    event_subscriptions: HashMap<LocGroupId, HashSet<GearKey>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -117,89 +142,72 @@ pub(crate) struct EventGroup {
 }
 
 /// Soft cap on the number of gears kept hot in limbo. Beyond this, the
-/// least-recently-demoted gear is evicted (its subscription is torn down and
-/// its dependencies may cascade-evict).
+/// oldest demoted gear is fully torn down (cascade-evicting dependencies).
 const LIMBO_CAPACITY: usize = 64;
 
-/// Identifier for a single direct (worker-side) subscription. Unique per core.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct SubId(u64);
-
-/// Per-gear subscription state. Lives in `gear_subscriptions` while the gear has
-/// any external interest (dependents, remote cores, or direct subscribers), and
-/// is moved to the `unref_gear` limbo when interest drops to zero. While in limbo
-/// the gear **keeps** running on events (stays hot) — only LRU eviction tears
-/// its subscription down (see `evict_gear`).
-#[derive(Debug)]
-pub(crate) struct GearSub<R: IsRuntime> {
-    pub(crate) output: R::GearOut,
-    /// Gears this one depends on (discovered via `secondary_get`).
-    pub(crate) dep_set: HashSet<R::GearId>,
-    /// Gears that depend on this one (forward gear-dep index).
-    pub(crate) local_dependents: HashSet<R::GearId>,
-    /// Remote cores subscribed to this gear's output.
-    pub(crate) remote_subscribers: HashSet<u32>,
-    /// Direct worker-side subscribers, keyed by `SubId`.
-    pub(crate) direct_subscribers: HashMap<SubId, watch::Sender<R::GearOut>>,
+/// Lifecycle of a gear's background computation task.
+///
+/// `Running`/`RunningQueued` own the spawned task's [`JoinHandle`]. Dropping
+/// the handle cancels the task (compio semantics), so when a gear is
+/// evicted (`gears.remove` → `ActiveGear` dropped → status dropped → handle
+/// dropped) its in-flight `run_step` is aborted immediately — no need for the
+/// task to discover the eviction after `run_step` completes. The task itself
+/// never drops its own handle: on the `Running → Eepy` transition it `detach`es
+/// the handle so it can finish its post-run fan-out and return naturally.
+#[derive(Debug, Default)]
+pub(crate) enum ActiveGearStatus {
+    /// No task attached; inputs haven't changed since the last run.
+    #[default]
+    Eepy,
+    /// A task is currently executing `run_step` for this gear.
+    Running { handle: JoinHandle<()>, rerun: bool },
 }
 
-impl<R: IsRuntime> GearSub<R> {
+#[derive(Debug)]
+pub(crate) enum ActiveGearExecution {
+    Local {
+        group: LocGroupId,
+        status: ActiveGearStatus,
+        /// Gears this one depends on (forward gear-dep index). Reconciled each
+        /// run from `GearCtx::deps`.
+        dep_set: HashSet<GearKey>,
+    },
+    Remote {
+        target_core: u32,
+    },
+}
+
+/// Per-gear state. Lives in `gears`. Orthogonal axes:
+/// - `output`        — has a value ever been computed?
+/// - `execution`     — local (with run status) or remote (subscribed elsewhere)
+/// - limbo membership (hot/cold) — are there any subscribers? (`unref_gear`)
+#[derive(Debug)]
+pub(crate) struct ActiveGear<R: IsRuntime> {
+    /// The gear's public `R::GearId`. Kept here so the arena can recover the
+    /// wire-facing identity for wire remap / `gear_index` reverse lookup.
+    pub(crate) id: R::GearId,
+    pub(crate) output: Option<R::GearOut>,
+    pub(crate) execution: ActiveGearExecution,
+    /// Gears (on this core) that depend on this one (forward gear-dep index).
+    /// For a remote gear, these are local gears that read it via `secondary_get`.
+    pub(crate) local_dependents: HashSet<GearKey>,
+    /// Remote cores subscribed to this gear's output (for local gears only). Stored to know whom to notify.
+    pub(crate) remote_subscribers: HashSet<u32>,
+    /// Count of direct (worker-side) subscribers. Eager demote trigger.
+    pub(crate) direct_subscriber_count: usize,
+    /// Fan-out for output updates to direct subscribers / `secondary_get`
+    /// awaiters. Persistent: created on first activate, notified on every
+    /// completed run (local) or `SubscriptionUpdate` (remote).
+    /// TODO: Replace with other mechanism?
+    pub(crate) changed: Event,
+}
+
+impl<R: IsRuntime> ActiveGear<R> {
     /// Whether anything still cares about this gear's output.
     fn has_interest(&self) -> bool {
         !self.local_dependents.is_empty()
             || !self.remote_subscribers.is_empty()
-            || !self.direct_subscribers.is_empty()
-    }
-}
-
-/// Minimal LRU: insertion order = recency (front = oldest). Used for the limbo
-/// cache; capacity is enforced by the caller draining `pop_lru` after insert.
-#[derive(Debug)]
-struct LruCache<K: Hash + Eq + Clone, V> {
-    order: VecDeque<K>,
-    entries: HashMap<K, V>,
-    capacity: usize,
-}
-
-impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            order: VecDeque::new(),
-            entries: HashMap::new(),
-            capacity,
-        }
-    }
-
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    fn insert(&mut self, key: K, value: V) {
-        if self.entries.contains_key(&key) {
-            self.order.retain(|k| k != &key);
-        }
-        self.entries.insert(key.clone(), value);
-        self.order.push_back(key);
-    }
-
-    fn remove(&mut self, key: &K) -> Option<V> {
-        let v = self.entries.remove(key)?;
-        self.order.retain(|k| k != key);
-        Some(v)
-    }
-
-    /// Pop the least-recently-inserted entry.
-    fn pop_lru(&mut self) -> Option<(K, V)> {
-        loop {
-            let key = self.order.pop_front()?;
-            if let Some(v) = self.entries.remove(&key) {
-                return Some((key, v));
-            }
-        }
+            || self.direct_subscriber_count > 0
     }
 }
 
@@ -249,15 +257,12 @@ impl<R: IsRuntime> Core<R> {
             inter_node_peers,
             inner: RefCell::new(CoreLocCtx {
                 gear_cache: HashMap::new(),
-                gear_in_flight: HashSet::new(),
-                secondary_cache: HashMap::new(),
                 events_by_group: HashMap::new(),
                 loc_ctx: LocCtx::new(),
-                gear_subscriptions: HashMap::new(),
-                unref_gear: LruCache::new(LIMBO_CAPACITY),
+                gears: SlotMap::with_key(),
+                gear_index: HashMap::new(),
+                unref_gear: VecDeque::new(),
                 event_subscriptions: HashMap::new(),
-                event_deps: HashMap::new(),
-                subscriptions_by_id: HashMap::new(),
             }),
         }
     }
@@ -292,93 +297,370 @@ impl<R: IsRuntime> Core<R> {
         self.inner.borrow().loc_ctx.get_stored_event(eid, f)
     }
 
-    pub(crate) fn run_any_gear(
-        &self,
-        gear: R::GearId,
-        msg_type: LocMsgTypeId,
-        group: &R::Group,
-    ) -> R::GearOut {
-        let group = self.inner.borrow().loc_ctx.find_group(msg_type, group);
-
-        {
-            let mut inner = self.inner.borrow_mut();
-            assert!(
-                !inner.gear_in_flight.contains(&gear),
-                "run_any_gear: gear is already in-flight (re-entrant execution)",
-            );
-            inner.gear_in_flight.insert(gear.clone());
-        }
-
-        let (key, mut cache) = {
-            let mut inner = self.inner.borrow_mut();
-            if let Some(entry) = inner.gear_cache.remove_entry(&gear) {
-                entry
-            } else {
-                let cache = R::make_cache(&gear);
-                (gear, cache)
+    /// Kick off a background run of a local gear if `Eepy`; mark `RunningQueued`
+    /// if already running. Panics if the gear is remote/missing.
+    fn kick_loc_gear(self: &Rc<Self>, key: GearKey) {
+        let mut inner = self.inner.borrow_mut();
+        let Some(ag) = inner.gears.get_mut(key) else {
+            panic!("Couldn't kick non-active gear");
+        };
+        let ActiveGearExecution::Local { status, group, .. } = &mut ag.execution else {
+            panic!("Kicked non-local gear");
+        };
+        match status {
+            ActiveGearStatus::Eepy => {
+                let group = *group;
+                let handle =
+                    compio::runtime::spawn(Self::run_loc_gear_task(self.clone(), key, group));
+                *status = ActiveGearStatus::Running {
+                    handle,
+                    rerun: false,
+                }
             }
+            ActiveGearStatus::Running { rerun, .. } => {
+                *rerun = true;
+            }
+        }
+    }
+
+    /// The background computation task. Runs `run_step`, then either re-runs
+    /// (if `RunningQueued`) or goes back to `Eepy`. Notifies the `changed`
+    /// fan-out on each completed run, kicks local dependents, and pushes the
+    /// new output to remote subscribers.
+    ///
+    /// Takes the arena [`GearKey`] (not `R::GearId`): the generation tag *is*
+    /// the staleness check. If the gear is evicted (or evicted-and-recreated
+    /// under a new generation) mid-flight, `gears.get(key)` returns `None` and
+    /// the task abandons — no `gear_index` re-resolution needed. Eviction also
+    /// drops the `JoinHandle` stored in `ActiveGearStatus`, which cancels this
+    /// task at its next await, so an evicted gear's in-flight `run_step` is
+    /// aborted rather than running to completion.
+    ///
+    /// Pre: `status` is `Running` (set by `kick_loc_gear` or by re-loop).
+    async fn run_loc_gear_task(self: Rc<Self>, key: GearKey, group_id: LocGroupId) {
+        loop {
+            // Pull the gear id + cache via the arena key. A stale key (gear
+            // evicted, or evicted-and-recreated under a new generation) yields
+            // `None` → abandon. The `R::GearId` is read from the `ActiveGear`
+            // for wire remap / cache construction; the key remains the
+            // authoritative handle for the rest of the iteration.
+            let (gear_id, mut cache) = {
+                let inner = self.inner.borrow();
+                let Some(ag) = inner.gears.get(key) else {
+                    return;
+                };
+                let gear_id = ag.id.clone();
+                let cache = inner
+                    .gear_cache
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| R::make_cache(&gear_id));
+                (gear_id, cache)
+            };
+
+            let mut ctx = GearCtx {
+                core: Rc::clone(&self),
+                gear: gear_id.clone(),
+                deps: RefCell::new(HashSet::new()),
+            };
+            let output = R::run_step(&mut ctx, Some(group_id), &mut cache).await;
+
+            // Write output + cache; reconcile stale dep edges; collect fan-out.
+            let (removed_deps, dependents, remote_subs, do_rerun) = {
+                let mut inner = self.inner.borrow_mut();
+                inner.gear_cache.insert(key, cache);
+                let updated_deps = ctx.deps.into_inner();
+                // Translate the runtime-facing `R::GearId` deps into arena keys.
+                // A dep currently evicted has no key here and is simply dropped
+                // from `dep_set` for this run; it re-registers itself on the
+                // next `secondary_get`. (Deps are normally active because
+                // `secondary_get` force-activates them.) Computed before the
+                // mutable `ag` borrow so it only touches `gear_index`.
+                let added_deps: HashSet<GearKey> = {
+                    let gi = &inner.gear_index;
+                    updated_deps
+                        .iter()
+                        .map(|d| gi.get(d).copied().expect("Missing dependency"))
+                        .collect()
+                };
+                let Some(ag) = inner.gears.get_mut(key) else {
+                    unreachable!("Expected run_loc_gear_task to be cancelled");
+                };
+                ag.output = Some(output.clone());
+                let ActiveGearExecution::Local {
+                    dep_set, status, ..
+                } = &mut ag.execution
+                else {
+                    unreachable!("run_loc_gear_task on a non-local gear");
+                };
+                let removed_deps: Vec<GearKey> = dep_set.difference(&added_deps).copied().collect();
+                *dep_set = added_deps;
+                let ActiveGearStatus::Running { rerun, .. } = status else {
+                    unreachable!("run_loc_gear_task on a non-local gear")
+                };
+                let do_rerun = if *rerun {
+                    *rerun = false;
+                    true
+                } else {
+                    *status = ActiveGearStatus::Eepy;
+                    false
+                };
+                let dependents: Vec<GearKey> = ag.local_dependents.iter().copied().collect();
+                let remote_subs: Vec<u32> = ag.remote_subscribers.iter().copied().collect();
+                ag.changed.notify_all();
+                (removed_deps, dependents, remote_subs, do_rerun)
+            };
+
+            // Tear down stale gear→gear edges (no inner borrow held across await).
+            {
+                let mut inner = self.inner.borrow_mut();
+                for dep in &removed_deps {
+                    if let Some(dag) = inner.gears.get_mut(*dep) {
+                        dag.local_dependents.remove(&key);
+                    }
+                }
+            }
+            for dep in &removed_deps {
+                self.rebalance_key(*dep);
+            }
+
+            // Push the new output to every remote subscriber.
+            for target in &remote_subs {
+                self.push_remote_update(&gear_id, &output, *target);
+            }
+
+            // Cascade reruns to local dependents.
+            for dep in dependents {
+                self.kick_loc_gear(dep);
+            }
+
+            if !do_rerun {
+                return;
+            }
+        }
+    }
+
+    /// Ensure `gear` is active: create it if absent (routing to its owning
+    /// core and starting its first computation/subscription) or promote it from
+    /// limbo if present. For a newly-created remote gear, sends
+    /// `StartSubscription` exactly once (per creation — re-sent only after
+    /// eviction + re-creation, since the only way its subscription ends is
+    /// eviction, which removes it from the arena). For a newly-created local
+    /// gear, registers the event-input edge and kicks a run.
+    ///
+    /// Existing gears are left alone: an arena-present gear either already has
+    /// an output (`Eepy`) or has a computation/subscription in flight
+    /// (`Running` / not-yet-answered `StartSubscription`), so there is nothing
+    /// to kick or (re-)subscribe — re-kicking a `Running` gear would only flag a
+    /// redundant rerun.
+    ///
+    /// Returns the gear's arena [`GearKey`]. On return an output is either
+    /// already cached or a run/subscription that will produce one is in flight,
+    /// so callers can [`wait_for_output_unpinned`] unconditionally — no "was it
+    /// cold?" flag is needed.
+    ///
+    /// WARNING: Forces active even if there are no subscribers.
+    fn force_active(self: &Rc<Self>, gear: &R::GearId) -> GearKey {
+        let mut inner = self.inner.borrow_mut();
+        // Existing gear: just promote it out of limbo if needed. See the doc:
+        // nothing to kick or re-subscribe — it already has an output or a run /
+        // StartSubscription in flight.
+        if let Some(&key) = inner.gear_index.get(gear) {
+            if let Some(pos) = inner.unref_gear.iter().position(|g| *g == key) {
+                inner.unref_gear.remove(pos);
+            }
+            return key;
+        }
+        // New gear: route, insert, and start its first computation/subscription.
+        let (msg_type, group_key) = R::meta(gear);
+        let target_core = R::route_group(&group_key, &inner.loc_ctx)
+            .expect("force_active: route_group")
+            .route(self.num_cores);
+        let (execution, local_group) = if target_core == self.core_id {
+            let loc_group = inner.loc_ctx.mk_loc_group(msg_type, group_key);
+            (
+                ActiveGearExecution::Local {
+                    group: loc_group,
+                    status: ActiveGearStatus::Eepy,
+                    dep_set: HashSet::new(),
+                },
+                Some(loc_group),
+            )
+        } else {
+            (ActiveGearExecution::Remote { target_core }, None)
         };
+        let key = inner.gears.insert(ActiveGear {
+            id: gear.clone(),
+            output: None,
+            execution,
+            local_dependents: HashSet::new(),
+            remote_subscribers: HashSet::new(),
+            direct_subscriber_count: 0,
+            changed: Event::new(),
+        });
+        inner.gear_index.insert(gear.clone(), key);
+        if let Some(g) = local_group {
+            inner.event_subscriptions.entry(g).or_default().insert(key);
+        }
+        drop(inner);
+        if target_core == self.core_id {
+            self.kick_loc_gear(key);
+        } else {
+            self.send_start_subscription(gear, target_core);
+        }
+        key
+    }
 
-        let output = R::run_step(&key, self, group, &mut cache);
+    /// Wait until the gear at arena `key` has a computed output and return it.
+    /// Returns immediately if one is already cached; otherwise awaits the gear's
+    /// `changed` event (fired on every completed run / `SubscriptionUpdate`).
+    /// Returns `None` if the gear was evicted — the generation tag on `key`
+    /// turns that into a safe staleness check instead of a dangling read.
+    ///
+    /// # This call is *unpinned* — it registers no interest of its own.
+    ///
+    /// This is the single shared "produce an output" primitive for *all*
+    /// consumers, and only one of them is a direct subscriber — so it
+    /// deliberately does **not** touch `direct_subscriber_count` or
+    /// [`Subscription`] RAII. That means the gear is **not** kept alive by this
+    /// wait: if every other interest in it disappears while we're awaiting (a
+    /// dependent is evicted, a remote subscriber drops, a `Subscription` is
+    /// dropped), `rebalance` is free to evict it out from under us and this
+    /// returns `None`. Each caller must therefore register the interest
+    /// appropriate to *its* relationship (`local_dependents` for gear→gear
+    /// edges, `remote_subscribers` for cross-core subs, `direct_subscriber_count`
+    /// via [`Subscription`] for worker reads) **before** awaiting. See
+    /// `secondary_get_impl` / `StartSubscription` / `subscribe_gear*`.
+    async fn wait_for_output_unpinned(self: &Rc<Self>, key: GearKey) -> Option<R::GearOut> {
+        loop {
+            let listener = {
+                let inner = self.inner.borrow();
+                let Some(ag) = inner.gears.get(key) else {
+                    return None;
+                };
+                if let Some(out) = ag.output.clone() {
+                    return Some(out);
+                }
+                ag.changed.listen()
+            };
+            listener.await;
+        }
+    }
 
+    /// Declare a dependency on `gear`'s output and pull its current value,
+    /// awaiting it if not yet computed. Records **both** halves of the gear→gear
+    /// edge eagerly, **before** awaiting: the reverse edge
+    /// (`caller` ∈ `gear.local_dependents` — the interest that keeps `gear` from
+    /// being evicted while we wait) and the forward edge (`gear` ∈ the caller's
+    /// `dep_set`). The forward edge is rewritten from `GearCtx::deps` at the end
+    /// of `run_step`; recording it eagerly means that if the run is cancelled
+    /// mid-flight (the caller's `JoinHandle` is dropped on eviction),
+    /// `evict_gear` still walks a `dep_set` that includes every dependency we
+    /// declared this run — so no reverse edge is left orphaned in a dependency
+    /// we never reconciled.
+    async fn secondary_get_impl(self: &Rc<Self>, caller: R::GearId, gear: R::GearId) -> R::GearOut {
+        let gear_key = self.force_active(&gear);
         {
             let mut inner = self.inner.borrow_mut();
-            inner.gear_in_flight.remove(&key);
-            inner.gear_cache.insert(key.clone(), cache);
-        }
-
-        output
-    }
-
-    pub fn secondary_get(&self, gear: R::GearId) -> R::GearOut {
-        let (msg_type, group) = R::meta(&gear);
-        let (group_wire, wire_ctx) = {
-            let inner = self.inner.borrow_mut();
-            let mut builder = WireLocCtxBuilder::new(&inner.loc_ctx);
-            let group_wire = builder
-                .remap(group.clone())
-                .expect("secondary_get: group remap");
-            (group_wire, builder.build())
-        };
-        println!(
-            "SECONDARY REQUEST TO {:?}, WHICH IS {:?}",
-            group_wire,
-            R::route_group(&group_wire, &wire_ctx).unwrap()
-        );
-        let target_core = R::route_group(&group_wire, &wire_ctx)
-            .expect("secondary_get: route_group")
-            .route(self.num_cores);
-
-        if target_core == self.core_id {
-            self.run_any_gear(gear.clone(), msg_type, &group)
-        } else {
-            // Snapshot any cached output first, releasing the borrow before
-            // `run_any_gear` (which borrows `inner` itself).
-            let cached = self.inner.borrow().secondary_cache.get(&gear).cloned();
-            let output =
-                cached.unwrap_or_else(|| self.run_any_gear(gear.clone(), msg_type, &group));
-
-            let (gear_wire, req_wire_ctx) = {
-                let inner = self.inner.borrow();
-                let mut req_builder = WireLocCtxBuilder::new(&inner.loc_ctx);
-                let gear_wire = req_builder.remap(gear).expect("secondary_get: gear remap");
-                (gear_wire, Arc::new(req_builder.build()))
+            let Some(caller_key) = inner.gear_index.get(&caller).copied() else {
+                panic!("secondary_get_impl: caller not active");
             };
-            let _ = self.intercore_tx[target_core as usize].send(InterCoreMsg::SecondaryRequest {
-                gear: gear_wire,
-                wire_ctx: req_wire_ctx,
-                from_core: self.core_id,
-            });
-            self.doorbells[target_core as usize].ring();
-
-            output
+            if let Some(ag) = inner.gears.get_mut(gear_key) {
+                ag.local_dependents.insert(caller_key);
+            }
+            if let Some(caller_ag) = inner.gears.get_mut(caller_key)
+                && let ActiveGearExecution::Local { dep_set, .. } = &mut caller_ag.execution {
+                    dep_set.insert(gear_key);
+                }
         }
+        self.wait_for_output_unpinned(gear_key)
+            .await
+            .expect("secondary_get_impl: dependency evicted while awaiting its output")
     }
 
-    /// Handle a `PostEvents` operation directly.
-    /// Import events into this core, optionally forwarding to inter-node peers.
+    fn current_output_key(&self, key: GearKey) -> Option<R::GearOut> {
+        let inner = self.inner.borrow();
+        inner.gears.get(key).and_then(|ag| ag.output.clone())
+    }
+
+    fn is_locally_running_key(&self, key: GearKey) -> bool {
+        let inner = self.inner.borrow();
+        inner.gears.get(key).is_some_and(|ag| {
+            matches!(
+                &ag.execution,
+                ActiveGearExecution::Local { status, .. } if !matches!(status, ActiveGearStatus::Eepy)
+            )
+        })
+    }
+
+    /// Register one direct (worker-side) subscriber for `key`. The matching
+    /// decrement is owned by the [`Subscription`] handed back to the caller, so
+    /// callers must construct that `Subscription` before any subsequent `.await`
+    /// — that way a cancelled wait still drops the `Subscription` and decrements.
+    fn inc_direct_subscriber(&self, key: GearKey) {
+        let mut inner = self.inner.borrow_mut();
+        inner
+            .gears
+            .get_mut(key)
+            .expect("inc_direct_subscriber: gear evicted immediately after force_active")
+            .direct_subscriber_count += 1;
+    }
+
+    // --- cross-core subscription wiring ---
+
+    fn build_gear_wire(&self, gear: &R::GearId) -> (R::GearId, Arc<WireLocCtx<R>>) {
+        self.inner.borrow().build_gear_wire(gear)
+    }
+
+    fn send_start_subscription(&self, gear: &R::GearId, target: u32) {
+        let (gear_wire, wire_ctx) = self.build_gear_wire(gear);
+        let _ = self.intercore_tx[target as usize].send(InterCoreMsg::StartSubscription {
+            gear: gear_wire,
+            wire_ctx,
+            from_core: self.core_id,
+        });
+        self.doorbells[target as usize].ring();
+    }
+
+    fn push_remote_update(&self, gear: &R::GearId, output: &R::GearOut, target: u32) {
+        let wire_ctx = {
+            let inner = self.inner.borrow();
+            let mut builder = WireLocCtxBuilder::new(&inner.loc_ctx);
+            let gear_wire = builder
+                .remap(gear.clone())
+                .expect("push_remote_update: gear remap");
+            let output_wire = builder
+                .remap(output.clone())
+                .expect("push_remote_update: output remap");
+            let wire_ctx = Arc::new(builder.build());
+            (gear_wire, output_wire, wire_ctx)
+        };
+        let (gear_wire, output_wire, wire_ctx) = wire_ctx;
+        let _ = self.intercore_tx[target as usize].send(InterCoreMsg::SubscriptionUpdate {
+            gear: gear_wire,
+            output: output_wire,
+            wire_ctx,
+        });
+        self.doorbells[target as usize].ring();
+    }
+
+    /// Rebalance a gear by its arena key. Any `StopSubscription` messages
+    /// produced by cascade evictions are emitted directly by `CoreLocCtx` via
+    /// the borrowed [`StopCtx`] (channels/doorbells/core id) — no `Vec` of
+    /// pending stops is round-tripped through `Core`.
+    fn rebalance_key(self: &Rc<Self>, key: GearKey) {
+        let stop_ctx = StopCtx {
+            intercore_tx: &self.intercore_tx,
+            doorbells: &self.doorbells,
+            core_id: self.core_id,
+        };
+        self.inner.borrow_mut().rebalance_gear(key, &stop_ctx);
+    }
+
+    /// Import events into this core, optionally forwarding to inter-node peers,
+    /// then schedule reruns for any active gear whose inputs were touched.
     fn post_events(
-        &self,
+        self: &Rc<Self>,
         wire_ctx: Arc<WireLocCtx<R>>,
         events: Arc<[WireEventBody<R::Group, R::Body>]>,
         global_core_ids: &Arc<[GlobalCoreId]>,
@@ -387,19 +669,48 @@ impl<R: IsRuntime> Core<R> {
         source_node: Option<NodeId>,
     ) -> Result<(), MergeError> {
         let node_id = self.node_id;
-        {
+        // Collect the gears to kick while the merge borrow is held, then release
+        // `inner` *before* kicking — `kick_loc_gear` borrows `inner` itself, so
+        // holding a `borrow_mut` across it would double-borrow and panic.
+        let kick_keys: Vec<GearKey> = {
             let mut inner = self.inner.borrow_mut();
-            let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
-            for &idx in seed_indices {
-                let event = &events[idx as usize];
-                let gcid = global_core_ids[idx as usize];
-                merger.import_new_event(
-                    event.clone(),
-                    gcid,
-                    timestamp,
-                    source_node.unwrap_or(node_id),
-                )?;
+            let mut dirty: HashSet<LocGroupId> = HashSet::new();
+            {
+                let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
+                for &idx in seed_indices {
+                    let event = &events[idx as usize];
+                    let gcid = global_core_ids[idx as usize];
+                    let (group_id, store_result) = merger.import_new_event(
+                        event.clone(),
+                        gcid,
+                        timestamp,
+                        source_node.unwrap_or(node_id),
+                    )?;
+                    if store_result.is_some() {
+                        dirty.insert(group_id);
+                    }
+                }
             }
+            let mut kick_keys = Vec::new();
+            for group in dirty {
+                for key in inner
+                    .event_subscriptions
+                    .get(&group)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                {
+                    assert!(
+                        inner.gears.get(key).is_some(),
+                        "event_subscription gear is missing from gears"
+                    );
+                    kick_keys.push(key);
+                }
+            }
+            kick_keys
+        };
+        for key in kick_keys {
+            self.kick_loc_gear(key);
         }
         if source_node.is_none() {
             // TODO: Don't pass wire_ctx, pass only the relevant subpart of it. I. e. update WireLocCtxMereger to regenerate
@@ -416,26 +727,31 @@ impl<R: IsRuntime> Core<R> {
         Ok(())
     }
 
-    /// Handle a `RunGear` operation directly.
-    pub(crate) fn run_gear(
-        &self,
+    /// Handle a `RunGear` operation: localize the gear, then read its output
+    /// once via a short-lived [`Subscription`] (`read_gear`). That force-
+    /// activates the gear, registers a direct subscriber for the duration of the
+    /// wait (so it can't be evicted out from under us — unlike a bare
+    /// `force_active` + `wait_for_output`, which left the gear with *no* interest
+    /// and either leaked a hot slot or panicked under limbo pressure), and drops
+    /// on completion so the gear can rebalance. Async — the caller is expected
+    /// to be a spawned task.
+    pub(crate) async fn run_gear(
+        self: &Rc<Self>,
         gear: R::GearId,
         wire_ctx: &WireLocCtx<R>,
     ) -> Result<R::GearOut, RunGearError> {
-        // Scope the merger's `borrow_mut` so it is released before `run_any_gear`
-        // (which borrows `inner` again) — otherwise RefCell panics.
-        let (gear, msg_type, localized_group) = {
+        let gear = {
+            // Scope ALL inner borrows so the async state machine doesn't hold
+            // them across the `.await` below.
             let mut inner = self.inner.borrow_mut();
             let mut merger = WireLocCtxMerger::new(wire_ctx, &mut *inner);
-            let gear = merger.remap(gear).map_err(RunGearError::Merge)?;
-            let (msg_type, localized_group) = R::meta(&gear);
-            (gear, msg_type, localized_group)
+            merger.remap(gear).map_err(RunGearError::Merge)?
         };
-        Ok(self.run_any_gear(gear, msg_type, &localized_group))
+        Ok(self.read_gear(gear).await)
     }
 
     /// Handle a `ClientOp` (received from a channel that is).
-    pub(crate) fn handle_client_op(&self, op: CoreCmd<R>) {
+    pub(crate) fn handle_client_op(self: &Rc<Self>, op: CoreCmd<R>) {
         match op {
             CoreCmd::PostEvents {
                 wire_ctx,
@@ -465,50 +781,51 @@ impl<R: IsRuntime> Core<R> {
                 wire_ctx,
                 reply,
             } => {
-                let result = self.run_gear(gear, &wire_ctx);
-                reply.send(result).expect("RunGear: reply channel closed");
+                let this = Rc::clone(self);
+                compio::runtime::spawn(async move {
+                    let result = this.run_gear(gear, &wire_ctx).await;
+                    let _ = reply.send(result);
+                })
+                .detach();
             }
         }
     }
 
-    pub(crate) fn handle_intercore_msg(&self, msg: InterCoreMsg<R>) {
+    pub(crate) fn handle_intercore_msg(self: &Rc<Self>, msg: InterCoreMsg<R>) {
         match msg {
             InterCoreMsg::Op(op) => self.handle_client_op(op),
-            InterCoreMsg::SecondaryRequest {
+            InterCoreMsg::StartSubscription {
                 gear,
                 wire_ctx,
                 from_core,
             } => {
-                let gear = {
-                    let mut inner = self.inner.borrow_mut();
-                    let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
-                    merger
-                        .remap(gear)
-                        .expect("SecondaryRequest: failed to localize gear")
-                };
-
-                let (msg_type, group) = R::meta(&gear);
-                let output = self.run_any_gear(gear.clone(), msg_type, &group);
-
-                let inner = self.inner.borrow();
-                let mut builder = WireLocCtxBuilder::new(&inner.loc_ctx);
-                let gear_wire = builder
-                    .remap(gear)
-                    .expect("SecondaryRequest: failed to remap gear");
-                let output_wire = builder
-                    .remap(output)
-                    .expect("SecondaryRequest: failed to remap output");
-                let reply_wire_ctx = Arc::new(builder.build());
-
-                let _ =
-                    self.intercore_tx[from_core as usize].send(InterCoreMsg::SecondaryResponse {
-                        gear: gear_wire,
-                        output: output_wire,
-                        wire_ctx: reply_wire_ctx,
-                    });
-                self.doorbells[from_core as usize].ring();
+                let this = Rc::clone(self);
+                compio::runtime::spawn(async move {
+                    let gear = {
+                        let mut inner = this.inner.borrow_mut();
+                        let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
+                        merger
+                            .remap(gear)
+                            .expect("StartSubscription: failed to localize gear")
+                    };
+                    // Register the remote subscriber, ensure a run, await output,
+                    // then push it back. The subscriber is attached before the
+                    // await, so the gear can't be evicted mid-wait.
+                    let key = this.force_active(&gear);
+                    {
+                        let mut inner = this.inner.borrow_mut();
+                        if let Some(ag) = inner.gears.get_mut(key) {
+                            ag.remote_subscribers.insert(from_core);
+                        }
+                    }
+                    let output = this.wait_for_output_unpinned(key).await.expect(
+                        "StartSubscription: gear evicted while a remote subscriber was attached",
+                    );
+                    this.push_remote_update(&gear, &output, from_core);
+                })
+                .detach();
             }
-            InterCoreMsg::SecondaryResponse {
+            InterCoreMsg::SubscriptionUpdate {
                 gear,
                 output,
                 wire_ctx,
@@ -518,18 +835,63 @@ impl<R: IsRuntime> Core<R> {
                     let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
                     let gear = merger
                         .remap(gear)
-                        .expect("SecondaryResponse: failed to localize gear");
+                        .expect("SubscriptionUpdate: failed to localize gear");
                     let output = merger
                         .remap(output)
-                        .expect("SecondaryResponse: failed to localize output");
+                        .expect("SubscriptionUpdate: failed to localize output");
                     (gear, output)
                 };
-                self.inner.borrow_mut().secondary_cache.insert(gear, output);
+                let dependents = {
+                    let mut inner = self.inner.borrow_mut();
+                    let Some(key) = inner.gear_index.get(&gear).copied() else {
+                        return;
+                    };
+                    let Some(ag) = inner.gears.get_mut(key) else {
+                        return;
+                    };
+                    ag.output = Some(output);
+                    ag.changed.notify_all();
+                    ag.local_dependents.iter().copied().collect::<Vec<_>>()
+                };
+                for dep in dependents {
+                    self.kick_loc_gear(dep);
+                }
+            }
+            InterCoreMsg::StopSubscription {
+                gear,
+                wire_ctx,
+                from_core,
+            } => {
+                let gear = {
+                    let mut inner = self.inner.borrow_mut();
+                    let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
+                    merger
+                        .remap(gear)
+                        .expect("StopSubscription: failed to localize gear")
+                };
+                self.rebalance_remote_unsub(&gear, from_core);
             }
         }
     }
 
-    pub(crate) fn handle_inter_node_msg(&self, peer_idx: usize, msg: InterNodeMsg<R>) {
+    /// Remove a remote subscriber and rebalance the (local) gear.
+    fn rebalance_remote_unsub(self: &Rc<Self>, gear: &R::GearId, from_core: u32) {
+        let stop_ctx = StopCtx {
+            intercore_tx: &self.intercore_tx,
+            doorbells: &self.doorbells,
+            core_id: self.core_id,
+        };
+        let mut inner = self.inner.borrow_mut();
+        let Some(key) = inner.gear_index.get(gear).copied() else {
+            return;
+        };
+        if let Some(ag) = inner.gears.get_mut(key) {
+            ag.remote_subscribers.remove(&from_core);
+        }
+        inner.rebalance_gear(key, &stop_ctx);
+    }
+
+    pub(crate) fn handle_inter_node_msg(self: &Rc<Self>, peer_idx: usize, msg: InterNodeMsg<R>) {
         let source_node = self.inter_node_peers[peer_idx].0;
         match msg {
             InterNodeMsg::ForwardEvents {
@@ -627,7 +989,7 @@ impl<R: IsRuntime> Core<R> {
     /// Self-targeting events call `Core::do_post_events` directly.
     /// Remote events go through SPSC `intercore_tx`.
     pub fn db_post_events(
-        &self,
+        self: &Rc<Self>,
         wire_ctx: WireLocCtx<R>,
         events: Vec<WireEventBody<R::Group, R::Body>>,
         timestamp: u32,
@@ -678,15 +1040,15 @@ impl<R: IsRuntime> Core<R> {
     /// Self-targeting: calls `Core::do_run_gear` directly.
     /// Remote: sends through SPSC `intercore_tx`.
     pub async fn db_run_gear(
-        &self,
+        self: &Rc<Self>,
         gear: R::GearId,
         wire_ctx: WireLocCtx<R>,
     ) -> Result<R::GearOut, RunGearError> {
         let target_core = db::route_gear(&gear, &wire_ctx, self.num_cores())?;
 
         if target_core == self.core_id {
-            // Direct call: synchronous, no channel overhead
-            self.run_gear(gear, &wire_ctx)
+            // Direct call on this core.
+            self.run_gear(gear, &wire_ctx).await
         } else {
             // Remote: send through SPSC intercore channel
             let (reply_tx, reply_rx) = flume::bounded(1);
@@ -702,99 +1064,277 @@ impl<R: IsRuntime> Core<R> {
             reply_rx.recv_async().await.expect("channel closed")
         }
     }
+
+    // --- worker-facing subscription API ---
+
+    /// Subscribe to a gear's output, returning a **fresh** value: if the gear is
+    /// local and currently computing (`Running`), waits for that run to land so
+    /// `current()` reads the latest value rather than a stale one. Otherwise
+    /// behaves like `subscribe_gear_stale`.
+    pub async fn subscribe_gear(self: &Rc<Self>, gear: R::GearId) -> Subscription<R> {
+        let key = self.force_active(&gear);
+        // Register interest BEFORE awaiting. `inc_direct_subscriber` is
+        // immediately followed by constructing `sub` with no `.await` in
+        // between, so if the wait below is cancelled the already-moved `sub` is
+        // dropped and its `Drop` decrements the count — no leak. Registering
+        // first also pins the gear (`has_interest`), so `key` can't go stale
+        // during the wait and there is nothing to rebind. The `Subscription`
+        // stores that `key` directly (not the `R::GearId`), so `Drop`/`current`/
+        // `next` skip the `gear_index` lookup.
+        self.inc_direct_subscriber(key);
+        let sub = Subscription {
+            core: Rc::clone(self),
+            key,
+        };
+        // Fresh: wait for the first output, and for any in-flight run, so
+        // `current()` returns the latest value rather than a pre-recompute one.
+        if self.current_output_key(key).is_none() || self.is_locally_running_key(key) {
+            let _ = self.wait_for_output_unpinned(key).await;
+        }
+        sub
+    }
+
+    /// Subscribe to a gear's output, returning immediately with whatever output
+    /// is currently available — waiting only for the *first* computation if the
+    /// gear is cold, never for an in-flight recompute. Reactivity reconciles
+    /// later via `changed`/dependent reruns.
+    pub async fn subscribe_gear_stale(self: &Rc<Self>, gear: R::GearId) -> Subscription<R> {
+        let key = self.force_active(&gear);
+        // See `subscribe_gear`: interest goes up before the await so the key
+        // can't go stale and a cancelled wait still decrements via `Drop`.
+        self.inc_direct_subscriber(key);
+        let sub = Subscription {
+            core: Rc::clone(self),
+            key,
+        };
+        if self.current_output_key(key).is_none() {
+            let _ = self.wait_for_output_unpinned(key).await;
+        }
+        sub
+    }
+
+    /// Read a gear's current output once (fresh). Implemented as a short-lived
+    /// subscription.
+    pub async fn read_gear(self: &Rc<Self>, gear: R::GearId) -> R::GearOut {
+        let sub = self.subscribe_gear(gear).await;
+        let out = sub.current();
+        drop(sub);
+        out
+    }
+
+    /// Read a gear's current output once (stale — does not wait for in-flight
+    /// runs). Implemented as a short-lived subscription.
+    pub async fn read_gear_stale(self: &Rc<Self>, gear: R::GearId) -> R::GearOut {
+        let sub = self.subscribe_gear_stale(gear).await;
+        let out = sub.current();
+        drop(sub);
+        out
+    }
 }
 
 /// RAII handle for a direct, worker-side subscription to a gear's output.
 ///
-/// Dropping it removes the subscription from its core and rebalances the gear
-/// (demoting it to limbo, or evicting it under LRU pressure). Naturally `!Sync`
-/// via `Rc<Core>`: it must live on the owning core's thread.
-///
-/// Value access (`next`/borrow) lands in Phase 2 alongside `subscribe_gear`.
+/// Dropping it decrements the gear's direct-subscriber count and rebalances
+/// the gear (demoting it to limbo, or evicting it under pressure). Naturally
+/// `!Sync` via `Rc<Core>`: it must live on the owning core's thread.
 #[must_use]
 pub struct Subscription<R: IsRuntime> {
     core: Rc<Core<R>>,
-    sub_id: SubId,
+    /// The arena key, stored directly (not the `R::GearId`) so `current`/
+    /// `next`/`Drop` skip the `gear_index` lookup. Safe because a live
+    /// `Subscription` holds `direct_subscriber_count >= 1`, so `has_interest`
+    /// is true and the gear cannot be evicted (its key cannot go stale) for as
+    /// long as this handle exists.
+    key: GearKey,
+}
+
+impl<R: IsRuntime> Subscription<R> {
+    /// Read the gear's currently-cached output. The value is guaranteed to be
+    /// present (subscribe awaits the first computation).
+    #[must_use]
+    pub fn current(&self) -> R::GearOut {
+        let inner = self.core.inner.borrow();
+        inner
+            .gears
+            .get(self.key)
+            .and_then(|ag| ag.output.clone())
+            .expect("Subscription::current: gear has no output")
+    }
+
+    /// Wait for the next output update (the gear's `changed` event fires after
+    /// each completed run / `SubscriptionUpdate`) and return the new value, or
+    /// `None` if the gear was evicted.
+    pub async fn next(&self) -> Option<R::GearOut> {
+        let listener = {
+            let inner = self.core.inner.borrow();
+            let Some(ag) = inner.gears.get(self.key) else {
+                return None;
+            };
+            ag.changed.listen()
+        };
+        listener.await;
+        let inner = self.core.inner.borrow();
+        inner
+            .gears
+            .get(self.key)
+            .and_then(|ag| ag.output.clone())
+    }
 }
 
 impl<R: IsRuntime> Drop for Subscription<R> {
     fn drop(&mut self) {
-        self.core.inner.borrow_mut().drop_direct_sub(self.sub_id);
+        let lost_interest = {
+            let mut inner = self.core.inner.borrow_mut();
+            let Some(ag) = inner.gears.get_mut(self.key) else {
+                return;
+            };
+            ag.direct_subscriber_count = ag.direct_subscriber_count.saturating_sub(1);
+            !ag.has_interest()
+        };
+        if lost_interest {
+            self.core.rebalance_key(self.key);
+        }
     }
 }
 
-impl<R: IsRuntime> CoreLocCtx<R> {
-    /// Remove a direct subscriber; if its gear loses all interest, demote it to
-    /// limbo (and possibly LRU-evict, cascading to dependencies).
-    fn drop_direct_sub(&mut self, sub_id: SubId) {
-        let Some(gear) = self.subscriptions_by_id.remove(&sub_id) else {
-            return;
-        };
-        let still_active = self.gear_subscriptions.get_mut(&gear).is_some_and(|g| {
-            g.direct_subscribers.remove(&sub_id);
-            g.has_interest()
-        });
-        if !still_active {
-            self.rebalance_gear(&gear);
-        }
+/// The context handed to `IsRuntime::run_step`. Carries the gear's own id, a
+/// handle to the live `Core` (via `Deref`, so `core.query_events()` /
+/// `core.stored_event()` keep working unchanged), and the per-run `deps` set
+/// accumulated by `secondary_get` calls (reconciled against the gear's stored
+/// `dep_set` at run end).
+pub struct GearCtx<R: IsRuntime> {
+    pub(crate) core: Rc<Core<R>>,
+    pub(crate) gear: R::GearId,
+    /// Deps accumulated by `secondary_get`. Interior-mutable so `secondary_get`
+    /// can be `&self` (lets a `dep_resolver` closure share `ctx` with sibling
+    /// closures that read `ctx` immutably).
+    pub(crate) deps: RefCell<HashSet<R::GearId>>,
+}
+
+impl<R: IsRuntime> std::ops::Deref for GearCtx<R> {
+    type Target = Core<R>;
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl<R: IsRuntime> GearCtx<R> {
+    /// The id of the gear currently running.
+    pub fn gear(&self) -> &R::GearId {
+        &self.gear
     }
 
-    /// If `gear` has no external interest, move it from the active set to limbo.
-    /// LRU over-capacity then evicts the least-recently-demoted entry, cascading
-    /// to its dependencies.
-    fn rebalance_gear(&mut self, gear: &R::GearId) {
-        let has_interest = self
-            .gear_subscriptions
-            .get(gear)
-            .is_some_and(GearSub::has_interest);
+    /// The underlying `Core`.
+    pub fn core(&self) -> &Rc<Core<R>> {
+        &self.core
+    }
+
+    /// Declare a dependency on `dep`'s output and pull its current value
+    /// (awaiting it if not yet computed). Records the edge `self.gear → dep`
+    /// (both the forward `deps` entry here and the reverse
+    /// `dep.local_dependents` entry in the core) so that when `dep` changes,
+    /// this gear reruns.
+    pub async fn secondary_get(&self, dep: R::GearId) -> R::GearOut {
+        self.deps.borrow_mut().insert(dep.clone());
+        self.core.secondary_get_impl(self.gear.clone(), dep).await
+    }
+}
+
+/// Borrowed cross-core send plumbing handed to `CoreLocCtx` during a
+/// rebalance/eviction so it can emit `StopSubscription` messages directly —
+/// without returning a `Vec` of pending stops for `Core` to drain, and without
+/// re-borrowing the `inner` `RefCell` (which `Core`'s send helpers would need).
+/// Carries only the channels, doorbells, and owning core id; the wire context
+/// is still built from `CoreLocCtx::loc_ctx`.
+struct StopCtx<'a, R: IsRuntime> {
+    intercore_tx: &'a [mpsc::Sender<InterCoreMsg<R>>],
+    doorbells: &'a [DoorbellHandle],
+    core_id: u32,
+}
+
+impl<R: IsRuntime> CoreLocCtx<R> {
+    /// Build a `(gear, WireLocCtx)` pair for an outgoing cross-core message.
+    /// Lives on `CoreLocCtx` (not `Core`) so the rebalance/eviction path can
+    /// build wires from `self.loc_ctx` while holding `&mut self`, without
+    /// re-borrowing `inner`.
+    fn build_gear_wire(&self, gear: &R::GearId) -> (R::GearId, Arc<WireLocCtx<R>>) {
+        let mut builder = WireLocCtxBuilder::new(&self.loc_ctx);
+        let gear_wire = builder
+            .remap(gear.clone())
+            .expect("build_gear_wire: gear remap");
+        (gear_wire, Arc::new(builder.build()))
+    }
+
+    /// Emit a `StopSubscription` for `gear` to `target` via `stop_ctx`.
+    fn send_stop(&self, gear: &R::GearId, target: u32, stop_ctx: &StopCtx<'_, R>) {
+        let (gear_wire, wire_ctx) = self.build_gear_wire(gear);
+        let _ = stop_ctx.intercore_tx[target as usize].send(InterCoreMsg::StopSubscription {
+            gear: gear_wire,
+            wire_ctx,
+            from_core: stop_ctx.core_id,
+        });
+        stop_ctx.doorbells[target as usize].ring();
+    }
+
+    /// If `gear` has no external interest, append it to the limbo deque. If
+    /// limbo exceeds capacity, evict the oldest entry (full teardown, cascading
+    /// to dependencies). Remote `StopSubscription` messages produced by any
+    /// eviction are emitted directly via `stop_ctx`.
+    fn rebalance_gear(&mut self, key: GearKey, stop_ctx: &StopCtx<'_, R>) {
+        let has_interest = self.gears.get(key).is_some_and(ActiveGear::has_interest);
         if has_interest {
             return;
         }
-        let Some(gsub) = self.gear_subscriptions.remove(gear) else {
-            // Already in limbo or fully absent: nothing to demote.
+        // Already in limbo?
+        if self.unref_gear.iter().any(|k| *k == key) {
             return;
-        };
-        self.unref_gear.insert(gear.clone(), gsub);
-        while self.unref_gear.len() >= self.unref_gear.capacity() {
-            let Some((evicted_id, evicted_sub)) = self.unref_gear.pop_lru() else {
+        }
+        if self.gears.get(key).is_none() {
+            return;
+        }
+        self.unref_gear.push_back(key);
+        while self.unref_gear.len() > LIMBO_CAPACITY {
+            let Some(evicted) = self.unref_gear.pop_front() else {
                 break;
             };
-            self.evict_gear(evicted_id, evicted_sub);
+            if let Some(ag) = self.gears.remove(evicted) {
+                self.evict_gear(evicted, ag, stop_ctx);
+            }
         }
     }
 
-    /// Fully tear down a gear: drop its event-input edges (reverse + forward
-    /// index), remove ourselves from each dependency's `local_dependents`, and
-    /// cascade-rebalance dependencies that lose their last dependent. The
-    /// dependency graph is acyclic by construction, so this terminates.
-    ///
-    /// Remote (`remote_subscribers`) teardown lands in Phase 4.
-    fn evict_gear(&mut self, gear: R::GearId, gsub: GearSub<R>) {
-        // 1. Event-input edges.
-        if let Some(keys) = self.event_deps.remove(&gear) {
-            for key in keys {
-                if let Some(set) = self.event_subscriptions.get_mut(&key) {
-                    set.remove(&gear);
+    /// Fully tear down a gear: fire remote `StopSubscription` if it was a
+    /// subscribed remote dep, drop its event-input edges, remove ourselves from
+    /// each dependency's `local_dependents`, and cascade-rebalance dependencies
+    /// that lose their last dependent. The dependency graph is acyclic by
+    /// construction, so this terminates. Remote stops are emitted directly via
+    /// `stop_ctx`.
+    fn evict_gear(&mut self, key: GearKey, ag: ActiveGear<R>, stop_ctx: &StopCtx<'_, R>) {
+        let gear_id = ag.id.clone();
+        self.gear_index.remove(&gear_id);
+        let dep_set = match ag.execution {
+            ActiveGearExecution::Remote { target_core } => {
+                self.send_stop(&gear_id, target_core, stop_ctx);
+                HashSet::new()
+            }
+            ActiveGearExecution::Local { group, dep_set, .. } => {
+                if let Some(set) = self.event_subscriptions.get_mut(&group) {
+                    set.remove(&key);
                     if set.is_empty() {
-                        self.event_subscriptions.remove(&key);
+                        self.event_subscriptions.remove(&group);
                     }
                 }
+                dep_set
             }
-        }
-        // 2. Gear-dep edges: drop ourselves from each dependency, then rebalance
-        //    any dependency that loses its last dependent. `gsub` is owned and
-        //    disjoint from `self`, so we can mutate `self` mid-iteration.
-        for dep in &gsub.dep_set {
-            let dep_lost_interest = self.gear_subscriptions.get_mut(dep).is_some_and(|dg| {
-                dg.local_dependents.remove(&gear);
-                !dg.has_interest()
-            });
-            if dep_lost_interest {
-                self.rebalance_gear(dep);
+        };
+        // Gear-dep edges: drop ourselves from each dependency, then cascade.
+        for dep in &dep_set {
+            if let Some(dag) = self.gears.get_mut(*dep) {
+                dag.local_dependents.remove(&key);
             }
+            self.rebalance_gear(*dep, stop_ctx);
         }
-        // 3. Drop cached computation state for this gear.
-        self.gear_cache.remove(&gear);
+        self.gear_cache.remove(&key);
     }
 }
 

@@ -2,7 +2,7 @@ use std::num::NonZero;
 
 use dentrado::{
     core::{
-        core_ctx::Core,
+        core_ctx::{Core, GearCtx},
         gear::IsRuntime,
         loc_ctx::{EventContext, EventStore},
     },
@@ -242,51 +242,61 @@ impl IsRuntime for Wiki2Runtime {
         }
     }
 
-    fn run_step(
-        gear: &Self::GearId,
-        core: &Core<Self>,
+    async fn run_step(
+        ctx: &mut GearCtx<Self>,
         group: Option<LocGroupId>,
         cache: &mut Self::GearCache,
     ) -> Self::GearOut {
-        match (gear, cache) {
+        match (ctx.gear(), cache) {
             (Wiki2Gear::Invited { branch }, Wiki2Cache::Invited(c)) => {
                 let Some(group) = group else {
                     return Wiki2GearOut::Invited(c.sg.as_writes());
                 };
                 let Some((added_ids, removed_ids)) =
-                    core.query_events(group, (c.processed_added, c.processed_removed), |a, r| {
+                    ctx.query_events(group, (c.processed_added, c.processed_removed), |a, r| {
                         (a.to_vec(), r.to_vec())
                     })
                 else {
                     return Wiki2GearOut::Invited(c.sg.as_writes());
                 };
 
-                let (_, branch_data) = core.data(*branch).expect("Branch data not found");
+                let (_, branch_data) = ctx.data(*branch).expect("Branch data not found");
                 let creator = branch_data.creator;
 
-                let handler =
-                    |invitee: &LocUserId, ctx: &HandlerCtx<(), (), (), Self, LocUserId, bool>| {
-                        let event_id = ctx.event_id;
-                        let stored = core
-                            .stored_event(event_id.local_id())
-                            .expect("stored event not found");
-                        let sender_sid = stored.sender;
-                        let sender_uid =
-                            core.sender_user(sender_sid).expect("sender user not found");
+                let mut handler = async move |invitee: &LocUserId,
+                                              hctx: &mut HandlerCtx<
+                    (),
+                    (),
+                    (),
+                    Self,
+                    LocUserId,
+                    bool,
+                    _,
+                >| {
+                    let event_id = hctx.event_id;
+                    let stored = hctx
+                        .store()
+                        .stored_event(event_id.local_id())
+                        .expect("stored event not found");
+                    let sender_sid = stored.sender;
+                    let sender_uid = hctx
+                        .store()
+                        .sender_user(sender_sid)
+                        .expect("sender user not found");
 
-                        let sender_invited = if sender_uid == creator {
-                            true
-                        } else {
-                            ctx.query(&sender_uid).unwrap_or(false)
-                        };
-
-                        if sender_invited {
-                            ctx.update(*invitee, true);
-                        }
+                    let sender_invited = if sender_uid == creator {
+                        true
+                    } else {
+                        hctx.query(&sender_uid).unwrap_or(false)
                     };
 
+                    if sender_invited {
+                        hctx.update(*invitee, true);
+                    }
+                };
+
                 let event_resolver = |local_id: AnyLocEventId| {
-                    let stored = core.stored_event(local_id).expect("stored event not found");
+                    let stored = ctx.stored_event(local_id).expect("stored event not found");
                     let sg_id = SGEventId::new(
                         SGBucketId {
                             timestamp: stored.timestamp,
@@ -297,21 +307,22 @@ impl IsRuntime for Wiki2Runtime {
                     (sg_id, stored.body.unwrap_invite())
                 };
 
-                let dep_resolver = |_: ()| -> Timeline<(), ()> { Timeline::new() };
+                let mut dep_resolver = async |_: &()| -> Timeline<(), ()> { Timeline::new() };
 
                 let added_len = added_ids.len();
                 let removed_len = removed_ids.len();
 
                 c.sg.apply(
-                    &handler,
+                    &mut handler,
                     &event_resolver,
-                    &dep_resolver,
-                    core,
+                    &mut dep_resolver,
+                    ctx.core().as_ref(),
                     &DeltaList {
                         removed: removed_ids,
                         added: added_ids,
                     },
-                );
+                )
+                .await;
 
                 c.processed_added += added_len;
                 c.processed_removed += removed_len;
@@ -326,7 +337,7 @@ impl IsRuntime for Wiki2Runtime {
                     };
                 };
                 let Some((added_ids, removed_ids)) =
-                    core.query_events(group, (c.processed_added, c.processed_removed), |a, r| {
+                    ctx.query_events(group, (c.processed_added, c.processed_removed), |a, r| {
                         (a.to_vec(), r.to_vec())
                     })
                 else {
@@ -338,7 +349,7 @@ impl IsRuntime for Wiki2Runtime {
 
                 // Update anchors
                 for &eid in &added_ids {
-                    let stored = core.stored_event(eid).expect("event not found");
+                    let stored = ctx.stored_event(eid).expect("event not found");
                     let attach_body = stored.body.unwrap_attach();
                     match &attach_body.payload {
                         UpdatePayload::Edit { edit } => {
@@ -347,50 +358,64 @@ impl IsRuntime for Wiki2Runtime {
                                 stored.global_core_id,
                                 stored.tx_id,
                             );
-                            c.anchors = c.anchors.clone().apply(sender_event_id, edit, core);
+                            c.anchors =
+                                c.anchors
+                                    .clone()
+                                    .apply(sender_event_id, edit, ctx.core().as_ref());
                         }
                         UpdatePayload::Merge { .. } => {}
                     }
                 }
 
-                let dep_resolver = |branch: LocDataId| -> Timeline<LocUserId, bool> {
-                    match core.secondary_get(Wiki2Gear::Invited { branch }) {
+                // `dep_resolver` is now async; pull the Invited timeline via
+                // `secondary_get` (awaits the dep if cold).
+                let mut dep_resolver = async |branch: &LocDataId| -> Timeline<LocUserId, bool> {
+                    match ctx
+                        .secondary_get(Wiki2Gear::Invited { branch: *branch })
+                        .await
+                    {
                         Wiki2GearOut::Invited(timeline) => timeline,
                         _ => panic!("Expected Invited output"),
                     }
                 };
 
-                let handler = |event_body: &AttachBody,
-                               ctx: &HandlerCtx<
+                let mut handler = async |event_body: &AttachBody,
+                                         hctx: &mut HandlerCtx<
                     LocDataId,
                     LocUserId,
                     bool,
                     Self,
                     LocDataId,
                     TextAgg,
+                    _,
                 >| {
-                    let event_id = ctx.event_id;
-                    let stored = core
+                    let event_id = hctx.event_id;
+                    let stored = hctx
+                        .store()
                         .stored_event(event_id.local_id())
                         .expect("stored event not found");
                     let sender_sid = stored.sender;
-                    let sender_uid = core.sender_user(sender_sid).expect("sender user not found");
+                    let sender_uid = hctx
+                        .store()
+                        .sender_user(sender_sid)
+                        .expect("sender user not found");
 
                     let branch = event_body.branch;
-                    let (_, branch_data) = core.data(branch).expect("Branch data not found");
+                    let (_, branch_data) =
+                        hctx.store().data(branch).expect("Branch data not found");
                     let creator = branch_data.creator;
 
                     let is_invited = if sender_uid == creator {
                         true
                     } else {
-                        ctx.dep_query(&branch, &sender_uid).unwrap_or(false)
+                        hctx.dep_query(&branch, &sender_uid).await.unwrap_or(false)
                     };
 
                     if is_invited {
-                        let curr_text_agg = ctx.query(&branch).unwrap_or_default();
+                        let curr_text_agg = hctx.query(&branch).unwrap_or_default();
                         let next_text_agg = match &event_body.payload {
                             UpdatePayload::Merge { from } => {
-                                let from_text_agg = ctx.query(from).unwrap_or_default();
+                                let from_text_agg = hctx.query(from).unwrap_or_default();
                                 curr_text_agg.merge(&from_text_agg)
                             }
                             UpdatePayload::Edit { edit } => {
@@ -402,12 +427,12 @@ impl IsRuntime for Wiki2Runtime {
                                 curr_text_agg.apply(sender_event_id, edit)
                             }
                         };
-                        ctx.update(branch, next_text_agg);
+                        hctx.update(branch, next_text_agg);
                     }
                 };
 
                 let event_resolver = |local_id: AnyLocEventId| {
-                    let stored = core.stored_event(local_id).expect("stored event not found");
+                    let stored = ctx.stored_event(local_id).expect("stored event not found");
                     let sg_id = SGEventId::new(
                         SGBucketId {
                             timestamp: stored.timestamp,
@@ -422,15 +447,16 @@ impl IsRuntime for Wiki2Runtime {
                 let removed_len = removed_ids.len();
 
                 c.sg.apply(
-                    &handler,
+                    &mut handler,
                     &event_resolver,
-                    &dep_resolver,
-                    core,
+                    &mut dep_resolver,
+                    ctx.core().as_ref(),
                     &DeltaList {
                         removed: removed_ids,
                         added: added_ids,
                     },
-                );
+                )
+                .await;
 
                 c.processed_added += added_len;
                 c.processed_removed += removed_len;
@@ -773,8 +799,9 @@ fn doc_content_cross_core_e2e() {
     let output1 = tc.run_gear_on(0, doc_gear.clone());
     let text1 = extract_doc_text(&output1, b0);
     assert_eq!(
-        text1, None,
-        "first run: no text expected (placeholder invited, cross-core deps not yet resolved)"
+        text1,
+        Some("Hello from Bob".to_string()),
+        "first run: cross-core secondary_get awaits the invited dep, so Bob's text is visible"
     );
 
     let output2 = tc.run_gear_on(0, doc_gear);
@@ -782,7 +809,7 @@ fn doc_content_cross_core_e2e() {
     assert_eq!(
         text2,
         Some("Hello from Bob".to_string()),
-        "second run: Bob's text should appear after secondary cache resolves invited dep"
+        "second run: idempotent — invited dep still resolved"
     );
 }
 
@@ -887,17 +914,14 @@ fn retroactive_invite_cross_core_e2e() {
     let output1 = tc.run_gear_on(0, doc_gear.clone());
     let text1 = extract_doc_text(&output1, b0);
     assert_eq!(
-        text1, None,
-        "run 1: no text expected (placeholder invited, cross-core deps not yet resolved)"
+        text1,
+        Some("Dave says hiHello from Bob".to_string()),
+        "run 1: cross-core secondary_get awaits invited dep; invited users' edits appear (RGA: higher tx_id first)"
     );
 
     let output2 = tc.run_gear_on(0, doc_gear.clone());
     let text2 = extract_doc_text(&output2, b0);
-    assert_eq!(
-        text2,
-        Some("Dave says hiHello from Bob".to_string()),
-        "run 2: invited users' edits appear (RGA: higher tx_id first)"
-    );
+    assert_eq!(text2, text1, "run 2: output should be stable");
 
     let output3 = tc.run_gear_on(0, doc_gear);
     let text3 = extract_doc_text(&output3, b0);
@@ -1110,8 +1134,8 @@ fn multi_user_doc_assembly_cross_core_e2e() {
     let text1 = extract_doc_text(&output1, b0);
     assert_eq!(
         text1,
-        Some("Hello".to_string()),
-        "run 1: Alice (creator) edit present with placeholder invited"
+        Some(" [Dave]!WorldHello".to_string()),
+        "run 1: cross-core secondary_get awaits invited dep; all invited users' edits (RGA: higher tx_id first), Eve excluded"
     );
 
     let output2 = tc.run_gear_on(0, doc_gear.clone());
@@ -1123,11 +1147,7 @@ fn multi_user_doc_assembly_cross_core_e2e() {
     );
 
     let text2 = extract_doc_text(&output2, b0);
-    assert_eq!(
-        text2,
-        Some(" [Dave]!WorldHello".to_string()),
-        "run 2: all invited users' edits (RGA: higher tx_id first), Eve excluded"
-    );
+    assert_eq!(text2, text1, "run 2: output should be stable");
 
     let output3 = tc.run_gear_on(0, doc_gear);
     let text3 = extract_doc_text(&output3, b0);

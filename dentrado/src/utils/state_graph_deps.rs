@@ -8,6 +8,14 @@ use std::collections::BTreeMap;
 const PK_A: SenderPk = SenderPk([0u8; 32]);
 const GCI_0: GlobalCoreId = GlobalCoreId(0);
 
+/// Drive a future on a throwaway compio runtime.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    compio::runtime::RuntimeBuilder::new()
+        .build()
+        .expect("compio runtime build failed")
+        .block_on(fut)
+}
+
 fn eid(ts: u32, lid: u64) -> SGEventId {
     SGEventId::new(
         SGBucketId {
@@ -62,183 +70,276 @@ fn make_resolver<E: Clone>(
     }
 }
 
-fn invite_resolver() -> &'static dyn Fn(u64) -> Timeline<u64, bool> {
-    &|_| Timeline {
-        writes: OrdMap::new(),
-    }
-}
-
 #[test]
 fn dep_query_basic() {
-    let ctx = make_test_ctx(20);
+    block_on(async {
+        let ctx = make_test_ctx(20);
 
-    let mut invite_sg: InviteSG = InviteSG::new();
-    let mut invite_events: EventStore<u64> = EventStore::new();
-    invite_events.insert(1, (0, 100));
-    let ih = |user_id: &u64, ctx: &HandlerCtx<u64, u64, bool, EmptyRuntime, u64, bool>| {
-        ctx.update(*user_id, true);
-    };
-    let ir = invite_resolver();
-    invite_sg.apply(
-        &ih,
-        &make_resolver(&invite_events),
-        ir,
-        &ctx,
-        &DeltaList {
-            removed: vec![],
-            added: vec![lid(1)],
-        },
-    );
-    assert_eq!(invite_sg.query(&100), Some(&true));
+        let mut invite_sg: InviteSG = InviteSG::new();
+        let mut invite_events: EventStore<u64> = EventStore::new();
+        invite_events.insert(1, (0, 100));
+        let ih =
+            async |user_id: &u64,
+                   ctx: &mut HandlerCtx<u64, u64, bool, EmptyRuntime, u64, bool, _>| {
+                ctx.update(*user_id, true);
+            };
+        let mut ir = async |_: &u64| Timeline::<u64, bool> {
+            writes: OrdMap::new(),
+        };
+        invite_sg
+            .apply(
+                &mut { ih },
+                &make_resolver(&invite_events),
+                &mut ir,
+                &ctx,
+                &DeltaList {
+                    removed: vec![],
+                    added: vec![lid(1)],
+                },
+            )
+            .await;
+        assert_eq!(invite_sg.query(&100), Some(&true));
 
-    let mut doc_sg: DocSG = DocSG::new();
-    let mut doc_events: EventStore<&str> = EventStore::new();
-    doc_events.insert(10, (0, "write"));
+        let mut doc_sg: DocSG = DocSG::new();
+        let mut doc_events: EventStore<&str> = EventStore::new();
+        doc_events.insert(10, (0, "write"));
 
-    let invite_writes = invite_sg.as_writes();
-    let dep_resolver = |_: u64| invite_writes.clone();
-    let doc_handler = |_ev: &&str, ctx: &HandlerCtx<u64, u64, bool, EmptyRuntime, &str, i32>| {
-        if let Some(invited) = ctx.dep_query(&0, &100u64) {
-            if invited {
-                ctx.update("content", 42);
-            }
-        }
-    };
-    doc_sg.apply(
-        &doc_handler,
-        &make_resolver(&doc_events),
-        &dep_resolver,
-        &ctx,
-        &DeltaList {
-            removed: vec![],
-            added: vec![lid(10)],
-        },
-    );
-    assert_eq!(doc_sg.query(&"content"), Some(&42));
+        let invite_writes = invite_sg.as_writes();
+        let mut dep_resolver = async move |_: &u64| invite_writes.clone();
+        let doc_handler =
+            async |_ev: &&str, ctx: &mut HandlerCtx<u64, u64, bool, EmptyRuntime, &str, i32, _>| {
+                if let Some(invited) = ctx.dep_query(&0, &100u64).await {
+                    if invited {
+                        ctx.update("content", 42);
+                    }
+                }
+            };
+        let mut dh = doc_handler;
+        doc_sg
+            .apply(
+                &mut dh,
+                &make_resolver(&doc_events),
+                &mut dep_resolver,
+                &ctx,
+                &DeltaList {
+                    removed: vec![],
+                    added: vec![lid(10)],
+                },
+            )
+            .await;
+        assert_eq!(doc_sg.query(&"content"), Some(&42));
+    });
 }
 
 #[test]
 fn dep_change_detection_and_propagation() {
-    let ctx = make_test_ctx(20);
+    block_on(async {
+        let ctx = make_test_ctx(20);
 
-    let mut invite_10: InviteSG = InviteSG::new();
-    let ir = invite_resolver();
-    let mut doc_sg: DocSG = DocSG::new();
-    let mut doc_events: EventStore<(u64, u64)> = EventStore::new();
-    let doc_handler =
-        |ev: &(u64, u64), ctx: &HandlerCtx<u64, u64, bool, EmptyRuntime, &str, i32>| {
+        async fn doc_handler<D: async FnMut(&u64) -> Timeline<u64, bool>>(
+            ev: &(u64, u64),
+            ctx: &mut HandlerCtx<'_, u64, u64, bool, EmptyRuntime, &str, i32, D>,
+        ) {
             let (branch, user) = *ev;
-            if let Some(invited) = ctx.dep_query(&branch, &user) {
+            if let Some(invited) = ctx.dep_query(&branch, &user).await {
                 if invited {
                     ctx.update("content", (branch ^ user) as i32);
                 }
             }
+        }
+
+        let mut invite_10: InviteSG = InviteSG::new();
+        let mut ir = async |_: &u64| Timeline::<u64, bool> {
+            writes: OrdMap::new(),
         };
+        let mut doc_sg: DocSG = DocSG::new();
+        let mut doc_events: EventStore<(u64, u64)> = EventStore::new();
 
-    doc_events.insert(10, (0, (10, 5)));
-    let mut w = invite_10.as_writes();
-    {
-        let dr = |_dep: u64| w.clone();
-        doc_sg.apply(
-            &doc_handler,
-            &make_resolver(&doc_events),
-            &dr,
-            &ctx,
-            &DeltaList {
-                removed: vec![],
-                added: vec![lid(10)],
-            },
-        );
-    }
-    assert_eq!(doc_sg.query(&"content"), None);
+        doc_events.insert(10, (0, (10, 5)));
+        let mut w = invite_10.as_writes();
+        {
+            let mut dr = async move |_dep: &u64| w.clone();
+            doc_sg
+                .apply(
+                    &mut doc_handler,
+                    &make_resolver(&doc_events),
+                    &mut dr,
+                    &ctx,
+                    &DeltaList {
+                        removed: vec![],
+                        added: vec![lid(10)],
+                    },
+                )
+                .await;
+        }
+        assert_eq!(doc_sg.query(&"content"), None);
 
-    let mut invite_events: EventStore<u64> = EventStore::new();
-    invite_events.insert(5, (0, 5));
-    let ih = |user_id: &u64, ctx: &HandlerCtx<u64, u64, bool, EmptyRuntime, u64, bool>| {
-        ctx.update(*user_id, true);
-    };
-    invite_10.apply(
-        &ih,
-        &make_resolver(&invite_events),
-        ir,
-        &ctx,
-        &DeltaList {
-            removed: vec![],
-            added: vec![lid(5)],
-        },
-    );
+        let mut invite_events: EventStore<u64> = EventStore::new();
+        invite_events.insert(5, (0, 5));
+        let ih = async |user_id: &u64,
+                        ctx: &mut HandlerCtx<
+            '_,
+            u64,
+            u64,
+            bool,
+            EmptyRuntime,
+            u64,
+            bool,
+            _,
+        >| {
+            ctx.update(*user_id, true);
+        };
+        invite_10
+            .apply(
+                &mut { ih },
+                &make_resolver(&invite_events),
+                &mut ir,
+                &ctx,
+                &DeltaList {
+                    removed: vec![],
+                    added: vec![lid(5)],
+                },
+            )
+            .await;
 
-    w = invite_10.as_writes();
-    let dr = |_dep: u64| w.clone();
-    doc_sg.apply(
-        &doc_handler,
-        &make_resolver(&doc_events),
-        &dr,
-        &ctx,
-        &DeltaList {
-            removed: vec![],
-            added: vec![],
-        },
-    );
-    assert_eq!(doc_sg.query(&"content"), Some(&{ 10 ^ 5 }));
+        w = invite_10.as_writes();
+        let mut dr = async move |_dep: &u64| w.clone();
+        doc_sg
+            .apply(
+                &mut doc_handler,
+                &make_resolver(&doc_events),
+                &mut dr,
+                &ctx,
+                &DeltaList {
+                    removed: vec![],
+                    added: vec![],
+                },
+            )
+            .await;
+        assert_eq!(doc_sg.query(&"content"), Some(&{ 10 ^ 5 }));
+    });
 }
 
 #[test]
 fn dep_isolation_between_branches() {
-    let ctx = make_test_ctx(20);
+    block_on(async {
+        let ctx = make_test_ctx(20);
 
-    let mut invite_10: InviteSG = InviteSG::new();
-    let mut invite_20: InviteSG = InviteSG::new();
-    let ir = invite_resolver();
-    let ih = |user_id: &u64, ctx: &HandlerCtx<u64, u64, bool, EmptyRuntime, u64, bool>| {
-        ctx.update(*user_id, true);
-    };
+        let mut invite_10: InviteSG = InviteSG::new();
+        let mut invite_20: InviteSG = InviteSG::new();
+        let mut ir = async |_: &u64| Timeline::<u64, bool> {
+            writes: OrdMap::new(),
+        };
+        let ih =
+            async |user_id: &u64,
+                   ctx: &mut HandlerCtx<u64, u64, bool, EmptyRuntime, u64, bool, _>| {
+                ctx.update(*user_id, true);
+            };
 
-    let mut ev10: EventStore<u64> = EventStore::new();
-    ev10.insert(1, (0, 5));
-    invite_10.apply(
-        &ih,
-        &make_resolver(&ev10),
-        ir,
-        &ctx,
-        &DeltaList {
-            removed: vec![],
-            added: vec![lid(1)],
-        },
-    );
+        let mut ev10: EventStore<u64> = EventStore::new();
+        ev10.insert(1, (0, 5));
+        invite_10
+            .apply(
+                &mut { ih },
+                &make_resolver(&ev10),
+                &mut ir,
+                &ctx,
+                &DeltaList {
+                    removed: vec![],
+                    added: vec![lid(1)],
+                },
+            )
+            .await;
 
-    let mut ev20: EventStore<u64> = EventStore::new();
-    ev20.insert(1, (0, 7));
-    invite_20.apply(
-        &ih,
-        &make_resolver(&ev20),
-        ir,
-        &ctx,
-        &DeltaList {
-            removed: vec![],
-            added: vec![lid(1)],
-        },
-    );
+        let mut ev20: EventStore<u64> = EventStore::new();
+        ev20.insert(1, (0, 7));
+        invite_20
+            .apply(
+                &mut { ih },
+                &make_resolver(&ev20),
+                &mut ir,
+                &ctx,
+                &DeltaList {
+                    removed: vec![],
+                    added: vec![lid(1)],
+                },
+            )
+            .await;
 
-    let mut doc_sg: DocSG = DocSG::new();
-    let mut doc_events: EventStore<(u64, u64)> = EventStore::new();
-    let doc_handler =
-        |ev: &(u64, u64), ctx: &HandlerCtx<u64, u64, bool, EmptyRuntime, &str, i32>| {
+        let mut doc_sg: DocSG = DocSG::new();
+        let mut doc_events: EventStore<(u64, u64)> = EventStore::new();
+        async fn doc_handler<D: async FnMut(&u64) -> Timeline<u64, bool>>(
+            ev: &(u64, u64),
+            ctx: &mut HandlerCtx<'_, u64, u64, bool, EmptyRuntime, &str, i32, D>,
+        ) {
             let (branch, user) = *ev;
-            if let Some(invited) = ctx.dep_query(&branch, &user) {
+            if let Some(invited) = ctx.dep_query(&branch, &user).await {
                 if invited {
                     ctx.update("content", (branch ^ user) as i32);
                 }
             }
-        };
-    doc_events.insert(10, (0, (10, 5)));
-    doc_events.insert(11, (0, (20, 7)));
+        }
+        doc_events.insert(10, (0, (10, 5)));
+        doc_events.insert(11, (0, (20, 7)));
 
-    let mut w10 = invite_10.as_writes();
-    let mut w20 = invite_20.as_writes();
-    {
-        let dr = |dep: u64| -> Timeline<u64, bool> {
-            match dep {
+        let mut w10 = invite_10.as_writes();
+        let mut w20 = invite_20.as_writes();
+        {
+            let mut dr = async move |dep: &u64| -> Timeline<u64, bool> {
+                match *dep {
+                    10 => w10.clone(),
+                    20 => w20.clone(),
+                    _ => Timeline {
+                        writes: OrdMap::new(),
+                    },
+                }
+            };
+            doc_sg
+                .apply(
+                    &mut doc_handler,
+                    &make_resolver(&doc_events),
+                    &mut dr,
+                    &ctx,
+                    &DeltaList {
+                        removed: vec![],
+                        added: vec![lid(10), lid(11)],
+                    },
+                )
+                .await;
+        }
+        assert_eq!(doc_sg.query(&"content"), Some(&{ 20 ^ 7 }));
+
+        let revoke = async |user_id: &u64,
+                            ctx: &mut HandlerCtx<
+            '_,
+            u64,
+            u64,
+            bool,
+            EmptyRuntime,
+            u64,
+            bool,
+            _,
+        >| {
+            ctx.update(*user_id, false);
+        };
+        ev10.insert(1, (0, 5));
+        invite_10
+            .apply(
+                &mut { revoke },
+                &make_resolver(&ev10),
+                &mut ir,
+                &ctx,
+                &DeltaList {
+                    removed: vec![],
+                    added: vec![lid(1)],
+                },
+            )
+            .await;
+
+        w10 = invite_10.as_writes();
+        w20 = invite_20.as_writes();
+        let mut dr = async move |dep: &u64| -> Timeline<u64, bool> {
+            match *dep {
                 10 => w10.clone(),
                 20 => w20.clone(),
                 _ => Timeline {
@@ -246,58 +347,22 @@ fn dep_isolation_between_branches() {
                 },
             }
         };
-        doc_sg.apply(
-            &doc_handler,
-            &make_resolver(&doc_events),
-            &dr,
-            &ctx,
-            &DeltaList {
-                removed: vec![],
-                added: vec![lid(10), lid(11)],
-            },
+        doc_sg
+            .apply(
+                &mut doc_handler,
+                &make_resolver(&doc_events),
+                &mut dr,
+                &ctx,
+                &DeltaList {
+                    removed: vec![],
+                    added: vec![],
+                },
+            )
+            .await;
+        assert_eq!(doc_sg.query_at(&"content", eid(0, 10), &ctx), None);
+        assert_eq!(
+            doc_sg.query_at(&"content", eid(0, 11), &ctx),
+            Some(&{ 20 ^ 7 })
         );
-    }
-    assert_eq!(doc_sg.query(&"content"), Some(&{ 20 ^ 7 }));
-
-    let revoke = |user_id: &u64, ctx: &HandlerCtx<u64, u64, bool, EmptyRuntime, u64, bool>| {
-        ctx.update(*user_id, false);
-    };
-    ev10.insert(1, (0, 5));
-    invite_10.apply(
-        &revoke,
-        &make_resolver(&ev10),
-        ir,
-        &ctx,
-        &DeltaList {
-            removed: vec![],
-            added: vec![lid(1)],
-        },
-    );
-
-    w10 = invite_10.as_writes();
-    w20 = invite_20.as_writes();
-    let dr = |dep: u64| -> Timeline<u64, bool> {
-        match dep {
-            10 => w10.clone(),
-            20 => w20.clone(),
-            _ => Timeline {
-                writes: OrdMap::new(),
-            },
-        }
-    };
-    doc_sg.apply(
-        &doc_handler,
-        &make_resolver(&doc_events),
-        &dr,
-        &ctx,
-        &DeltaList {
-            removed: vec![],
-            added: vec![],
-        },
-    );
-    assert_eq!(doc_sg.query_at(&"content", eid(0, 10), &ctx), None);
-    assert_eq!(
-        doc_sg.query_at(&"content", eid(0, 11), &ctx),
-        Some(&{ 20 ^ 7 })
-    );
+    });
 }

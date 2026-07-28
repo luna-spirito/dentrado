@@ -129,23 +129,18 @@ impl IsRuntime for KolorinkoRT {
         }
     }
 
-    fn run_step(
-        gear: &Self::GearId,
-        core: &dentrado::core::core_ctx::Core<Self>,
+    async fn run_step(
+        ctx: &mut dentrado::core::core_ctx::GearCtx<Self>,
         group: Option<dentrado::types::LocGroupId>,
         cache: &mut Self::GearCache,
     ) -> Self::GearOut {
-        match gear {
+        match ctx.gear().clone() {
             GearId::Repo(repo_meta) => {
-                GearOut::RepoOut(repo(repo_meta, group, cache.downcast_mut().unwrap()))
+                GearOut::RepoOut(repo(&repo_meta, group, cache.downcast_mut().unwrap()))
             }
-            GearId::Load { repo, site, slug } => GearOut::LoadOut(load_page(
-                repo,
-                site,
-                slug,
-                core,
-                cache.downcast_mut().unwrap(),
-            )),
+            GearId::Load { repo, site, slug } => GearOut::LoadOut(
+                load_page(&repo, &site, &slug, ctx, cache.downcast_mut().unwrap()).await,
+            ),
         }
     }
 }

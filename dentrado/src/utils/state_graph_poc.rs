@@ -9,6 +9,32 @@ use std::collections::BTreeMap;
 const PK_A: SenderPk = SenderPk([0u8; 32]);
 const GCI_0: GlobalCoreId = GlobalCoreId(0);
 
+/// Drive a future on a throwaway compio runtime.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    compio::runtime::RuntimeBuilder::new()
+        .build()
+        .expect("compio runtime build failed")
+        .block_on(fut)
+}
+
+/// Drive a future on a long-lived compio runtime (for tight loops / proptests
+/// where per-iteration runtime creation OOMs).
+fn block_on_shared<F: std::future::Future>(fut: F) -> F::Output {
+    use std::cell::RefCell;
+    thread_local! {
+        static RT: RefCell<Option<compio::runtime::Runtime>> = const { RefCell::new(None) };
+    }
+    RT.with(|cell| {
+        let mut rt = cell.borrow_mut();
+        let rt = rt.get_or_insert_with(|| {
+            compio::runtime::RuntimeBuilder::new()
+                .build()
+                .expect("compio runtime build failed")
+        });
+        rt.block_on(fut)
+    })
+}
+
 fn eid(local_id: u64) -> SGEventId {
     SGEventId::new(
         SGBucketId {
@@ -63,9 +89,9 @@ enum SiteEvent {
     },
 }
 
-fn site_handler(
+async fn site_handler<R: async FnMut(&SGEventId) -> Timeline<(), ()>>(
     event: &SiteEvent,
-    ctx: &HandlerCtx<SGEventId, (), (), EmptyRuntime, SGEventId, SiteAccessLevel>,
+    ctx: &mut HandlerCtx<'_, SGEventId, (), (), EmptyRuntime, SGEventId, SiteAccessLevel, R>,
 ) {
     match event {
         SiteEvent::AdminSetAccessLevel {
@@ -85,7 +111,7 @@ fn site_handler(
     }
 }
 
-fn oneshot(
+async fn oneshot(
     events: &[(SGEventId, SiteEvent)],
     ctx: &LocCtx<EmptyRuntime>,
 ) -> StateGraph<SGEventId, (), (), SGEventId, SiteAccessLevel> {
@@ -95,13 +121,14 @@ fn oneshot(
         .map(|(eid, e)| (eid.1.0, (eid.0.timestamp, e.clone())))
         .collect();
 
-    let r = |_: SGEventId| Timeline::<(), ()> {
+    let mut r = async |_: &SGEventId| Timeline::<(), ()> {
         writes: OrdMap::new(),
     };
     let added: Vec<AnyLocEventId> = events.iter().map(|(eid, _)| eid.1).collect();
+    let mut h = site_handler;
 
     sg.apply(
-        &site_handler,
+        &mut h,
         &|local_id: AnyLocEventId| {
             let (ts, e) = store.get(&local_id.0).expect("poc: event not found");
             let sg_id = SGEventId::new(
@@ -113,18 +140,19 @@ fn oneshot(
             );
             (sg_id, e.clone())
         },
-        &r,
+        &mut r,
         ctx,
         &DeltaList {
             removed: vec![],
             added,
         },
-    );
+    )
+    .await;
 
     sg
 }
 
-fn multishot(
+async fn multishot(
     events: &[(SGEventId, SiteEvent)],
     ctx: &LocCtx<EmptyRuntime>,
 ) -> StateGraph<SGEventId, (), (), SGEventId, SiteAccessLevel> {
@@ -134,7 +162,7 @@ fn multishot(
         .map(|(eid, e)| (eid.1.0, (eid.0.timestamp, e.clone())))
         .collect();
 
-    let r = |_: SGEventId| Timeline::<(), ()> {
+    let mut r = async |_: &SGEventId| Timeline::<(), ()> {
         writes: OrdMap::new(),
     };
     let resolver = |local_id: AnyLocEventId| {
@@ -149,17 +177,19 @@ fn multishot(
         (sg_id, e.clone())
     };
 
+    let mut h = site_handler;
     for (eid, _) in events.iter() {
         sg.apply(
-            &site_handler,
+            &mut h,
             &resolver,
-            &r,
+            &mut r,
             ctx,
             &DeltaList {
                 removed: vec![],
                 added: vec![eid.1],
             },
-        );
+        )
+        .await;
     }
 
     sg
@@ -249,7 +279,7 @@ fn test1_events() -> Vec<(SGEventId, SiteEvent)> {
 #[test]
 fn poc_model_test1() {
     let ctx = make_test_ctx(11);
-    let result = sg_to_lists(&oneshot(&test1_events(), &ctx));
+    let result = sg_to_lists(&block_on(oneshot(&test1_events(), &ctx)));
     let expected = vec![
         (eid(0), vec![(eid(4), SiteAccessLevel::Admin)]),
         (
@@ -284,8 +314,8 @@ proptest! {
         let ctx = make_test_ctx(11);
         let events = test1_events();
         let shuffled = shuffle_events(&events, seed);
-        let oneshot_result = sg_to_lists(&oneshot(&shuffled, &ctx));
-        let multishot_result = sg_to_lists(&multishot(&shuffled, &ctx));
+        let oneshot_result = sg_to_lists(&block_on_shared(oneshot(&shuffled, &ctx)));
+        let multishot_result = sg_to_lists(&block_on_shared(multishot(&shuffled, &ctx)));
         prop_assert_eq!(oneshot_result, multishot_result);
     }
 }
