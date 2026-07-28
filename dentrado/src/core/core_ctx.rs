@@ -83,10 +83,14 @@ pub(crate) enum RerouteMsg<R: IsRuntime> {
 /// Cross-core subscription protocol (push-based, replacing the old
 /// request/response `SecondaryRequest`/`SecondaryResponse` pair).
 ///
-/// - `StartSubscription`: "I (`from_core`) want push updates for `gear`."
+/// - `StartSubscription`: "I (`from_core`, speaking as arena key `session`)
+///   want push updates for `gear`."
 /// - `SubscriptionUpdate`: "Here is the current/new output for the gear you
 ///   subscribed to." Sent on subscribe and on every recompute while subscribed.
-/// - `StopSubscription`: "I (`from_core`) no longer care; drop me."
+/// - `StopSubscription`: "I (`from_core`) no longer care; the subscription was
+///   `session`." Carries only the opaque session id — no gear, no `wire_ctx` —
+///   so the `Drop`-driven eviction path (`evict_gear` → `send_stop`) never has
+///   to read localization tables (which will become async).
 #[derive(Debug)]
 pub(crate) enum InterCoreMsg<R: IsRuntime> {
     Op(CoreCmd<R>),
@@ -94,6 +98,11 @@ pub(crate) enum InterCoreMsg<R: IsRuntime> {
         gear: R::GearId,
         wire_ctx: Arc<WireLocCtx<R>>,
         from_core: u32,
+        /// Opaque session token = the subscriber's own arena [`GearKey`] for
+        /// this remote gear. Echoed back in [`InterCoreMsg::StopSubscription`]
+        /// so the receiver can route the stop without localizing `gear`. Per-
+        /// arena + generational ⇒ unique per `(from_core, session)`.
+        session: GearKey,
     },
     SubscriptionUpdate {
         gear: R::GearId,
@@ -101,8 +110,8 @@ pub(crate) enum InterCoreMsg<R: IsRuntime> {
         wire_ctx: Arc<WireLocCtx<R>>,
     },
     StopSubscription {
-        gear: R::GearId,
-        wire_ctx: Arc<WireLocCtx<R>>,
+        /// The session id from the matching [`InterCoreMsg::StartSubscription`].
+        session: GearKey,
         from_core: u32,
     },
 }
@@ -116,7 +125,12 @@ new_key_type! {
 
 #[derive(Debug)]
 struct CoreLocCtx<R: IsRuntime> {
-    gear_cache: HashMap<GearKey, R::GearCache>,
+    /// Per-gear working state (`R::GearCache`), keyed by the **stable**
+    /// `R::GearId`. Persistent across activation/eviction cycles: a gear that
+    /// is evicted from the arena and later reactivated picks up its old cache
+    /// (so, e.g., the watermark it stores is preserved). Stays in RAM — the hot
+    /// cache is not routed through the async `Storage` trait.
+    gear_cache: HashMap<R::GearId, R::GearCache>,
     events_by_group: HashMap<LocGroupId, EventGroup>,
     loc_ctx: LocCtx<R>,
     // --- subscription state ---
@@ -140,6 +154,13 @@ struct CoreLocCtx<R: IsRuntime> {
     /// Scanned by the epoch ticker each tick to find gears whose `next_due`
     /// has been reached. Mirrors `event_subscriptions` for the timer path.
     timer_gears: HashSet<GearKey>,
+    /// Incoming cross-core subscriptions: `(from_core, session)` → this core's
+    /// arena [`GearKey`] backing the subscribed gear. Populated on
+    /// [`InterCoreMsg::StartSubscription`], drained on
+    /// [`InterCoreMsg::StopSubscription`] (which carries only the session).
+    /// Kept consistent with each gear's `remote_subscribers` (added/removed in
+    /// lockstep), so a local gear is only evicted when it has no incoming sub.
+    incoming_subs: HashMap<(u32, GearKey), GearKey>,
     /// Monotonic epoch counter, advanced by [`Core::epoch_tick`] every
     /// [`EPOCH_INTERVAL`]. [`GearSource::Timer`] gears compare their
     /// `next_due` against this to decide `tick`.
@@ -292,6 +313,7 @@ impl<R: IsRuntime> Core<R> {
                 unref_gear: VecDeque::new(),
                 event_subscriptions: HashMap::new(),
                 timer_gears: HashSet::new(),
+                incoming_subs: HashMap::new(),
                 epoch: 0,
             }),
         }
@@ -461,7 +483,7 @@ impl<R: IsRuntime> Core<R> {
                 };
                 let gear_id = ag.id.clone();
                 let cache = gear_cache
-                    .get(&key)
+                    .get(&gear_id)
                     .cloned()
                     .unwrap_or_else(|| R::make_cache(&gear_id));
                 let input = match &mut ag.execution {
@@ -492,7 +514,7 @@ impl<R: IsRuntime> Core<R> {
             // Write output + cache; reconcile stale dep edges; collect fan-out.
             let (removed_deps, dependents, remote_subs, do_rerun) = {
                 let mut inner = self.inner.borrow_mut();
-                inner.gear_cache.insert(key, cache);
+                inner.gear_cache.insert(gear_id.clone(), cache);
                 let updated_deps = ctx.deps.into_inner();
                 // Translate the runtime-facing `R::GearId` deps into arena keys.
                 // A dep currently evicted has no key here and is simply dropped
@@ -668,7 +690,7 @@ impl<R: IsRuntime> Core<R> {
         if target_core == self.core_id {
             self.kick_loc_gear(key);
         } else {
-            self.send_start_subscription(gear, target_core);
+            self.send_start_subscription(gear, key, target_core);
         }
         key
     }
@@ -775,12 +797,13 @@ impl<R: IsRuntime> Core<R> {
         self.inner.borrow().build_gear_wire(gear)
     }
 
-    fn send_start_subscription(&self, gear: &R::GearId, target: u32) {
+    fn send_start_subscription(&self, gear: &R::GearId, subscriber_key: GearKey, target: u32) {
         let (gear_wire, wire_ctx) = self.build_gear_wire(gear);
         let _ = self.intercore_tx[target as usize].send(InterCoreMsg::StartSubscription {
             gear: gear_wire,
             wire_ctx,
             from_core: self.core_id,
+            session: subscriber_key,
         });
         self.doorbells[target as usize].ring();
     }
@@ -961,6 +984,7 @@ impl<R: IsRuntime> Core<R> {
                 gear,
                 wire_ctx,
                 from_core,
+                session,
             } => {
                 let this = Rc::clone(self);
                 compio::runtime::spawn(async move {
@@ -980,6 +1004,9 @@ impl<R: IsRuntime> Core<R> {
                         if let Some(ag) = inner.gears.get_mut(key) {
                             ag.remote_subscribers.insert(from_core);
                         }
+                        // Route table for the eventual StopSubscription (which
+                        // carries only `session`, no gear to localize).
+                        inner.incoming_subs.insert((from_core, session), key);
                     }
                     let output = this.wait_for_output_unpinned(key).await.expect(
                         "StartSubscription: gear evicted while a remote subscriber was attached",
@@ -1020,32 +1047,22 @@ impl<R: IsRuntime> Core<R> {
                     self.kick_loc_gear(dep);
                 }
             }
-            InterCoreMsg::StopSubscription {
-                gear,
-                wire_ctx,
-                from_core,
-            } => {
-                let gear = {
-                    let mut inner = self.inner.borrow_mut();
-                    let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
-                    merger
-                        .remap(gear)
-                        .expect("StopSubscription: failed to localize gear")
-                };
-                self.rebalance_remote_unsub(&gear, from_core);
+            InterCoreMsg::StopSubscription { session, from_core } => {
+                // No localization: route purely by the opaque session token.
+                self.rebalance_remote_unsub(from_core, session);
             }
         }
     }
 
     /// Remove a remote subscriber and rebalance the (local) gear.
-    fn rebalance_remote_unsub(self: &Rc<Self>, gear: &R::GearId, from_core: u32) {
+    fn rebalance_remote_unsub(self: &Rc<Self>, from_core: u32, session: GearKey) {
         let stop_ctx = StopCtx {
             intercore_tx: &self.intercore_tx,
             doorbells: &self.doorbells,
             core_id: self.core_id,
         };
         let mut inner = self.inner.borrow_mut();
-        let Some(key) = inner.gear_index.get(gear).copied() else {
+        let Some(key) = inner.incoming_subs.remove(&(from_core, session)) else {
             return;
         };
         if let Some(ag) = inner.gears.get_mut(key) {
@@ -1425,12 +1442,13 @@ impl<R: IsRuntime> CoreLocCtx<R> {
         (gear_wire, Arc::new(builder.build()))
     }
 
-    /// Emit a `StopSubscription` for `gear` to `target` via `stop_ctx`.
-    fn send_stop(&self, gear: &R::GearId, target: u32, stop_ctx: &StopCtx<'_, R>) {
-        let (gear_wire, wire_ctx) = self.build_gear_wire(gear);
+    /// Emit a `StopSubscription` carrying only the opaque `session` id. No
+    /// localization is read here: `send_stop` is on the `Drop`-driven eviction
+    /// path (`evict_gear`), and `Drop` is synchronous, so it must not depend on
+    /// state that will become async.
+    fn send_stop(&self, session: GearKey, target: u32, stop_ctx: &StopCtx<'_, R>) {
         let _ = stop_ctx.intercore_tx[target as usize].send(InterCoreMsg::StopSubscription {
-            gear: gear_wire,
-            wire_ctx,
+            session,
             from_core: stop_ctx.core_id,
         });
         stop_ctx.doorbells[target as usize].ring();
@@ -1474,7 +1492,10 @@ impl<R: IsRuntime> CoreLocCtx<R> {
         self.gear_index.remove(&gear_id);
         let dep_set = match ag.execution {
             ActiveGearExecution::Remote { target_core } => {
-                self.send_stop(&gear_id, target_core, stop_ctx);
+                // Session id = this (subscriber) gear's own arena key. The
+                // receiver routes the stop by it alone — no gear, no wire_ctx,
+                // no localization read on this `Drop`-driven path.
+                self.send_stop(key, target_core, stop_ctx);
                 HashSet::new()
             }
             ActiveGearExecution::Local {
@@ -1503,7 +1524,9 @@ impl<R: IsRuntime> CoreLocCtx<R> {
             }
             self.rebalance_gear(*dep, stop_ctx);
         }
-        self.gear_cache.remove(&key);
+        // NOTE: `gear_cache` is intentionally NOT touched here. It is keyed by
+        // the stable `R::GearId` and persists across eviction/reactivation so a
+        // returning gear resumes from its old working state (e.g. its watermark).
     }
 }
 
