@@ -1,7 +1,7 @@
 use dentrado::{
     core::{
         core_ctx::{Core, GearCtx},
-        gear::IsRuntime,
+        gear::{GearInput, GearMeta, IsRuntime},
         loc_ctx::{EventContext, EventStore},
     },
     types::*,
@@ -74,9 +74,12 @@ impl IsRuntime for MulSumRuntime {
         )))
     }
 
-    fn meta(gear: &Self::GearId) -> (LocMsgTypeId, Self::Group) {
+    fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
-            MulSumGear::MulSum { bucket } => (MSG_MULSUM, *bucket),
+            MulSumGear::MulSum { bucket } => GearMeta::Event {
+                msg_type: MSG_MULSUM,
+                group: *bucket,
+            },
         }
     }
 
@@ -90,10 +93,10 @@ impl IsRuntime for MulSumRuntime {
 
     async fn run_step(
         _ctx: &mut GearCtx<Self>,
-        group: Option<LocGroupId>,
+        input: GearInput,
         cache: &mut Self::GearCache,
     ) -> i64 {
-        let Some(group) = group else {
+        let GearInput::Events(group) = input else {
             return cache.agg;
         };
         let Some((added_ids, removed_ids)) = _ctx.query_events(

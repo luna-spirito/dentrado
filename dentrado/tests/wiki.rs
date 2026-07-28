@@ -1,7 +1,7 @@
 use dentrado::{
     core::{
         core_ctx::{Core, GearCtx},
-        gear::IsRuntime,
+        gear::{GearInput, GearMeta, IsRuntime},
         loc_ctx::{EventContext, EventStore},
     },
     types::*,
@@ -87,9 +87,12 @@ impl IsRuntime for WikiCounterRuntime {
         )))
     }
 
-    fn meta(gear: &Self::GearId) -> (LocMsgTypeId, Self::Group) {
+    fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
-            WikiGear::InvitesCount { branch } => (MSG_INVITE, *branch),
+            WikiGear::InvitesCount { branch } => GearMeta::Event {
+                msg_type: MSG_INVITE,
+                group: *branch,
+            },
         }
     }
 
@@ -103,10 +106,10 @@ impl IsRuntime for WikiCounterRuntime {
 
     async fn run_step(
         _ctx: &mut GearCtx<Self>,
-        group: Option<LocGroupId>,
+        input: GearInput,
         cache: &mut Self::GearCache,
     ) -> i64 {
-        let Some(group) = group else {
+        let GearInput::Events(group) = input else {
             return cache.out;
         };
         let Some((added_ids, removed_ids)) = _ctx.query_events(

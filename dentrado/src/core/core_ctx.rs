@@ -5,6 +5,7 @@ use std::{
     num::NonZero,
     rc::Rc,
     sync::{Arc, mpsc},
+    time::Duration,
 };
 
 use compio::runtime::JoinHandle;
@@ -15,7 +16,7 @@ use crate::{
     core::{
         db,
         doorbell::DoorbellHandle,
-        gear::IsRuntime,
+        gear::{GearInput, GearMeta, IsRuntime},
         loc_ctx::{EventContext, EventStore, LocCtx, StoreResultSuccess, StoredEvent},
     },
     types::{
@@ -133,6 +134,14 @@ struct CoreLocCtx<R: IsRuntime> {
     unref_gear: VecDeque<GearKey>,
     /// Reverse index: which gears care about a given event input.
     event_subscriptions: HashMap<LocGroupId, HashSet<GearKey>>,
+    /// Timer-driven (oracle) gears on this core, keyed by arena [`GearKey`].
+    /// Scanned by the epoch ticker each tick to find gears whose `next_due`
+    /// has been reached. Mirrors `event_subscriptions` for the timer path.
+    timer_gears: HashSet<GearKey>,
+    /// Monotonic epoch counter, advanced by [`Core::epoch_tick`] every
+    /// [`EPOCH_INTERVAL`]. [`GearSource::Timer`] gears compare their
+    /// `next_due` against this to decide `tick`.
+    epoch: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -144,6 +153,11 @@ pub(crate) struct EventGroup {
 /// Soft cap on the number of gears kept hot in limbo. Beyond this, the
 /// oldest demoted gear is fully torn down (cascade-evicting dependencies).
 const LIMBO_CAPACITY: usize = 64;
+
+/// Wall-clock interval between two epoch-counter advances. A `Timer` gear with
+/// `period = N` is rerun at most once per `N` epochs, i.e. at most once per
+/// `N * EPOCH_INTERVAL` of real time while it has interest.
+const EPOCH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Lifecycle of a gear's background computation task.
 ///
@@ -163,10 +177,22 @@ pub(crate) enum ActiveGearStatus {
     Running { handle: JoinHandle<()>, rerun: bool },
 }
 
+/// What drives a local gear's re-runs, stored in [`ActiveGearExecution::Local`].
+/// The runtime-facing mirror of [`GearMeta`] plus the bookkeeping (the timer's
+/// `next_due`) the core needs to decide when to fire it.
+#[derive(Debug)]
+pub(crate) enum GearSource {
+    /// Event-driven: rerun when new events land in this group.
+    Events(LocGroupId),
+    /// Timer-driven (oracle): rerun when the core's epoch counter reaches
+    /// `next_due`. `period` is the minimum gap between two `tick = true` runs.
+    Timer { period: NonZero<u64>, next_due: u64 },
+}
+
 #[derive(Debug)]
 pub(crate) enum ActiveGearExecution {
     Local {
-        group: LocGroupId,
+        source: GearSource,
         status: ActiveGearStatus,
         /// Gears this one depends on (forward gear-dep index). Reconciled each
         /// run from `GearCtx::deps`.
@@ -263,6 +289,8 @@ impl<R: IsRuntime> Core<R> {
                 gear_index: HashMap::new(),
                 unref_gear: VecDeque::new(),
                 event_subscriptions: HashMap::new(),
+                timer_gears: HashSet::new(),
+                epoch: 0,
             }),
         }
     }
@@ -299,19 +327,34 @@ impl<R: IsRuntime> Core<R> {
 
     /// Kick off a background run of a local gear if `Eepy`; mark `RunningQueued`
     /// if already running. Panics if the gear is remote/missing.
+    /// Kick off a background run of a local gear if `Eepy`; mark `RunningQueued`
+    /// if already running. Panics if the gear is remote/missing. Single-shot
+    /// convenience wrapper that borrows `inner` — hot loops should call
+    /// [`kick_loc_gear_in`] directly under a split field borrow to avoid
+    /// re-borrowing `inner` (and a `Vec`) per iteration.
     fn kick_loc_gear(self: &Rc<Self>, key: GearKey) {
         let mut inner = self.inner.borrow_mut();
-        let Some(ag) = inner.gears.get_mut(key) else {
+        Self::kick_loc_gear_in(&mut inner.gears, self, key);
+    }
+
+    /// Same as [`kick_loc_gear`](Self::kick_loc_gear) but takes the gears arena
+    /// by `&mut` so the caller can hold a split borrow of `inner` (e.g. iterate
+    /// `event_subscriptions` / `timer_gears` shared while mutating `gears`) and
+    /// kick in-loop without collecting into a `Vec` first.
+    fn kick_loc_gear_in(
+        gears: &mut SlotMap<GearKey, ActiveGear<R>>,
+        self_rc: &Rc<Self>,
+        key: GearKey,
+    ) {
+        let Some(ag) = gears.get_mut(key) else {
             panic!("Couldn't kick non-active gear");
         };
-        let ActiveGearExecution::Local { status, group, .. } = &mut ag.execution else {
+        let ActiveGearExecution::Local { status, .. } = &mut ag.execution else {
             panic!("Kicked non-local gear");
         };
         match status {
             ActiveGearStatus::Eepy => {
-                let group = *group;
-                let handle =
-                    compio::runtime::spawn(Self::run_loc_gear_task(self.clone(), key, group));
+                let handle = compio::runtime::spawn(Self::run_loc_gear_task(self_rc.clone(), key));
                 *status = ActiveGearStatus::Running {
                     handle,
                     rerun: false,
@@ -320,6 +363,62 @@ impl<R: IsRuntime> Core<R> {
             ActiveGearStatus::Running { rerun, .. } => {
                 *rerun = true;
             }
+        }
+    }
+
+    /// Advance the epoch counter by one and re-kick every timer (oracle) gear
+    /// whose `next_due` has been reached *and* that still has interest. Gears
+    /// without interest (in limbo) are skipped — oracles only run while active.
+    /// A gear that is `Running` gets `rerun` flagged; `run_loc_gear_task`
+    /// recomputes `tick` (and re-advances `next_due`) when the rerun starts, so
+    /// a tick that lands mid-run is consumed at the next iteration rather than
+    /// lost. Public so tests can drive the epoch deterministically instead of
+    /// waiting on [`epoch_ticker_task`]'s real-time [`EPOCH_INTERVAL`].
+    pub(crate) fn epoch_tick(self: &Rc<Self>) {
+        let mut inner = self.inner.borrow_mut();
+        // Split-borrow: iterate `timer_gears` (shared) while mutating `gears`
+        // (via `kick_loc_gear_in`) — no `Vec` of due keys, one `inner` borrow for
+        // the whole tick. `timer_gears` and `gears` are disjoint fields, so the
+        // shared iterator borrow and the mutable kick borrow coexist.
+        let CoreLocCtx {
+            epoch,
+            timer_gears,
+            gears,
+            ..
+        } = &mut *inner;
+        *epoch = epoch.saturating_add(1);
+        let epoch_val = *epoch;
+        for k in timer_gears.iter().copied() {
+            let due = {
+                let Some(ag) = gears.get(k) else {
+                    continue;
+                };
+                if !ag.has_interest() {
+                    continue;
+                }
+                matches!(
+                    &ag.execution,
+                    ActiveGearExecution::Local {
+                        source: GearSource::Timer { next_due, .. },
+                        ..
+                    } if *next_due <= epoch_val
+                )
+            };
+            if due {
+                Self::kick_loc_gear_in(gears, self, k);
+            }
+        }
+    }
+
+    /// Background task that advances the epoch every [`EPOCH_INTERVAL`] and
+    /// fires due timer gears. Spawned once per core alongside the worker task;
+    /// lives for the core's lifetime (dropping the core's runtime drops this
+    /// task). `compio::time::sleep` is `!Send`, but compio spawns this task
+    /// locally on the core's own thread, so it never crosses runtimes.
+    pub(crate) async fn epoch_ticker_task(self: Rc<Self>) {
+        loop {
+            compio::time::sleep(EPOCH_INTERVAL).await;
+            self.epoch_tick();
         }
     }
 
@@ -337,25 +436,48 @@ impl<R: IsRuntime> Core<R> {
     /// aborted rather than running to completion.
     ///
     /// Pre: `status` is `Running` (set by `kick_loc_gear` or by re-loop).
-    async fn run_loc_gear_task(self: Rc<Self>, key: GearKey, group_id: LocGroupId) {
+    async fn run_loc_gear_task(self: Rc<Self>, key: GearKey) {
         loop {
-            // Pull the gear id + cache via the arena key. A stale key (gear
-            // evicted, or evicted-and-recreated under a new generation) yields
-            // `None` → abandon. The `R::GearId` is read from the `ActiveGear`
-            // for wire remap / cache construction; the key remains the
-            // authoritative handle for the rest of the iteration.
-            let (gear_id, mut cache) = {
-                let inner = self.inner.borrow();
-                let Some(ag) = inner.gears.get(key) else {
+            // Pull the gear id + cache + run trigger via the arena key. A stale
+            // key (gear evicted, or evicted-and-recreated under a new
+            // generation) yields `None` → abandon. The `R::GearId` is read from
+            // the `ActiveGear` for wire remap / cache construction; the key
+            // remains the authoritative handle for the rest of the iteration.
+            //
+            // For a `Timer` gear the `tick` flag is computed here and
+            // `next_due` is advanced *before* `run_step` runs: "consuming" a
+            // due tick at the moment the run starts is what enforces the
+            // `period` rate limit even if the run is cancelled or re-looped.
+            let (gear_id, mut cache, input) = {
+                let mut inner = self.inner.borrow_mut();
+                let epoch = inner.epoch;
+                let CoreLocCtx {
+                    gears, gear_cache, ..
+                } = &mut *inner;
+                let Some(ag) = gears.get_mut(key) else {
                     return;
                 };
                 let gear_id = ag.id.clone();
-                let cache = inner
-                    .gear_cache
+                let cache = gear_cache
                     .get(&key)
                     .cloned()
                     .unwrap_or_else(|| R::make_cache(&gear_id));
-                (gear_id, cache)
+                let input = match &mut ag.execution {
+                    ActiveGearExecution::Local { source, .. } => match source {
+                        GearSource::Events(group) => GearInput::Events(*group),
+                        GearSource::Timer { period, next_due } => {
+                            let tick = *next_due <= epoch;
+                            if tick {
+                                *next_due = epoch + period.get();
+                            }
+                            GearInput::Timer { tick }
+                        }
+                    },
+                    ActiveGearExecution::Remote { .. } => {
+                        unreachable!("run_loc_gear_task on a remote gear")
+                    }
+                };
+                (gear_id, cache, input)
             };
 
             let mut ctx = GearCtx {
@@ -363,7 +485,7 @@ impl<R: IsRuntime> Core<R> {
                 gear: gear_id.clone(),
                 deps: RefCell::new(HashSet::new()),
             };
-            let output = R::run_step(&mut ctx, Some(group_id), &mut cache).await;
+            let output = R::run_step(&mut ctx, input, &mut cache).await;
 
             // Write output + cache; reconcile stale dep edges; collect fan-out.
             let (removed_deps, dependents, remote_subs, do_rerun) = {
@@ -472,22 +594,49 @@ impl<R: IsRuntime> Core<R> {
             return key;
         }
         // New gear: route, insert, and start its first computation/subscription.
-        let (msg_type, group_key) = R::meta(gear);
+        let meta = R::meta(gear);
+        let group_key = meta.group().clone();
         let target_core = R::route_group(&group_key, &inner.loc_ctx)
             .expect("force_active: route_group")
             .route(self.num_cores);
-        let (execution, local_group) = if target_core == self.core_id {
-            let loc_group = inner.loc_ctx.mk_loc_group(msg_type, group_key);
-            (
-                ActiveGearExecution::Local {
-                    group: loc_group,
-                    status: ActiveGearStatus::Eepy,
-                    dep_set: HashSet::new(),
-                },
-                Some(loc_group),
-            )
+        // What kind of gear, and what (if anything) to register it in once
+        // inserted. Event gears join `event_subscriptions`; timer (oracle)
+        // gears join `timer_gears`. Remote gears register nothing here — their
+        // owning core tracks them.
+        enum Reg {
+            Event(LocGroupId),
+            Timer,
+            Remote,
+        }
+        let (execution, registration) = if target_core == self.core_id {
+            match meta {
+                GearMeta::Event { msg_type, group } => {
+                    let loc_group = inner.loc_ctx.mk_loc_group(msg_type, group);
+                    (
+                        ActiveGearExecution::Local {
+                            source: GearSource::Events(loc_group),
+                            status: ActiveGearStatus::Eepy,
+                            dep_set: HashSet::new(),
+                        },
+                        Reg::Event(loc_group),
+                    )
+                }
+                GearMeta::Timer { group: _, period } => (
+                    ActiveGearExecution::Local {
+                        source: GearSource::Timer {
+                            period,
+                            // Due immediately on first activation: the oracle
+                            // has never polled, so its first run is `tick = true`.
+                            next_due: 0,
+                        },
+                        status: ActiveGearStatus::Eepy,
+                        dep_set: HashSet::new(),
+                    },
+                    Reg::Timer,
+                ),
+            }
         } else {
-            (ActiveGearExecution::Remote { target_core }, None)
+            (ActiveGearExecution::Remote { target_core }, Reg::Remote)
         };
         let key = inner.gears.insert(ActiveGear {
             id: gear.clone(),
@@ -499,8 +648,19 @@ impl<R: IsRuntime> Core<R> {
             changed: Event::new(),
         });
         inner.gear_index.insert(gear.clone(), key);
-        if let Some(g) = local_group {
-            inner.event_subscriptions.entry(g).or_default().insert(key);
+        // Register the local gear in its trigger index.
+        match registration {
+            Reg::Event(loc_group) => {
+                inner
+                    .event_subscriptions
+                    .entry(loc_group)
+                    .or_default()
+                    .insert(key);
+            }
+            Reg::Timer => {
+                inner.timer_gears.insert(key);
+            }
+            Reg::Remote => {}
         }
         drop(inner);
         if target_core == self.core_id {
@@ -569,9 +729,10 @@ impl<R: IsRuntime> Core<R> {
                 ag.local_dependents.insert(caller_key);
             }
             if let Some(caller_ag) = inner.gears.get_mut(caller_key)
-                && let ActiveGearExecution::Local { dep_set, .. } = &mut caller_ag.execution {
-                    dep_set.insert(gear_key);
-                }
+                && let ActiveGearExecution::Local { dep_set, .. } = &mut caller_ag.execution
+            {
+                dep_set.insert(gear_key);
+            }
         }
         self.wait_for_output_unpinned(gear_key)
             .await
@@ -669,10 +830,13 @@ impl<R: IsRuntime> Core<R> {
         source_node: Option<NodeId>,
     ) -> Result<(), MergeError> {
         let node_id = self.node_id;
-        // Collect the gears to kick while the merge borrow is held, then release
-        // `inner` *before* kicking — `kick_loc_gear` borrows `inner` itself, so
-        // holding a `borrow_mut` across it would double-borrow and panic.
-        let kick_keys: Vec<GearKey> = {
+        // Merge imports under a full `&mut inner` borrow, then split-borrow to
+        // kick: iterate `event_subscriptions` (shared) while mutating `gears`
+        // (via `kick_loc_gear_in`) in one pass — no `Vec` of kick keys, no
+        // re-borrow per kick. `event_subscriptions` and `gears` are disjoint
+        // fields, so the shared iterator borrow and the mutable kick borrow
+        // coexist.
+        {
             let mut inner = self.inner.borrow_mut();
             let mut dirty: HashSet<LocGroupId> = HashSet::new();
             {
@@ -691,26 +855,23 @@ impl<R: IsRuntime> Core<R> {
                     }
                 }
             }
-            let mut kick_keys = Vec::new();
+            let CoreLocCtx {
+                gears,
+                event_subscriptions,
+                ..
+            } = &mut *inner;
             for group in dirty {
-                for key in inner
-                    .event_subscriptions
-                    .get(&group)
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                {
-                    assert!(
-                        inner.gears.get(key).is_some(),
+                let Some(keys) = event_subscriptions.get(&group) else {
+                    continue;
+                };
+                for key in keys.iter().copied() {
+                    debug_assert!(
+                        gears.get(key).is_some(),
                         "event_subscription gear is missing from gears"
                     );
-                    kick_keys.push(key);
+                    Self::kick_loc_gear_in(gears, self, key);
                 }
             }
-            kick_keys
-        };
-        for key in kick_keys {
-            self.kick_loc_gear(key);
         }
         if source_node.is_none() {
             // TODO: Don't pass wire_ctx, pass only the relevant subpart of it. I. e. update WireLocCtxMereger to regenerate
@@ -1174,10 +1335,7 @@ impl<R: IsRuntime> Subscription<R> {
         };
         listener.await;
         let inner = self.core.inner.borrow();
-        inner
-            .gears
-            .get(self.key)
-            .and_then(|ag| ag.output.clone())
+        inner.gears.get(self.key).and_then(|ag| ag.output.clone())
     }
 }
 
@@ -1304,11 +1462,11 @@ impl<R: IsRuntime> CoreLocCtx<R> {
     }
 
     /// Fully tear down a gear: fire remote `StopSubscription` if it was a
-    /// subscribed remote dep, drop its event-input edges, remove ourselves from
-    /// each dependency's `local_dependents`, and cascade-rebalance dependencies
-    /// that lose their last dependent. The dependency graph is acyclic by
-    /// construction, so this terminates. Remote stops are emitted directly via
-    /// `stop_ctx`.
+    /// subscribed remote dep, drop its trigger registration (event group or
+    /// epoch counter), remove ourselves from each dependency's
+    /// `local_dependents`, and cascade-rebalance dependencies that lose their
+    /// last dependent. The dependency graph is acyclic by construction, so this
+    /// terminates. Remote stops are emitted directly via `stop_ctx`.
     fn evict_gear(&mut self, key: GearKey, ag: ActiveGear<R>, stop_ctx: &StopCtx<'_, R>) {
         let gear_id = ag.id.clone();
         self.gear_index.remove(&gear_id);
@@ -1317,11 +1475,20 @@ impl<R: IsRuntime> CoreLocCtx<R> {
                 self.send_stop(&gear_id, target_core, stop_ctx);
                 HashSet::new()
             }
-            ActiveGearExecution::Local { group, dep_set, .. } => {
-                if let Some(set) = self.event_subscriptions.get_mut(&group) {
-                    set.remove(&key);
-                    if set.is_empty() {
-                        self.event_subscriptions.remove(&group);
+            ActiveGearExecution::Local {
+                source, dep_set, ..
+            } => {
+                match source {
+                    GearSource::Events(group) => {
+                        if let Some(set) = self.event_subscriptions.get_mut(&group) {
+                            set.remove(&key);
+                            if set.is_empty() {
+                                self.event_subscriptions.remove(&group);
+                            }
+                        }
+                    }
+                    GearSource::Timer { .. } => {
+                        self.timer_gears.remove(&key);
                     }
                 }
                 dep_set

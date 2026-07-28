@@ -114,8 +114,8 @@ pub(crate) fn route_gear<R: IsRuntime>(
     wire_ctx: &WireLocCtx<R>,
     num_cores: NonZero<u32>,
 ) -> Result<u32, RunGearError> {
-    let (_, group) = R::meta(gear);
-    let global_core_id = R::route_group(&group, wire_ctx).map_err(RunGearError::Route)?;
+    let global_core_id =
+        R::route_group(R::meta(gear).group(), wire_ctx).map_err(RunGearError::Route)?;
     Ok(global_core_id.route(num_cores))
 }
 
@@ -252,6 +252,7 @@ impl<R: IsRuntime> Db<R> {
                         ));
 
                         compio::runtime::spawn(worker_fn(state.clone())).detach();
+                        compio::runtime::spawn(state.clone().epoch_ticker_task()).detach();
 
                         core_event_loop(
                             state,
