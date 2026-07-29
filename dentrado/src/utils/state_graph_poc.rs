@@ -41,7 +41,7 @@ fn eid(local_id: u64) -> SGEventId {
             timestamp: 0,
             global_core_id: GCI_0,
         },
-        AnyLocEventId(local_id),
+        AnyLocEventId(LocGroupId(0), local_id as u32),
     )
 }
 
@@ -64,7 +64,7 @@ fn make_test_ctx(num_events: u64) -> LocCtx<EmptyRuntime> {
 
 #[allow(dead_code)]
 const fn lid(id: u64) -> AnyLocEventId {
-    AnyLocEventId(id)
+    AnyLocEventId(LocGroupId(0), id as u32)
 }
 
 #[allow(dead_code)]
@@ -118,7 +118,7 @@ async fn oneshot(
     let mut sg = StateGraph::new();
     let store: BTreeMap<u64, (u32, SiteEvent)> = events
         .iter()
-        .map(|(eid, e)| (eid.1.0, (eid.0.timestamp, e.clone())))
+        .map(|(eid, e)| (eid.1.1 as u64, (eid.0.timestamp, e.clone())))
         .collect();
 
     let mut r = async |_: &SGEventId| Timeline::<(), ()> {
@@ -130,7 +130,9 @@ async fn oneshot(
     sg.apply(
         &mut h,
         &|local_id: AnyLocEventId| {
-            let (ts, e) = store.get(&local_id.0).expect("poc: event not found");
+            let (ts, e) = store
+                .get(&(local_id.1 as u64))
+                .expect("poc: event not found");
             let sg_id = SGEventId::new(
                 SGBucketId {
                     timestamp: *ts,
@@ -159,14 +161,16 @@ async fn multishot(
     let mut sg = StateGraph::new();
     let store: BTreeMap<u64, (u32, SiteEvent)> = events
         .iter()
-        .map(|(eid, e)| (eid.1.0, (eid.0.timestamp, e.clone())))
+        .map(|(eid, e)| (eid.1.1 as u64, (eid.0.timestamp, e.clone())))
         .collect();
 
     let mut r = async |_: &SGEventId| Timeline::<(), ()> {
         writes: OrdMap::new(),
     };
     let resolver = |local_id: AnyLocEventId| {
-        let (ts, e) = store.get(&local_id.0).expect("poc: event not found");
+        let (ts, e) = store
+            .get(&(local_id.1 as u64))
+            .expect("poc: event not found");
         let sg_id = SGEventId::new(
             SGBucketId {
                 timestamp: *ts,

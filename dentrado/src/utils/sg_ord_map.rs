@@ -735,7 +735,7 @@ mod tests {
                 timestamp: ts,
                 global_core_id: GlobalCoreId(gci),
             },
-            AnyLocEventId(lid),
+            AnyLocEventId(LocGroupId(0), lid as u32),
         )
     }
 
@@ -895,7 +895,7 @@ mod tests {
         m.insert(k2, "b", &ctx);
 
         m.try_remap_local_ids::<std::convert::Infallible>(&mut |lid| {
-            Ok(AnyLocEventId(lid.0 + 1000))
+            Ok(AnyLocEventId(lid.0, lid.1 + 1000))
         })
         .unwrap();
 

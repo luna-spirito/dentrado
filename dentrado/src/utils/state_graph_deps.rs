@@ -22,12 +22,12 @@ fn eid(ts: u32, lid: u64) -> SGEventId {
             timestamp: ts,
             global_core_id: GCI_0,
         },
-        AnyLocEventId(lid),
+        AnyLocEventId(LocGroupId(0), lid as u32),
     )
 }
 
 const fn lid(id: u64) -> AnyLocEventId {
-    AnyLocEventId(id)
+    AnyLocEventId(LocGroupId(0), id as u32)
 }
 
 fn make_test_ctx(num_events: u64) -> LocCtx<EmptyRuntime> {
@@ -57,7 +57,7 @@ fn make_resolver<E: Clone>(
 ) -> impl Fn(AnyLocEventId) -> (SGEventId, E) + '_ {
     move |local_id: AnyLocEventId| {
         let (ts, e) = events
-            .get(&local_id.0)
+            .get(&(local_id.1 as u64))
             .expect("make_resolver: event not found");
         let sg_id = SGEventId::new(
             SGBucketId {

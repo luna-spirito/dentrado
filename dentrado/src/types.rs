@@ -4,109 +4,12 @@ use std::{mem::size_of, num::NonZero};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
 
-#[repr(transparent)]
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
-pub struct AnyLocEventId(pub u64);
-
-#[repr(transparent)]
-pub struct LocEventId<T>(pub AnyLocEventId, pub std::marker::PhantomData<T>);
-
-impl<T> Clone for LocEventId<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<T> Copy for LocEventId<T> {}
-
-impl<T> std::fmt::Debug for LocEventId<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl<T> PartialEq for LocEventId<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-impl<T> Eq for LocEventId<T> {}
-
-impl<T> std::hash::Hash for LocEventId<T> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-impl<T> PartialOrd for LocEventId<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl<T> Ord for LocEventId<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-
-impl<T> LocEventId<T> {
-    #[must_use]
-    pub const fn new(id: u64) -> Self {
-        Self(AnyLocEventId(id), std::marker::PhantomData)
-    }
-
-    #[must_use]
-    pub const fn to_any(self) -> AnyLocEventId {
-        self.0
-    }
-}
-
-impl<T> rkyv::Archive for LocEventId<T> {
-    type Archived = <AnyLocEventId as rkyv::Archive>::Archived;
-    type Resolver = <AnyLocEventId as rkyv::Archive>::Resolver;
-
-    const COPY_OPTIMIZATION: rkyv::traits::CopyOptimization<Self> =
-        rkyv::traits::CopyOptimization::disable();
-
-    fn resolve(&self, resolver: Self::Resolver, out: rkyv::Place<Self::Archived>) {
-        self.0.resolve(resolver, out);
-    }
-}
-
-impl<T, S: rkyv::rancor::Fallible + ?Sized> rkyv::Serialize<S> for LocEventId<T> {
-    fn serialize(
-        &self,
-        serializer: &mut S,
-    ) -> Result<Self::Resolver, <S as rkyv::rancor::Fallible>::Error> {
-        self.0.serialize(serializer)
-    }
-}
-
-impl<T, D: rkyv::rancor::Fallible + ?Sized> rkyv::Deserialize<LocEventId<T>, D>
-    for <LocEventId<T> as rkyv::Archive>::Archived
-{
-    fn deserialize(
-        &self,
-        deserializer: &mut D,
-    ) -> Result<LocEventId<T>, <D as rkyv::rancor::Fallible>::Error> {
-        let any = <<AnyLocEventId as rkyv::Archive>::Archived as rkyv::Deserialize<
-            AnyLocEventId,
-            D,
-        >>::deserialize(self, deserializer)?;
-        Ok(LocEventId(any, std::marker::PhantomData))
-    }
-}
+/// Composite event reference: `(group, slot)`. The group selects a per-group
+/// shard; the slot indexes that shard's flat body `Vec`. Storage is sharded by
+/// group, so a reference names the shard plus a position within it — there is
+/// no single global event log. Ordering is lexicographic on `(group, slot)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AnyLocEventId(pub LocGroupId, pub u32);
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

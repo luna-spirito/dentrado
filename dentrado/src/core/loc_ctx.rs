@@ -4,8 +4,7 @@ use crate::{
     core::gear::IsRuntime,
     types::{
         AnyLocEventId, DataId, DataVerifyError, GlobalCoreId, GlobalResolver, GroupRouteError,
-        LocDataId, LocGroupId, LocMsgTypeId, LocSenderEventId, LocSenderId, LocUserId, SenderPk,
-        UserId,
+        LocDataId, LocGroupId, LocMsgTypeId, LocSenderId, LocUserId, SenderPk, UserId,
     },
 };
 
@@ -20,23 +19,41 @@ pub struct StoredEvent<B> {
     pub body: B,
 }
 
+/// Per-group event shard. Owns, for one group: its event bodies (a flat,
+/// append-only `Vec`), its dedup index, and its `added`/`removed` changelog.
+///
+/// The dedup key is group-scoped — `(sender, tx_id)` — rather than the former
+/// `(sender, global_core_id, tx_id)`: `global_core_id` is implied by the group
+/// (one group maps to exactly one core), so it is constant within a shard and
+/// carries no information. The consequence is that supersede is **always
+/// intra-group by construction** — a cross-group "supersede" cannot arise, so a
+/// `removed` entry never references a foreign shard.
+///
+/// `added`/`removed` mirror the previous per-group changelog; each references a
+/// body by its `AnyLocEventId` = `(this group, slot)`. Superseded bodies stay in
+/// `bodies` (still fetchable); "removal" is purely a `removed` entry, never a
+/// deletion.
 #[derive(Debug)]
-pub struct LocCtxInner<R: IsRuntime> {
-    pk_to_sender: HashMap<SenderPk, LocSenderId>,
-    sender_to_pk: HashMap<LocSenderId, SenderPk>,
-    sender_to_user: HashMap<LocSenderId, LocUserId>,
+pub(crate) struct EventGroup<B> {
+    pub(crate) bodies: Vec<StoredEvent<B>>,
+    /// `(sender, tx_id)` -> slot of the currently-live version.
+    dedup: HashMap<(LocSenderId, u32), u32>,
+    pub(crate) added: Vec<AnyLocEventId>,
+    pub(crate) removed: Vec<AnyLocEventId>,
+}
 
-    user_id_to_local: HashMap<UserId, LocUserId>,
-    local_to_user_id: HashMap<LocUserId, UserId>,
-
-    events: Vec<StoredEvent<R::Body>>,
-    sender_tx_index: HashMap<LocSenderEventId, AnyLocEventId>,
-
-    data_by_id: Vec<(DataId, R::Data)>,
-    data_id_to_local: HashMap<DataId, LocDataId>,
-
-    group_by_key: HashMap<(LocMsgTypeId, R::Group), LocGroupId>,
-    group_by_id: HashMap<LocGroupId, (LocMsgTypeId, R::Group)>,
+// Hand-written (not derived) so it does NOT impose `B: Default` (which
+// `#[derive(Default)]` would — `R::Body` is not `Default`). `Vec`/`HashMap`
+// default without any bound on `B`.
+impl<B> Default for EventGroup<B> {
+    fn default() -> Self {
+        Self {
+            bodies: Vec::new(),
+            dedup: HashMap::new(),
+            added: Vec::new(),
+            removed: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -48,8 +65,11 @@ pub struct LocCtx<R: IsRuntime> {
     user_id_to_local: HashMap<UserId, LocUserId>,
     local_to_user_id: HashMap<LocUserId, UserId>,
 
-    events: Vec<StoredEvent<R::Body>>,
-    sender_tx_index: HashMap<LocSenderEventId, AnyLocEventId>,
+    /// Sharded event storage: one [`EventGroup`] per group. Bodies + dedup +
+    /// changelog live together here (previously bodies+dedup were a global
+    /// `Vec`/`HashMap` in `LocCtx` and the changelog lived separately in
+    /// `CoreLocCtx`); `store_event` is now atomic over all three.
+    events_by_group: HashMap<LocGroupId, EventGroup<R::Body>>,
 
     data_by_id: Vec<(DataId, R::Data)>,
     data_id_to_local: HashMap<DataId, LocDataId>,
@@ -67,8 +87,7 @@ impl<R: IsRuntime> LocCtx<R> {
             sender_to_user: HashMap::new(),
             user_id_to_local: HashMap::new(),
             local_to_user_id: HashMap::new(),
-            events: Vec::new(),
-            sender_tx_index: HashMap::new(),
+            events_by_group: HashMap::new(),
             data_by_id: Vec::new(),
             data_id_to_local: HashMap::new(),
             group_by_key: HashMap::new(),
@@ -106,11 +125,24 @@ impl<R: IsRuntime> LocCtx<R> {
         eid: AnyLocEventId,
         f: impl Fn(&StoredEvent<R::Body>) -> F,
     ) -> Option<F> {
-        self.events.get(eid.0 as usize).map(f)
+        self.events_by_group
+            .get(&eid.0)?
+            .bodies
+            .get(eid.1 as usize)
+            .map(f)
     }
 
-    pub(crate) fn find_event_by_sender_tx(&self, id: LocSenderEventId) -> Option<AnyLocEventId> {
-        self.sender_tx_index.get(&id).copied()
+    /// `(added, removed)` appended to `group`'s changelog since `since`, mapped
+    /// through `f`. `None` if the group has no shard yet.
+    pub(crate) fn query_events<F>(
+        &self,
+        group: LocGroupId,
+        since: (usize, usize),
+        f: impl Fn(&[AnyLocEventId], &[AnyLocEventId]) -> F,
+    ) -> Option<F> {
+        self.events_by_group
+            .get(&group)
+            .map(|eg| f(&eg.added[since.0..], &eg.removed[since.1..]))
     }
 
     #[must_use]
@@ -186,7 +218,11 @@ pub trait EventStore<R: IsRuntime> {
 
 impl<R: IsRuntime> EventStore<R> for LocCtx<R> {
     fn stored_event(&self, eid: AnyLocEventId) -> Option<StoredEvent<R::Body>> {
-        self.events.get(eid.0 as usize).cloned()
+        self.events_by_group
+            .get(&eid.0)?
+            .bodies
+            .get(eid.1 as usize)
+            .cloned()
     }
 
     fn sender_user(&self, sid: LocSenderId) -> Option<LocUserId> {
@@ -256,14 +292,19 @@ impl<R: IsRuntime> EventContext<R> for LocCtx<R> {
     }
 
     fn store_event(&mut self, ev: StoredEvent<R::Body>) -> Option<StoreResultSuccess> {
-        let eid = AnyLocEventId(self.events.len() as u64);
-        let sender_key = LocSenderEventId(ev.sender, ev.global_core_id, ev.tx_id);
+        let group = ev.group;
+        let g = self.events_by_group.entry(group).or_default();
+        let key = (ev.sender, ev.tx_id);
+        let new_key = (ev.timestamp, ev.source_node);
 
-        let old = if let Some(existing_eid) = self.find_event_by_sender_tx(sender_key) {
-            let old_key = self
-                .get_stored_event(existing_eid, |ev| (ev.timestamp, ev.source_node))
-                .expect("sender_tx_index points to valid event");
-            let new_key = (ev.timestamp, ev.source_node);
+        // Supersede detection: same `(sender, tx_id)` already stored. The
+        // freshness tiebreak is `(timestamp, source_node)`, earliest-wins (a
+        // stored observation that is at-least-as-early makes the incoming one
+        // stale). Same logic as before — only the key lost `global_core_id`
+        // (now implied by the group).
+        if let Some(&old_slot) = g.dedup.get(&key) {
+            let old_ev = &g.bodies[old_slot as usize];
+            let old_key = (old_ev.timestamp, old_ev.source_node);
 
             // (eid, ev.timestamp, ev.source_node) is unique in a network where source_node's are never duplicated.
             // TODO: Make sure that "source_node is unique" is always the case.
@@ -271,16 +312,28 @@ impl<R: IsRuntime> EventContext<R> for LocCtx<R> {
                 return None; // Event isn't earlier, skip it
             }
 
-            Some(existing_eid)
-        } else {
-            None
-        };
-        self.sender_tx_index.insert(
-            LocSenderEventId(ev.sender, ev.global_core_id, ev.tx_id),
-            eid,
-        );
-        self.events.push(ev);
-        Some(StoreResultSuccess { old, new: eid })
+            // Supersede: append the fresh body, repoint dedup at it, and record
+            // the old slot removed (its body stays in `bodies`).
+            let new_slot = g.bodies.len() as u32;
+            g.bodies.push(ev);
+            g.dedup.insert(key, new_slot);
+            g.added.push(AnyLocEventId(group, new_slot));
+            g.removed.push(AnyLocEventId(group, old_slot));
+            return Some(StoreResultSuccess {
+                old: Some(AnyLocEventId(group, old_slot)),
+                new: AnyLocEventId(group, new_slot),
+            });
+        }
+
+        // Fresh identity.
+        let new_slot = g.bodies.len() as u32;
+        g.bodies.push(ev);
+        g.dedup.insert(key, new_slot);
+        g.added.push(AnyLocEventId(group, new_slot));
+        Some(StoreResultSuccess {
+            old: None,
+            new: AnyLocEventId(group, new_slot),
+        })
     }
 
     // fn loc_ctx(&self) -> &LocCtx<R> {

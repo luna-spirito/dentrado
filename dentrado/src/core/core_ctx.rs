@@ -131,7 +131,6 @@ struct CoreLocCtx<R: IsRuntime> {
     /// (so, e.g., the watermark it stores is preserved). Stays in RAM — the hot
     /// cache is not routed through the async `Storage` trait.
     gear_cache: HashMap<R::GearId, R::GearCache>,
-    events_by_group: HashMap<LocGroupId, EventGroup>,
     loc_ctx: LocCtx<R>,
     // --- subscription state ---
     /// Every gear this core knows about (active), stored in a generational
@@ -165,12 +164,6 @@ struct CoreLocCtx<R: IsRuntime> {
     /// [`EPOCH_INTERVAL`]. [`GearSource::Timer`] gears compare their
     /// `next_due` against this to decide `tick`.
     epoch: u64,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct EventGroup {
-    pub(crate) added: Vec<AnyLocEventId>,
-    pub(crate) removed: Vec<AnyLocEventId>,
 }
 
 /// Soft cap on the number of gears kept hot in limbo. Beyond this, the
@@ -306,7 +299,6 @@ impl<R: IsRuntime> Core<R> {
             inter_node_peers,
             inner: RefCell::new(CoreLocCtx {
                 gear_cache: HashMap::new(),
-                events_by_group: HashMap::new(),
                 loc_ctx: LocCtx::new(),
                 gears: SlotMap::with_key(),
                 gear_index: HashMap::new(),
@@ -1156,11 +1148,7 @@ impl<R: IsRuntime> Core<R> {
         since: (usize, usize),
         f: impl Fn(&[AnyLocEventId], &[AnyLocEventId]) -> F,
     ) -> Option<F> {
-        self.inner
-            .borrow()
-            .events_by_group
-            .get(&group)
-            .map(|eg| f(&eg.added[since.0..], &eg.removed[since.1..]))
+        self.inner.borrow().loc_ctx.query_events(group, since, f)
     }
 
     // Send commands to db via this Core
@@ -1565,17 +1553,10 @@ impl<R: IsRuntime> EventContext<R> for CoreLocCtx<R> {
     }
 
     fn store_event(&mut self, ev: StoredEvent<R::Body>) -> Option<StoreResultSuccess> {
-        let group_id = ev.group;
-
-        let res = self.loc_ctx.store_event(ev);
-        if let Some(StoreResultSuccess { old, new }) = res {
-            let group = self.events_by_group.entry(group_id).or_default();
-            group.added.push(new);
-            if let Some(old) = old {
-                group.removed.push(old);
-            }
-        }
-        res
+        // Bodies + dedup + added/removed changelog all live together inside
+        // `loc_ctx`'s per-group shards now, so this is a plain delegate. The
+        // changelog push that used to live here moved into `LocCtx::store_event`.
+        self.loc_ctx.store_event(ev)
     }
 
     fn mk_data(&mut self, data_id: DataId, content: R::Data) -> Result<LocDataId, DataVerifyError> {
