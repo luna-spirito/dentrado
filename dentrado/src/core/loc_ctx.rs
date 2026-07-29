@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::{
     core::gear::IsRuntime,
     types::{
-        AnyLocEventId, DataId, DataVerifyError, GlobalCoreId, GlobalResolver, GroupRouteError,
+        DataId, DataVerifyError, GlobalCoreId, GlobalResolver, GroupEventId, GroupRouteError,
         LocDataId, LocGroupId, LocMsgTypeId, LocSenderId, LocUserId, SenderPk, UserId,
     },
 };
@@ -30,16 +30,16 @@ pub struct StoredEvent<B> {
 /// `removed` entry never references a foreign shard.
 ///
 /// `added`/`removed` mirror the previous per-group changelog; each references a
-/// body by its `AnyLocEventId` = `(this group, slot)`. Superseded bodies stay in
+/// body by its `LocEventId` (a slot within this shard). Superseded bodies stay in
 /// `bodies` (still fetchable); "removal" is purely a `removed` entry, never a
 /// deletion.
 #[derive(Debug)]
 pub(crate) struct EventGroup<B> {
     pub(crate) bodies: Vec<StoredEvent<B>>,
     /// `(sender, tx_id)` -> slot of the currently-live version.
-    dedup: HashMap<(LocSenderId, u32), u32>,
-    pub(crate) added: Vec<AnyLocEventId>,
-    pub(crate) removed: Vec<AnyLocEventId>,
+    dedup: HashMap<(LocSenderId, u32), u64>,
+    pub(crate) added: Vec<GroupEventId>,
+    pub(crate) removed: Vec<GroupEventId>,
 }
 
 // Hand-written (not derived) so it does NOT impose `B: Default` (which
@@ -122,13 +122,14 @@ impl<R: IsRuntime> LocCtx<R> {
     /// Panics if `Fn` accesses `Core`.
     pub fn get_stored_event<F>(
         &self,
-        eid: AnyLocEventId,
+        group: LocGroupId,
+        slot: GroupEventId,
         f: impl Fn(&StoredEvent<R::Body>) -> F,
     ) -> Option<F> {
         self.events_by_group
-            .get(&eid.0)?
+            .get(&group)?
             .bodies
-            .get(eid.1 as usize)
+            .get(slot.0 as usize)
             .map(f)
     }
 
@@ -138,7 +139,7 @@ impl<R: IsRuntime> LocCtx<R> {
         &self,
         group: LocGroupId,
         since: (usize, usize),
-        f: impl Fn(&[AnyLocEventId], &[AnyLocEventId]) -> F,
+        f: impl Fn(&[GroupEventId], &[GroupEventId]) -> F,
     ) -> Option<F> {
         self.events_by_group
             .get(&group)
@@ -194,47 +195,101 @@ impl<R: IsRuntime> GlobalResolver for LocCtx<R> {
 }
 
 pub struct StoreResultSuccess {
-    pub old: Option<AnyLocEventId>,
-    pub new: AnyLocEventId,
+    pub old: Option<GroupEventId>,
+    pub new: GroupEventId,
 }
 
-/// Read-only access to a core's localised event/data/sender store.
+/// Read-only access to a localised event/data/sender store, scoped to a single
+/// group.
 ///
-/// Implemented both for `LocCtx` (which owns the data directly) and for `Core`
-/// (which reaches the same data through a short-lived `inner` borrow). This is
-/// what lets the Fadeno VM read events/data uniformly whether it's running in
-/// construction mode (against a bare `&LocCtx`) or in gear-step mode (against a
-/// `&Core`, where a long-lived borrow is impossible because `secondary_get`
-/// takes `inner` mutably mid-step).
+/// The only implementor is [`GroupStore`] — a thin view that pairs a backing
+/// [`GroupEventSource`] with the one group a gear is running for. Because the
+/// group is bound when the view is built, `stored_event` takes only the slot;
+/// everything below this trait (`sg_ord_map`, `state_graph`) is completely
+/// `LocGroupId`-free.
 ///
-/// All methods return owned values (no borrows from `&self`) so that the trait
-/// is object-safe and usable as `&dyn EventStore<R>` even behind a `RefCell`.
+/// All methods return owned values (no borrows from `&self`) so the trait is
+/// object-safe and usable as `&dyn EventStore<R>` even behind a `RefCell`.
 pub trait EventStore<R: IsRuntime> {
-    fn stored_event(&self, eid: AnyLocEventId) -> Option<StoredEvent<R::Body>>;
+    fn stored_event(&self, slot: GroupEventId) -> Option<StoredEvent<R::Body>>;
     fn sender_user(&self, sid: LocSenderId) -> Option<LocUserId>;
     fn sender_pk(&self, sid: LocSenderId) -> Option<SenderPk>;
     fn data(&self, did: LocDataId) -> Option<(DataId, R::Data)>;
 }
 
-impl<R: IsRuntime> EventStore<R> for LocCtx<R> {
-    fn stored_event(&self, eid: AnyLocEventId) -> Option<StoredEvent<R::Body>> {
+/// Backing store for a [`GroupStore`]: group-scoped event/data/sender reads.
+///
+/// Implemented directly by `LocCtx` (which owns the data) and by `Core` (which
+/// re-borrows its `RefCell`-guarded `LocCtx` per call) — see `core_ctx.rs`.
+pub(crate) trait GroupEventSource<R: IsRuntime> {
+    fn stored_event_in(
+        &self,
+        group: LocGroupId,
+        slot: GroupEventId,
+    ) -> Option<StoredEvent<R::Body>>;
+    fn sender_user_in(&self, sid: LocSenderId) -> Option<LocUserId>;
+    fn sender_pk_in(&self, sid: LocSenderId) -> Option<SenderPk>;
+    fn data_in(&self, did: LocDataId) -> Option<(DataId, R::Data)>;
+}
+
+/// A group-bound read view over a localised store. Carries the group so that
+/// [`EventStore::stored_event`] needs only the slot — the group is a property
+/// of the gear (one gear = one group), never of the event id. Construct this
+/// once at the gear-run boundary; everything passed it downstream stays
+/// group-agnostic.
+pub struct GroupStore<'a, R: IsRuntime> {
+    src: &'a dyn GroupEventSource<R>,
+    group: LocGroupId,
+}
+
+impl<'a, R: IsRuntime> GroupStore<'a, R> {
+    #[must_use]
+    pub(crate) fn new<S: GroupEventSource<R>>(src: &'a S, group: LocGroupId) -> Self {
+        Self { src, group }
+    }
+}
+
+impl<R: IsRuntime> GroupEventSource<R> for LocCtx<R> {
+    fn stored_event_in(
+        &self,
+        group: LocGroupId,
+        slot: GroupEventId,
+    ) -> Option<StoredEvent<R::Body>> {
         self.events_by_group
-            .get(&eid.0)?
+            .get(&group)?
             .bodies
-            .get(eid.1 as usize)
+            .get(slot.0 as usize)
             .cloned()
     }
 
-    fn sender_user(&self, sid: LocSenderId) -> Option<LocUserId> {
+    fn sender_user_in(&self, sid: LocSenderId) -> Option<LocUserId> {
         self.sender_to_user.get(&sid).copied()
     }
 
-    fn sender_pk(&self, sid: LocSenderId) -> Option<SenderPk> {
+    fn sender_pk_in(&self, sid: LocSenderId) -> Option<SenderPk> {
         self.sender_to_pk.get(&sid).copied()
     }
 
-    fn data(&self, did: LocDataId) -> Option<(DataId, R::Data)> {
+    fn data_in(&self, did: LocDataId) -> Option<(DataId, R::Data)> {
         self.data_by_id.get(did.0 as usize).cloned()
+    }
+}
+
+impl<R: IsRuntime> EventStore<R> for GroupStore<'_, R> {
+    fn stored_event(&self, slot: GroupEventId) -> Option<StoredEvent<R::Body>> {
+        self.src.stored_event_in(self.group, slot)
+    }
+
+    fn sender_user(&self, sid: LocSenderId) -> Option<LocUserId> {
+        self.src.sender_user_in(sid)
+    }
+
+    fn sender_pk(&self, sid: LocSenderId) -> Option<SenderPk> {
+        self.src.sender_pk_in(sid)
+    }
+
+    fn data(&self, did: LocDataId) -> Option<(DataId, R::Data)> {
+        self.src.data_in(did)
     }
 }
 
@@ -314,25 +369,25 @@ impl<R: IsRuntime> EventContext<R> for LocCtx<R> {
 
             // Supersede: append the fresh body, repoint dedup at it, and record
             // the old slot removed (its body stays in `bodies`).
-            let new_slot = g.bodies.len() as u32;
+            let new_slot = g.bodies.len() as u64;
             g.bodies.push(ev);
             g.dedup.insert(key, new_slot);
-            g.added.push(AnyLocEventId(group, new_slot));
-            g.removed.push(AnyLocEventId(group, old_slot));
+            g.added.push(GroupEventId(new_slot));
+            g.removed.push(GroupEventId(old_slot));
             return Some(StoreResultSuccess {
-                old: Some(AnyLocEventId(group, old_slot)),
-                new: AnyLocEventId(group, new_slot),
+                old: Some(GroupEventId(old_slot)),
+                new: GroupEventId(new_slot),
             });
         }
 
         // Fresh identity.
-        let new_slot = g.bodies.len() as u32;
+        let new_slot = g.bodies.len() as u64;
         g.bodies.push(ev);
         g.dedup.insert(key, new_slot);
-        g.added.push(AnyLocEventId(group, new_slot));
+        g.added.push(GroupEventId(new_slot));
         Some(StoreResultSuccess {
             old: None,
-            new: AnyLocEventId(group, new_slot),
+            new: GroupEventId(new_slot),
         })
     }
 

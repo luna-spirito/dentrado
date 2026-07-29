@@ -1,7 +1,7 @@
 use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, Timeline};
 use crate::core::gear::EmptyRuntime;
-use crate::core::loc_ctx::{EventContext, LocCtx, StoredEvent};
-use crate::types::{AnyLocEventId, GlobalCoreId, LocGroupId, SenderPk};
+use crate::core::loc_ctx::{EventContext, GroupStore, LocCtx, StoredEvent};
+use crate::types::{GlobalCoreId, GroupEventId, LocGroupId, SenderPk};
 use im::OrdMap;
 use std::collections::BTreeMap;
 
@@ -16,18 +16,22 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         .block_on(fut)
 }
 
+fn gs(ctx: &LocCtx<EmptyRuntime>) -> GroupStore<'_, EmptyRuntime> {
+    GroupStore::new(ctx, LocGroupId(0))
+}
+
 fn eid(ts: u32, lid: u64) -> SGEventId {
     SGEventId::new(
         SGBucketId {
             timestamp: ts,
             global_core_id: GCI_0,
         },
-        AnyLocEventId(LocGroupId(0), lid as u32),
+        GroupEventId(lid),
     )
 }
 
-const fn lid(id: u64) -> AnyLocEventId {
-    AnyLocEventId(LocGroupId(0), id as u32)
+const fn lid(id: u64) -> GroupEventId {
+    GroupEventId(id)
 }
 
 fn make_test_ctx(num_events: u64) -> LocCtx<EmptyRuntime> {
@@ -52,12 +56,10 @@ type InviteSG = StateGraph<u64, u64, bool, u64, bool>;
 
 type EventStore<E> = BTreeMap<u64, (u32, E)>;
 
-fn make_resolver<E: Clone>(
-    events: &EventStore<E>,
-) -> impl Fn(AnyLocEventId) -> (SGEventId, E) + '_ {
-    move |local_id: AnyLocEventId| {
+fn make_resolver<E: Clone>(events: &EventStore<E>) -> impl Fn(GroupEventId) -> (SGEventId, E) + '_ {
+    move |local_id: GroupEventId| {
         let (ts, e) = events
-            .get(&(local_id.1 as u64))
+            .get(&(local_id.0 as u64))
             .expect("make_resolver: event not found");
         let sg_id = SGEventId::new(
             SGBucketId {
@@ -73,7 +75,8 @@ fn make_resolver<E: Clone>(
 #[test]
 fn dep_query_basic() {
     block_on(async {
-        let ctx = make_test_ctx(20);
+        let loc = make_test_ctx(20);
+        let ctx = gs(&loc);
 
         let mut invite_sg: InviteSG = InviteSG::new();
         let mut invite_events: EventStore<u64> = EventStore::new();
@@ -134,7 +137,8 @@ fn dep_query_basic() {
 #[test]
 fn dep_change_detection_and_propagation() {
     block_on(async {
-        let ctx = make_test_ctx(20);
+        let loc = make_test_ctx(20);
+        let ctx = gs(&loc);
 
         async fn doc_handler<D: async FnMut(&u64) -> Timeline<u64, bool>>(
             ev: &(u64, u64),
@@ -223,7 +227,8 @@ fn dep_change_detection_and_propagation() {
 #[test]
 fn dep_isolation_between_branches() {
     block_on(async {
-        let ctx = make_test_ctx(20);
+        let loc = make_test_ctx(20);
+        let ctx = gs(&loc);
 
         let mut invite_10: InviteSG = InviteSG::new();
         let mut invite_20: InviteSG = InviteSG::new();

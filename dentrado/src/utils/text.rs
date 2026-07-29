@@ -563,6 +563,16 @@ fn char_slice(s: &str, start: usize, end: usize) -> &str {
 mod tests {
     use super::*;
     use crate::core::gear::EmptyRuntime;
+    use crate::core::loc_ctx::GroupStore;
+    use crate::types::LocGroupId;
+
+    /// Empty group-bound store. Text's RGA ordering only consults `sender_pk`
+    /// (group-independent), so an empty `LocCtx` under an arbitrary group works.
+    macro_rules! store {
+        () => {
+            &GroupStore::new(&LocCtx::<EmptyRuntime>::new(), LocGroupId(0))
+        };
+    }
 
     const S1: LocSenderId = LocSenderId(1);
     const _S2: LocSenderId = LocSenderId(2);
@@ -587,7 +597,7 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["hello".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
         let doc = Document::new(&agg, &text);
@@ -607,7 +617,7 @@ mod tests {
             ],
             vec!["first".to_string(), "second".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
         let doc = Document::new(&agg, &text);
@@ -624,7 +634,7 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["base".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd1);
 
         let parent = AnchorId(eid(S1, 1), 0);
@@ -632,7 +642,7 @@ mod tests {
             vec![AnchorPos::new(parent, 2)],
             vec![" inserted ".to_string()],
         );
-        let agg = agg.apply(eid(S1, 2), &upd2, &LocCtx::<EmptyRuntime>::new());
+        let agg = agg.apply(eid(S1, 2), &upd2, store!());
         let text = text.apply(eid(S1, 2), &upd2);
 
         let doc = Document::new(&agg, &text);
@@ -645,14 +655,14 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["abcde".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, store!());
 
         let parent = AnchorId(eid(S1, 1), 0);
         let upd2 = TextUpd::new(
             vec![AnchorPos::new(parent, 3), AnchorPos::new(parent, 1)],
             vec!["[C1]".to_string(), "[C2]".to_string()],
         );
-        let agg = agg.apply(eid(S1, 2), &upd2, &LocCtx::<EmptyRuntime>::new());
+        let agg = agg.apply(eid(S1, 2), &upd2, store!());
 
         let text = TextAgg::new()
             .apply(eid(S1, 1), &upd1)
@@ -668,7 +678,7 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["hello".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd1);
 
         let upd2 = TextUpd::empty().with_deletions(vec![AnchorId(eid(S1, 1), 0)]);
@@ -684,12 +694,12 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["parent ".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, store!());
         let mut text = TextAgg::new().apply(eid(S1, 1), &upd1);
 
         let parent = AnchorId(eid(S1, 1), 0);
         let upd2 = TextUpd::new(vec![AnchorPos::new(parent, 0)], vec!["child".to_string()]);
-        let agg = agg.apply(eid(S1, 2), &upd2, &LocCtx::<EmptyRuntime>::new());
+        let agg = agg.apply(eid(S1, 2), &upd2, store!());
         text = text.apply(eid(S1, 2), &upd2);
 
         let upd3 = TextUpd::empty().with_deletions(vec![parent]);
@@ -705,7 +715,7 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["hello".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
         let branch = text.fork().apply(
@@ -723,10 +733,10 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["test".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        let agg2 = agg.apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg2 = agg.apply(eid(S1, 1), &upd, store!());
         let text2 = text.apply(eid(S1, 1), &upd);
 
         assert_eq!(Document::new(&agg2, &text2).get(), "test");
@@ -741,7 +751,7 @@ mod tests {
             ],
             vec!["мир ".to_string(), "Привет ".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
         let doc = Document::new(&agg, &text);
@@ -764,8 +774,7 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["hello world".to_string()],
         );
-        let base_agg =
-            AnchorAgg::new().apply(eid(S1, 1), &base_upd, &LocCtx::<EmptyRuntime>::new());
+        let base_agg = AnchorAgg::new().apply(eid(S1, 1), &base_upd, store!());
         let base_text = TextAgg::new().apply(eid(S1, 1), &base_upd);
 
         let alice_upd = Document::new(&base_agg, &base_text).diff("hello, world");
@@ -777,8 +786,8 @@ mod tests {
 
         let merged_agg = base_agg
             .clone()
-            .apply(eid(ALICE, 2), &alice_upd, &LocCtx::<EmptyRuntime>::new())
-            .apply(eid(BOB, 3), &bob_upd, &LocCtx::<EmptyRuntime>::new());
+            .apply(eid(ALICE, 2), &alice_upd, store!())
+            .apply(eid(BOB, 3), &bob_upd, store!());
         let merged_text = base_text
             .clone()
             .apply(eid(ALICE, 2), &alice_upd)
@@ -803,9 +812,7 @@ mod tests {
             assert_eq!(doc.get(), new_text);
             return;
         }
-        let agg2 = agg
-            .clone()
-            .apply(event_id, &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg2 = agg.clone().apply(event_id, &upd, store!());
         let text2 = text.clone().apply(event_id, &upd);
         let doc2 = Document::new(&agg2, &text2);
         assert_eq!(
@@ -824,7 +831,7 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["hello".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
         let doc = Document::new(&agg, &text);
@@ -838,7 +845,7 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["hello".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
         assert_diff_roundtrip(&agg, &text, "hello world", eid(S1, 2));
@@ -850,7 +857,7 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["hello".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
         assert_diff_roundtrip(&agg, &text, "well hello", eid(S1, 2));
@@ -862,7 +869,7 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["hello world".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
         assert_diff_roundtrip(&agg, &text, "hello beautiful world", eid(S1, 2));
@@ -874,7 +881,7 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["hello world".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
         assert_diff_roundtrip(&agg, &text, "hello", eid(S1, 2));
@@ -886,7 +893,7 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["hello world".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
         assert_diff_roundtrip(&agg, &text, "world", eid(S1, 2));
@@ -898,7 +905,7 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["hello world".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
         assert_diff_roundtrip(&agg, &text, "hallo world", eid(S1, 2));
@@ -910,7 +917,7 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["hello".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
         assert_diff_roundtrip(&agg, &text, "", eid(S1, 2));
@@ -933,7 +940,7 @@ mod tests {
             ],
             vec!["first".to_string(), "second".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
         let doc = Document::new(&agg, &text);
@@ -948,7 +955,7 @@ mod tests {
             vec![AnchorPos::new(ROOT_ANCHOR, 0)],
             vec!["Привет мир".to_string()],
         );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, &LocCtx::<EmptyRuntime>::new());
+        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
         let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
         assert_diff_roundtrip(&agg, &text, "Привет прекрасный мир", eid(S1, 2));

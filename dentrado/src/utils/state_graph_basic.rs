@@ -1,7 +1,7 @@
 use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, Timeline};
 use crate::core::gear::EmptyRuntime;
-use crate::core::loc_ctx::{EventContext, LocCtx, StoredEvent};
-use crate::types::{AnyLocEventId, GlobalCoreId, LocGroupId, SenderPk};
+use crate::core::loc_ctx::{EventContext, GroupStore, LocCtx, StoredEvent};
+use crate::types::{GlobalCoreId, GroupEventId, LocGroupId, SenderPk};
 use im::OrdMap;
 use std::collections::BTreeMap;
 
@@ -18,18 +18,22 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         .block_on(fut)
 }
 
+fn gs(ctx: &LocCtx<EmptyRuntime>) -> GroupStore<'_, EmptyRuntime> {
+    GroupStore::new(ctx, LocGroupId(0))
+}
+
 fn eid(ts: u32, lid: u64) -> SGEventId {
     SGEventId::new(
         SGBucketId {
             timestamp: ts,
             global_core_id: GCI_0,
         },
-        AnyLocEventId(LocGroupId(0), lid as u32),
+        GroupEventId(lid),
     )
 }
 
-const fn lid(id: u64) -> AnyLocEventId {
-    AnyLocEventId(LocGroupId(0), id as u32)
+const fn lid(id: u64) -> GroupEventId {
+    GroupEventId(id)
 }
 
 fn make_test_ctx(num_events: u64) -> LocCtx<EmptyRuntime> {
@@ -77,12 +81,10 @@ async fn test_handler<R: async FnMut(&()) -> Timeline<(), ()>>(
 
 type EventStore<E> = BTreeMap<u64, (u32, E)>;
 
-fn make_resolver<E: Clone>(
-    events: &EventStore<E>,
-) -> impl Fn(AnyLocEventId) -> (SGEventId, E) + '_ {
-    move |local_id: AnyLocEventId| {
+fn make_resolver<E: Clone>(events: &EventStore<E>) -> impl Fn(GroupEventId) -> (SGEventId, E) + '_ {
+    move |local_id: GroupEventId| {
         let (ts, e) = events
-            .get(&(local_id.1 as u64))
+            .get(&(local_id.0 as u64))
             .expect("make_resolver: event not found");
         let sg_id = SGEventId::new(
             SGBucketId {
@@ -100,7 +102,7 @@ async fn apply_added<E: Clone, H, R>(
     events: &mut EventStore<E>,
     handler: &mut H,
     r: &mut R,
-    ctx: &LocCtx<EmptyRuntime>,
+    ctx: &dyn crate::core::loc_ctx::EventStore<EmptyRuntime>,
     added: &[(u64, u32, E)],
 ) where
     H: async FnMut(&E, &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &'static str, i32, R>),
@@ -127,7 +129,7 @@ async fn apply_removed<E: Clone, H, R>(
     events: &mut EventStore<E>,
     handler: &mut H,
     r: &mut R,
-    ctx: &LocCtx<EmptyRuntime>,
+    ctx: &dyn crate::core::loc_ctx::EventStore<EmptyRuntime>,
     removed: &[u64],
 ) where
     H: async FnMut(&E, &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &'static str, i32, R>),
@@ -151,7 +153,8 @@ fn single_event_update() {
     block_on(async {
         let mut sg: SG<&str, i32> = SG::new();
         let mut events = EventStore::new();
-        let ctx = make_test_ctx(10);
+        let loc = make_test_ctx(10);
+        let ctx = gs(&loc);
         let mut handler = test_handler;
         let mut r = async |_: &()| Timeline::<(), ()> {
             writes: OrdMap::new(),
@@ -174,7 +177,8 @@ fn query_and_propagation() {
     block_on(async {
         let mut sg: SG<&str, i32> = SG::new();
         let mut events = EventStore::new();
-        let ctx = make_test_ctx(10);
+        let loc = make_test_ctx(10);
+        let ctx = gs(&loc);
         let mut handler = test_handler;
         let mut r = async |_: &()| Timeline::<(), ()> {
             writes: OrdMap::new(),
@@ -210,7 +214,8 @@ fn transitive_propagation() {
     block_on(async {
         let mut sg: SG<&str, i32> = SG::new();
         let mut events = EventStore::new();
-        let ctx = make_test_ctx(10);
+        let loc = make_test_ctx(10);
+        let ctx = gs(&loc);
         let mut handler = test_handler;
         let mut r = async |_: &()| Timeline::<(), ()> {
             writes: OrdMap::new(),
@@ -250,7 +255,8 @@ fn no_propagation_when_value_unchanged() {
     block_on(async {
         let mut sg: SG<&str, i32> = SG::new();
         let mut events = EventStore::new();
-        let ctx = make_test_ctx(10);
+        let loc = make_test_ctx(10);
+        let ctx = gs(&loc);
         let mut handler = test_handler;
         let mut r = async |_: &()| Timeline::<(), ()> {
             writes: OrdMap::new(),
@@ -285,7 +291,8 @@ fn remove_event_cascades() {
     block_on(async {
         let mut sg: SG<&str, i32> = SG::new();
         let mut events = EventStore::new();
-        let ctx = make_test_ctx(10);
+        let loc = make_test_ctx(10);
+        let ctx = gs(&loc);
         let mut handler = test_handler;
         let mut r = async |_: &()| Timeline::<(), ()> {
             writes: OrdMap::new(),
@@ -328,7 +335,8 @@ fn conditional_write_changes_on_re_evaluation() {
             };
         let mut sg: SG<&str, i32> = SG::new();
         let mut events: EventStore<E> = EventStore::new();
-        let ctx = make_test_ctx(10);
+        let loc = make_test_ctx(10);
+        let ctx = gs(&loc);
         let mut r = async |_: &()| Timeline::<(), ()> {
             writes: OrdMap::new(),
         };
@@ -382,7 +390,8 @@ fn bounded_propagation_skips_events_after_next_write() {
             };
         let mut sg: SG<&str, i32> = SG::new();
         let mut events: EventStore<E> = EventStore::new();
-        let ctx = make_test_ctx(10);
+        let loc = make_test_ctx(10);
+        let ctx = gs(&loc);
         let mut r = async |_: &()| Timeline::<(), ()> {
             writes: OrdMap::new(),
         };
@@ -442,7 +451,8 @@ fn handler_query_excludes_own_write() {
             };
         let mut sg: SG<&str, i32> = SG::new();
         let mut events: EventStore<E> = EventStore::new();
-        let ctx = make_test_ctx(10);
+        let loc = make_test_ctx(10);
+        let ctx = gs(&loc);
         let mut r = async |_: &()| Timeline::<(), ()> {
             writes: OrdMap::new(),
         };

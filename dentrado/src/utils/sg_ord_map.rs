@@ -5,7 +5,7 @@ use crate::core::gear::IsRuntime;
 use crate::core::loc_ctx::EventStore;
 #[cfg(test)]
 use crate::core::loc_ctx::LocCtx;
-use crate::types::{AnyLocEventId, GlobalCoreId};
+use crate::types::{GlobalCoreId, GroupEventId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SGBucketId {
@@ -16,11 +16,11 @@ pub struct SGBucketId {
 pub type Timestamp = u32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SGEventId(pub SGBucketId, pub AnyLocEventId);
+pub struct SGEventId(pub SGBucketId, pub GroupEventId);
 
 impl SGEventId {
     #[must_use]
-    pub fn new(bucket: SGBucketId, local_id: AnyLocEventId) -> Self {
+    pub fn new(bucket: SGBucketId, local_id: GroupEventId) -> Self {
         Self(bucket, local_id)
     }
 
@@ -30,7 +30,7 @@ impl SGEventId {
     }
 
     #[must_use]
-    pub fn local_id(&self) -> AnyLocEventId {
+    pub fn local_id(&self) -> GroupEventId {
         self.1
     }
 }
@@ -49,7 +49,7 @@ impl Ord for SGEventId {
 
 #[derive(Clone, Debug)]
 pub struct SgEntry<X> {
-    pub local_id: AnyLocEventId,
+    pub local_id: GroupEventId,
     pub value: X,
 }
 
@@ -85,8 +85,8 @@ impl<X> SgDiffItem<X> {
 
 fn cmp_tx_sender<R: IsRuntime>(
     ctx: &dyn EventStore<R>,
-    a: AnyLocEventId,
-    b: AnyLocEventId,
+    a: GroupEventId,
+    b: GroupEventId,
 ) -> std::cmp::Ordering {
     let a_ev = ctx.stored_event(a).expect("cmp_tx_sender: event not found");
     let b_ev = ctx.stored_event(b).expect("cmp_tx_sender: event not found");
@@ -108,9 +108,9 @@ fn cmp_tx_sender<R: IsRuntime>(
 
 fn bucket_binary_search<E, R: IsRuntime>(
     entries: &[E],
-    target_lid: AnyLocEventId,
+    target_lid: GroupEventId,
     ctx: &dyn EventStore<R>,
-    get_local_id: impl Fn(&E) -> AnyLocEventId,
+    get_local_id: impl Fn(&E) -> GroupEventId,
 ) -> Result<usize, usize> {
     let mut left = 0;
     let mut right = entries.len();
@@ -127,9 +127,9 @@ fn bucket_binary_search<E, R: IsRuntime>(
 
 fn bucket_upper_bound<E, R: IsRuntime>(
     entries: &[E],
-    target_lid: AnyLocEventId,
+    target_lid: GroupEventId,
     ctx: &dyn EventStore<R>,
-    get_local_id: impl Fn(&E) -> AnyLocEventId,
+    get_local_id: impl Fn(&E) -> GroupEventId,
 ) -> usize {
     match bucket_binary_search(entries, target_lid, ctx, get_local_id) {
         Ok(idx) => idx + 1,
@@ -139,9 +139,9 @@ fn bucket_upper_bound<E, R: IsRuntime>(
 
 fn bucket_lower_bound_inclusive<E, R: IsRuntime>(
     entries: &[E],
-    target_lid: AnyLocEventId,
+    target_lid: GroupEventId,
     ctx: &dyn EventStore<R>,
-    get_local_id: impl Fn(&E) -> AnyLocEventId,
+    get_local_id: impl Fn(&E) -> GroupEventId,
 ) -> Option<usize> {
     match bucket_binary_search(entries, target_lid, ctx, get_local_id) {
         Ok(idx) => Some(idx),
@@ -151,9 +151,9 @@ fn bucket_lower_bound_inclusive<E, R: IsRuntime>(
 
 fn bucket_lower_bound_exclusive<E, R: IsRuntime>(
     entries: &[E],
-    target_lid: AnyLocEventId,
+    target_lid: GroupEventId,
     ctx: &dyn EventStore<R>,
-    get_local_id: impl Fn(&E) -> AnyLocEventId,
+    get_local_id: impl Fn(&E) -> GroupEventId,
 ) -> Option<usize> {
     match bucket_binary_search(entries, target_lid, ctx, get_local_id) {
         Ok(idx) => idx.checked_sub(1),
@@ -161,7 +161,7 @@ fn bucket_lower_bound_exclusive<E, R: IsRuntime>(
     }
 }
 
-fn find_by_local_id<X>(entries: &[SgEntry<X>], local_id: AnyLocEventId) -> Option<usize> {
+fn find_by_local_id<X>(entries: &[SgEntry<X>], local_id: GroupEventId) -> Option<usize> {
     entries.iter().position(|e| e.local_id == local_id)
 }
 
@@ -447,7 +447,7 @@ impl<X: Clone> SgOrdMap<X> {
 
     pub fn try_remap_local_ids<E>(
         &mut self,
-        f: &mut dyn FnMut(AnyLocEventId) -> Result<AnyLocEventId, E>,
+        f: &mut dyn FnMut(GroupEventId) -> Result<GroupEventId, E>,
     ) -> Result<(), E> {
         let old = std::mem::take(&mut self.buckets);
         for (bk, entries) in old {
@@ -687,7 +687,7 @@ impl SgOrdSet {
 
     pub fn try_remap_local_ids<E>(
         &mut self,
-        f: &mut dyn FnMut(AnyLocEventId) -> Result<AnyLocEventId, E>,
+        f: &mut dyn FnMut(GroupEventId) -> Result<GroupEventId, E>,
     ) -> Result<(), E> {
         self.0.try_remap_local_ids(f)
     }
@@ -697,7 +697,7 @@ impl SgOrdSet {
 mod tests {
     use super::*;
     use crate::core::gear::EmptyRuntime;
-    use crate::core::loc_ctx::{EventContext, StoredEvent};
+    use crate::core::loc_ctx::{EventContext, GroupStore, StoredEvent};
     use crate::types::{GlobalCoreId, LocGroupId, SenderPk};
 
     const PK_A: SenderPk = SenderPk([0u8; 32]);
@@ -729,20 +729,25 @@ mod tests {
         ctx
     }
 
+    fn gs(ctx: &LocCtx<EmptyRuntime>) -> GroupStore<'_, EmptyRuntime> {
+        GroupStore::new(ctx, LocGroupId(0))
+    }
+
     fn eid(ts: u32, gci: u32, lid: u64) -> SGEventId {
         SGEventId::new(
             SGBucketId {
                 timestamp: ts,
                 global_core_id: GlobalCoreId(gci),
             },
-            AnyLocEventId(LocGroupId(0), lid as u32),
+            GroupEventId(lid),
         )
     }
 
     #[test]
     fn map_insert_get_remove() {
         let mut m = SgOrdMap::new();
-        let ctx = make_test_ctx();
+        let loc = make_test_ctx();
+        let ctx = gs(&loc);
         let k = eid(1, 0, 0);
         assert!(m.insert(k, "hello", &ctx).is_none());
         assert_eq!(m.get(&k), Some(&"hello"));
@@ -753,7 +758,8 @@ mod tests {
     #[test]
     fn map_insert_overwrite() {
         let mut m = SgOrdMap::new();
-        let ctx = make_test_ctx();
+        let loc = make_test_ctx();
+        let ctx = gs(&loc);
         let k = eid(1, 0, 0);
         assert!(m.insert(k, "old", &ctx).is_none());
         assert_eq!(m.insert(k, "new", &ctx), Some("old"));
@@ -763,7 +769,8 @@ mod tests {
     #[test]
     fn map_concurrent_events_in_bucket() {
         let mut m = SgOrdMap::new();
-        let ctx = make_test_ctx();
+        let loc = make_test_ctx();
+        let ctx = gs(&loc);
         let ka = eid(1, 0, 0);
         let kb = eid(1, 0, 1);
         m.insert(ka, "A", &ctx);
@@ -777,7 +784,8 @@ mod tests {
     #[test]
     fn map_latest_at() {
         let mut m = SgOrdMap::new();
-        let ctx = make_test_ctx();
+        let loc = make_test_ctx();
+        let ctx = gs(&loc);
         let k1 = eid(1, 0, 0);
         let k2 = eid(2, 0, 0);
         m.insert(k1, "first", &ctx);
@@ -796,7 +804,8 @@ mod tests {
     #[test]
     fn map_latest_before() {
         let mut m = SgOrdMap::new();
-        let ctx = make_test_ctx();
+        let loc = make_test_ctx();
+        let ctx = gs(&loc);
         let k1 = eid(1, 0, 0);
         let k2 = eid(2, 0, 0);
         m.insert(k1, "first", &ctx);
@@ -809,7 +818,8 @@ mod tests {
     #[test]
     fn map_latest_at_same_bucket() {
         let mut m = SgOrdMap::new();
-        let ctx = make_test_ctx();
+        let loc = make_test_ctx();
+        let ctx = gs(&loc);
         let ka = eid(1, 0, 0);
         let kb = eid(1, 0, 1);
         m.insert(ka, "A", &ctx);
@@ -822,7 +832,8 @@ mod tests {
     #[test]
     fn map_next_after() {
         let mut m = SgOrdMap::new();
-        let ctx = make_test_ctx();
+        let loc = make_test_ctx();
+        let ctx = gs(&loc);
         let k1 = eid(1, 0, 0);
         let k2 = eid(2, 0, 0);
         let k3 = eid(2, 0, 3);
@@ -838,7 +849,8 @@ mod tests {
     #[test]
     fn map_iter_order() {
         let mut m = SgOrdMap::new();
-        let ctx = make_test_ctx();
+        let loc = make_test_ctx();
+        let ctx = gs(&loc);
         let k2 = eid(2, 0, 0);
         let k1 = eid(1, 0, 0);
         let k3 = eid(2, 0, 3);
@@ -855,7 +867,8 @@ mod tests {
     #[test]
     fn map_first_last() {
         let mut m = SgOrdMap::new();
-        let ctx = make_test_ctx();
+        let loc = make_test_ctx();
+        let ctx = gs(&loc);
         let k1 = eid(1, 0, 0);
         let k2 = eid(2, 0, 0);
         m.insert(k1, "first", &ctx);
@@ -868,7 +881,8 @@ mod tests {
     #[test]
     fn map_diff_cloned() {
         let mut old = SgOrdMap::new();
-        let ctx = make_test_ctx();
+        let loc = make_test_ctx();
+        let ctx = gs(&loc);
         let k1 = eid(1, 0, 0);
         let k2 = eid(2, 0, 0);
         old.insert(k1, "keep", &ctx);
@@ -888,14 +902,15 @@ mod tests {
     #[test]
     fn map_remap_local_ids() {
         let mut m = SgOrdMap::new();
-        let ctx = make_test_ctx();
+        let loc = make_test_ctx();
+        let ctx = gs(&loc);
         let k1 = eid(1, 0, 10);
         let k2 = eid(2, 0, 20);
         m.insert(k1, "a", &ctx);
         m.insert(k2, "b", &ctx);
 
         m.try_remap_local_ids::<std::convert::Infallible>(&mut |lid| {
-            Ok(AnyLocEventId(lid.0, lid.1 + 1000))
+            Ok(GroupEventId(lid.0 + 1000))
         })
         .unwrap();
 
@@ -911,7 +926,8 @@ mod tests {
     #[test]
     fn set_insert_remove_contains() {
         let mut s = SgOrdSet::new();
-        let ctx = make_test_ctx();
+        let loc = make_test_ctx();
+        let ctx = gs(&loc);
         let k = eid(1, 0, 0);
         assert!(s.insert(k, &ctx));
         assert!(s.contains(&k));
@@ -924,7 +940,8 @@ mod tests {
     #[test]
     fn set_range_between() {
         let mut s = SgOrdSet::new();
-        let ctx = make_test_ctx();
+        let loc = make_test_ctx();
+        let ctx = gs(&loc);
         let k1 = eid(1, 0, 0);
         let k2 = eid(2, 0, 0);
         let k3 = eid(3, 0, 0);
@@ -941,7 +958,8 @@ mod tests {
     #[test]
     fn set_range_after() {
         let mut s = SgOrdSet::new();
-        let ctx = make_test_ctx();
+        let loc = make_test_ctx();
+        let ctx = gs(&loc);
         let k1 = eid(1, 0, 0);
         let k2 = eid(2, 0, 0);
         let k3 = eid(3, 0, 0);
@@ -956,7 +974,8 @@ mod tests {
     #[test]
     fn set_range_between_same_bucket() {
         let mut s = SgOrdSet::new();
-        let ctx = make_test_ctx();
+        let loc = make_test_ctx();
+        let ctx = gs(&loc);
         let ka = eid(1, 0, 0);
         let kb = eid(1, 0, 1);
         let kc = eid(1, 0, 2);

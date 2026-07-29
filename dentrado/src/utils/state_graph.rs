@@ -4,7 +4,7 @@ use std::{collections::BTreeSet, hash::Hash};
 
 use crate::core::gear::IsRuntime;
 use crate::core::loc_ctx::EventStore;
-use crate::types::{AnyLocEventId, Localizable, Remapper};
+use crate::types::{GroupEventId, Localizable, Remapper};
 use crate::utils::sg_ord_map::{SgOrdMap, SgOrdSet};
 
 pub use crate::utils::sg_ord_map::{SGBucketId, SGEventId, Timestamp};
@@ -238,10 +238,10 @@ where
     pub async fn apply<R: IsRuntime, E, H, D>(
         &mut self,
         handler: &mut H,
-        event_resolver: &impl Fn(AnyLocEventId) -> (SGEventId, E),
+        event_resolver: &impl Fn(GroupEventId) -> (SGEventId, E),
         dep_resolver: &mut D,
         ctx: &dyn EventStore<R>,
-        delta: &DeltaList<AnyLocEventId>,
+        delta: &DeltaList<GroupEventId>,
     ) where
         E: Clone,
         H: async FnMut(&E, &mut HandlerCtx<'_, Dep, DepK, DepV, R, K, V, D>),
@@ -497,7 +497,7 @@ where
     async fn process_queue<R: IsRuntime, E, H, D>(
         &mut self,
         handler: &mut H,
-        event_resolver: &impl Fn(AnyLocEventId) -> (SGEventId, E),
+        event_resolver: &impl Fn(GroupEventId) -> (SGEventId, E),
         dep_resolver: &mut D,
         ctx: &dyn EventStore<R>,
         queue: &mut BTreeSet<SGEventId>,

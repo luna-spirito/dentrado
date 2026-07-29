@@ -4,12 +4,15 @@ use std::{mem::size_of, num::NonZero};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
 
-/// Composite event reference: `(group, slot)`. The group selects a per-group
-/// shard; the slot indexes that shard's flat body `Vec`. Storage is sharded by
-/// group, so a reference names the shard plus a position within it — there is
-/// no single global event log. Ordering is lexicographic on `(group, slot)`.
+/// Per-group event identity: a slot indexing one group's event shard.
+///
+/// The group itself is **not** carried here. Storage is sharded by group, and
+/// a gear is bound to exactly one group (`GearSource::Events(loc_group)`), so a
+/// `LocEventId` is only ever interpreted within the single group whose shard
+/// it indexes — the group is a property of the gear/store, never of each event.
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AnyLocEventId(pub LocGroupId, pub u32);
+pub struct GroupEventId(pub u64);
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

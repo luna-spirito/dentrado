@@ -17,10 +17,12 @@ use crate::{
         db,
         doorbell::DoorbellHandle,
         gear::{GearInput, GearMeta, IsRuntime},
-        loc_ctx::{EventContext, EventStore, LocCtx, StoreResultSuccess, StoredEvent},
+        loc_ctx::{
+            EventContext, GroupEventSource, GroupStore, LocCtx, StoreResultSuccess, StoredEvent,
+        },
     },
     types::{
-        AnyLocEventId, DataId, DataVerifyError, GlobalCoreId, LocDataId, LocGroupId, LocMsgTypeId,
+        DataId, DataVerifyError, GlobalCoreId, GroupEventId, LocDataId, LocGroupId, LocMsgTypeId,
         LocSenderId, LocUserId, NodeId, SenderPk, UserId,
     },
     wire::{
@@ -335,10 +337,18 @@ impl<R: IsRuntime> Core<R> {
     /// Panics if `Fn` accesses `Core`.
     pub fn get_stored_event<F>(
         &self,
-        eid: AnyLocEventId,
+        group: LocGroupId,
+        slot: GroupEventId,
         f: impl Fn(&StoredEvent<R::Body>) -> F,
     ) -> Option<F> {
-        self.inner.borrow().loc_ctx.get_stored_event(eid, f)
+        self.inner.borrow().loc_ctx.get_stored_event(group, slot, f)
+    }
+
+    /// A group-bound read view over this core, for the one group a gear runs
+    /// for. See [`GroupStore`].
+    #[must_use]
+    pub fn group_store(&self, group: LocGroupId) -> GroupStore<'_, R> {
+        GroupStore::new(self, group)
     }
 
     /// Kick off a background run of a local gear if `Eepy`; mark `RunningQueued`
@@ -1146,7 +1156,7 @@ impl<R: IsRuntime> Core<R> {
         &self,
         group: LocGroupId,
         since: (usize, usize),
-        f: impl Fn(&[AnyLocEventId], &[AnyLocEventId]) -> F,
+        f: impl Fn(&[GroupEventId], &[GroupEventId]) -> F,
     ) -> Option<F> {
         self.inner.borrow().loc_ctx.query_events(group, since, f)
     }
@@ -1518,23 +1528,27 @@ impl<R: IsRuntime> CoreLocCtx<R> {
     }
 }
 
-impl<R: IsRuntime> EventStore<R> for Core<R> {
-    fn stored_event(&self, eid: AnyLocEventId) -> Option<StoredEvent<R::Body>> {
+impl<R: IsRuntime> GroupEventSource<R> for Core<R> {
+    fn stored_event_in(
+        &self,
+        group: LocGroupId,
+        slot: GroupEventId,
+    ) -> Option<StoredEvent<R::Body>> {
         self.inner
             .borrow()
             .loc_ctx
-            .get_stored_event(eid, std::clone::Clone::clone)
+            .get_stored_event(group, slot, std::clone::Clone::clone)
     }
 
-    fn sender_user(&self, sid: LocSenderId) -> Option<LocUserId> {
+    fn sender_user_in(&self, sid: LocSenderId) -> Option<LocUserId> {
         self.inner.borrow().loc_ctx.sender_user(sid)
     }
 
-    fn sender_pk(&self, sid: LocSenderId) -> Option<SenderPk> {
+    fn sender_pk_in(&self, sid: LocSenderId) -> Option<SenderPk> {
         self.inner.borrow().loc_ctx.sender_pk(sid)
     }
 
-    fn data(&self, did: LocDataId) -> Option<(DataId, R::Data)> {
+    fn data_in(&self, did: LocDataId) -> Option<(DataId, R::Data)> {
         self.inner.borrow().loc_ctx.get_data(did, Clone::clone)
     }
 }

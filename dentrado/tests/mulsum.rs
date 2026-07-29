@@ -106,12 +106,15 @@ impl IsRuntime for MulSumRuntime {
         ) else {
             return cache.agg;
         };
+        let core = _ctx.core();
+        let store = core.group_store(group);
+
         for &eid in &added_ids {
-            let body = _ctx.stored_event(eid).map(|e| e.body).unwrap();
+            let body = store.stored_event(eid).map(|e| e.body).unwrap();
             cache.agg += body.a * body.b;
         }
         for &eid in &removed_ids {
-            let body = _ctx.stored_event(eid).map(|e| e.body).unwrap();
+            let body = store.stored_event(eid).map(|e| e.body).unwrap();
             cache.agg -= body.a * body.b;
         }
         cache.processed_added += added_ids.len();

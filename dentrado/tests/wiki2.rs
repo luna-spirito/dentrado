@@ -272,7 +272,9 @@ impl IsRuntime for Wiki2Runtime {
                     return Wiki2GearOut::Invited(c.sg.as_writes());
                 };
 
-                let (_, branch_data) = ctx.data(*branch).expect("Branch data not found");
+                let core = ctx.core();
+                let store = core.group_store(group);
+                let (_, branch_data) = store.data(*branch).expect("Branch data not found");
                 let creator = branch_data.creator;
 
                 let mut handler = async move |invitee: &LocUserId,
@@ -307,8 +309,10 @@ impl IsRuntime for Wiki2Runtime {
                     }
                 };
 
-                let event_resolver = |local_id: AnyLocEventId| {
-                    let stored = ctx.stored_event(local_id).expect("stored event not found");
+                let event_resolver = |local_id: GroupEventId| {
+                    let stored = store
+                        .stored_event(local_id)
+                        .expect("stored event not found");
                     let sg_id = SGEventId::new(
                         SGBucketId {
                             timestamp: stored.timestamp,
@@ -328,7 +332,7 @@ impl IsRuntime for Wiki2Runtime {
                     &mut handler,
                     &event_resolver,
                     &mut dep_resolver,
-                    ctx.core().as_ref(),
+                    &store,
                     &DeltaList {
                         removed: removed_ids,
                         added: added_ids,
@@ -353,9 +357,12 @@ impl IsRuntime for Wiki2Runtime {
                     };
                 };
 
+                let core = ctx.core();
+                let store = core.group_store(group);
+
                 // Update anchors
                 for &eid in &added_ids {
-                    let stored = ctx.stored_event(eid).expect("event not found");
+                    let stored = store.stored_event(eid).expect("event not found");
                     let attach_body = stored.body.unwrap_attach();
                     match &attach_body.payload {
                         UpdatePayload::Edit { edit } => {
@@ -364,10 +371,7 @@ impl IsRuntime for Wiki2Runtime {
                                 stored.global_core_id,
                                 stored.tx_id,
                             );
-                            c.anchors =
-                                c.anchors
-                                    .clone()
-                                    .apply(sender_event_id, edit, ctx.core().as_ref());
+                            c.anchors = c.anchors.clone().apply(sender_event_id, edit, &store);
                         }
                         UpdatePayload::Merge { .. } => {}
                     }
@@ -437,8 +441,10 @@ impl IsRuntime for Wiki2Runtime {
                     }
                 };
 
-                let event_resolver = |local_id: AnyLocEventId| {
-                    let stored = ctx.stored_event(local_id).expect("stored event not found");
+                let event_resolver = |local_id: GroupEventId| {
+                    let stored = store
+                        .stored_event(local_id)
+                        .expect("stored event not found");
                     let sg_id = SGEventId::new(
                         SGBucketId {
                             timestamp: stored.timestamp,
@@ -456,7 +462,7 @@ impl IsRuntime for Wiki2Runtime {
                     &mut handler,
                     &event_resolver,
                     &mut dep_resolver,
-                    ctx.core().as_ref(),
+                    &store,
                     &DeltaList {
                         removed: removed_ids,
                         added: added_ids,

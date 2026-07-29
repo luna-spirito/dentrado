@@ -1,7 +1,7 @@
 use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, Timeline};
 use crate::core::gear::EmptyRuntime;
-use crate::core::loc_ctx::{EventContext, LocCtx, StoredEvent};
-use crate::types::{AnyLocEventId, GlobalCoreId, LocGroupId, SenderPk};
+use crate::core::loc_ctx::{EventContext, GroupStore, LocCtx, StoredEvent};
+use crate::types::{GlobalCoreId, GroupEventId, LocGroupId, SenderPk};
 use im::OrdMap;
 use proptest::prelude::*;
 use std::collections::BTreeMap;
@@ -35,13 +35,17 @@ fn block_on_shared<F: std::future::Future>(fut: F) -> F::Output {
     })
 }
 
+fn gs(ctx: &LocCtx<EmptyRuntime>) -> GroupStore<'_, EmptyRuntime> {
+    GroupStore::new(ctx, LocGroupId(0))
+}
+
 fn eid(local_id: u64) -> SGEventId {
     SGEventId::new(
         SGBucketId {
             timestamp: 0,
             global_core_id: GCI_0,
         },
-        AnyLocEventId(LocGroupId(0), local_id as u32),
+        GroupEventId(local_id),
     )
 }
 
@@ -63,8 +67,8 @@ fn make_test_ctx(num_events: u64) -> LocCtx<EmptyRuntime> {
 }
 
 #[allow(dead_code)]
-const fn lid(id: u64) -> AnyLocEventId {
-    AnyLocEventId(LocGroupId(0), id as u32)
+const fn lid(id: u64) -> GroupEventId {
+    GroupEventId(id)
 }
 
 #[allow(dead_code)]
@@ -113,25 +117,25 @@ async fn site_handler<R: async FnMut(&SGEventId) -> Timeline<(), ()>>(
 
 async fn oneshot(
     events: &[(SGEventId, SiteEvent)],
-    ctx: &LocCtx<EmptyRuntime>,
+    ctx: &dyn crate::core::loc_ctx::EventStore<EmptyRuntime>,
 ) -> StateGraph<SGEventId, (), (), SGEventId, SiteAccessLevel> {
     let mut sg = StateGraph::new();
     let store: BTreeMap<u64, (u32, SiteEvent)> = events
         .iter()
-        .map(|(eid, e)| (eid.1.1 as u64, (eid.0.timestamp, e.clone())))
+        .map(|(eid, e)| (eid.1.0 as u64, (eid.0.timestamp, e.clone())))
         .collect();
 
     let mut r = async |_: &SGEventId| Timeline::<(), ()> {
         writes: OrdMap::new(),
     };
-    let added: Vec<AnyLocEventId> = events.iter().map(|(eid, _)| eid.1).collect();
+    let added: Vec<GroupEventId> = events.iter().map(|(eid, _)| eid.1).collect();
     let mut h = site_handler;
 
     sg.apply(
         &mut h,
-        &|local_id: AnyLocEventId| {
+        &|local_id: GroupEventId| {
             let (ts, e) = store
-                .get(&(local_id.1 as u64))
+                .get(&(local_id.0 as u64))
                 .expect("poc: event not found");
             let sg_id = SGEventId::new(
                 SGBucketId {
@@ -156,20 +160,20 @@ async fn oneshot(
 
 async fn multishot(
     events: &[(SGEventId, SiteEvent)],
-    ctx: &LocCtx<EmptyRuntime>,
+    ctx: &dyn crate::core::loc_ctx::EventStore<EmptyRuntime>,
 ) -> StateGraph<SGEventId, (), (), SGEventId, SiteAccessLevel> {
     let mut sg = StateGraph::new();
     let store: BTreeMap<u64, (u32, SiteEvent)> = events
         .iter()
-        .map(|(eid, e)| (eid.1.1 as u64, (eid.0.timestamp, e.clone())))
+        .map(|(eid, e)| (eid.1.0 as u64, (eid.0.timestamp, e.clone())))
         .collect();
 
     let mut r = async |_: &SGEventId| Timeline::<(), ()> {
         writes: OrdMap::new(),
     };
-    let resolver = |local_id: AnyLocEventId| {
+    let resolver = |local_id: GroupEventId| {
         let (ts, e) = store
-            .get(&(local_id.1 as u64))
+            .get(&(local_id.0 as u64))
             .expect("poc: event not found");
         let sg_id = SGEventId::new(
             SGBucketId {
@@ -282,7 +286,8 @@ fn test1_events() -> Vec<(SGEventId, SiteEvent)> {
 
 #[test]
 fn poc_model_test1() {
-    let ctx = make_test_ctx(11);
+    let loc = make_test_ctx(11);
+    let ctx = gs(&loc);
     let result = sg_to_lists(&block_on(oneshot(&test1_events(), &ctx)));
     let expected = vec![
         (eid(0), vec![(eid(4), SiteAccessLevel::Admin)]),
@@ -315,7 +320,7 @@ fn shuffle_events(events: &[(SGEventId, SiteEvent)], seed: u64) -> Vec<(SGEventI
 proptest! {
     #[test]
     fn multishot_converges(seed in 0u64..1000) {
-        let ctx = make_test_ctx(11);
+        let loc = make_test_ctx(11); let ctx = gs(&loc);
         let events = test1_events();
         let shuffled = shuffle_events(&events, seed);
         let oneshot_result = sg_to_lists(&block_on_shared(oneshot(&shuffled, &ctx)));
