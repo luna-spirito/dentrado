@@ -870,10 +870,8 @@ impl<R: IsRuntime> Core<R> {
                 let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
                 for &idx in seed_indices {
                     let event = &events[idx as usize];
-                    let gcid = global_core_ids[idx as usize];
                     let (group_id, store_result) = merger.import_new_event(
                         event.clone(),
-                        gcid,
                         timestamp,
                         source_node.unwrap_or(node_id),
                     )?;
@@ -1566,11 +1564,15 @@ impl<R: IsRuntime> EventContext<R> for CoreLocCtx<R> {
         self.loc_ctx.mk_loc_group(msg_type, group)
     }
 
-    fn store_event(&mut self, ev: StoredEvent<R::Body>) -> Option<StoreResultSuccess> {
+    fn store_event(
+        &mut self,
+        group: LocGroupId,
+        ev: StoredEvent<R::Body>,
+    ) -> Option<StoreResultSuccess> {
         // Bodies + dedup + added/removed changelog all live together inside
         // `loc_ctx`'s per-group shards now, so this is a plain delegate. The
         // changelog push that used to live here moved into `LocCtx::store_event`.
-        self.loc_ctx.store_event(ev)
+        self.loc_ctx.store_event(group, ev)
     }
 
     fn mk_data(&mut self, data_id: DataId, content: R::Data) -> Result<LocDataId, DataVerifyError> {
@@ -1595,8 +1597,12 @@ impl<R: IsRuntime> EventContext<R> for Core<R> {
         self.inner.get_mut().mk_loc_group(msg_type, group)
     }
 
-    fn store_event(&mut self, event: StoredEvent<R::Body>) -> Option<StoreResultSuccess> {
-        self.inner.get_mut().store_event(event)
+    fn store_event(
+        &mut self,
+        group: LocGroupId,
+        event: StoredEvent<R::Body>,
+    ) -> Option<StoreResultSuccess> {
+        self.inner.get_mut().store_event(group, event)
     }
 
     fn mk_data(&mut self, data_id: DataId, content: R::Data) -> Result<LocDataId, DataVerifyError> {

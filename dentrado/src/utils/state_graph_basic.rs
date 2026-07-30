@@ -1,14 +1,13 @@
 use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, Timeline};
 use crate::core::gear::EmptyRuntime;
 use crate::core::loc_ctx::{EventContext, GroupStore, LocCtx, StoredEvent};
-use crate::types::{GlobalCoreId, GroupEventId, LocGroupId, SenderPk};
+use crate::types::{GroupEventId, LocGroupId, SenderPk};
 use im::OrdMap;
 use std::collections::BTreeMap;
 
 type SG<K, V> = StateGraph<(), (), (), K, V>;
 
 const PK_A: SenderPk = SenderPk([0u8; 32]);
-const GCI_0: GlobalCoreId = GlobalCoreId(0);
 
 /// Drive a future on a throwaway compio runtime (state_graph is async but I/O-free).
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -23,13 +22,7 @@ fn gs(ctx: &LocCtx<EmptyRuntime>) -> GroupStore<'_, EmptyRuntime> {
 }
 
 fn eid(ts: u32, lid: u64) -> SGEventId {
-    SGEventId::new(
-        SGBucketId {
-            timestamp: ts,
-            global_core_id: GCI_0,
-        },
-        GroupEventId(lid),
-    )
+    SGEventId::new(SGBucketId { timestamp: ts }, GroupEventId(lid))
 }
 
 const fn lid(id: u64) -> GroupEventId {
@@ -40,15 +33,16 @@ fn make_test_ctx(num_events: u64) -> LocCtx<EmptyRuntime> {
     let mut ctx = LocCtx::new();
     let sid_a = ctx.mk_loc_sender(PK_A, None);
     for i in 0..num_events {
-        ctx.store_event(StoredEvent {
-            group: LocGroupId(0),
-            sender: sid_a,
-            global_core_id: GCI_0,
-            tx_id: i as u32,
-            timestamp: 0,
-            source_node: crate::types::NodeId(0),
-            body: (),
-        });
+        ctx.store_event(
+            LocGroupId(0),
+            StoredEvent {
+                sender: sid_a,
+                tx_id: i as u32,
+                timestamp: 0,
+                source_node: crate::types::NodeId(0),
+                body: (),
+            },
+        );
     }
     ctx
 }
@@ -86,13 +80,7 @@ fn make_resolver<E: Clone>(events: &EventStore<E>) -> impl Fn(GroupEventId) -> (
         let (ts, e) = events
             .get(&(local_id.0 as u64))
             .expect("make_resolver: event not found");
-        let sg_id = SGEventId::new(
-            SGBucketId {
-                timestamp: *ts,
-                global_core_id: GCI_0,
-            },
-            local_id,
-        );
+        let sg_id = SGEventId::new(SGBucketId { timestamp: *ts }, local_id);
         (sg_id, e.clone())
     }
 }

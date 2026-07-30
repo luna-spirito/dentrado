@@ -5,12 +5,11 @@ use crate::core::gear::IsRuntime;
 use crate::core::loc_ctx::EventStore;
 #[cfg(test)]
 use crate::core::loc_ctx::LocCtx;
-use crate::types::{GlobalCoreId, GroupEventId};
+use crate::types::GroupEventId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SGBucketId {
     pub timestamp: Timestamp,
-    pub global_core_id: GlobalCoreId,
 }
 
 pub type Timestamp = u32;
@@ -698,12 +697,11 @@ mod tests {
     use super::*;
     use crate::core::gear::EmptyRuntime;
     use crate::core::loc_ctx::{EventContext, GroupStore, StoredEvent};
-    use crate::types::{GlobalCoreId, LocGroupId, SenderPk};
+    use crate::types::{LocGroupId, SenderPk};
 
     const PK_A: SenderPk = SenderPk([0u8; 32]);
     const PK_B: SenderPk = SenderPk([1u8; 32]);
     const PK_C: SenderPk = SenderPk([2u8; 32]);
-    const GCI_0: GlobalCoreId = GlobalCoreId(0);
 
     fn make_test_ctx() -> LocCtx<EmptyRuntime> {
         let mut ctx = LocCtx::new();
@@ -716,15 +714,16 @@ mod tests {
                 1 => sid_b,
                 _ => sid_c,
             };
-            ctx.store_event(StoredEvent {
-                group: LocGroupId(0),
-                sender: sid,
-                global_core_id: GCI_0,
-                tx_id: i as u32,
-                timestamp: 0,
-                source_node: crate::types::NodeId(0),
-                body: (),
-            });
+            ctx.store_event(
+                LocGroupId(0),
+                StoredEvent {
+                    sender: sid,
+                    tx_id: i as u32,
+                    timestamp: 0,
+                    source_node: crate::types::NodeId(0),
+                    body: (),
+                },
+            );
         }
         ctx
     }
@@ -733,14 +732,8 @@ mod tests {
         GroupStore::new(ctx, LocGroupId(0))
     }
 
-    fn eid(ts: u32, gci: u32, lid: u64) -> SGEventId {
-        SGEventId::new(
-            SGBucketId {
-                timestamp: ts,
-                global_core_id: GlobalCoreId(gci),
-            },
-            GroupEventId(lid),
-        )
+    fn eid(ts: u32, lid: u64) -> SGEventId {
+        SGEventId::new(SGBucketId { timestamp: ts }, GroupEventId(lid))
     }
 
     #[test]
@@ -748,7 +741,7 @@ mod tests {
         let mut m = SgOrdMap::new();
         let loc = make_test_ctx();
         let ctx = gs(&loc);
-        let k = eid(1, 0, 0);
+        let k = eid(1, 0);
         assert!(m.insert(k, "hello", &ctx).is_none());
         assert_eq!(m.get(&k), Some(&"hello"));
         assert_eq!(m.remove(&k), Some("hello"));
@@ -760,7 +753,7 @@ mod tests {
         let mut m = SgOrdMap::new();
         let loc = make_test_ctx();
         let ctx = gs(&loc);
-        let k = eid(1, 0, 0);
+        let k = eid(1, 0);
         assert!(m.insert(k, "old", &ctx).is_none());
         assert_eq!(m.insert(k, "new", &ctx), Some("old"));
         assert_eq!(m.get(&k), Some(&"new"));
@@ -771,8 +764,8 @@ mod tests {
         let mut m = SgOrdMap::new();
         let loc = make_test_ctx();
         let ctx = gs(&loc);
-        let ka = eid(1, 0, 0);
-        let kb = eid(1, 0, 1);
+        let ka = eid(1, 0);
+        let kb = eid(1, 1);
         m.insert(ka, "A", &ctx);
         m.insert(kb, "B", &ctx);
 
@@ -786,18 +779,18 @@ mod tests {
         let mut m = SgOrdMap::new();
         let loc = make_test_ctx();
         let ctx = gs(&loc);
-        let k1 = eid(1, 0, 0);
-        let k2 = eid(2, 0, 0);
+        let k1 = eid(1, 0);
+        let k2 = eid(3, 0);
         m.insert(k1, "first", &ctx);
         m.insert(k2, "second", &ctx);
 
         assert_eq!(m.latest_at(&k1, &ctx), Some((k1, &"first")));
         assert_eq!(m.latest_at(&k2, &ctx), Some((k2, &"second")));
 
-        let between = eid(1, 1, 99);
+        let between = eid(2, 0);
         assert_eq!(m.latest_at(&between, &ctx), Some((k1, &"first")));
 
-        let before = eid(0, 0, 0);
+        let before = eid(0, 0);
         assert!(m.latest_at(&before, &ctx).is_none());
     }
 
@@ -806,8 +799,8 @@ mod tests {
         let mut m = SgOrdMap::new();
         let loc = make_test_ctx();
         let ctx = gs(&loc);
-        let k1 = eid(1, 0, 0);
-        let k2 = eid(2, 0, 0);
+        let k1 = eid(1, 0);
+        let k2 = eid(2, 0);
         m.insert(k1, "first", &ctx);
         m.insert(k2, "second", &ctx);
 
@@ -820,8 +813,8 @@ mod tests {
         let mut m = SgOrdMap::new();
         let loc = make_test_ctx();
         let ctx = gs(&loc);
-        let ka = eid(1, 0, 0);
-        let kb = eid(1, 0, 1);
+        let ka = eid(1, 0);
+        let kb = eid(1, 1);
         m.insert(ka, "A", &ctx);
         m.insert(kb, "B", &ctx);
 
@@ -834,9 +827,9 @@ mod tests {
         let mut m = SgOrdMap::new();
         let loc = make_test_ctx();
         let ctx = gs(&loc);
-        let k1 = eid(1, 0, 0);
-        let k2 = eid(2, 0, 0);
-        let k3 = eid(2, 0, 3);
+        let k1 = eid(1, 0);
+        let k2 = eid(2, 0);
+        let k3 = eid(2, 3);
         m.insert(k1, "first", &ctx);
         m.insert(k2, "second", &ctx);
         m.insert(k3, "third", &ctx);
@@ -851,9 +844,9 @@ mod tests {
         let mut m = SgOrdMap::new();
         let loc = make_test_ctx();
         let ctx = gs(&loc);
-        let k2 = eid(2, 0, 0);
-        let k1 = eid(1, 0, 0);
-        let k3 = eid(2, 0, 3);
+        let k2 = eid(2, 0);
+        let k1 = eid(1, 0);
+        let k3 = eid(2, 3);
         m.insert(k2, "second", &ctx);
         m.insert(k1, "first", &ctx);
         m.insert(k3, "third", &ctx);
@@ -869,8 +862,8 @@ mod tests {
         let mut m = SgOrdMap::new();
         let loc = make_test_ctx();
         let ctx = gs(&loc);
-        let k1 = eid(1, 0, 0);
-        let k2 = eid(2, 0, 0);
+        let k1 = eid(1, 0);
+        let k2 = eid(2, 0);
         m.insert(k1, "first", &ctx);
         m.insert(k2, "second", &ctx);
 
@@ -883,13 +876,13 @@ mod tests {
         let mut old = SgOrdMap::new();
         let loc = make_test_ctx();
         let ctx = gs(&loc);
-        let k1 = eid(1, 0, 0);
-        let k2 = eid(2, 0, 0);
+        let k1 = eid(1, 0);
+        let k2 = eid(2, 0);
         old.insert(k1, "keep", &ctx);
         old.insert(k2, "remove", &ctx);
 
         let mut new = SgOrdMap::new();
-        let k3 = eid(3, 0, 0);
+        let k3 = eid(3, 0);
         new.insert(k1, "keep", &ctx);
         new.insert(k3, "add", &ctx);
 
@@ -904,8 +897,8 @@ mod tests {
         let mut m = SgOrdMap::new();
         let loc = make_test_ctx();
         let ctx = gs(&loc);
-        let k1 = eid(1, 0, 10);
-        let k2 = eid(2, 0, 20);
+        let k1 = eid(1, 10);
+        let k2 = eid(2, 20);
         m.insert(k1, "a", &ctx);
         m.insert(k2, "b", &ctx);
 
@@ -917,8 +910,8 @@ mod tests {
         assert!(m.get(&k1).is_none());
         assert!(m.get(&k2).is_none());
 
-        let new_k1 = eid(1, 0, 1010);
-        let new_k2 = eid(2, 0, 1020);
+        let new_k1 = eid(1, 1010);
+        let new_k2 = eid(2, 1020);
         assert_eq!(m.get(&new_k1), Some(&"a"));
         assert_eq!(m.get(&new_k2), Some(&"b"));
     }
@@ -928,7 +921,7 @@ mod tests {
         let mut s = SgOrdSet::new();
         let loc = make_test_ctx();
         let ctx = gs(&loc);
-        let k = eid(1, 0, 0);
+        let k = eid(1, 0);
         assert!(s.insert(k, &ctx));
         assert!(s.contains(&k));
         assert!(!s.insert(k, &ctx));
@@ -942,10 +935,10 @@ mod tests {
         let mut s = SgOrdSet::new();
         let loc = make_test_ctx();
         let ctx = gs(&loc);
-        let k1 = eid(1, 0, 0);
-        let k2 = eid(2, 0, 0);
-        let k3 = eid(3, 0, 0);
-        let k4 = eid(4, 0, 0);
+        let k1 = eid(1, 0);
+        let k2 = eid(2, 0);
+        let k3 = eid(3, 0);
+        let k4 = eid(4, 0);
         s.insert(k1, &ctx);
         s.insert(k2, &ctx);
         s.insert(k3, &ctx);
@@ -960,9 +953,9 @@ mod tests {
         let mut s = SgOrdSet::new();
         let loc = make_test_ctx();
         let ctx = gs(&loc);
-        let k1 = eid(1, 0, 0);
-        let k2 = eid(2, 0, 0);
-        let k3 = eid(3, 0, 0);
+        let k1 = eid(1, 0);
+        let k2 = eid(2, 0);
+        let k3 = eid(3, 0);
         s.insert(k1, &ctx);
         s.insert(k2, &ctx);
         s.insert(k3, &ctx);
@@ -976,9 +969,9 @@ mod tests {
         let mut s = SgOrdSet::new();
         let loc = make_test_ctx();
         let ctx = gs(&loc);
-        let ka = eid(1, 0, 0);
-        let kb = eid(1, 0, 1);
-        let kc = eid(1, 0, 2);
+        let ka = eid(1, 0);
+        let kb = eid(1, 1);
+        let kc = eid(1, 2);
         s.insert(ka, &ctx);
         s.insert(kb, &ctx);
         s.insert(kc, &ctx);

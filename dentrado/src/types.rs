@@ -225,11 +225,11 @@ pub(crate) struct Attestation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LocSenderEventId(pub LocSenderId, pub GlobalCoreId, pub u32);
+pub struct LocSenderEventId(pub LocSenderId, pub u32);
 
 impl Localizable for LocSenderEventId {
     fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
-        Ok(LocSenderEventId(self.0.localize(r)?, self.1, self.2))
+        Ok(LocSenderEventId(self.0.localize(r)?, self.1))
     }
 }
 

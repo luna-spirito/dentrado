@@ -8,16 +8,14 @@ use std::collections::BTreeSet;
 use crate::core::loc_ctx::LocCtx;
 use crate::{
     core::{gear::IsRuntime, loc_ctx::EventStore},
-    types::{GlobalCoreId, LocSenderEventId, LocSenderId, Localizable, Remapper},
+    types::{LocSenderEventId, LocSenderId, Localizable, Remapper},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AnchorId(pub LocSenderEventId, pub u32);
 
-pub const ROOT_ANCHOR: AnchorId = AnchorId(
-    LocSenderEventId(LocSenderId(u64::MAX), GlobalCoreId(u32::MAX), u32::MAX),
-    u32::MAX,
-);
+pub const ROOT_ANCHOR: AnchorId =
+    AnchorId(LocSenderEventId(LocSenderId(u64::MAX), u32::MAX), u32::MAX);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AnchorPos {
@@ -109,12 +107,11 @@ impl ChildEntry {
     }
 
     fn cmp_rga<R: IsRuntime>(&self, other: &Self, ctx: &dyn EventStore<R>) -> std::cmp::Ordering {
-        let LocSenderEventId(s_sender, s_core, s_tx) = self.child_id.0;
-        let LocSenderEventId(o_sender, o_core, o_tx) = other.child_id.0;
+        let LocSenderEventId(s_sender, s_tx) = self.child_id.0;
+        let LocSenderEventId(o_sender, o_tx) = other.child_id.0;
         self.offset
             .cmp(&other.offset)
             .then_with(|| o_tx.cmp(&s_tx))
-            .then_with(|| o_core.cmp(&s_core))
             .then_with(|| other.child_id.1.cmp(&self.child_id.1))
             .then_with(|| {
                 let pk_a = ctx.sender_pk(s_sender).expect("sender_pk: unknown");
@@ -576,10 +573,8 @@ mod tests {
 
     const S1: LocSenderId = LocSenderId(1);
     const _S2: LocSenderId = LocSenderId(2);
-    const CID: GlobalCoreId = GlobalCoreId(0);
-
     const fn eid(sender: LocSenderId, tx: u32) -> LocSenderEventId {
-        LocSenderEventId(sender, CID, tx)
+        LocSenderEventId(sender, tx)
     }
 
     #[test]

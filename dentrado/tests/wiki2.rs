@@ -316,7 +316,6 @@ impl IsRuntime for Wiki2Runtime {
                     let sg_id = SGEventId::new(
                         SGBucketId {
                             timestamp: stored.timestamp,
-                            global_core_id: stored.global_core_id,
                         },
                         local_id,
                     );
@@ -366,11 +365,7 @@ impl IsRuntime for Wiki2Runtime {
                     let attach_body = stored.body.unwrap_attach();
                     match &attach_body.payload {
                         UpdatePayload::Edit { edit } => {
-                            let sender_event_id = LocSenderEventId(
-                                stored.sender,
-                                stored.global_core_id,
-                                stored.tx_id,
-                            );
+                            let sender_event_id = LocSenderEventId(stored.sender, stored.tx_id);
                             c.anchors = c.anchors.clone().apply(sender_event_id, edit, &store);
                         }
                         UpdatePayload::Merge { .. } => {}
@@ -429,11 +424,7 @@ impl IsRuntime for Wiki2Runtime {
                                 curr_text_agg.merge(&from_text_agg)
                             }
                             UpdatePayload::Edit { edit } => {
-                                let sender_event_id = LocSenderEventId(
-                                    stored.sender,
-                                    stored.global_core_id,
-                                    stored.tx_id,
-                                );
+                                let sender_event_id = LocSenderEventId(stored.sender, stored.tx_id);
                                 curr_text_agg.apply(sender_event_id, edit)
                             }
                         };
@@ -448,7 +439,6 @@ impl IsRuntime for Wiki2Runtime {
                     let sg_id = SGEventId::new(
                         SGBucketId {
                             timestamp: stored.timestamp,
-                            global_core_id: stored.global_core_id,
                         },
                         local_id,
                     );

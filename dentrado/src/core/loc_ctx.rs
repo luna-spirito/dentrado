@@ -3,16 +3,14 @@ use std::collections::HashMap;
 use crate::{
     core::gear::IsRuntime,
     types::{
-        DataId, DataVerifyError, GlobalCoreId, GlobalResolver, GroupEventId, GroupRouteError,
-        LocDataId, LocGroupId, LocMsgTypeId, LocSenderId, LocUserId, SenderPk, UserId,
+        DataId, DataVerifyError, GlobalResolver, GroupEventId, GroupRouteError, LocDataId,
+        LocGroupId, LocMsgTypeId, LocSenderId, LocUserId, SenderPk, UserId,
     },
 };
 
 #[derive(Clone, Debug)]
 pub struct StoredEvent<B> {
-    pub group: LocGroupId,
     pub sender: LocSenderId,
-    pub global_core_id: GlobalCoreId,
     pub tx_id: u32,
     pub timestamp: u32,
     pub source_node: crate::types::NodeId,
@@ -37,7 +35,7 @@ pub struct StoredEvent<B> {
 pub(crate) struct EventGroup<B> {
     pub(crate) bodies: Vec<StoredEvent<B>>,
     /// `(sender, tx_id)` -> slot of the currently-live version.
-    dedup: HashMap<(LocSenderId, u32), u64>,
+    pub(crate) dedup: HashMap<(LocSenderId, u32), u64>,
     pub(crate) added: Vec<GroupEventId>,
     pub(crate) removed: Vec<GroupEventId>,
 }
@@ -297,7 +295,11 @@ pub trait EventContext<R: IsRuntime> {
     fn mk_loc_user(&mut self, uid: UserId) -> LocUserId;
     fn mk_loc_sender(&mut self, pk: SenderPk, uid: Option<UserId>) -> LocSenderId;
     fn mk_loc_group(&mut self, msg_type: LocMsgTypeId, group: R::Group) -> LocGroupId;
-    fn store_event(&mut self, event: StoredEvent<R::Body>) -> Option<StoreResultSuccess>;
+    fn store_event(
+        &mut self,
+        group: LocGroupId,
+        event: StoredEvent<R::Body>,
+    ) -> Option<StoreResultSuccess>;
     fn mk_data(&mut self, data_id: DataId, content: R::Data) -> Result<LocDataId, DataVerifyError>;
     fn find_data_by_data_id(&self, data_id: &DataId) -> Option<LocDataId>;
 }
@@ -346,8 +348,11 @@ impl<R: IsRuntime> EventContext<R> for LocCtx<R> {
         gid
     }
 
-    fn store_event(&mut self, ev: StoredEvent<R::Body>) -> Option<StoreResultSuccess> {
-        let group = ev.group;
+    fn store_event(
+        &mut self,
+        group: LocGroupId,
+        ev: StoredEvent<R::Body>,
+    ) -> Option<StoreResultSuccess> {
         let g = self.events_by_group.entry(group).or_default();
         let key = (ev.sender, ev.tx_id);
         let new_key = (ev.timestamp, ev.source_node);
