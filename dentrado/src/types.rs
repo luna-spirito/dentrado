@@ -83,6 +83,15 @@ fn jump_consistent_hash(hash: u64, num_cores: i64) -> i32 {
 }
 
 impl GlobalCoreId {
+    /// Derive a placement id from a content hash by taking its low 32 bits.
+    /// Combined with [`GlobalCoreId::route`] this is the whole of "route by
+    /// hash": a value's `global_hash` → `from_hash` → `route(num_cores)`.
+    /// Only routing truncates; the content-hash path keeps the full 32 bytes.
+    #[must_use]
+    pub fn from_hash(hash: [u8; 32]) -> Self {
+        Self(u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]))
+    }
+
     #[must_use]
     pub fn route(&self, num_cores: NonZero<u32>) -> u32 {
         jump_consistent_hash(u64::from(self.0), i64::from(num_cores.get())) as u32
@@ -286,6 +295,57 @@ pub trait Localizable: Sized {
     async fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err>;
 }
 
+/// Re-export the derive macro so it lives at the same path as the trait
+/// (`dentrado::types::Localizable` is both the trait and the derive, in their
+/// respective namespaces — same convention as `serde::Serialize`).
+pub use dentrado_macros::Localizable;
+
+/// A value that knows its own global content hash.
+///
+/// Supertrait of [`Localizable`] because anything content-addressed or
+/// routable must also be localizable. The hash is on the *value*, not the
+/// runtime: routing becomes `value.global_hash(resolver)` →
+/// [`GlobalCoreId::from_hash`] → [`GlobalCoreId::route`], and content
+/// addressing keeps the full `[u8; 32]`.
+///
+/// `resolver` resolves embedded [`LocDataId`] refs — the reason the old
+/// `IsRuntime::hash_data` took a resolver (see `storage/in_memory.rs`). For
+/// id/key types with no embedded content-addressed refs this is a pure
+/// `Hash` fold that ignores the resolver.
+pub trait GlobalHash: Localizable {
+    fn global_hash(&self, resolver: &dyn GlobalResolver) -> Result<[u8; 32], GroupRouteError>;
+}
+
+impl GlobalHash for () {
+    fn global_hash(&self, _resolver: &dyn GlobalResolver) -> Result<[u8; 32], GroupRouteError> {
+        Ok([0; 32])
+    }
+}
+
+/// Content hash of a `LocDataId` = the hash of the global [`DataId`] it
+/// resolves to (`timestamp || hash`). This is the canonical way to
+/// content-address a local data id; routing then truncates via
+/// [`GlobalCoreId::from_hash`].
+impl GlobalHash for LocDataId {
+    fn global_hash(&self, resolver: &dyn GlobalResolver) -> Result<[u8; 32], GroupRouteError> {
+        let resolved = resolver.resolve_data(*self)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&resolved.timestamp.to_le_bytes());
+        hasher.update(&resolved.hash);
+        Ok(*hasher.finalize().as_bytes())
+    }
+}
+
+/// An `i64` used as a routing key hashes via blake3 of its little-endian bytes
+/// (deterministic placement; matches the former hand-written runtime impl).
+impl GlobalHash for i64 {
+    fn global_hash(&self, _resolver: &dyn GlobalResolver) -> Result<[u8; 32], GroupRouteError> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.to_le_bytes());
+        Ok(*hasher.finalize().as_bytes())
+    }
+}
+
 impl Localizable for LocUserId {
     async fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
         remapper.remap_user(self).await
@@ -315,6 +375,37 @@ macro_rules! impl_localizable_trivial {
 impl_localizable_trivial!(i64);
 impl_localizable_trivial!(bool);
 impl_localizable_trivial!(());
+impl_localizable_trivial!(u32);
+impl_localizable_trivial!(u64);
+impl_localizable_trivial!(usize);
+impl_localizable_trivial!(String);
+impl_localizable_trivial!(&'static str);
+impl_localizable_trivial!(&'static std::path::Path);
+
+impl<T: Localizable> Localizable for Option<T> {
+    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+        match self {
+            Some(t) => Ok(Some(t.localize(r).await?)),
+            None => Ok(None),
+        }
+    }
+}
+
+impl<A: Localizable, B: Localizable> Localizable for (A, B) {
+    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+        Ok((self.0.localize(r).await?, self.1.localize(r).await?))
+    }
+}
+
+impl<A: Localizable, B: Localizable, C: Localizable> Localizable for (A, B, C) {
+    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+        Ok((
+            self.0.localize(r).await?,
+            self.1.localize(r).await?,
+            self.2.localize(r).await?,
+        ))
+    }
+}
 
 impl<T: Localizable> Localizable for Box<T> {
     async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
@@ -360,4 +451,107 @@ pub(crate) fn decode_varint(data: &[u8], offset: usize) -> Option<(u64, usize)> 
         }
     }
     Some((result, pos - offset))
+}
+
+#[cfg(test)]
+mod localizable_derive_tests {
+    use super::*;
+
+    /// Polls a non-blocking future to completion on the current thread.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+        struct Noop;
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Waker::from(Arc::new(Noop));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(fut);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("future yielded unexpectedly"),
+        }
+    }
+
+    /// Test remapper: shifts every local id by a fixed delta so we can observe
+    /// which fields were actually remapped.
+    struct ShiftRemapper;
+    impl Remapper for ShiftRemapper {
+        type Err = ();
+        async fn remap_user(&mut self, uid: LocUserId) -> Result<LocUserId, Self::Err> {
+            Ok(LocUserId(uid.0 + 100))
+        }
+        async fn remap_sender(&mut self, sid: LocSenderId) -> Result<LocSenderId, Self::Err> {
+            Ok(LocSenderId(sid.0 + 100))
+        }
+        async fn remap_data(&mut self, did: LocDataId) -> Result<LocDataId, Self::Err> {
+            Ok(LocDataId(did.0 + 100))
+        }
+    }
+
+    // Named-field struct recursing into a `Localizable` field and skipping a
+    // plain-data field.
+    #[derive(Debug, PartialEq, Localizable)]
+    struct Mixed {
+        user: LocUserId,
+        #[localizable(skip)]
+        tag: String,
+        note: &'static str,
+    }
+
+    #[derive(Debug, PartialEq, Localizable)]
+    enum TestEnum {
+        Unit,
+        Sender(LocSenderId),
+        Data {
+            d: LocDataId,
+            #[localizable(skip)]
+            opaque: u64,
+        },
+        #[localizable(skip)]
+        SkipWhole(u64, &'static str),
+    }
+
+    #[test]
+    fn struct_recurses_and_skips() {
+        let val = Mixed {
+            user: LocUserId(5),
+            tag: String::from("hi"),
+            note: "x",
+        };
+        let out = block_on(val.localize(&mut ShiftRemapper)).unwrap();
+        assert_eq!(out.user, LocUserId(105));
+        assert_eq!(out.tag, "hi");
+        assert_eq!(out.note, "x");
+    }
+
+    #[test]
+    fn enum_all_shapes() {
+        let unit = block_on(TestEnum::Unit.localize(&mut ShiftRemapper)).unwrap();
+        assert_eq!(unit, TestEnum::Unit);
+
+        let sender =
+            block_on(TestEnum::Sender(LocSenderId(7)).localize(&mut ShiftRemapper)).unwrap();
+        assert_eq!(sender, TestEnum::Sender(LocSenderId(107)));
+
+        let data = block_on(
+            TestEnum::Data {
+                d: LocDataId(9),
+                opaque: 42,
+            }
+            .localize(&mut ShiftRemapper),
+        )
+        .unwrap();
+        assert_eq!(
+            data,
+            TestEnum::Data {
+                d: LocDataId(109),
+                opaque: 42,
+            }
+        );
+
+        let skipped = block_on(TestEnum::SkipWhole(1, "z").localize(&mut ShiftRemapper)).unwrap();
+        assert_eq!(skipped, TestEnum::SkipWhole(1, "z"));
+    }
 }

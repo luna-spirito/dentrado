@@ -25,8 +25,8 @@ use crate::{
         storage::{AlignedPage, CacheSer, GroupDiff, PageHandle, PageId, Storage},
     },
     types::{
-        DataId, DataVerifyError, GlobalResolver, GroupEventId, GroupRouteError, LocDataId,
-        LocGroupId, LocMsgTypeId, LocSenderId, LocUserId, SenderPk, UserId,
+        DataId, DataVerifyError, GlobalHash, GlobalResolver, GroupEventId, GroupRouteError,
+        LocDataId, LocGroupId, LocMsgTypeId, LocSenderId, LocUserId, SenderPk, UserId,
     },
 };
 
@@ -217,10 +217,10 @@ where
         if let Some(&existing) = self.inner.borrow().data_id_to_local.get(&data_id) {
             return ready(Ok(existing));
         }
-        // 2. Verify content hash. `hash_data` resolves embedded LocDataId refs
+        // 2. Verify content hash. `global_hash` resolves embedded LocDataId refs
         //    via `GlobalResolver`, which takes its own shared borrow — so no
         //    borrow may be held across this call.
-        match R::hash_data(&content, self) {
+        match content.global_hash(self) {
             Ok(hash) if hash == data_id.hash => {}
             Ok(computed_hash) => {
                 return ready(Err(DataVerifyError::HashMismatch {

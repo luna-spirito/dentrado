@@ -14,7 +14,7 @@ use crate::{
         gear::IsRuntime,
         storage::Storage,
     },
-    types::{GlobalCoreId, NodeId},
+    types::{GlobalCoreId, GlobalHash, NodeId},
     wire::{MergeError, RunGearError, WireEventBody, WireLocCtx},
 };
 
@@ -92,7 +92,7 @@ pub(crate) fn route_events<R: IsRuntime>(
 ) -> Result<RoutedEvents<R>, MergeError> {
     let global_core_ids: Vec<GlobalCoreId> = events
         .iter()
-        .map(|e| R::route_group(&e.group, &wire_ctx))
+        .map(|e| e.group.global_hash(&wire_ctx).map(GlobalCoreId::from_hash))
         .collect::<Result<_, _>>()
         .map_err(MergeError::Route)?;
 
@@ -120,8 +120,11 @@ pub(crate) fn route_gear<R: IsRuntime>(
     wire_ctx: &WireLocCtx<R>,
     num_cores: NonZero<u32>,
 ) -> Result<u32, RunGearError> {
-    let global_core_id =
-        R::route_group(R::meta(gear).group(), wire_ctx).map_err(RunGearError::Route)?;
+    let global_core_id = R::meta(gear)
+        .group()
+        .global_hash(wire_ctx)
+        .map(GlobalCoreId::from_hash)
+        .map_err(RunGearError::Route)?;
     Ok(global_core_id.route(num_cores))
 }
 

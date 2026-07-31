@@ -57,6 +57,17 @@ impl Localizable for BranchData {
     }
 }
 
+impl GlobalHash for BranchData {
+    fn global_hash(&self, resolver: &dyn GlobalResolver) -> Result<[u8; 32], GroupRouteError> {
+        let resolved_creator = resolver.resolve_user(self.creator)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&resolved_creator.id.to_le_bytes());
+        hasher.update(&resolved_creator.identity_server_pk.0);
+        hasher.update(&self.created_at.to_le_bytes());
+        Ok(*hasher.finalize().as_bytes())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WikiCounterRuntime;
 
@@ -71,31 +82,6 @@ impl IsRuntime for WikiCounterRuntime {
         = CounterCache<W>
     where
         W: Debug + Clone + 'static;
-
-    fn hash_data(
-        data: &Self::Data,
-        resolver: &dyn GlobalResolver,
-    ) -> Result<[u8; 32], GroupRouteError> {
-        let resolved_creator = resolver.resolve_user(data.creator)?;
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&resolved_creator.id.to_le_bytes());
-        hasher.update(&resolved_creator.identity_server_pk.0);
-        hasher.update(&data.created_at.to_le_bytes());
-        Ok(*hasher.finalize().as_bytes())
-    }
-
-    fn route_group(
-        group: &Self::Group,
-        resolver: &dyn GlobalResolver,
-    ) -> Result<GlobalCoreId, GroupRouteError> {
-        let resolved = resolver.resolve_data(*group)?;
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&resolved.timestamp.to_le_bytes());
-        hasher.update(&resolved.hash);
-        Ok(GlobalCoreId(u32::from_le_bytes(
-            hasher.finalize().as_bytes()[..4].try_into().unwrap(),
-        )))
-    }
 
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {

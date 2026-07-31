@@ -20,7 +20,7 @@ use crate::{
         gear::{GearInput, GearMeta, IsRuntime},
         storage::{GroupStore, Storage},
     },
-    types::{GlobalCoreId, LocGroupId, NodeId},
+    types::{GlobalCoreId, GlobalHash, LocGroupId, NodeId},
     wire::{
         MergeError, RunGearError, WireEventBody, WireLocCtx, WireLocCtxBuilder, WireLocCtxMerger,
     },
@@ -615,8 +615,10 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
         // no borrow spans the `.await`.
         let meta = R::meta(gear);
         let group_key = meta.group().clone();
-        let target_core = R::route_group(&group_key, &self.storage)
-            .expect("force_active: route_group")
+        let target_core = group_key
+            .global_hash(&self.storage)
+            .map(GlobalCoreId::from_hash)
+            .expect("force_active: global_hash")
             .route(self.num_cores);
         enum Reg {
             Event(LocGroupId),

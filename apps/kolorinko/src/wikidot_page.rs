@@ -15,13 +15,13 @@ use std::{
     sync::Arc,
 };
 
-use crate::runtime::{GearId, GearOut, KolorinkoRT};
+use crate::runtime::KolorinkoRT;
 
 /// Configuration for the `repo` oracle gear: where to clone and how often to
 /// re-pull. `path` is the on-disk clone location — a piece of *configuration*
 /// (not a gear output), so holding a `&'static Path` here is fine; it never
 /// appears in a `GearOut`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado::types::Localizable)]
 pub(crate) struct RepoMeta {
     url: &'static str,
     path: &'static Path,
@@ -565,9 +565,7 @@ pub(crate) async fn load_page<S: Storage<KolorinkoRT>>(
     ctx: &mut GearCtx<KolorinkoRT, S>,
     cache: &mut LoadCache,
 ) -> Arc<Content> {
-    let GearOut::RepoOut(data) = ctx.secondary_get(GearId::Repo(meta.clone())).await else {
-        unreachable!("repo gear must produce RepoOut")
-    };
+    let data = crate::runtime::dep_repo(ctx, meta.clone()).await;
     let Some(text) = data.get(site, slug) else {
         // Page no longer present in the dataset: drop any stale cached parse
         // and return empty content.

@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado::types::Localizable)]
 pub(crate) struct SafePathComponent(String);
 
 // TODO: Validate

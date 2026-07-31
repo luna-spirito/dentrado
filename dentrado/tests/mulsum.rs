@@ -65,25 +65,6 @@ impl IsRuntime for MulSumRuntime {
     where
         W: Debug + Clone + 'static;
 
-    fn hash_data(
-        _data: &Self::Data,
-        _resolver: &dyn GlobalResolver,
-    ) -> Result<[u8; 32], GroupRouteError> {
-        let hash = *blake3::Hasher::new().finalize().as_bytes();
-        Ok(hash)
-    }
-
-    fn route_group(
-        group: &Self::Group,
-        _resolver: &dyn GlobalResolver,
-    ) -> Result<GlobalCoreId, GroupRouteError> {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&group.to_le_bytes());
-        Ok(GlobalCoreId(u32::from_le_bytes(
-            hasher.finalize().as_bytes()[..4].try_into().unwrap(),
-        )))
-    }
-
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
             MulSumGear::MulSum { bucket } => GearMeta::Event {

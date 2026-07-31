@@ -2,13 +2,14 @@ use std::{fmt::Debug, hash::Hash, num::NonZero};
 
 use crate::{
     core::{core_ctx::GearCtx, storage::Storage},
-    types::{GlobalCoreId, GlobalResolver, GroupRouteError, LocGroupId, LocMsgTypeId, Localizable},
+    types::{GlobalHash, LocGroupId, LocMsgTypeId, Localizable},
 };
 
 /// How a gear is driven and where it lives, returned by [`IsRuntime::meta`].
 ///
-/// Every gear is routed to its owning core by `group` (via
-/// [`IsRuntime::route_group`]). What differs is the *trigger* for re-running:
+/// Every gear is routed to its owning core by `group` (the group value's
+/// [`GlobalHash`] → [`GlobalCoreId`](crate::types::GlobalCoreId)). What differs
+/// is the *trigger* for re-running:
 ///
 /// - [`GearMeta::Event`] gears are subscribed to an event group and rerun
 ///   whenever new events land in it (the original model).
@@ -33,7 +34,7 @@ pub enum GearMeta<R: IsRuntime> {
 
 impl<R: IsRuntime> GearMeta<R> {
     /// The routing group, common to both variants (used to pick the owning
-    /// core via [`IsRuntime::route_group`]).
+    /// core via the group's [`GlobalHash`]).
     pub fn group(&self) -> &R::Group {
         match self {
             GearMeta::Event { group, .. } | GearMeta::Timer { group, .. } => group,
@@ -68,11 +69,11 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
 
     type Module: Debug + Send + Sync + 'static;
 
-    type Group: Debug + Clone + Hash + Eq + Send + Sync + 'static + Localizable;
+    type Group: Debug + Clone + Hash + Eq + Send + Sync + 'static + GlobalHash;
 
     type Body: Debug + Clone + Send + Sync + 'static + Localizable;
 
-    type Data: Debug + Clone + Hash + Eq + Send + Sync + 'static + Localizable;
+    type Data: Debug + Clone + Hash + Eq + Send + Sync + 'static + GlobalHash;
 
     /// Per-gear working state carried across `run_step` invocations.
     ///
@@ -83,16 +84,6 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
     type GearCache<Watermark>: Debug + Clone + 'static
     where
         Watermark: Debug + Clone + 'static;
-
-    fn hash_data(
-        data: &Self::Data,
-        resolver: &dyn GlobalResolver,
-    ) -> Result<[u8; 32], GroupRouteError>;
-
-    fn route_group(
-        key: &Self::Group,
-        resolver: &dyn GlobalResolver,
-    ) -> Result<GlobalCoreId, GroupRouteError>;
 
     fn meta(gear: &Self::GearId) -> GearMeta<Self>;
 
@@ -127,13 +118,6 @@ impl IsRuntime for EmptyRuntime {
     where
         Watermark: Debug + Clone + 'static;
 
-    fn route_group(
-        _key: &Self::Group,
-        _resolver: &dyn GlobalResolver,
-    ) -> Result<GlobalCoreId, crate::types::GroupRouteError> {
-        Ok(GlobalCoreId(0))
-    }
-
     fn meta(_gear: &Self::GearId) -> GearMeta<Self> {
         GearMeta::Event {
             msg_type: LocMsgTypeId(0),
@@ -151,13 +135,5 @@ impl IsRuntime for EmptyRuntime {
         _input: GearInput,
         _cache: &mut Self::GearCache<S::Watermark>,
     ) -> Self::GearOut {
-    }
-
-    fn hash_data(
-        _data: &Self::Data,
-        _resolver: &dyn GlobalResolver,
-    ) -> Result<[u8; 32], GroupRouteError> {
-        let hash = *blake3::Hasher::new().finalize().as_bytes();
-        Ok(hash)
     }
 }

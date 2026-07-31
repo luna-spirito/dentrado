@@ -179,7 +179,7 @@ pub trait Storage<R: IsRuntime>: GlobalResolver /* TODO: Remove this, unviable. 
         group: R::Group,
     ) -> impl Future<Output = LocGroupId>;
     /// То же для content-addressed `R::Data`; `data_id.hash` проверяется
-    /// против `R::hash_data`.
+    /// против `R::Data::global_hash`.
     fn mk_data(
         &self,
         data_id: DataId,
