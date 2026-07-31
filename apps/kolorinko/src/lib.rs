@@ -2,6 +2,7 @@ use dentrado::{
     core::{
         core_ctx::Core,
         db::{Db, DbConfig, Doorbell},
+        storage::InMemoryStorage,
     },
     types::NodeId,
 };
@@ -47,7 +48,7 @@ pub fn main() -> anyhow::Result<()> {
         }
     };
 
-    let config = DbConfig::<KolorinkoRT> {
+    let config = DbConfig::<KolorinkoRT, InMemoryStorage<KolorinkoRT>> {
         num_cores: cores,
         node_id: NodeId(0),
         module: Arc::new(()),
@@ -55,6 +56,7 @@ pub fn main() -> anyhow::Result<()> {
         doorbells: iter::repeat_with(Doorbell::new)
             .take(cores.get() as usize)
             .collect(),
+        make_storage: Arc::new(|| InMemoryStorage::<KolorinkoRT>::default()),
     };
 
     let repo_meta = make_repo_meta();
@@ -70,7 +72,7 @@ pub fn main() -> anyhow::Result<()> {
     // One web worker per core. Each binds the same `(addr, port)` with
     // SO_REUSEPORT; the kernel hashes each incoming connection to a single
     // core, preserving the thread-per-core, shared-nothing model.
-    let worker = move |core: Rc<Core<KolorinkoRT>>| {
+    let worker = move |core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>| {
         let addr = bind_addr.clone();
         let dist = web_dist.clone();
         let meta = repo_meta.clone();

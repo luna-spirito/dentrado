@@ -79,7 +79,9 @@
 
 pub mod in_memory;
 
-use std::{fmt::Debug, future::Future, io};
+pub use in_memory::InMemoryStorage;
+
+use std::{fmt::Debug, future::Future, io, marker::PhantomData};
 
 use crate::{
     core::{
@@ -87,8 +89,8 @@ use crate::{
         loc_ctx::{StoreResultSuccess, StoredEvent},
     },
     types::{
-        DataId, DataVerifyError, GroupEventId, LocDataId, LocGroupId, LocMsgTypeId, LocSenderId,
-        LocUserId, SenderPk, UserId,
+        DataId, DataVerifyError, GlobalResolver, GroupEventId, LocDataId, LocGroupId, LocMsgTypeId,
+        LocSenderId, LocUserId, SenderPk, UserId,
     },
 };
 
@@ -104,29 +106,50 @@ pub struct GroupDiff<W> {
     pub watermark: W,
 }
 
-/// Positional, write-once (immutable) page handle. "Modify" = allocate a new
-/// page. Identity is by position, not by content hash. Dormant: the substrate
-/// for the future disk-spilling persistent maps; unused by dentrado today.
+/// Page size of the write-once page substrate ([`AlignedPage`]). Matches the
+/// on-disk direct-IO page (see `fs`), so a page is one IO unit.
+pub const PAGE_SIZE: usize = 4096;
+
+/// Positional id of a write-once (immutable) page. Identity is by position, not
+/// by content hash. A raw `PageId` carries **no** reference-counting: it is
+/// what [`Storage::read_page`] takes, and it is the key a gear cache (via
+/// [`CacheSer::page_roots`]) or a parent page's `refs` roots. Dormant today: the
+/// substrate for future disk-spilling persistent maps; unused by dentrado yet.
 /// Page content is raw bytes by design — its layout is defined by the spill-map
 /// format, not a typed domain object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PageId(pub u64);
 
-/// A value that may directly root (pin) storage pages. Storage
-/// reference-counts the pages each value declares, so they stay alive while
-/// reachable and are reclaimed (cascading) once not.
+/// Owned, reference-counted handle to a page — what [`Storage::write_page`]
+/// hands back and [`Storage::drop_page_handle`] consumes. While a handle (or a
+/// rooting edge: a parent page's `refs`, or a cache's `page_roots`) exists, the
+/// page is live; dropping the last such reference cascade-frees it. Wraps the
+/// positional [`PageId`] so the runtime can still [`Storage::read_page`] by id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PageHandle(pub PageId); // TODO: Doesn't call drop right now, causing leak.
+
+/// A single aligned page — the write-once storage unit. `#[repr(align(4096))]`
+/// so it can later be handed to direct IO verbatim; owned by value (move on
+/// write, clone on read).
+#[repr(align(4096))]
+#[derive(Clone, Debug)]
+pub struct AlignedPage(pub [u8; PAGE_SIZE]);
+
+/// (De)serialization + page-rooting interface a gear cache (`R::GearCache`)
+/// implements so a [`Storage`] backend can persist it and track the pages it
+/// roots.
 ///
-/// The point of this trait: a gear cache (`R::GearCache`) that *is* a
-/// spill-map already knows the pages it roots — they are part of the cache,
-/// not separate data. So storage asks the cache for them (`page_roots`)
-/// instead of taking a redundant `roots` argument on [`Storage::put_cache`].
-/// A plain in-memory cache that holds no pages returns `&[]`.
-pub trait PageRooted {
-    /// The pages this value directly roots.
+/// `page_roots` is the only member the storage layer calls today: a cache
+/// declares the pages it directly roots, and storage reference-counts them
+/// (incref on [`Storage::put_cache`] **before** decref of the superseded
+/// cache's roots, so a shared root never dips to zero mid-swap).
+/// TODO: Add <GearId> parameter to make key-aware deserialization
+pub trait CacheSer {
+    /// The pages this cache directly roots.
     fn page_roots(&self) -> &[PageId];
 }
 
-impl PageRooted for () {
+impl CacheSer for () {
     fn page_roots(&self) -> &[PageId] {
         &[]
     }
@@ -140,91 +163,142 @@ impl PageRooted for () {
 /// reverse lookup its sibling getter reads. Allocation of a fresh id uses an
 /// internal monotonic counter (NOT a row count) so that future sender eviction
 /// cannot alias a live id.
-pub trait Storage<R: IsRuntime> {
-    type Watermark: Clone + Debug + Default;
+pub trait Storage<R: IsRuntime>: GlobalResolver /* TODO: Remove this, unviable. */ + 'static {
+    type Watermark: Clone + Debug + Default + 'static;
 
-    // ── localization: idempotent allocators ───────────────────────────────
+    // ── Layer 1: localization, идемпотентные аллокаторы ──────────────────
 
     fn mk_loc_user(&self, uid: UserId) -> impl Future<Output = LocUserId>;
+    /// То же для сендеров; при наличии `uid` пользователь тоже регистрируется.
     fn mk_loc_sender(&self, pk: SenderPk, uid: Option<UserId>)
     -> impl Future<Output = LocSenderId>;
+    /// То же для `R::Group`.
     fn mk_loc_group(
         &self,
         msg_type: LocMsgTypeId,
         group: R::Group,
     ) -> impl Future<Output = LocGroupId>;
-    /// Content-addressed: verifies `content` against `data_id.hash` (resolving
-    /// embedded `LocDataId` references via this same store) before recording.
+    /// То же для content-addressed `R::Data`; `data_id.hash` проверяется
+    /// против `R::hash_data`.
     fn mk_data(
         &self,
         data_id: DataId,
         content: R::Data,
     ) -> impl Future<Output = Result<LocDataId, DataVerifyError>>;
 
-    // ── localization: reverse lookups ─────────────────────────────────────
+    // ── Localization: reverse lookups ─────────────────────────────────────
 
     fn user_by_local(&self, lid: LocUserId) -> impl Future<Output = Option<UserId>>;
     fn sender_user(&self, sid: LocSenderId) -> impl Future<Output = Option<LocUserId>>;
     fn sender_pk(&self, sid: LocSenderId) -> impl Future<Output = Option<SenderPk>>;
     fn find_data(&self, data_id: &DataId) -> impl Future<Output = Option<LocDataId>>;
-    /// Read a previously-stored data payload by local id.
-    fn fetch_data(&self, did: LocDataId) -> impl Future<Output = Option<R::Data>>;
+    /// Прочитать ранее сохранённый payload по локальному id (вместе с его
+    /// content-addressed `DataId` — запись целиком: gear-read API и билдер
+    /// wire-контекста получают `DataId` и контент одним чтением).
+    fn fetch_data(&self, did: LocDataId) -> impl Future<Output = Option<(DataId, R::Data)>>;
 
-    // ── event log (owns its dedup index internally) ───────────────────────
+    // ── Layer 2: события, могут ссылаться на объекты layer 1 ─────────────
 
-    /// Append an event to `group`'s shard, deduping on `(sender, tx_id)` (the
-    /// group is the shard, so it is not part of the dedup key nor of the
-    /// payload — see [`StoredEvent`]). `None` ⇒ the event was stale (an
-    /// at-least-as-fresh one exists) and was not stored; otherwise `old` is the
-    /// slot superseded, if any.
+    /// Добавить событие в шард группы с dedup по `(sender, tx_id)`.
+    /// `None` ⇒ изменение не применено; иначе `old` — вытесненный слот.
+    /// NOTE: побеждает СТАРШЕЕ (по `(timestamp, source_node)`) наблюдение.
     fn store_event(
         &self,
         group: LocGroupId,
         ev: StoredEvent<R::Body>,
     ) -> impl Future<Output = Option<StoreResultSuccess>>;
 
-    /// Random access by slot within `group`'s shard.
+    /// Произвольный доступ по слоту внутри шарда группы.
     fn fetch_event(
         &self,
         group: LocGroupId,
-        slot: GroupEventId,
+        slot: crate::types::GroupEventId,
     ) -> impl Future<Output = Option<StoredEvent<R::Body>>>;
 
-    /// Ids added to / superseded in `group` since `since`, plus the new tip.
+    /// Ids, добавленные/вытесненные в `group` с момента `since`, плюс новый tip.
     fn diff_group(
         &self,
         group: LocGroupId,
         since: Self::Watermark,
     ) -> impl Future<Output = GroupDiff<Self::Watermark>>;
 
-    // ── gear cache (restart-surviving working state — see module docs) ────
-    //
-    // Per-gear `R::GearCache`, keyed by the stable `R::GearId`. Typed
-    // end-to-end — zero serialization in `InMemoryStorage`. Restart-surviving
-    // (persisted by `flush`, strictly after the event log, so its event
-    // watermark never outlives the events it indexes) AND persistent across
-    // eviction/reactivation within a run (untouched by `evict_gear`): a
-    // returning gear resumes from its old working state either way.
-    //
-    // Page rooting is *not* a separate argument: a cache declares the pages it
-    // roots via [`PageRooted::page_roots`], so storage derives them from the
-    // cache itself (and re-derives the superseded cache's roots to decref).
-    fn get_cache(&self, gear: &R::GearId) -> impl Future<Output = Option<R::GearCache>>;
-    fn put_cache(&self, gear: R::GearId, cache: R::GearCache) -> impl Future<Output = ()>;
+    // ── Layer 3: gear cache + страницы (CoW, reference counting) ─────────
 
-    // ── pages: write-once substrate (dormant; for spill maps) ─────────────
-    //
-    // A page lives only while reachable: from a gear cache's `roots` (above)
-    // and/or from another page's `refs` (here). `refs` declares this page's
-    // direct children; storage increfs them on write and cascade-decrefs on
-    // reclaim. A freshly-written page starts unreferenced — it becomes live
-    // only once a `put_cache` (or a parent page) references it. Pages orphaned
-    // by a crash mid-construction are reclaimed at the next `flush`.
-    fn write_page(&self, data: &[u8], refs: &[PageId]) -> impl Future<Output = PageId>;
-    fn read_page(&self, id: PageId) -> impl Future<Output = Option<Box<[u8]>>>;
-    fn drop_page(&self, id: PageId);
+    /// Получить cache по id. Десериализует и возвращает typed cache.
+    fn get_cache(&self, gear: &R::GearId) -> impl Future<Output = Option<R::GearCache<Self::Watermark>>>;
 
-    // ── durability (localization → event log → gear cache → pages, internally)
+    /// Перезаписать cache. Storage сам извлекает корни старой и новой записи
+    /// через [`CacheSer::page_roots`]: incref новых ДО decref старых, чтобы
+    /// общий корень никогда не проваливался в ноль между проходами.
+    fn put_cache(&self, gear: R::GearId, cache: R::GearCache<Self::Watermark>) -> impl Future<Output = ()>;
 
+    /// Записать новую страницу, вернуть owned handle. `refs` — дочерние
+    /// страницы (их refcount инкрементится). Страница immutable.
+    fn write_page(&self, data: AlignedPage, refs: &[PageId]) -> impl Future<Output = PageHandle>;
+
+    /// Прочитать страницу по id. Паника на несуществующем id — чтение
+    /// не-живой страницы это баг вызывающего (live-страница не может быть
+    /// освобождена, пока на неё есть handle или ссылка).
+    fn read_page(&self, id: PageId) -> impl Future<Output = AlignedPage>;
+
+    /// Вызывается рантаймом при дропе handle. Дочерние refs страницы storage
+    /// знает сам (они записаны вместе со страницей) — каскадный decref.
+    fn drop_page_handle(&self, handle: PageHandle) -> impl Future<Output = ()>;
+
+    // ── Durability ────────────────────────────────────────────────────────
+
+    /// Commit point: после успешного `flush` всё, записанное до него,
+    /// переживает крах процесса. Порядок внутри: layer 1 → layer 2 →
+    /// gear cache → страницы.
     fn flush(&self) -> impl Future<Output = io::Result<()>>;
+}
+
+/// Группа-bound асинхронный read-view над бекендом [`Storage`]. Связывает группу
+/// один раз (на границе запуска gear), чтобы CPU-алгоритмы ниже оставались
+/// group-agnostic: они видят только `&GroupStore` + slot, никогда `LocGroupId`.
+///
+/// Методы `async` и делегируют unboxed в [`Storage`] (без аллокаций сверх тех,
+/// что делает сам бекенд). Заменяет прежнюю синхронную пару
+/// `loc_ctx::GroupStore`/`EventStore`, теперь когда бекенд — `async`.
+pub struct GroupStore<'a, R: IsRuntime, S: Storage<R>> {
+    storage: &'a S,
+    group: LocGroupId,
+    _r: PhantomData<fn() -> R>,
+}
+
+impl<'a, R: IsRuntime, S: Storage<R>> GroupStore<'a, R, S> {
+    #[must_use]
+    pub fn new(storage: &'a S, group: LocGroupId) -> Self {
+        Self {
+            storage,
+            group,
+            _r: PhantomData,
+        }
+    }
+
+    /// Привязанная группа (один gear = одна группа).
+    #[must_use]
+    pub fn group(&self) -> LocGroupId {
+        self.group
+    }
+
+    /// Тело события по слоту в этой группе.
+    pub async fn stored_event(&self, slot: GroupEventId) -> Option<StoredEvent<R::Body>> {
+        self.storage.fetch_event(self.group, slot).await
+    }
+
+    /// Локальный user сендера.
+    pub async fn sender_user(&self, sid: LocSenderId) -> Option<LocUserId> {
+        self.storage.sender_user(sid).await
+    }
+
+    /// Публичный ключ сендера.
+    pub async fn sender_pk(&self, sid: LocSenderId) -> Option<SenderPk> {
+        self.storage.sender_pk(sid).await
+    }
+
+    /// Запись данных `(DataId, content)` по локальному id.
+    pub async fn data(&self, did: LocDataId) -> Option<(DataId, R::Data)> {
+        self.storage.fetch_data(did).await
+    }
 }

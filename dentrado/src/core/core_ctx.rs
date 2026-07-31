@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
     num::NonZero,
+    ops::Deref,
     rc::Rc,
     sync::{Arc, mpsc},
     time::Duration,
@@ -17,14 +18,9 @@ use crate::{
         db,
         doorbell::DoorbellHandle,
         gear::{GearInput, GearMeta, IsRuntime},
-        loc_ctx::{
-            EventContext, GroupEventSource, GroupStore, LocCtx, StoreResultSuccess, StoredEvent,
-        },
+        storage::{GroupStore, Storage},
     },
-    types::{
-        DataId, DataVerifyError, GlobalCoreId, GroupEventId, LocDataId, LocGroupId, LocMsgTypeId,
-        LocSenderId, LocUserId, NodeId, SenderPk, UserId,
-    },
+    types::{GlobalCoreId, LocGroupId, NodeId},
     wire::{
         MergeError, RunGearError, WireEventBody, WireLocCtx, WireLocCtxBuilder, WireLocCtxMerger,
     },
@@ -127,13 +123,6 @@ new_key_type! {
 
 #[derive(Debug)]
 struct CoreLocCtx<R: IsRuntime> {
-    /// Per-gear working state (`R::GearCache`), keyed by the **stable**
-    /// `R::GearId`. Persistent across activation/eviction cycles: a gear that
-    /// is evicted from the arena and later reactivated picks up its old cache
-    /// (so, e.g., the watermark it stores is preserved). Stays in RAM — the hot
-    /// cache is not routed through the async `Storage` trait.
-    gear_cache: HashMap<R::GearId, R::GearCache>,
-    loc_ctx: LocCtx<R>,
     // --- subscription state ---
     /// Every gear this core knows about (active), stored in a generational
     /// arena. A slot present ⟺ the gear has been touched by a
@@ -256,7 +245,7 @@ impl<R: IsRuntime> ActiveGear<R> {
 }
 
 #[derive(Debug)]
-pub struct Core<R: IsRuntime> {
+pub struct Core<R: IsRuntime, S: Storage<R>> {
     num_cores: NonZero<u32>,
     core_id: u32,
     node_id: NodeId,
@@ -272,10 +261,15 @@ pub struct Core<R: IsRuntime> {
         Option<(mpsc::Sender<InterNodeMsg<R>>, DoorbellHandle)>,
     )>,
 
+    /// Typed per-core storage backend. Lives **outside** the `inner` `RefCell`
+    /// (it is interior-mutable, mirroring `fs::Fs`), so an `.await` on a storage
+    /// op never holds `inner` and never collides with arena mutations. Carries
+    /// localization, the event log, and the gear cache (keyed by `R::GearId`).
+    storage: S,
     inner: RefCell<CoreLocCtx<R>>,
 }
 
-impl<R: IsRuntime> Core<R> {
+impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
     pub(crate) fn new(
         num_cores: NonZero<u32>,
         core_id: u32,
@@ -289,6 +283,7 @@ impl<R: IsRuntime> Core<R> {
             NonZero<u32>,
             Option<(mpsc::Sender<InterNodeMsg<R>>, DoorbellHandle)>,
         )>,
+        storage: S,
     ) -> Self {
         Core {
             num_cores,
@@ -299,9 +294,8 @@ impl<R: IsRuntime> Core<R> {
             reroute_tx,
             doorbells,
             inter_node_peers,
+            storage,
             inner: RefCell::new(CoreLocCtx {
-                gear_cache: HashMap::new(),
-                loc_ctx: LocCtx::new(),
                 gears: SlotMap::with_key(),
                 gear_index: HashMap::new(),
                 unref_gear: VecDeque::new(),
@@ -311,6 +305,11 @@ impl<R: IsRuntime> Core<R> {
                 epoch: 0,
             }),
         }
+    }
+
+    /// The per-core storage backend.
+    pub(crate) fn storage(&self) -> &S {
+        &self.storage
     }
 
     #[must_use]
@@ -333,22 +332,12 @@ impl<R: IsRuntime> Core<R> {
         self.num_cores
     }
 
+    /// A group-bound async read view over this core's storage, for the one
+    /// group a gear runs for. Cheap to construct (binds the group); gears hand
+    /// it to `sg_ord_map`/`state_graph`/`text`.
     #[must_use]
-    /// Panics if `Fn` accesses `Core`.
-    pub fn get_stored_event<F>(
-        &self,
-        group: LocGroupId,
-        slot: GroupEventId,
-        f: impl Fn(&StoredEvent<R::Body>) -> F,
-    ) -> Option<F> {
-        self.inner.borrow().loc_ctx.get_stored_event(group, slot, f)
-    }
-
-    /// A group-bound read view over this core, for the one group a gear runs
-    /// for. See [`GroupStore`].
-    #[must_use]
-    pub fn group_store(&self, group: LocGroupId) -> GroupStore<'_, R> {
-        GroupStore::new(self, group)
+    pub fn group_store(&self, group: LocGroupId) -> GroupStore<'_, R, S> {
+        GroupStore::new(&self.storage, group)
     }
 
     /// Kick off a background run of a local gear if `Eepy`; mark `RunningQueued`
@@ -474,20 +463,13 @@ impl<R: IsRuntime> Core<R> {
             // `next_due` is advanced *before* `run_step` runs: "consuming" a
             // due tick at the moment the run starts is what enforces the
             // `period` rate limit even if the run is cancelled or re-looped.
-            let (gear_id, mut cache, input) = {
+            let (gear_id, input) = {
                 let mut inner = self.inner.borrow_mut();
                 let epoch = inner.epoch;
-                let CoreLocCtx {
-                    gears, gear_cache, ..
-                } = &mut *inner;
-                let Some(ag) = gears.get_mut(key) else {
+                let Some(ag) = inner.gears.get_mut(key) else {
                     return;
                 };
                 let gear_id = ag.id.clone();
-                let cache = gear_cache
-                    .get(&gear_id)
-                    .cloned()
-                    .unwrap_or_else(|| R::make_cache(&gear_id));
                 let input = match &mut ag.execution {
                     ActiveGearExecution::Local { source, .. } => match source {
                         GearSource::Events(group) => GearInput::Events(*group),
@@ -503,8 +485,15 @@ impl<R: IsRuntime> Core<R> {
                         unreachable!("run_loc_gear_task on a remote gear")
                     }
                 };
-                (gear_id, cache, input)
+                (gear_id, input)
             };
+
+            // Load this gear's working state from storage (cold start ⇒ fresh).
+            let mut cache = self
+                .storage
+                .get_cache(&gear_id)
+                .await
+                .unwrap_or_else(|| R::make_cache(&gear_id));
 
             let mut ctx = GearCtx {
                 core: Rc::clone(&self),
@@ -513,10 +502,11 @@ impl<R: IsRuntime> Core<R> {
             };
             let output = R::run_step(&mut ctx, input, &mut cache).await;
 
-            // Write output + cache; reconcile stale dep edges; collect fan-out.
+            // Persist the cache, then write output + reconcile dep edges.
+            self.storage.put_cache(gear_id.clone(), cache).await;
+
             let (removed_deps, dependents, remote_subs, do_rerun) = {
                 let mut inner = self.inner.borrow_mut();
-                inner.gear_cache.insert(gear_id.clone(), cache);
                 let updated_deps = ctx.deps.into_inner();
                 // Translate the runtime-facing `R::GearId` deps into arena keys.
                 // A dep currently evicted has no key here and is simply dropped
@@ -574,7 +564,7 @@ impl<R: IsRuntime> Core<R> {
 
             // Push the new output to every remote subscriber.
             for target in &remote_subs {
-                self.push_remote_update(&gear_id, &output, *target);
+                self.push_remote_update(&gear_id, &output, *target).await;
             }
 
             // Cascade reruns to local dependents.
@@ -608,27 +598,26 @@ impl<R: IsRuntime> Core<R> {
     /// cold?" flag is needed.
     ///
     /// WARNING: Forces active even if there are no subscribers.
-    fn force_active(self: &Rc<Self>, gear: &R::GearId) -> GearKey {
-        let mut inner = self.inner.borrow_mut();
-        // Existing gear: just promote it out of limbo if needed. See the doc:
-        // nothing to kick or re-subscribe — it already has an output or a run /
-        // StartSubscription in flight.
-        if let Some(&key) = inner.gear_index.get(gear) {
-            if let Some(pos) = inner.unref_gear.iter().position(|g| *g == key) {
-                inner.unref_gear.remove(pos);
+    async fn force_active(self: &Rc<Self>, gear: &R::GearId) -> GearKey {
+        // Existing gear: promote it out of limbo if needed. Nothing to kick or
+        // re-subscribe — it already has an output or a run/subscription in flight.
+        {
+            let mut inner = self.inner.borrow_mut();
+            if let Some(&key) = inner.gear_index.get(gear) {
+                if let Some(pos) = inner.unref_gear.iter().position(|g| *g == key) {
+                    inner.unref_gear.remove(pos);
+                }
+                return key;
             }
-            return key;
         }
-        // New gear: route, insert, and start its first computation/subscription.
+        // New gear: route, then (for a local event gear) allocate its localized
+        // group — both via `storage` (async). Done WITHOUT an `inner` borrow so
+        // no borrow spans the `.await`.
         let meta = R::meta(gear);
         let group_key = meta.group().clone();
-        let target_core = R::route_group(&group_key, &inner.loc_ctx)
+        let target_core = R::route_group(&group_key, &self.storage)
             .expect("force_active: route_group")
             .route(self.num_cores);
-        // What kind of gear, and what (if anything) to register it in once
-        // inserted. Event gears join `event_subscriptions`; timer (oracle)
-        // gears join `timer_gears`. Remote gears register nothing here — their
-        // owning core tracks them.
         enum Reg {
             Event(LocGroupId),
             Timer,
@@ -637,7 +626,7 @@ impl<R: IsRuntime> Core<R> {
         let (execution, registration) = if target_core == self.core_id {
             match meta {
                 GearMeta::Event { msg_type, group } => {
-                    let loc_group = inner.loc_ctx.mk_loc_group(msg_type, group);
+                    let loc_group = self.storage.mk_loc_group(msg_type, group).await;
                     (
                         ActiveGearExecution::Local {
                             source: GearSource::Events(loc_group),
@@ -664,35 +653,37 @@ impl<R: IsRuntime> Core<R> {
         } else {
             (ActiveGearExecution::Remote { target_core }, Reg::Remote)
         };
-        let key = inner.gears.insert(ActiveGear {
-            id: gear.clone(),
-            output: None,
-            execution,
-            local_dependents: HashSet::new(),
-            remote_subscribers: HashSet::new(),
-            direct_subscriber_count: 0,
-            changed: Event::new(),
-        });
-        inner.gear_index.insert(gear.clone(), key);
-        // Register the local gear in its trigger index.
-        match registration {
-            Reg::Event(loc_group) => {
-                inner
-                    .event_subscriptions
-                    .entry(loc_group)
-                    .or_default()
-                    .insert(key);
+        let key = {
+            let mut inner = self.inner.borrow_mut();
+            let key = inner.gears.insert(ActiveGear {
+                id: gear.clone(),
+                output: None,
+                execution,
+                local_dependents: HashSet::new(),
+                remote_subscribers: HashSet::new(),
+                direct_subscriber_count: 0,
+                changed: Event::new(),
+            });
+            inner.gear_index.insert(gear.clone(), key);
+            match registration {
+                Reg::Event(loc_group) => {
+                    inner
+                        .event_subscriptions
+                        .entry(loc_group)
+                        .or_default()
+                        .insert(key);
+                }
+                Reg::Timer => {
+                    inner.timer_gears.insert(key);
+                }
+                Reg::Remote => {}
             }
-            Reg::Timer => {
-                inner.timer_gears.insert(key);
-            }
-            Reg::Remote => {}
-        }
-        drop(inner);
+            key
+        };
         if target_core == self.core_id {
             self.kick_loc_gear(key);
         } else {
-            self.send_start_subscription(gear, key, target_core);
+            self.send_start_subscription(gear, key, target_core).await;
         }
         key
     }
@@ -745,7 +736,7 @@ impl<R: IsRuntime> Core<R> {
     /// declared this run — so no reverse edge is left orphaned in a dependency
     /// we never reconciled.
     async fn secondary_get_impl(self: &Rc<Self>, caller: R::GearId, gear: R::GearId) -> R::GearOut {
-        let gear_key = self.force_active(&gear);
+        let gear_key = self.force_active(&gear).await;
         {
             let mut inner = self.inner.borrow_mut();
             let Some(caller_key) = inner.gear_index.get(&caller).copied() else {
@@ -795,12 +786,22 @@ impl<R: IsRuntime> Core<R> {
 
     // --- cross-core subscription wiring ---
 
-    fn build_gear_wire(&self, gear: &R::GearId) -> (R::GearId, Arc<WireLocCtx<R>>) {
-        self.inner.borrow().build_gear_wire(gear)
+    async fn build_gear_wire(&self, gear: &R::GearId) -> (R::GearId, Arc<WireLocCtx<R>>) {
+        let mut builder = WireLocCtxBuilder::new(&self.storage);
+        let gear_wire = builder
+            .remap(gear.clone())
+            .await
+            .expect("build_gear_wire: gear remap");
+        (gear_wire, Arc::new(builder.build()))
     }
 
-    fn send_start_subscription(&self, gear: &R::GearId, subscriber_key: GearKey, target: u32) {
-        let (gear_wire, wire_ctx) = self.build_gear_wire(gear);
+    async fn send_start_subscription(
+        &self,
+        gear: &R::GearId,
+        subscriber_key: GearKey,
+        target: u32,
+    ) {
+        let (gear_wire, wire_ctx) = self.build_gear_wire(gear).await;
         let _ = self.intercore_tx[target as usize].send(InterCoreMsg::StartSubscription {
             gear: gear_wire,
             wire_ctx,
@@ -810,20 +811,17 @@ impl<R: IsRuntime> Core<R> {
         self.doorbells[target as usize].ring();
     }
 
-    fn push_remote_update(&self, gear: &R::GearId, output: &R::GearOut, target: u32) {
-        let wire_ctx = {
-            let inner = self.inner.borrow();
-            let mut builder = WireLocCtxBuilder::new(&inner.loc_ctx);
-            let gear_wire = builder
-                .remap(gear.clone())
-                .expect("push_remote_update: gear remap");
-            let output_wire = builder
-                .remap(output.clone())
-                .expect("push_remote_update: output remap");
-            let wire_ctx = Arc::new(builder.build());
-            (gear_wire, output_wire, wire_ctx)
-        };
-        let (gear_wire, output_wire, wire_ctx) = wire_ctx;
+    async fn push_remote_update(&self, gear: &R::GearId, output: &R::GearOut, target: u32) {
+        let mut builder = WireLocCtxBuilder::new(&self.storage);
+        let gear_wire = builder
+            .remap(gear.clone())
+            .await
+            .expect("push_remote_update: gear remap");
+        let output_wire = builder
+            .remap(output.clone())
+            .await
+            .expect("push_remote_update: output remap");
+        let wire_ctx = Arc::new(builder.build());
         let _ = self.intercore_tx[target as usize].send(InterCoreMsg::SubscriptionUpdate {
             gear: gear_wire,
             output: output_wire,
@@ -847,7 +845,7 @@ impl<R: IsRuntime> Core<R> {
 
     /// Import events into this core, optionally forwarding to inter-node peers,
     /// then schedule reruns for any active gear whose inputs were touched.
-    fn post_events(
+    async fn post_events(
         self: &Rc<Self>,
         wire_ctx: Arc<WireLocCtx<R>>,
         events: Arc<[WireEventBody<R::Group, R::Body>]>,
@@ -857,29 +855,23 @@ impl<R: IsRuntime> Core<R> {
         source_node: Option<NodeId>,
     ) -> Result<(), MergeError> {
         let node_id = self.node_id;
-        // Merge imports under a full `&mut inner` borrow, then split-borrow to
-        // kick: iterate `event_subscriptions` (shared) while mutating `gears`
-        // (via `kick_loc_gear_in`) in one pass — no `Vec` of kick keys, no
-        // re-borrow per kick. `event_subscriptions` and `gears` are disjoint
-        // fields, so the shared iterator borrow and the mutable kick borrow
-        // coexist.
+        // Merge via storage (async; no `inner` borrow spans the await), then
+        // kick dirty gears under a split borrow of `inner`.
+        let mut dirty: HashSet<LocGroupId> = HashSet::new();
         {
-            let mut inner = self.inner.borrow_mut();
-            let mut dirty: HashSet<LocGroupId> = HashSet::new();
-            {
-                let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
-                for &idx in seed_indices {
-                    let event = &events[idx as usize];
-                    let (group_id, store_result) = merger.import_new_event(
-                        event.clone(),
-                        timestamp,
-                        source_node.unwrap_or(node_id),
-                    )?;
-                    if store_result.is_some() {
-                        dirty.insert(group_id);
-                    }
+            let mut merger = WireLocCtxMerger::new(&wire_ctx, &self.storage);
+            for &idx in seed_indices {
+                let event = &events[idx as usize];
+                let (group_id, store_result) = merger
+                    .import_new_event(event.clone(), timestamp, source_node.unwrap_or(node_id))
+                    .await?;
+                if store_result.is_some() {
+                    dirty.insert(group_id);
                 }
             }
+        }
+        {
+            let mut inner = self.inner.borrow_mut();
             let CoreLocCtx {
                 gears,
                 event_subscriptions,
@@ -927,17 +919,14 @@ impl<R: IsRuntime> Core<R> {
         wire_ctx: &WireLocCtx<R>,
     ) -> Result<R::GearOut, RunGearError> {
         let gear = {
-            // Scope ALL inner borrows so the async state machine doesn't hold
-            // them across the `.await` below.
-            let mut inner = self.inner.borrow_mut();
-            let mut merger = WireLocCtxMerger::new(wire_ctx, &mut *inner);
-            merger.remap(gear).map_err(RunGearError::Merge)?
+            let mut merger = WireLocCtxMerger::new(wire_ctx, &self.storage);
+            merger.remap(gear).await.map_err(RunGearError::Merge)?
         };
         Ok(self.read_gear(gear).await)
     }
 
     /// Handle a `ClientOp` (received from a channel that is).
-    pub(crate) fn handle_client_op(self: &Rc<Self>, op: CoreCmd<R>) {
+    pub(crate) async fn handle_client_op(self: &Rc<Self>, op: CoreCmd<R>) {
         match op {
             CoreCmd::PostEvents {
                 wire_ctx,
@@ -948,14 +937,16 @@ impl<R: IsRuntime> Core<R> {
                 forwarded_from,
                 reply,
             } => {
-                let result = self.post_events(
-                    wire_ctx,
-                    events,
-                    &global_core_ids,
-                    timestamp,
-                    &seed_indices,
-                    forwarded_from,
-                );
+                let result = self
+                    .post_events(
+                        wire_ctx,
+                        events,
+                        &global_core_ids,
+                        timestamp,
+                        &seed_indices,
+                        forwarded_from,
+                    )
+                    .await;
                 if let Some(reply) = reply {
                     reply
                         .send(result)
@@ -977,9 +968,9 @@ impl<R: IsRuntime> Core<R> {
         }
     }
 
-    pub(crate) fn handle_intercore_msg(self: &Rc<Self>, msg: InterCoreMsg<R>) {
+    pub(crate) async fn handle_intercore_msg(self: &Rc<Self>, msg: InterCoreMsg<R>) {
         match msg {
-            InterCoreMsg::Op(op) => self.handle_client_op(op),
+            InterCoreMsg::Op(op) => self.handle_client_op(op).await,
             InterCoreMsg::StartSubscription {
                 gear,
                 wire_ctx,
@@ -989,16 +980,16 @@ impl<R: IsRuntime> Core<R> {
                 let this = Rc::clone(self);
                 compio::runtime::spawn(async move {
                     let gear = {
-                        let mut inner = this.inner.borrow_mut();
-                        let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
+                        let mut merger = WireLocCtxMerger::new(&wire_ctx, &this.storage);
                         merger
                             .remap(gear)
+                            .await
                             .expect("StartSubscription: failed to localize gear")
                     };
                     // Register the remote subscriber, ensure a run, await output,
                     // then push it back. The subscriber is attached before the
                     // await, so the gear can't be evicted mid-wait.
-                    let key = this.force_active(&gear);
+                    let key = this.force_active(&gear).await;
                     {
                         let mut inner = this.inner.borrow_mut();
                         if let Some(ag) = inner.gears.get_mut(key) {
@@ -1011,7 +1002,7 @@ impl<R: IsRuntime> Core<R> {
                     let output = this.wait_for_output_unpinned(key).await.expect(
                         "StartSubscription: gear evicted while a remote subscriber was attached",
                     );
-                    this.push_remote_update(&gear, &output, from_core);
+                    this.push_remote_update(&gear, &output, from_core).await;
                 })
                 .detach();
             }
@@ -1021,13 +1012,14 @@ impl<R: IsRuntime> Core<R> {
                 wire_ctx,
             } => {
                 let (gear, output) = {
-                    let mut inner = self.inner.borrow_mut();
-                    let mut merger = WireLocCtxMerger::new(&wire_ctx, &mut *inner);
+                    let mut merger = WireLocCtxMerger::new(&wire_ctx, &self.storage);
                     let gear = merger
                         .remap(gear)
+                        .await
                         .expect("SubscriptionUpdate: failed to localize gear");
                     let output = merger
                         .remap(output)
+                        .await
                         .expect("SubscriptionUpdate: failed to localize output");
                     (gear, output)
                 };
@@ -1071,7 +1063,11 @@ impl<R: IsRuntime> Core<R> {
         inner.rebalance_gear(key, &stop_ctx);
     }
 
-    pub(crate) fn handle_inter_node_msg(self: &Rc<Self>, peer_idx: usize, msg: InterNodeMsg<R>) {
+    pub(crate) async fn handle_inter_node_msg(
+        self: &Rc<Self>,
+        peer_idx: usize,
+        msg: InterNodeMsg<R>,
+    ) {
         let source_node = self.inter_node_peers[peer_idx].0;
         match msg {
             InterNodeMsg::ForwardEvents {
@@ -1080,6 +1076,7 @@ impl<R: IsRuntime> Core<R> {
                 timestamp,
             } => self
                 .db_post_events(wire_ctx, events, timestamp, (Some(source_node), || None))
+                .await
                 .expect("Received invalid push from server of the cluster"), // TODO: Don't fail.
         }
     }
@@ -1149,22 +1146,12 @@ impl<R: IsRuntime> Core<R> {
         }
     }
 
-    #[must_use]
-    pub fn query_events<F>(
-        &self,
-        group: LocGroupId,
-        since: (usize, usize),
-        f: impl Fn(&[GroupEventId], &[GroupEventId]) -> F,
-    ) -> Option<F> {
-        self.inner.borrow().loc_ctx.query_events(group, since, f)
-    }
-
     // Send commands to db via this Core
 
     /// Post events, routing each to the correct core.
     /// Self-targeting events call `Core::do_post_events` directly.
     /// Remote events go through SPSC `intercore_tx`.
-    pub fn db_post_events(
+    pub async fn db_post_events(
         self: &Rc<Self>,
         wire_ctx: WireLocCtx<R>,
         events: Vec<WireEventBody<R::Group, R::Body>>,
@@ -1179,7 +1166,7 @@ impl<R: IsRuntime> Core<R> {
         let mut our_task = None;
         for (target_core, seed_indices) in routed.core_seeds {
             if target_core == self.core_id() {
-                // Direct call: synchronous, no channel overhead
+                // Direct call on this core: no channel overhead.
                 our_task = Some(seed_indices);
             } else {
                 // Remote: send through SPSC intercore channel
@@ -1207,7 +1194,8 @@ impl<R: IsRuntime> Core<R> {
                 timestamp,
                 &seed_indices,
                 forwarded_from,
-            )?;
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1247,8 +1235,8 @@ impl<R: IsRuntime> Core<R> {
     /// local and currently computing (`Running`), waits for that run to land so
     /// `current()` reads the latest value rather than a stale one. Otherwise
     /// behaves like `subscribe_gear_stale`.
-    pub async fn subscribe_gear(self: &Rc<Self>, gear: R::GearId) -> Subscription<R> {
-        let key = self.force_active(&gear);
+    pub async fn subscribe_gear(self: &Rc<Self>, gear: R::GearId) -> Subscription<R, S> {
+        let key = self.force_active(&gear).await;
         // Register interest BEFORE awaiting. `inc_direct_subscriber` is
         // immediately followed by constructing `sub` with no `.await` in
         // between, so if the wait below is cancelled the already-moved `sub` is
@@ -1274,8 +1262,8 @@ impl<R: IsRuntime> Core<R> {
     /// is currently available — waiting only for the *first* computation if the
     /// gear is cold, never for an in-flight recompute. Reactivity reconciles
     /// later via `changed`/dependent reruns.
-    pub async fn subscribe_gear_stale(self: &Rc<Self>, gear: R::GearId) -> Subscription<R> {
-        let key = self.force_active(&gear);
+    pub async fn subscribe_gear_stale(self: &Rc<Self>, gear: R::GearId) -> Subscription<R, S> {
+        let key = self.force_active(&gear).await;
         // See `subscribe_gear`: interest goes up before the await so the key
         // can't go stale and a cancelled wait still decrements via `Drop`.
         self.inc_direct_subscriber(key);
@@ -1314,8 +1302,8 @@ impl<R: IsRuntime> Core<R> {
 /// the gear (demoting it to limbo, or evicting it under pressure). Naturally
 /// `!Sync` via `Rc<Core>`: it must live on the owning core's thread.
 #[must_use]
-pub struct Subscription<R: IsRuntime> {
-    core: Rc<Core<R>>,
+pub struct Subscription<R: IsRuntime, S: Storage<R>> {
+    core: Rc<Core<R, S>>,
     /// The arena key, stored directly (not the `R::GearId`) so `current`/
     /// `next`/`Drop` skip the `gear_index` lookup. Safe because a live
     /// `Subscription` holds `direct_subscriber_count >= 1`, so `has_interest`
@@ -1324,7 +1312,7 @@ pub struct Subscription<R: IsRuntime> {
     key: GearKey,
 }
 
-impl<R: IsRuntime> Subscription<R> {
+impl<R: IsRuntime, S: Storage<R>> Subscription<R, S> {
     /// Read the gear's currently-cached output. The value is guaranteed to be
     /// present (subscribe awaits the first computation).
     #[must_use]
@@ -1354,7 +1342,7 @@ impl<R: IsRuntime> Subscription<R> {
     }
 }
 
-impl<R: IsRuntime> Drop for Subscription<R> {
+impl<R: IsRuntime, S: Storage<R>> Drop for Subscription<R, S> {
     fn drop(&mut self) {
         let lost_interest = {
             let mut inner = self.core.inner.borrow_mut();
@@ -1371,12 +1359,12 @@ impl<R: IsRuntime> Drop for Subscription<R> {
 }
 
 /// The context handed to `IsRuntime::run_step`. Carries the gear's own id, a
-/// handle to the live `Core` (via `Deref`, so `core.query_events()` /
-/// `core.stored_event()` keep working unchanged), and the per-run `deps` set
+/// handle to the live `Core` (via `Deref`, so `core.group_store()` keeps
+/// working unchanged), and the per-run `deps` set
 /// accumulated by `secondary_get` calls (reconciled against the gear's stored
 /// `dep_set` at run end).
-pub struct GearCtx<R: IsRuntime> {
-    pub(crate) core: Rc<Core<R>>,
+pub struct GearCtx<R: IsRuntime, S: Storage<R>> {
+    pub(crate) core: Rc<Core<R, S>>,
     pub(crate) gear: R::GearId,
     /// Deps accumulated by `secondary_get`. Interior-mutable so `secondary_get`
     /// can be `&self` (lets a `dep_resolver` closure share `ctx` with sibling
@@ -1384,22 +1372,27 @@ pub struct GearCtx<R: IsRuntime> {
     pub(crate) deps: RefCell<HashSet<R::GearId>>,
 }
 
-impl<R: IsRuntime> std::ops::Deref for GearCtx<R> {
-    type Target = Core<R>;
+impl<R: IsRuntime, S: Storage<R>> Deref for GearCtx<R, S> {
+    type Target = Core<R, S>;
     fn deref(&self) -> &Self::Target {
         &self.core
     }
 }
 
-impl<R: IsRuntime> GearCtx<R> {
+impl<R: IsRuntime, S: Storage<R>> GearCtx<R, S> {
     /// The id of the gear currently running.
     pub fn gear(&self) -> &R::GearId {
         &self.gear
     }
 
     /// The underlying `Core`.
-    pub fn core(&self) -> &Rc<Core<R>> {
+    pub fn core(&self) -> &Rc<Core<R, S>> {
         &self.core
+    }
+
+    /// The per-core storage backend.
+    pub fn storage(&self) -> &S {
+        &self.core.storage
     }
 
     /// Declare a dependency on `dep`'s output and pull its current value
@@ -1426,18 +1419,6 @@ struct StopCtx<'a, R: IsRuntime> {
 }
 
 impl<R: IsRuntime> CoreLocCtx<R> {
-    /// Build a `(gear, WireLocCtx)` pair for an outgoing cross-core message.
-    /// Lives on `CoreLocCtx` (not `Core`) so the rebalance/eviction path can
-    /// build wires from `self.loc_ctx` while holding `&mut self`, without
-    /// re-borrowing `inner`.
-    fn build_gear_wire(&self, gear: &R::GearId) -> (R::GearId, Arc<WireLocCtx<R>>) {
-        let mut builder = WireLocCtxBuilder::new(&self.loc_ctx);
-        let gear_wire = builder
-            .remap(gear.clone())
-            .expect("build_gear_wire: gear remap");
-        (gear_wire, Arc::new(builder.build()))
-    }
-
     /// Emit a `StopSubscription` carrying only the opaque `session` id. No
     /// localization is read here: `send_stop` is on the `Drop`-driven eviction
     /// path (`evict_gear`), and `Drop` is synchronous, so it must not depend on
@@ -1523,93 +1504,5 @@ impl<R: IsRuntime> CoreLocCtx<R> {
         // NOTE: `gear_cache` is intentionally NOT touched here. It is keyed by
         // the stable `R::GearId` and persists across eviction/reactivation so a
         // returning gear resumes from its old working state (e.g. its watermark).
-    }
-}
-
-impl<R: IsRuntime> GroupEventSource<R> for Core<R> {
-    fn stored_event_in(
-        &self,
-        group: LocGroupId,
-        slot: GroupEventId,
-    ) -> Option<StoredEvent<R::Body>> {
-        self.inner
-            .borrow()
-            .loc_ctx
-            .get_stored_event(group, slot, std::clone::Clone::clone)
-    }
-
-    fn sender_user_in(&self, sid: LocSenderId) -> Option<LocUserId> {
-        self.inner.borrow().loc_ctx.sender_user(sid)
-    }
-
-    fn sender_pk_in(&self, sid: LocSenderId) -> Option<SenderPk> {
-        self.inner.borrow().loc_ctx.sender_pk(sid)
-    }
-
-    fn data_in(&self, did: LocDataId) -> Option<(DataId, R::Data)> {
-        self.inner.borrow().loc_ctx.get_data(did, Clone::clone)
-    }
-}
-
-impl<R: IsRuntime> EventContext<R> for CoreLocCtx<R> {
-    fn mk_loc_user(&mut self, uid: UserId) -> LocUserId {
-        self.loc_ctx.mk_loc_user(uid)
-    }
-
-    fn mk_loc_sender(&mut self, pk: SenderPk, uid: Option<UserId>) -> LocSenderId {
-        self.loc_ctx.mk_loc_sender(pk, uid)
-    }
-
-    fn mk_loc_group(&mut self, msg_type: LocMsgTypeId, group: R::Group) -> LocGroupId {
-        self.loc_ctx.mk_loc_group(msg_type, group)
-    }
-
-    fn store_event(
-        &mut self,
-        group: LocGroupId,
-        ev: StoredEvent<R::Body>,
-    ) -> Option<StoreResultSuccess> {
-        // Bodies + dedup + added/removed changelog all live together inside
-        // `loc_ctx`'s per-group shards now, so this is a plain delegate. The
-        // changelog push that used to live here moved into `LocCtx::store_event`.
-        self.loc_ctx.store_event(group, ev)
-    }
-
-    fn mk_data(&mut self, data_id: DataId, content: R::Data) -> Result<LocDataId, DataVerifyError> {
-        self.loc_ctx.mk_data(data_id, content)
-    }
-
-    fn find_data_by_data_id(&self, data_id: &DataId) -> Option<LocDataId> {
-        self.loc_ctx.find_data_by_data_id(data_id)
-    }
-}
-
-impl<R: IsRuntime> EventContext<R> for Core<R> {
-    fn mk_loc_user(&mut self, uid: UserId) -> LocUserId {
-        self.inner.get_mut().mk_loc_user(uid)
-    }
-
-    fn mk_loc_sender(&mut self, pk: SenderPk, uid: Option<UserId>) -> LocSenderId {
-        self.inner.get_mut().mk_loc_sender(pk, uid)
-    }
-
-    fn mk_loc_group(&mut self, msg_type: LocMsgTypeId, group: R::Group) -> LocGroupId {
-        self.inner.get_mut().mk_loc_group(msg_type, group)
-    }
-
-    fn store_event(
-        &mut self,
-        group: LocGroupId,
-        event: StoredEvent<R::Body>,
-    ) -> Option<StoreResultSuccess> {
-        self.inner.get_mut().store_event(group, event)
-    }
-
-    fn mk_data(&mut self, data_id: DataId, content: R::Data) -> Result<LocDataId, DataVerifyError> {
-        self.inner.get_mut().mk_data(data_id, content)
-    }
-
-    fn find_data_by_data_id(&self, data_id: &DataId) -> Option<LocDataId> {
-        self.inner.borrow().find_data_by_data_id(data_id)
     }
 }

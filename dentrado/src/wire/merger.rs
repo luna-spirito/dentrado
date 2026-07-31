@@ -1,27 +1,28 @@
 use crate::{
     core::{
         gear::IsRuntime,
-        loc_ctx::{EventContext, StoreResultSuccess, StoredEvent},
+        loc_ctx::{StoreResultSuccess, StoredEvent},
+        storage::Storage,
     },
     types::{LocDataId, LocGroupId, LocSenderId, LocUserId, Localizable, NodeId, Remapper},
     wire::format::{MergeError, WireEventBody, WireLocCtx},
 };
 
-pub(crate) struct WireLocCtxMerger<'a, R: IsRuntime, Target: EventContext<R>> {
+pub(crate) struct WireLocCtxMerger<'a, R: IsRuntime, S: Storage<R>> {
     source: &'a WireLocCtx<R>,
-    target: &'a mut Target,
+    target: &'a S,
     user_map: Vec<Option<LocUserId>>,
     sender_map: Vec<Option<LocSenderId>>,
     data_map: Vec<Option<LocDataId>>,
 }
 
-struct MergerRemapper<'a, 'b, R: IsRuntime, Target: EventContext<R>> {
-    merger: &'b mut WireLocCtxMerger<'a, R, Target>,
+struct MergerRemapper<'a, 'b, R: IsRuntime, S: Storage<R>> {
+    merger: &'b mut WireLocCtxMerger<'a, R, S>,
     allowed_before: usize,
 }
 
-impl<'a, R: IsRuntime, Target: EventContext<R>> WireLocCtxMerger<'a, R, Target> {
-    pub(crate) fn new(source: &'a WireLocCtx<R>, target: &'a mut Target) -> Self {
+impl<'a, R: IsRuntime, S: Storage<R>> WireLocCtxMerger<'a, R, S> {
+    pub(crate) fn new(source: &'a WireLocCtx<R>, target: &'a S) -> Self {
         Self {
             source,
             target,
@@ -31,43 +32,46 @@ impl<'a, R: IsRuntime, Target: EventContext<R>> WireLocCtxMerger<'a, R, Target> 
         }
     }
 
-    pub(crate) fn remap<L: Localizable + Clone>(&mut self, obj: L) -> Result<L, MergeError> {
+    pub(crate) async fn remap<L: Localizable>(&mut self, obj: L) -> Result<L, MergeError> {
         obj.localize(&mut MergerRemapper {
             allowed_before: self.source.data.len(),
             merger: self,
         })
+        .await
     }
 
-    pub(crate) fn import_new_event(
+    pub(crate) async fn import_new_event(
         &mut self,
         event: WireEventBody<R::Group, R::Body>,
         timestamp: u32,
         source_node: NodeId,
     ) -> Result<(LocGroupId, Option<StoreResultSuccess>), MergeError> {
-        let sender = self.remap(event.sender)?;
-        let group = self.remap(event.group)?;
-        let body = self.remap(event.body)?;
+        let sender = self.remap(event.sender).await?;
+        let group = self.remap(event.group).await?;
+        let body = self.remap(event.body).await?;
 
-        let group_id = self.target.mk_loc_group(event.msg_type, group);
+        let group_id = self.target.mk_loc_group(event.msg_type, group).await;
         Ok((
             group_id,
-            self.target.store_event(
-                group_id,
-                StoredEvent {
-                    sender,
-                    tx_id: event.tx_id,
-                    timestamp,
-                    source_node,
-                    body,
-                },
-            ),
+            self.target
+                .store_event(
+                    group_id,
+                    StoredEvent {
+                        sender,
+                        tx_id: event.tx_id,
+                        timestamp,
+                        source_node,
+                        body,
+                    },
+                )
+                .await,
         ))
     }
 }
 
-impl<R: IsRuntime, Target: EventContext<R>> Remapper for MergerRemapper<'_, '_, R, Target> {
+impl<R: IsRuntime, S: Storage<R>> Remapper for MergerRemapper<'_, '_, R, S> {
     type Err = MergeError;
-    fn remap_user(&mut self, lid: LocUserId) -> Result<LocUserId, MergeError> {
+    async fn remap_user(&mut self, lid: LocUserId) -> Result<LocUserId, MergeError> {
         let idx = lid.0 as usize;
 
         if idx >= self.merger.source.users.len() {
@@ -83,12 +87,12 @@ impl<R: IsRuntime, Target: EventContext<R>> Remapper for MergerRemapper<'_, '_, 
 
         let uid = self.merger.source.users[idx];
 
-        let local_id = self.merger.target.mk_loc_user(uid);
+        let local_id = self.merger.target.mk_loc_user(uid).await;
         self.merger.user_map[idx] = Some(local_id);
         Ok(local_id)
     }
 
-    fn remap_sender(&mut self, sid: LocSenderId) -> Result<LocSenderId, MergeError> {
+    async fn remap_sender(&mut self, sid: LocSenderId) -> Result<LocSenderId, MergeError> {
         let idx = sid.0 as usize;
 
         if idx >= self.merger.source.senders.len() {
@@ -104,7 +108,7 @@ impl<R: IsRuntime, Target: EventContext<R>> Remapper for MergerRemapper<'_, '_, 
 
         let (pk, user_idx) = &self.merger.source.senders[idx];
         let user_idx_val = *user_idx as usize;
-        self.remap_user(LocUserId(user_idx_val as u64))?;
+        self.remap_user(LocUserId(user_idx_val as u64)).await?;
 
         if user_idx_val >= self.merger.source.users.len() {
             return Err(MergeError::SenderUserOutOfBounds {
@@ -115,12 +119,12 @@ impl<R: IsRuntime, Target: EventContext<R>> Remapper for MergerRemapper<'_, '_, 
         }
         let uid = self.merger.source.users[user_idx_val];
 
-        let local_id = self.merger.target.mk_loc_sender(*pk, Some(uid));
+        let local_id = self.merger.target.mk_loc_sender(*pk, Some(uid)).await;
         self.merger.sender_map[idx] = Some(local_id);
         Ok(local_id)
     }
 
-    fn remap_data(&mut self, did: LocDataId) -> Result<LocDataId, MergeError> {
+    async fn remap_data(&mut self, did: LocDataId) -> Result<LocDataId, MergeError> {
         let idx = did.0 as usize;
 
         if idx >= self.merger.source.data.len() {
@@ -143,21 +147,26 @@ impl<R: IsRuntime, Target: EventContext<R>> Remapper for MergerRemapper<'_, '_, 
 
         let (data_id, content) = &self.merger.source.data[idx];
 
-        if let Some(existing) = self.merger.target.find_data_by_data_id(data_id) {
+        if let Some(existing) = self.merger.target.find_data(data_id).await {
             self.merger.data_map[idx] = Some(existing);
             return Ok(existing);
         }
 
         let next_max = idx; // data[i]'s content may only reference data[0..i)
-        let localized = content.clone().localize(&mut MergerRemapper {
+        // Box the recursive `localize`: `remap_data` → `R::Data::localize` →
+        // `remap_data` is a cycle, so the recursive future must be type-erased
+        // to keep `remap_data`'s own future finite.
+        let localized = Box::pin(content.clone().localize(&mut MergerRemapper {
             merger: &mut *self.merger,
             allowed_before: next_max,
-        })?;
+        }))
+        .await?;
 
         let new_did = self
             .merger
             .target
             .mk_data(*data_id, localized)
+            .await
             .map_err(MergeError::DataVerify)?;
 
         self.merger.data_map[idx] = Some(new_did);

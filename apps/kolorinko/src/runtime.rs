@@ -12,7 +12,10 @@ use crate::{
     wikidot_parser::types::Content,
 };
 use dentrado::{
-    core::gear::{GearInput, GearMeta, IsRuntime},
+    core::{
+        gear::{GearInput, GearMeta, IsRuntime},
+        storage::{CacheSer, PageId, Storage},
+    },
     types::{GlobalCoreId, LocMsgTypeId, Localizable},
 };
 
@@ -45,7 +48,10 @@ pub(crate) enum Group {
 const PHANTOM_MSG: LocMsgTypeId = LocMsgTypeId(0);
 
 impl Localizable for GearId {
-    fn localize<Rm: dentrado::types::Remapper>(self, _remapper: &mut Rm) -> Result<Self, Rm::Err> {
+    async fn localize<Rm: dentrado::types::Remapper>(
+        self,
+        _remapper: &mut Rm,
+    ) -> Result<Self, Rm::Err> {
         use GearId::*;
         match self {
             Repo { .. } => Ok(self),
@@ -55,7 +61,10 @@ impl Localizable for GearId {
 }
 
 impl Localizable for GearOut {
-    fn localize<Rm: dentrado::types::Remapper>(self, _remapper: &mut Rm) -> Result<Self, Rm::Err> {
+    async fn localize<Rm: dentrado::types::Remapper>(
+        self,
+        _remapper: &mut Rm,
+    ) -> Result<Self, Rm::Err> {
         use GearOut::*;
         match self {
             RepoOut { .. } => Ok(self),
@@ -65,7 +74,10 @@ impl Localizable for GearOut {
 }
 
 impl Localizable for Group {
-    fn localize<Rm: dentrado::types::Remapper>(self, _remapper: &mut Rm) -> Result<Self, Rm::Err> {
+    async fn localize<Rm: dentrado::types::Remapper>(
+        self,
+        _remapper: &mut Rm,
+    ) -> Result<Self, Rm::Err> {
         use Group::*;
         match self {
             Phantom(_) => Ok(self),
@@ -103,6 +115,12 @@ impl Deref for Boxed {
     }
 }
 
+impl CacheSer for Boxed {
+    fn page_roots(&self) -> &[PageId] {
+        &[]
+    }
+}
+
 impl IsRuntime for KolorinkoRT {
     type GearId = GearId;
 
@@ -116,7 +134,10 @@ impl IsRuntime for KolorinkoRT {
 
     type Data = ();
 
-    type GearCache = Boxed;
+    type GearCache<W>
+        = Boxed
+    where
+        W: Debug + Clone + 'static;
 
     fn hash_data(
         _data: &Self::Data,
@@ -169,17 +190,19 @@ impl IsRuntime for KolorinkoRT {
 
     // Heterogeneous per-gear cache payloads are erased behind `Box<dyn Any>`;
     // each gear variant downcasts to its own cache type inside `run_step`.
-    fn make_cache(gear: &Self::GearId) -> Self::GearCache {
+    fn make_cache<Watermark: Debug + Clone + Default + 'static>(
+        gear: &Self::GearId,
+    ) -> Self::GearCache<Watermark> {
         Boxed(match gear {
             GearId::Repo(_) => Box::new(RepoCache::default()),
             GearId::Load { .. } => Box::new(LoadCache::default()),
         })
     }
 
-    async fn run_step(
-        ctx: &mut dentrado::core::core_ctx::GearCtx<Self>,
+    async fn run_step<S: Storage<Self>>(
+        ctx: &mut dentrado::core::core_ctx::GearCtx<Self, S>,
         input: GearInput,
-        cache: &mut Self::GearCache,
+        cache: &mut Self::GearCache<S::Watermark>,
     ) -> Self::GearOut {
         match ctx.gear().clone() {
             // Oracle: pull + rebuild on a tick, return the cached dataset

@@ -27,7 +27,10 @@ use compio::{
     runtime,
     ws::{Config, WebSocketStream, tungstenite},
 };
-use dentrado::{core::core_ctx::Core, wire::WireLocCtx};
+use dentrado::{
+    core::{core_ctx::Core, storage::InMemoryStorage},
+    wire::WireLocCtx,
+};
 use futures::channel::mpsc;
 use futures::future::FutureExt;
 use futures::select;
@@ -56,7 +59,7 @@ const PLACEHOLDER_INDEX: &str = "<!doctype html>\
 /// same `(addr, port)`; the kernel hashes each incoming connection to exactly
 /// one core, preserving the thread-per-core, shared-nothing model.
 pub(crate) async fn serve(
-    core: Rc<Core<KolorinkoRT>>,
+    core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     addr: &str,
     assets_dir: PathBuf,
     repo_meta: RepoMeta,
@@ -109,7 +112,7 @@ async fn bind_reuseport(addr: &str) -> io::Result<TcpListener> {
 /// Handle a single TCP connection: route by request line.
 async fn handle_conn(
     mut stream: TcpStream,
-    core: &Rc<Core<KolorinkoRT>>,
+    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     assets: &HashMap<String, Vec<u8>>,
     repo_meta: RepoMeta,
 ) -> io::Result<()> {
@@ -232,7 +235,7 @@ impl Reply {
 /// i.e. a page is only kept hot while a client is actually viewing it.
 async fn ws_loop(
     ws: &mut WebSocketStream<TcpStream>,
-    core: &Rc<Core<KolorinkoRT>>,
+    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     repo_meta: RepoMeta,
 ) -> io::Result<()> {
     let (tx, mut rx) = mpsc::unbounded::<Reply>();
@@ -282,7 +285,7 @@ async fn handle_text(
     text: &str,
     tx: &mpsc::UnboundedSender<Reply>,
     subs: &mut HashMap<PageKey, runtime::JoinHandle<()>>,
-    core: &Rc<Core<KolorinkoRT>>,
+    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     repo_meta: &RepoMeta,
 ) {
     let req: Request = match serde_json::from_str(text) {

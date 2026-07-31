@@ -1,21 +1,33 @@
 use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, Timeline};
 use crate::core::gear::EmptyRuntime;
-use crate::core::loc_ctx::{EventContext, GroupStore, LocCtx, StoredEvent};
-use crate::types::{GroupEventId, LocGroupId, SenderPk};
+use crate::core::loc_ctx::StoredEvent;
+use crate::core::storage::{GroupStore, InMemoryStorage, Storage};
+use crate::types::{GroupEventId, LocGroupId, LocMsgTypeId, NodeId, SenderPk};
 use im::OrdMap;
 use std::collections::BTreeMap;
+
+type Store = InMemoryStorage<EmptyRuntime>;
 
 const PK_A: SenderPk = SenderPk([0u8; 32]);
 
 /// Drive a future on a throwaway compio runtime.
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    compio::runtime::RuntimeBuilder::new()
-        .build()
-        .expect("compio runtime build failed")
-        .block_on(fut)
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Noop;
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+    let waker = Waker::from(Arc::new(Noop));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => panic!("future yielded unexpectedly"),
+    }
 }
 
-fn gs(ctx: &LocCtx<EmptyRuntime>) -> GroupStore<'_, EmptyRuntime> {
+fn gs(ctx: &Store) -> GroupStore<'_, EmptyRuntime, Store> {
     GroupStore::new(ctx, LocGroupId(0))
 }
 
@@ -27,20 +39,21 @@ const fn lid(id: u64) -> GroupEventId {
     GroupEventId(id)
 }
 
-fn make_test_ctx(num_events: u64) -> LocCtx<EmptyRuntime> {
-    let mut ctx = LocCtx::new();
-    let sid_a = ctx.mk_loc_sender(PK_A, None);
+fn make_test_ctx(num_events: u64) -> Store {
+    let ctx = InMemoryStorage::<EmptyRuntime>::default();
+    let sid_a = block_on(ctx.mk_loc_sender(PK_A, None));
+    block_on(ctx.mk_loc_group(LocMsgTypeId(0), ()));
     for i in 0..num_events {
-        ctx.store_event(
+        block_on(ctx.store_event(
             LocGroupId(0),
             StoredEvent {
                 sender: sid_a,
                 tx_id: i as u32,
                 timestamp: 0,
-                source_node: crate::types::NodeId(0),
+                source_node: NodeId(0),
                 body: (),
             },
-        );
+        ));
     }
     ctx
 }
@@ -50,8 +63,10 @@ type InviteSG = StateGraph<u64, u64, bool, u64, bool>;
 
 type EventStore<E> = BTreeMap<u64, (u32, E)>;
 
-fn make_resolver<E: Clone>(events: &EventStore<E>) -> impl Fn(GroupEventId) -> (SGEventId, E) + '_ {
-    move |local_id: GroupEventId| {
+fn make_resolver<E: Clone>(
+    events: &EventStore<E>,
+) -> impl async Fn(GroupEventId) -> (SGEventId, E) + '_ {
+    async move |local_id: GroupEventId| {
         let (ts, e) = events
             .get(&(local_id.0 as u64))
             .expect("make_resolver: event not found");
@@ -71,7 +86,7 @@ fn dep_query_basic() {
         invite_events.insert(1, (0, 100));
         let ih =
             async |user_id: &u64,
-                   ctx: &mut HandlerCtx<u64, u64, bool, EmptyRuntime, u64, bool, _>| {
+                   ctx: &mut HandlerCtx<u64, u64, bool, EmptyRuntime, Store, u64, bool, _>| {
                 ctx.update(*user_id, true);
             };
         let mut ir = async |_: &u64| Timeline::<u64, bool> {
@@ -97,14 +112,23 @@ fn dep_query_basic() {
 
         let invite_writes = invite_sg.as_writes();
         let mut dep_resolver = async move |_: &u64| invite_writes.clone();
-        let doc_handler =
-            async |_ev: &&str, ctx: &mut HandlerCtx<u64, u64, bool, EmptyRuntime, &str, i32, _>| {
-                if let Some(invited) = ctx.dep_query(&0, &100u64).await {
-                    if invited {
-                        ctx.update("content", 42);
-                    }
+        let doc_handler = async |_ev: &&str,
+                                 ctx: &mut HandlerCtx<
+            u64,
+            u64,
+            bool,
+            EmptyRuntime,
+            Store,
+            &str,
+            i32,
+            _,
+        >| {
+            if let Some(invited) = ctx.dep_query(&0, &100u64).await {
+                if invited {
+                    ctx.update("content", 42);
                 }
-            };
+            }
+        };
         let mut dh = doc_handler;
         doc_sg
             .apply(
@@ -130,7 +154,7 @@ fn dep_change_detection_and_propagation() {
 
         async fn doc_handler<D: async FnMut(&u64) -> Timeline<u64, bool>>(
             ev: &(u64, u64),
-            ctx: &mut HandlerCtx<'_, u64, u64, bool, EmptyRuntime, &str, i32, D>,
+            ctx: &mut HandlerCtx<'_, u64, u64, bool, EmptyRuntime, Store, &str, i32, D>,
         ) {
             let (branch, user) = *ev;
             if let Some(invited) = ctx.dep_query(&branch, &user).await {
@@ -175,6 +199,7 @@ fn dep_change_detection_and_propagation() {
             u64,
             bool,
             EmptyRuntime,
+            Store,
             u64,
             bool,
             _,
@@ -225,7 +250,7 @@ fn dep_isolation_between_branches() {
         };
         let ih =
             async |user_id: &u64,
-                   ctx: &mut HandlerCtx<u64, u64, bool, EmptyRuntime, u64, bool, _>| {
+                   ctx: &mut HandlerCtx<u64, u64, bool, EmptyRuntime, Store, u64, bool, _>| {
                 ctx.update(*user_id, true);
             };
 
@@ -263,7 +288,7 @@ fn dep_isolation_between_branches() {
         let mut doc_events: EventStore<(u64, u64)> = EventStore::new();
         async fn doc_handler<D: async FnMut(&u64) -> Timeline<u64, bool>>(
             ev: &(u64, u64),
-            ctx: &mut HandlerCtx<'_, u64, u64, bool, EmptyRuntime, &str, i32, D>,
+            ctx: &mut HandlerCtx<'_, u64, u64, bool, EmptyRuntime, Store, &str, i32, D>,
         ) {
             let (branch, user) = *ev;
             if let Some(invited) = ctx.dep_query(&branch, &user).await {
@@ -309,6 +334,7 @@ fn dep_isolation_between_branches() {
             u64,
             bool,
             EmptyRuntime,
+            Store,
             u64,
             bool,
             _,
@@ -352,9 +378,9 @@ fn dep_isolation_between_branches() {
                 },
             )
             .await;
-        assert_eq!(doc_sg.query_at(&"content", eid(0, 10), &ctx), None);
+        assert_eq!(doc_sg.query_at(&"content", eid(0, 10), &ctx).await, None);
         assert_eq!(
-            doc_sg.query_at(&"content", eid(0, 11), &ctx),
+            doc_sg.query_at(&"content", eid(0, 11), &ctx).await,
             Some(&{ 20 ^ 7 })
         );
     });

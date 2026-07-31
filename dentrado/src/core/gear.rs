@@ -1,7 +1,7 @@
 use std::{fmt::Debug, hash::Hash, num::NonZero};
 
 use crate::{
-    core::core_ctx::GearCtx,
+    core::{core_ctx::GearCtx, storage::Storage},
     types::{GlobalCoreId, GlobalResolver, GroupRouteError, LocGroupId, LocMsgTypeId, Localizable},
 };
 
@@ -80,7 +80,9 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
     /// type and skip all type erasure. A runtime whose gears need heterogeneous
     /// cache payloads can instead erase them, e.g. `type GearCache = Box<dyn Any>`
     /// (or a tagged pointer) and downcast inside `run_step`.
-    type GearCache: Debug + Clone + 'static;
+    type GearCache<Watermark>: Debug + Clone + 'static
+    where
+        Watermark: Debug + Clone + 'static;
 
     fn hash_data(
         data: &Self::Data,
@@ -94,7 +96,9 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
 
     fn meta(gear: &Self::GearId) -> GearMeta<Self>;
 
-    fn make_cache(gear: &Self::GearId) -> Self::GearCache;
+    fn make_cache<Watermark: Debug + Clone + Default + 'static>(
+        gear: &Self::GearId,
+    ) -> Self::GearCache<Watermark>;
 
     /// Compute (or incrementally update) the gear's output.
     ///
@@ -102,10 +106,10 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
     /// `secondary_get` entry point for declaring gear→gear dependencies.
     /// Must not hold any `inner` borrow across `.await` (the core's `RefCell`
     /// is shared between all concurrently-polled gears on this core).
-    async fn run_step(
-        ctx: &mut GearCtx<Self>,
+    async fn run_step<S: Storage<Self>>(
+        ctx: &mut GearCtx<Self, S>,
         input: GearInput,
-        cache: &mut Self::GearCache,
+        cache: &mut Self::GearCache<S::Watermark>,
     ) -> Self::GearOut;
 }
 
@@ -118,7 +122,10 @@ impl IsRuntime for EmptyRuntime {
     type Group = ();
     type Body = ();
     type Data = ();
-    type GearCache = ();
+    type GearCache<Watermark>
+        = ()
+    where
+        Watermark: Debug + Clone + 'static;
 
     fn route_group(
         _key: &Self::Group,
@@ -134,12 +141,15 @@ impl IsRuntime for EmptyRuntime {
         }
     }
 
-    fn make_cache(_gear: &Self::GearId) -> Self::GearCache {}
+    fn make_cache<Watermark: Debug + Clone + Default + 'static>(
+        _gear: &Self::GearId,
+    ) -> Self::GearCache<Watermark> {
+    }
 
-    async fn run_step(
-        _ctx: &mut crate::core::core_ctx::GearCtx<Self>,
+    async fn run_step<S: Storage<Self>>(
+        _ctx: &mut crate::core::core_ctx::GearCtx<Self, S>,
         _input: GearInput,
-        _cache: &mut Self::GearCache,
+        _cache: &mut Self::GearCache<S::Watermark>,
     ) -> Self::GearOut {
     }
 

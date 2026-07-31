@@ -2,7 +2,7 @@ use crate::{
     safe_path::SafePathComponent,
     wikidot_parser::{parse, types::Content},
 };
-use dentrado::core::core_ctx::GearCtx;
+use dentrado::core::{core_ctx::GearCtx, storage::Storage};
 use git2::{Oid, Repository};
 use im::HashMap as ImHashMap;
 use log::error;
@@ -558,11 +558,11 @@ pub(crate) struct LoadCache {
 /// pages actually viewed are ever parsed, and a page whose text is unchanged
 /// since last run is not re-parsed (pointer-identity check on the persistent
 /// map's shared `Arc<str>`).
-pub(crate) async fn load_page(
+pub(crate) async fn load_page<S: Storage<KolorinkoRT>>(
     meta: &RepoMeta,
     site: &SafePathComponent,
     slug: &(Option<SafePathComponent>, SafePathComponent),
-    ctx: &mut GearCtx<KolorinkoRT>,
+    ctx: &mut GearCtx<KolorinkoRT, S>,
     cache: &mut LoadCache,
 ) -> Arc<Content> {
     let GearOut::RepoOut(data) = ctx.secondary_get(GearId::Repo(meta.clone())).await else {

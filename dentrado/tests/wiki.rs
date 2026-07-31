@@ -1,8 +1,10 @@
+use std::fmt::Debug;
+
 use dentrado::{
     core::{
-        core_ctx::{Core, GearCtx},
+        core_ctx::GearCtx,
         gear::{GearInput, GearMeta, IsRuntime},
-        loc_ctx::{EventContext, EventStore},
+        storage::{CacheSer, InMemoryStorage, PageId, Storage},
     },
     types::*,
     wire::WireEventBody,
@@ -19,20 +21,25 @@ pub enum WikiGear {
 }
 
 impl Localizable for WikiGear {
-    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+    async fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
         match self {
             Self::InvitesCount { branch } => Ok(Self::InvitesCount {
-                branch: branch.localize(remapper)?,
+                branch: branch.localize(remapper).await?,
             }),
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct CounterCache {
-    pub processed_added: usize,
-    pub processed_removed: usize,
+pub struct CounterCache<W> {
+    pub watermark: W,
     pub out: i64,
+}
+
+impl<W> CacheSer for CounterCache<W> {
+    fn page_roots(&self) -> &[PageId] {
+        &[]
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -42,9 +49,9 @@ pub struct BranchData {
 }
 
 impl Localizable for BranchData {
-    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+    async fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
         Ok(BranchData {
-            creator: self.creator.localize(remapper)?,
+            creator: self.creator.localize(remapper).await?,
             created_at: self.created_at,
         })
     }
@@ -60,7 +67,10 @@ impl IsRuntime for WikiCounterRuntime {
     type Group = LocDataId;
     type Body = LocUserId;
     type Data = BranchData;
-    type GearCache = CounterCache;
+    type GearCache<W>
+        = CounterCache<W>
+    where
+        W: Debug + Clone + 'static;
 
     fn hash_data(
         data: &Self::Data,
@@ -96,40 +106,38 @@ impl IsRuntime for WikiCounterRuntime {
         }
     }
 
-    fn make_cache(_gear: &Self::GearId) -> Self::GearCache {
+    fn make_cache<W: Debug + Clone + Default + 'static>(
+        _gear: &Self::GearId,
+    ) -> Self::GearCache<W> {
         CounterCache {
-            processed_added: 0,
-            processed_removed: 0,
+            watermark: W::default(),
             out: 0,
         }
     }
 
-    async fn run_step(
-        _ctx: &mut GearCtx<Self>,
+    async fn run_step<S: Storage<Self>>(
+        ctx: &mut GearCtx<Self, S>,
         input: GearInput,
-        cache: &mut Self::GearCache,
+        cache: &mut Self::GearCache<S::Watermark>,
     ) -> i64 {
         let GearInput::Events(group) = input else {
             return cache.out;
         };
-        let Some((added_ids, removed_ids)) = _ctx.query_events(
-            group,
-            (cache.processed_added, cache.processed_removed),
-            |a, r| (a.to_vec(), r.to_vec()),
-        ) else {
-            return cache.out;
-        };
-        cache.out += added_ids.len() as i64;
-        cache.out -= removed_ids.len() as i64;
-        cache.processed_added += added_ids.len();
-        cache.processed_removed += removed_ids.len();
+        let diff = ctx
+            .storage()
+            .diff_group(group, cache.watermark.clone())
+            .await;
+        cache.out += diff.added.len() as i64;
+        cache.out -= diff.removed.len() as i64;
+        cache.watermark = diff.watermark;
         cache.out
     }
 }
 
 #[test]
 fn wiki_engine() {
-    let mut tc: TestCluster<WikiCounterRuntime> = TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<WikiCounterRuntime, InMemoryStorage<WikiCounterRuntime>> =
+        TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -150,17 +158,17 @@ fn wiki_engine() {
 
     let alice = tc.add_user(SenderPk([42u8; 32]), alice_uid);
 
-    let alice_loc_uid = tc.loc_ctx.mk_loc_user(alice_uid);
-    let bob_loc_uid = tc.loc_ctx.mk_loc_user(bob_uid);
-    let carol_loc_uid = tc.loc_ctx.mk_loc_user(carol_uid);
-    let dave_loc_uid = tc.loc_ctx.mk_loc_user(dave_uid);
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.mk_loc_user(bob_uid);
+    let carol_loc_uid = tc.mk_loc_user(carol_uid);
+    let dave_loc_uid = tc.mk_loc_user(dave_uid);
 
     // Seed branch b0
     let b0 = tc.add_data(BranchData {
         creator: alice_loc_uid,
         created_at: 1,
     });
-    tc.loc_ctx.mk_loc_group(MSG_INVITE, b0);
+    tc.mk_loc_group(MSG_INVITE, b0);
 
     let gear_0 = WikiGear::InvitesCount { branch: b0 };
 
@@ -206,7 +214,7 @@ fn wiki_engine() {
         creator: alice_loc_uid,
         created_at: 2,
     });
-    tc.loc_ctx.mk_loc_group(MSG_INVITE, b1);
+    tc.mk_loc_group(MSG_INVITE, b1);
 
     let gear_1 = WikiGear::InvitesCount { branch: b1 };
 

@@ -1,9 +1,8 @@
 use im::OrdMap;
-use std::cell::RefCell;
 use std::{collections::BTreeSet, hash::Hash};
 
 use crate::core::gear::IsRuntime;
-use crate::core::loc_ctx::EventStore;
+use crate::core::storage::{GroupStore, Storage};
 use crate::types::{GroupEventId, Localizable, Remapper};
 use crate::utils::sg_ord_map::{SgOrdMap, SgOrdSet};
 
@@ -31,15 +30,19 @@ where
         }
     }
 
-    pub(crate) fn query_at<R: IsRuntime>(
+    pub(crate) async fn query_at<R: IsRuntime, S: Storage<R>>(
         &self,
         key: &DepK,
         at: SGEventId,
-        ctx: &dyn EventStore<R>,
+        store: &GroupStore<'_, R, S>,
     ) -> Option<DepV> {
-        self.writes
-            .get(key)
-            .and_then(|timeline| timeline.latest_at(&at, ctx).map(|(_, v)| v.clone()))
+        let Some(timeline) = self.writes.get(key) else {
+            return None;
+        };
+        let Some((_, v)) = timeline.latest_at(&at, store).await else {
+            return None;
+        };
+        Some(v.clone())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&DepK, &SgOrdMap<DepV>)> {
@@ -128,20 +131,22 @@ pub struct HandlerCtx<
     DepK: Ord + Clone + Hash,
     DepV: Clone + PartialEq + Hash + Ord,
     R: IsRuntime,
+    S: Storage<R>,
     K: Ord + Clone + Hash,
     V: Clone + Hash,
     D: ?Sized,
 > {
     pub event_id: SGEventId,
-    reads: RefCell<&'a mut im::OrdSet<K>>,
-    writes: RefCell<&'a mut OrdMap<K, V>>,
+    reads: &'a mut im::OrdSet<K>,
+    writes: &'a mut OrdMap<K, V>,
     pub(crate) self_writes: &'a OrdMap<K, SgOrdMap<V>>,
-    ext: RefCell<&'a mut OrdMap<Dep, ExtDep<DepK, DepV>>>,
+    ext: &'a mut OrdMap<Dep, ExtDep<DepK, DepV>>,
     dep_resolver: &'a mut D,
-    ctx: &'a dyn EventStore<R>,
+    store: &'a GroupStore<'a, R, S>,
 }
 
-impl<Dep, DepK, DepV, R: IsRuntime, K, V, D> HandlerCtx<'_, Dep, DepK, DepV, R, K, V, D>
+impl<Dep, DepK, DepV, R: IsRuntime, S: Storage<R>, K, V, D>
+    HandlerCtx<'_, Dep, DepK, DepV, R, S, K, V, D>
 where
     Dep: Ord + Clone + Hash,
     DepK: Ord + Clone + Hash,
@@ -150,28 +155,31 @@ where
     V: Clone + Hash,
     D: async FnMut(&Dep) -> Timeline<DepK, DepV> + ?Sized,
 {
-    pub fn query(&self, k: &K) -> Option<V> {
-        self.reads.borrow_mut().insert(k.clone());
-        self.self_writes.get(k).and_then(|timeline| {
-            timeline
-                .latest_before(&self.event_id, self.ctx)
-                .map(|(_, v)| v.clone())
-        })
+    pub async fn query(&mut self, k: &K) -> Option<V> {
+        self.reads.insert(k.clone());
+        let Some(timeline) = self.self_writes.get(k) else {
+            return None;
+        };
+        let Some((_, v)) = timeline.latest_before(&self.event_id, self.store).await else {
+            return None;
+        };
+        Some(v.clone())
     }
 
-    pub fn update(&self, k: K, v: V) {
-        self.writes.borrow_mut().insert(k, v);
+    pub fn update(&mut self, k: K, v: V) {
+        self.writes.insert(k, v);
     }
 
-    /// The event store this handler runs against.
-    pub fn store(&self) -> &dyn EventStore<R> {
-        self.ctx
+    /// The group-bound store this handler runs against.
+    #[must_use]
+    pub fn store(&self) -> &GroupStore<'_, R, S> {
+        self.store
     }
 
     pub async fn dep_query(&mut self, dep: &Dep, dep_key: &DepK) -> Option<DepV> {
         let writes = (self.dep_resolver)(dep).await;
 
-        match self.ext.borrow_mut().entry(dep.clone()) {
+        match self.ext.entry(dep.clone()) {
             im::ordmap::Entry::Vacant(entry) => {
                 entry.insert(ExtDep {
                     cached: writes.clone(),
@@ -181,10 +189,11 @@ where
             im::ordmap::Entry::Occupied(_) => {}
         }
 
-        if let Some(ext_dep) = self.ext.borrow_mut().get_mut(dep) {
+        let store = self.store;
+        if let Some(ext_dep) = self.ext.get_mut(dep) {
             match ext_dep.reads.entry(dep_key.clone()) {
                 im::ordmap::Entry::Occupied(mut entry) => {
-                    entry.get_mut().insert(self.event_id, self.ctx);
+                    entry.get_mut().insert(self.event_id, store).await;
                 }
                 im::ordmap::Entry::Vacant(entry) => {
                     entry.insert(SgOrdSet::unit(self.event_id));
@@ -192,7 +201,7 @@ where
             }
         }
 
-        writes.query_at(dep_key, self.event_id, self.ctx)
+        writes.query_at(dep_key, self.event_id, store).await
     }
 }
 
@@ -235,22 +244,22 @@ where
         }
     }
 
-    pub async fn apply<R: IsRuntime, E, H, D>(
+    pub async fn apply<R: IsRuntime, S: Storage<R>, E, H, D>(
         &mut self,
         handler: &mut H,
-        event_resolver: &impl Fn(GroupEventId) -> (SGEventId, E),
+        event_resolver: &impl async Fn(GroupEventId) -> (SGEventId, E),
         dep_resolver: &mut D,
-        ctx: &dyn EventStore<R>,
+        store: &GroupStore<'_, R, S>,
         delta: &DeltaList<GroupEventId>,
     ) where
         E: Clone,
-        H: async FnMut(&E, &mut HandlerCtx<'_, Dep, DepK, DepV, R, K, V, D>),
+        H: async FnMut(&E, &mut HandlerCtx<'_, Dep, DepK, DepV, R, S, K, V, D>),
         D: async FnMut(&Dep) -> Timeline<DepK, DepV>,
     {
         let mut queue: BTreeSet<SGEventId> = BTreeSet::new();
 
         for &local_id in &delta.removed {
-            let (event_id, _) = event_resolver(local_id);
+            let (event_id, _) = event_resolver(local_id).await;
             if let Some(old_effects) = self.effects.remove(&event_id) {
                 for k in &old_effects.reads {
                     Self::remove_from_reads(&mut self.reads, k, &event_id);
@@ -268,23 +277,24 @@ where
                         &k,
                         event_id,
                         &mut queue,
-                        ctx,
-                    );
+                        store,
+                    )
+                    .await;
                 }
             }
         }
 
-        let dep_queue = self.detect_dep_changes(dep_resolver, ctx).await;
+        let dep_queue = self.detect_dep_changes(dep_resolver, store).await;
         for event_id in dep_queue {
             queue.insert(event_id);
         }
 
         for &local_id in &delta.added {
-            let (event_id, _) = event_resolver(local_id);
+            let (event_id, _) = event_resolver(local_id).await;
             queue.insert(event_id);
         }
 
-        self.process_queue(handler, event_resolver, dep_resolver, ctx, &mut queue)
+        self.process_queue(handler, event_resolver, dep_resolver, store, &mut queue)
             .await;
     }
 
@@ -295,15 +305,19 @@ where
             .map(|(_, v)| v)
     }
 
-    pub(crate) fn query_at<R: IsRuntime>(
-        &self,
+    pub(crate) async fn query_at<'a, R: IsRuntime, S: Storage<R>>(
+        &'a self,
         k: &K,
         event_id: SGEventId,
-        ctx: &dyn EventStore<R>,
-    ) -> Option<&V> {
-        self.writes
-            .get(k)
-            .and_then(|timeline| timeline.latest_at(&event_id, ctx).map(|(_, v)| v))
+        store: &GroupStore<'_, R, S>,
+    ) -> Option<&'a V> {
+        let Some(timeline) = self.writes.get(k) else {
+            return None;
+        };
+        let Some((_, v)) = timeline.latest_at(&event_id, store).await else {
+            return None;
+        };
+        Some(v)
     }
 
     pub(crate) fn keys(&self) -> impl Iterator<Item = &K> {
@@ -314,10 +328,10 @@ where
         self.writes.get(k).into_iter().flat_map(SgOrdMap::iter)
     }
 
-    async fn detect_dep_changes<R: IsRuntime, D>(
+    async fn detect_dep_changes<R: IsRuntime, S: Storage<R>, D>(
         &mut self,
         dep_resolver: &mut D,
-        ctx: &dyn EventStore<R>,
+        store: &GroupStore<'_, R, S>,
     ) -> BTreeSet<SGEventId>
     where
         D: async FnMut(&Dep) -> Timeline<DepK, DepV>,
@@ -341,7 +355,7 @@ where
                             if let Some(readers) = ext_dep.reads.get(dep_key)
                                 && let Some((first_write, _)) = new_timeline.first()
                             {
-                                for reader in readers.range_after(&first_write, ctx) {
+                                for reader in readers.range_after(&first_write, store).await {
                                     affected.insert(reader);
                                 }
                             }
@@ -350,7 +364,7 @@ where
                             if let Some(readers) = ext_dep.reads.get(dep_key)
                                 && let Some((first_write, _)) = old_timeline.first()
                             {
-                                for reader in readers.range_after(&first_write, ctx) {
+                                for reader in readers.range_after(&first_write, store).await {
                                     affected.insert(reader);
                                 }
                             }
@@ -360,15 +374,18 @@ where
                             new: (_, new_timeline),
                         } => {
                             if let Some(readers) = ext_dep.reads.get(dep_key) {
-                                for inner_item in old_timeline.diff_cloned(new_timeline, ctx) {
+                                for inner_item in
+                                    old_timeline.diff_cloned(new_timeline, store).await
+                                {
                                     let changed_at = *inner_item.key();
                                     Self::add_affected_readers(
                                         new_timeline,
                                         changed_at,
                                         readers,
                                         &mut affected,
-                                        ctx,
-                                    );
+                                        store,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -384,21 +401,21 @@ where
         affected
     }
 
-    fn add_affected_readers<R: IsRuntime>(
+    async fn add_affected_readers<R: IsRuntime, S: Storage<R>>(
         new_timeline: &SgOrdMap<DepV>,
         changed_at: SGEventId,
         readers: &SgOrdSet,
         affected: &mut BTreeSet<SGEventId>,
-        ctx: &dyn EventStore<R>,
+        store: &GroupStore<'_, R, S>,
     ) {
-        match new_timeline.next_after(&changed_at, ctx) {
+        match new_timeline.next_after(&changed_at, store).await {
             Some(next_write) => {
-                for reader in readers.range_between(&changed_at, &next_write, ctx) {
+                for reader in readers.range_between(&changed_at, &next_write, store).await {
                     affected.insert(reader);
                 }
             }
             None => {
-                for reader in readers.range_after(&changed_at, ctx) {
+                for reader in readers.range_after(&changed_at, store).await {
                     affected.insert(reader);
                 }
             }
@@ -417,15 +434,15 @@ where
         }
     }
 
-    fn add_to_reads<R: IsRuntime>(
+    async fn add_to_reads<R: IsRuntime, S: Storage<R>>(
         reads: &mut OrdMap<K, SgOrdSet>,
         k: K,
         event_id: SGEventId,
-        ctx: &dyn EventStore<R>,
+        store: &GroupStore<'_, R, S>,
     ) {
         match reads.entry(k) {
             im::ordmap::Entry::Occupied(mut entry) => {
-                entry.get_mut().insert(event_id, ctx);
+                entry.get_mut().insert(event_id, store).await;
             }
             im::ordmap::Entry::Vacant(entry) => {
                 entry.insert(SgOrdSet::unit(event_id));
@@ -464,53 +481,55 @@ where
         }
     }
 
-    fn propagate_key_change<R: IsRuntime>(
+    async fn propagate_key_change<R: IsRuntime, S: Storage<R>>(
         reads: &OrdMap<K, SgOrdSet>,
         writes: &OrdMap<K, SgOrdMap<V>>,
         k: &K,
         event_id: SGEventId,
         queue: &mut BTreeSet<SGEventId>,
-        ctx: &dyn EventStore<R>,
+        store: &GroupStore<'_, R, S>,
     ) {
-        if let Some(read_set) = reads.get(k) {
-            let upper = writes
-                .get(k)
-                .and_then(|timeline| timeline.next_after(&event_id, ctx));
+        let Some(read_set) = reads.get(k) else {
+            return;
+        };
+        let upper = if let Some(timeline) = writes.get(k) {
+            timeline.next_after(&event_id, store).await
+        } else {
+            None
+        };
 
-            match upper {
-                Some(next_write) => {
-                    for reader in read_set.range_between(&event_id, &next_write, ctx) {
-                        queue.insert(reader);
-                    }
+        match upper {
+            Some(next_write) => {
+                for reader in read_set.range_between(&event_id, &next_write, store).await {
+                    queue.insert(reader);
                 }
-                None => {
-                    for reader in read_set.range_after(&event_id, ctx) {
-                        queue.insert(reader);
-                    }
+            }
+            None => {
+                for reader in read_set.range_after(&event_id, store).await {
+                    queue.insert(reader);
                 }
             }
         }
     }
 
     #[allow(clippy::too_many_lines)]
-    #[allow(clippy::too_many_lines)]
-    async fn process_queue<R: IsRuntime, E, H, D>(
+    async fn process_queue<R: IsRuntime, S: Storage<R>, E, H, D>(
         &mut self,
         handler: &mut H,
-        event_resolver: &impl Fn(GroupEventId) -> (SGEventId, E),
+        event_resolver: &impl async Fn(GroupEventId) -> (SGEventId, E),
         dep_resolver: &mut D,
-        ctx: &dyn EventStore<R>,
+        store: &GroupStore<'_, R, S>,
         queue: &mut BTreeSet<SGEventId>,
     ) where
         E: Clone,
-        H: async FnMut(&E, &mut HandlerCtx<'_, Dep, DepK, DepV, R, K, V, D>),
+        H: async FnMut(&E, &mut HandlerCtx<'_, Dep, DepK, DepV, R, S, K, V, D>),
         D: async FnMut(&Dep) -> Timeline<DepK, DepV>,
     {
         while let Some(&event_id) = queue.first() {
             queue.remove(&event_id);
 
             let local_id = event_id.1;
-            let (_, event_data) = event_resolver(local_id);
+            let (_, event_data) = event_resolver(local_id).await;
 
             let old_effects = self.effects.remove(&event_id);
             let (old_reads, old_writes, old_dep_reads) = match old_effects {
@@ -523,12 +542,12 @@ where
             {
                 let mut hctx = HandlerCtx {
                     event_id,
-                    reads: RefCell::new(&mut reads),
-                    writes: RefCell::new(&mut writes),
+                    reads: &mut reads,
+                    writes: &mut writes,
                     self_writes: &self.writes,
-                    ext: RefCell::new(&mut self.ext),
+                    ext: &mut self.ext,
                     dep_resolver,
-                    ctx,
+                    store,
                 };
                 handler(&event_data, &mut hctx).await;
             }
@@ -537,7 +556,7 @@ where
                 Self::remove_from_reads(&mut self.reads, k, &event_id);
             }
             for k in reads.iter().filter(|k| !old_reads.contains(k)) {
-                Self::add_to_reads(&mut self.reads, k.clone(), event_id, ctx);
+                Self::add_to_reads(&mut self.reads, k.clone(), event_id, store).await;
             }
 
             for (dep, dep_keys) in &old_dep_reads {
@@ -560,7 +579,8 @@ where
                 .collect::<Vec<_>>()
             {
                 Self::remove_from_timeline(&mut self.writes, &k, &event_id);
-                Self::propagate_key_change(&self.reads, &self.writes, &k, event_id, queue, ctx);
+                Self::propagate_key_change(&self.reads, &self.writes, &k, event_id, queue, store)
+                    .await;
             }
 
             for (k, new_val) in &writes {
@@ -571,7 +591,10 @@ where
 
                 match self.writes.entry(k.clone()) {
                     im::ordmap::Entry::Occupied(mut entry) => {
-                        entry.get_mut().insert(event_id, new_val.clone(), ctx);
+                        entry
+                            .get_mut()
+                            .insert(event_id, new_val.clone(), store)
+                            .await;
                     }
                     im::ordmap::Entry::Vacant(entry) => {
                         entry.insert(SgOrdMap::unit(event_id, new_val.clone()));
@@ -579,7 +602,15 @@ where
                 }
 
                 if changed {
-                    Self::propagate_key_change(&self.reads, &self.writes, k, event_id, queue, ctx);
+                    Self::propagate_key_change(
+                        &self.reads,
+                        &self.writes,
+                        k,
+                        event_id,
+                        queue,
+                        store,
+                    )
+                    .await;
                 }
             }
 
@@ -648,11 +679,11 @@ where
     DepK: Ord + Clone + Hash + Localizable,
     DepV: Clone + PartialEq + Hash + Ord + Localizable,
 {
-    fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
+    async fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
         let mut writes = OrdMap::new();
         for (k, mut sg_map) in self.writes {
-            let new_k = k.localize(remapper)?;
-            sg_map.try_remap_values(&mut |v| v.localize(remapper))?;
+            let new_k = k.localize(remapper).await?;
+            sg_map.try_remap_values(remapper).await?;
             writes.insert(new_k, sg_map);
         }
         Ok(Timeline { writes })

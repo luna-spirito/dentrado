@@ -4,10 +4,11 @@ use im::HashMap as ImHashMap;
 use similar::{Algorithm, DiffOp, capture_diff_slices};
 use std::collections::BTreeSet;
 
-#[cfg(test)]
-use crate::core::loc_ctx::LocCtx;
 use crate::{
-    core::{gear::IsRuntime, loc_ctx::EventStore},
+    core::{
+        gear::IsRuntime,
+        storage::{GroupStore, Storage},
+    },
     types::{LocSenderEventId, LocSenderId, Localizable, Remapper},
 };
 
@@ -106,18 +107,28 @@ impl ChildEntry {
         Self { child_id, offset }
     }
 
-    fn cmp_rga<R: IsRuntime>(&self, other: &Self, ctx: &dyn EventStore<R>) -> std::cmp::Ordering {
+    async fn cmp_rga<R: IsRuntime, S: Storage<R>>(
+        &self,
+        other: &Self,
+        store: &GroupStore<'_, R, S>,
+    ) -> std::cmp::Ordering {
         let LocSenderEventId(s_sender, s_tx) = self.child_id.0;
         let LocSenderEventId(o_sender, o_tx) = other.child_id.0;
-        self.offset
+        // Lazy: only consult the store when all tie-breakers above pk are equal
+        // (matches the old short-circuiting `then_with` chain, and keeps the
+        // empty-store tests panic-free).
+        let pre = self
+            .offset
             .cmp(&other.offset)
             .then_with(|| o_tx.cmp(&s_tx))
-            .then_with(|| other.child_id.1.cmp(&self.child_id.1))
-            .then_with(|| {
-                let pk_a = ctx.sender_pk(s_sender).expect("sender_pk: unknown");
-                let pk_b = ctx.sender_pk(o_sender).expect("sender_pk: unknown");
-                pk_a.cmp(&pk_b)
-            })
+            .then_with(|| other.child_id.1.cmp(&self.child_id.1));
+        if pre == std::cmp::Ordering::Equal {
+            let pk_a = store.sender_pk(s_sender).await.expect("sender_pk: unknown");
+            let pk_b = store.sender_pk(o_sender).await.expect("sender_pk: unknown");
+            pre.then(pk_a.cmp(&pk_b))
+        } else {
+            pre
+        }
     }
 }
 
@@ -154,11 +165,11 @@ impl AnchorAgg {
     }
 
     #[must_use]
-    pub fn apply<R: IsRuntime>(
+    pub async fn apply<R: IsRuntime, S: Storage<R>>(
         mut self,
         event_id: LocSenderEventId,
         upd: &TextUpd,
-        ctx: &dyn EventStore<R>,
+        store: &GroupStore<'_, R, S>,
     ) -> Self {
         for (i, pos) in upd.new_anchors.iter().enumerate() {
             let id = AnchorId(event_id, i as u32);
@@ -167,10 +178,23 @@ impl AnchorAgg {
             if parent_children.iter().any(|e| e.child_id == id) {
                 continue;
             }
-            let idx = parent_children
-                .binary_search_by(|e| e.cmp_rga(&entry, ctx))
-                .unwrap_or_else(|x| x);
-            parent_children.insert(idx, entry);
+            // `cmp_rga` needs `sender_pk` from the store (async), so the
+            // std `binary_search_by` (sync closure) is replaced by a manual
+            // async binary search. Element-vs-entry, matching the old closure.
+            let mut left = 0;
+            let mut right = parent_children.len();
+            while left < right {
+                let mid = left + (right - left) / 2;
+                match parent_children[mid].cmp_rga(&entry, store).await {
+                    std::cmp::Ordering::Less => left = mid + 1,
+                    std::cmp::Ordering::Greater => right = mid,
+                    std::cmp::Ordering::Equal => {
+                        left = mid;
+                        break;
+                    }
+                }
+            }
+            parent_children.insert(left, entry);
         }
         self
     }
@@ -560,14 +584,31 @@ fn char_slice(s: &str, start: usize, end: usize) -> &str {
 mod tests {
     use super::*;
     use crate::core::gear::EmptyRuntime;
-    use crate::core::loc_ctx::GroupStore;
+    use crate::core::storage::{GroupStore, InMemoryStorage};
     use crate::types::LocGroupId;
 
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+        struct Noop;
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Waker::from(Arc::new(Noop));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(fut);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("future yielded unexpectedly"),
+        }
+    }
+
     /// Empty group-bound store. Text's RGA ordering only consults `sender_pk`
-    /// (group-independent), so an empty `LocCtx` under an arbitrary group works.
+    /// lazily (on a full tie only), so an empty store works — `sender_pk` is
+    /// never actually called by these tests.
     macro_rules! store {
         () => {
-            &GroupStore::new(&LocCtx::<EmptyRuntime>::new(), LocGroupId(0))
+            &GroupStore::new(&InMemoryStorage::<EmptyRuntime>::new(), LocGroupId(0))
         };
     }
 
@@ -588,169 +629,187 @@ mod tests {
 
     #[test]
     fn single_anchor() {
-        let upd = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["hello".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd);
+        block_on(async {
+            let upd = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["hello".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        let doc = Document::new(&agg, &text);
-        assert_eq!(doc.get(), "hello");
+            let doc = Document::new(&agg, &text);
+            assert_eq!(doc.get(), "hello");
 
-        let segs = text.get_document(&agg);
-        assert_eq!(segs.len(), 1);
-        assert_eq!(segs[0], ((AnchorId(eid(S1, 1), 0), 0), "hello".to_string()));
+            let segs = text.get_document(&agg);
+            assert_eq!(segs.len(), 1);
+            assert_eq!(segs[0], ((AnchorId(eid(S1, 1), 0), 0), "hello".to_string()));
+        })
     }
 
     #[test]
     fn two_siblings_ordering() {
-        let upd = TextUpd::new(
-            vec![
-                AnchorPos::new(ROOT_ANCHOR, 0), // anchor 0
-                AnchorPos::new(ROOT_ANCHOR, 0), // anchor 1
-            ],
-            vec!["first".to_string(), "second".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd);
+        block_on(async {
+            let upd = TextUpd::new(
+                vec![
+                    AnchorPos::new(ROOT_ANCHOR, 0), // anchor 0
+                    AnchorPos::new(ROOT_ANCHOR, 0), // anchor 1
+                ],
+                vec!["first".to_string(), "second".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        let doc = Document::new(&agg, &text);
-        assert_eq!(doc.get(), "secondfirst");
+            let doc = Document::new(&agg, &text);
+            assert_eq!(doc.get(), "secondfirst");
 
-        let segs = text.get_document(&agg);
-        assert_eq!(segs[0].1, "second");
-        assert_eq!(segs[1].1, "first");
+            let segs = text.get_document(&agg);
+            assert_eq!(segs[0].1, "second");
+            assert_eq!(segs[1].1, "first");
+        })
     }
 
     #[test]
     fn child_at_offset() {
-        let upd1 = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["base".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd1);
+        block_on(async {
+            let upd1 = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["base".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd1);
 
-        let parent = AnchorId(eid(S1, 1), 0);
-        let upd2 = TextUpd::new(
-            vec![AnchorPos::new(parent, 2)],
-            vec![" inserted ".to_string()],
-        );
-        let agg = agg.apply(eid(S1, 2), &upd2, store!());
-        let text = text.apply(eid(S1, 2), &upd2);
+            let parent = AnchorId(eid(S1, 1), 0);
+            let upd2 = TextUpd::new(
+                vec![AnchorPos::new(parent, 2)],
+                vec![" inserted ".to_string()],
+            );
+            let agg = agg.apply(eid(S1, 2), &upd2, store!()).await;
+            let text = text.apply(eid(S1, 2), &upd2);
 
-        let doc = Document::new(&agg, &text);
-        assert_eq!(doc.get(), "ba inserted se");
+            let doc = Document::new(&agg, &text);
+            assert_eq!(doc.get(), "ba inserted se");
+        })
     }
 
     #[test]
     fn children_ordered_by_offset() {
-        let upd1 = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["abcde".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, store!());
+        block_on(async {
+            let upd1 = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["abcde".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, store!()).await;
 
-        let parent = AnchorId(eid(S1, 1), 0);
-        let upd2 = TextUpd::new(
-            vec![AnchorPos::new(parent, 3), AnchorPos::new(parent, 1)],
-            vec!["[C1]".to_string(), "[C2]".to_string()],
-        );
-        let agg = agg.apply(eid(S1, 2), &upd2, store!());
+            let parent = AnchorId(eid(S1, 1), 0);
+            let upd2 = TextUpd::new(
+                vec![AnchorPos::new(parent, 3), AnchorPos::new(parent, 1)],
+                vec!["[C1]".to_string(), "[C2]".to_string()],
+            );
+            let agg = agg.apply(eid(S1, 2), &upd2, store!()).await;
 
-        let text = TextAgg::new()
-            .apply(eid(S1, 1), &upd1)
-            .apply(eid(S1, 2), &upd2);
+            let text = TextAgg::new()
+                .apply(eid(S1, 1), &upd1)
+                .apply(eid(S1, 2), &upd2);
 
-        let doc = Document::new(&agg, &text);
-        assert_eq!(doc.get(), "a[C2]bc[C1]de");
+            let doc = Document::new(&agg, &text);
+            assert_eq!(doc.get(), "a[C2]bc[C1]de");
+        })
     }
 
     #[test]
     fn delete_single() {
-        let upd1 = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["hello".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd1);
+        block_on(async {
+            let upd1 = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["hello".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd1);
 
-        let upd2 = TextUpd::empty().with_deletions(vec![AnchorId(eid(S1, 1), 0)]);
-        let text = text.apply(eid(S1, 2), &upd2);
+            let upd2 = TextUpd::empty().with_deletions(vec![AnchorId(eid(S1, 1), 0)]);
+            let text = text.apply(eid(S1, 2), &upd2);
 
-        let doc = Document::new(&agg, &text);
-        assert_eq!(doc.get(), "");
+            let doc = Document::new(&agg, &text);
+            assert_eq!(doc.get(), "");
+        })
     }
 
     #[test]
     fn deleted_parent_keeps_children() {
-        let upd1 = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["parent ".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, store!());
-        let mut text = TextAgg::new().apply(eid(S1, 1), &upd1);
+        block_on(async {
+            let upd1 = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["parent ".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd1, store!()).await;
+            let mut text = TextAgg::new().apply(eid(S1, 1), &upd1);
 
-        let parent = AnchorId(eid(S1, 1), 0);
-        let upd2 = TextUpd::new(vec![AnchorPos::new(parent, 0)], vec!["child".to_string()]);
-        let agg = agg.apply(eid(S1, 2), &upd2, store!());
-        text = text.apply(eid(S1, 2), &upd2);
+            let parent = AnchorId(eid(S1, 1), 0);
+            let upd2 = TextUpd::new(vec![AnchorPos::new(parent, 0)], vec!["child".to_string()]);
+            let agg = agg.apply(eid(S1, 2), &upd2, store!()).await;
+            text = text.apply(eid(S1, 2), &upd2);
 
-        let upd3 = TextUpd::empty().with_deletions(vec![parent]);
-        text = text.apply(eid(S1, 3), &upd3);
+            let upd3 = TextUpd::empty().with_deletions(vec![parent]);
+            text = text.apply(eid(S1, 3), &upd3);
 
-        let doc = Document::new(&agg, &text);
-        assert_eq!(doc.get(), "child");
+            let doc = Document::new(&agg, &text);
+            assert_eq!(doc.get(), "child");
+        })
     }
 
     #[test]
     fn fork_independence() {
-        let upd = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["hello".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd);
+        block_on(async {
+            let upd = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["hello".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        let branch = text.fork().apply(
-            eid(S1, 2),
-            &TextUpd::empty().with_deletions(vec![AnchorId(eid(S1, 1), 0)]),
-        );
+            let branch = text.fork().apply(
+                eid(S1, 2),
+                &TextUpd::empty().with_deletions(vec![AnchorId(eid(S1, 1), 0)]),
+            );
 
-        assert_eq!(Document::new(&agg, &text).get(), "hello");
-        assert_eq!(Document::new(&agg, &branch).get(), "");
+            assert_eq!(Document::new(&agg, &text).get(), "hello");
+            assert_eq!(Document::new(&agg, &branch).get(), "");
+        })
     }
 
     #[test]
     fn reapply_is_idempotent() {
-        let upd = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["test".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd);
+        block_on(async {
+            let upd = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["test".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        let agg2 = agg.apply(eid(S1, 1), &upd, store!());
-        let text2 = text.apply(eid(S1, 1), &upd);
+            let agg2 = agg.apply(eid(S1, 1), &upd, store!()).await;
+            let text2 = text.apply(eid(S1, 1), &upd);
 
-        assert_eq!(Document::new(&agg2, &text2).get(), "test");
+            assert_eq!(Document::new(&agg2, &text2).get(), "test");
+        })
     }
 
     #[test]
     fn utf8_content() {
-        let upd = TextUpd::new(
-            vec![
-                AnchorPos::new(ROOT_ANCHOR, 0),
-                AnchorPos::new(ROOT_ANCHOR, 0),
-            ],
-            vec!["мир ".to_string(), "Привет ".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd);
+        block_on(async {
+            let upd = TextUpd::new(
+                vec![
+                    AnchorPos::new(ROOT_ANCHOR, 0),
+                    AnchorPos::new(ROOT_ANCHOR, 0),
+                ],
+                vec!["мир ".to_string(), "Привет ".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        let doc = Document::new(&agg, &text);
-        assert_eq!(doc.get(), "Привет мир ");
+            let doc = Document::new(&agg, &text);
+            assert_eq!(doc.get(), "Привет мир ");
+        })
     }
 
     #[test]
@@ -765,37 +824,43 @@ mod tests {
 
     #[test]
     fn concurrent_non_overlapping_inserts() {
-        let base_upd = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["hello world".to_string()],
-        );
-        let base_agg = AnchorAgg::new().apply(eid(S1, 1), &base_upd, store!());
-        let base_text = TextAgg::new().apply(eid(S1, 1), &base_upd);
+        block_on(async {
+            let base_upd = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["hello world".to_string()],
+            );
+            let base_agg = AnchorAgg::new()
+                .apply(eid(S1, 1), &base_upd, store!())
+                .await;
+            let base_text = TextAgg::new().apply(eid(S1, 1), &base_upd);
 
-        let alice_upd = Document::new(&base_agg, &base_text).diff("hello, world");
+            let alice_upd = Document::new(&base_agg, &base_text).diff("hello, world");
 
-        let bob_upd = Document::new(&base_agg, &base_text).diff("hello world!");
+            let bob_upd = Document::new(&base_agg, &base_text).diff("hello world!");
 
-        const ALICE: LocSenderId = LocSenderId(2);
-        const BOB: LocSenderId = LocSenderId(3);
+            const ALICE: LocSenderId = LocSenderId(2);
+            const BOB: LocSenderId = LocSenderId(3);
 
-        let merged_agg = base_agg
-            .clone()
-            .apply(eid(ALICE, 2), &alice_upd, store!())
-            .apply(eid(BOB, 3), &bob_upd, store!());
-        let merged_text = base_text
-            .clone()
-            .apply(eid(ALICE, 2), &alice_upd)
-            .apply(eid(BOB, 3), &bob_upd);
+            let merged_agg = base_agg
+                .clone()
+                .apply(eid(ALICE, 2), &alice_upd, store!())
+                .await
+                .apply(eid(BOB, 3), &bob_upd, store!())
+                .await;
+            let merged_text = base_text
+                .clone()
+                .apply(eid(ALICE, 2), &alice_upd)
+                .apply(eid(BOB, 3), &bob_upd);
 
-        assert_eq!(
-            Document::new(&merged_agg, &merged_text).get(),
-            "hello, world!",
-            "concurrent non-overlapping inserts should merge cleanly"
-        );
+            assert_eq!(
+                Document::new(&merged_agg, &merged_text).get(),
+                "hello, world!",
+                "concurrent non-overlapping inserts should merge cleanly"
+            );
+        })
     }
 
-    fn assert_diff_roundtrip(
+    async fn assert_diff_roundtrip(
         agg: &AnchorAgg,
         text: &TextAgg,
         new_text: &str,
@@ -807,7 +872,7 @@ mod tests {
             assert_eq!(doc.get(), new_text);
             return;
         }
-        let agg2 = agg.clone().apply(event_id, &upd, store!());
+        let agg2 = agg.clone().apply(event_id, &upd, store!()).await;
         let text2 = text.clone().apply(event_id, &upd);
         let doc2 = Document::new(&agg2, &text2);
         assert_eq!(
@@ -822,177 +887,199 @@ mod tests {
 
     #[test]
     fn diff_no_change() {
-        let upd = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["hello".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd);
+        block_on(async {
+            let upd = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["hello".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        let doc = Document::new(&agg, &text);
-        let result = doc.diff("hello");
-        assert!(result.is_empty());
+            let doc = Document::new(&agg, &text);
+            let result = doc.diff("hello");
+            assert!(result.is_empty());
+        })
     }
 
     #[test]
     fn diff_insert_at_end() {
-        let upd = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["hello".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd);
+        block_on(async {
+            let upd = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["hello".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        assert_diff_roundtrip(&agg, &text, "hello world", eid(S1, 2));
+            assert_diff_roundtrip(&agg, &text, "hello world", eid(S1, 2)).await;
+        })
     }
 
     #[test]
     fn diff_insert_at_beginning() {
-        let upd = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["hello".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd);
+        block_on(async {
+            let upd = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["hello".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        assert_diff_roundtrip(&agg, &text, "well hello", eid(S1, 2));
+            assert_diff_roundtrip(&agg, &text, "well hello", eid(S1, 2)).await;
+        })
     }
 
     #[test]
     fn diff_insert_in_middle() {
-        let upd = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["hello world".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd);
+        block_on(async {
+            let upd = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["hello world".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        assert_diff_roundtrip(&agg, &text, "hello beautiful world", eid(S1, 2));
+            assert_diff_roundtrip(&agg, &text, "hello beautiful world", eid(S1, 2)).await;
+        })
     }
 
     #[test]
     fn diff_delete_suffix() {
-        let upd = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["hello world".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd);
+        block_on(async {
+            let upd = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["hello world".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        assert_diff_roundtrip(&agg, &text, "hello", eid(S1, 2));
+            assert_diff_roundtrip(&agg, &text, "hello", eid(S1, 2)).await;
+        })
     }
 
     #[test]
     fn diff_delete_prefix() {
-        let upd = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["hello world".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd);
+        block_on(async {
+            let upd = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["hello world".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        assert_diff_roundtrip(&agg, &text, "world", eid(S1, 2));
+            assert_diff_roundtrip(&agg, &text, "world", eid(S1, 2)).await;
+        })
     }
 
     #[test]
     fn diff_replace_middle() {
-        let upd = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["hello world".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd);
+        block_on(async {
+            let upd = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["hello world".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        assert_diff_roundtrip(&agg, &text, "hallo world", eid(S1, 2));
+            assert_diff_roundtrip(&agg, &text, "hallo world", eid(S1, 2)).await;
+        })
     }
 
     #[test]
     fn diff_delete_all() {
-        let upd = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["hello".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd);
+        block_on(async {
+            let upd = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["hello".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        assert_diff_roundtrip(&agg, &text, "", eid(S1, 2));
+            assert_diff_roundtrip(&agg, &text, "", eid(S1, 2)).await;
+        })
     }
 
     #[test]
     fn diff_insert_into_empty() {
-        let agg = AnchorAgg::new();
-        let text = TextAgg::new();
+        block_on(async {
+            let agg = AnchorAgg::new();
+            let text = TextAgg::new();
 
-        assert_diff_roundtrip(&agg, &text, "new text", eid(S1, 1));
+            assert_diff_roundtrip(&agg, &text, "new text", eid(S1, 1)).await;
+        })
     }
 
     #[test]
     fn diff_multi_anchor_preserves_clean() {
-        let upd = TextUpd::new(
-            vec![
-                AnchorPos::new(ROOT_ANCHOR, 0),
-                AnchorPos::new(ROOT_ANCHOR, 0),
-            ],
-            vec!["first".to_string(), "second".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd);
+        block_on(async {
+            let upd = TextUpd::new(
+                vec![
+                    AnchorPos::new(ROOT_ANCHOR, 0),
+                    AnchorPos::new(ROOT_ANCHOR, 0),
+                ],
+                vec!["first".to_string(), "second".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        let doc = Document::new(&agg, &text);
-        assert_eq!(doc.get(), "secondfirst");
+            let doc = Document::new(&agg, &text);
+            assert_eq!(doc.get(), "secondfirst");
 
-        assert_diff_roundtrip(&agg, &text, "secondFIRST", eid(S1, 3));
+            assert_diff_roundtrip(&agg, &text, "secondFIRST", eid(S1, 3)).await;
+        })
     }
 
     #[test]
     fn diff_utf8() {
-        let upd = TextUpd::new(
-            vec![AnchorPos::new(ROOT_ANCHOR, 0)],
-            vec!["Привет мир".to_string()],
-        );
-        let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!());
-        let text = TextAgg::new().apply(eid(S1, 1), &upd);
+        block_on(async {
+            let upd = TextUpd::new(
+                vec![AnchorPos::new(ROOT_ANCHOR, 0)],
+                vec!["Привет мир".to_string()],
+            );
+            let agg = AnchorAgg::new().apply(eid(S1, 1), &upd, store!()).await;
+            let text = TextAgg::new().apply(eid(S1, 1), &upd);
 
-        assert_diff_roundtrip(&agg, &text, "Привет прекрасный мир", eid(S1, 2));
+            assert_diff_roundtrip(&agg, &text, "Привет прекрасный мир", eid(S1, 2)).await;
+        })
     }
 }
 
 impl Localizable for AnchorId {
-    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
         if self == ROOT_ANCHOR {
             Ok(self)
         } else {
-            Ok(AnchorId(self.0.localize(r)?, self.1))
+            Ok(AnchorId(self.0.localize(r).await?, self.1))
         }
     }
 }
 
 impl Localizable for AnchorPos {
-    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
         Ok(AnchorPos {
-            parent: self.parent.localize(r)?,
+            parent: self.parent.localize(r).await?,
             offset: self.offset,
         })
     }
 }
 
 impl Localizable for ChildEntry {
-    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
         Ok(ChildEntry {
-            child_id: self.child_id.localize(r)?,
+            child_id: self.child_id.localize(r).await?,
             offset: self.offset,
         })
     }
 }
 
 impl Localizable for AnchorAgg {
-    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
         let mut children = ImHashMap::new();
         for (k, v) in self.children {
-            let k_new = k.localize(r)?;
+            let k_new = k.localize(r).await?;
             let mut v_new = Vec::with_capacity(v.len());
             for e in v {
-                v_new.push(e.localize(r)?);
+                v_new.push(e.localize(r).await?);
             }
             children.insert(k_new, v_new);
         }
@@ -1001,27 +1088,27 @@ impl Localizable for AnchorAgg {
 }
 
 impl Localizable for TextAgg {
-    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
         let mut content = ImHashMap::new();
         for (k, v) in self.content {
-            content.insert(k.localize(r)?, v);
+            content.insert(k.localize(r).await?, v);
         }
         Ok(TextAgg { content })
     }
 }
 
 impl Localizable for TextUpd {
-    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
         let mut new_anchors = Vec::with_capacity(self.new_anchors.len());
         for a in &self.new_anchors {
             new_anchors.push(AnchorPos {
-                parent: a.parent.localize(r)?,
+                parent: a.parent.localize(r).await?,
                 offset: a.offset,
             });
         }
         let mut deletions = Vec::with_capacity(self.deletions.len());
         for d in &self.deletions {
-            deletions.push(d.localize(r)?);
+            deletions.push(d.localize(r).await?);
         }
         Ok(TextUpd {
             new_anchors,

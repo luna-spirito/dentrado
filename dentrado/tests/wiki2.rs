@@ -1,10 +1,10 @@
-use std::num::NonZero;
+use std::{fmt::Debug, num::NonZero};
 
 use dentrado::{
     core::{
-        core_ctx::{Core, GearCtx},
+        core_ctx::GearCtx,
         gear::{GearInput, GearMeta, IsRuntime},
-        loc_ctx::{EventContext, EventStore},
+        storage::{CacheSer, InMemoryStorage, PageId, Storage},
     },
     types::*,
     utils::{
@@ -13,7 +13,6 @@ use dentrado::{
     },
     wire::WireEventBody,
 };
-use im::OrdMap;
 
 mod common;
 use common::TestCluster;
@@ -28,10 +27,10 @@ pub enum Wiki2Gear {
 }
 
 impl Localizable for Wiki2Gear {
-    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+    async fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
         match self {
             Self::Invited { branch } => Ok(Self::Invited {
-                branch: branch.localize(remapper)?,
+                branch: branch.localize(remapper).await?,
             }),
             Self::DocContent { doc } => Ok(Self::DocContent { doc }),
         }
@@ -48,12 +47,12 @@ pub enum Wiki2GearOut {
 }
 
 impl Localizable for Wiki2GearOut {
-    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+    async fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
         match self {
-            Self::Invited(timeline) => Ok(Self::Invited(timeline.localize(remapper)?)),
+            Self::Invited(timeline) => Ok(Self::Invited(timeline.localize(remapper).await?)),
             Self::DocContent { anchors, text } => Ok(Self::DocContent {
-                anchors: anchors.localize(remapper)?,
-                text: text.localize(remapper)?,
+                anchors: anchors.localize(remapper).await?,
+                text: text.localize(remapper).await?,
             }),
         }
     }
@@ -78,31 +77,31 @@ pub enum UpdatePayload {
 }
 
 impl Localizable for Wiki2Body {
-    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+    async fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
         match self {
-            Self::Invite(uid) => Ok(Self::Invite(uid.localize(remapper)?)),
-            Self::Attach(body) => Ok(Self::Attach(body.localize(remapper)?)),
+            Self::Invite(uid) => Ok(Self::Invite(uid.localize(remapper).await?)),
+            Self::Attach(body) => Ok(Self::Attach(body.localize(remapper).await?)),
         }
     }
 }
 
 impl Localizable for AttachBody {
-    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+    async fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
         Ok(AttachBody {
-            branch: self.branch.localize(remapper)?,
-            payload: self.payload.localize(remapper)?,
+            branch: self.branch.localize(remapper).await?,
+            payload: self.payload.localize(remapper).await?,
         })
     }
 }
 
 impl Localizable for UpdatePayload {
-    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+    async fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
         match self {
             Self::Edit { edit } => Ok(Self::Edit {
-                edit: edit.localize(remapper)?,
+                edit: edit.localize(remapper).await?,
             }),
             Self::Merge { from } => Ok(Self::Merge {
-                from: from.localize(remapper)?,
+                from: from.localize(remapper).await?,
             }),
         }
     }
@@ -131,33 +130,37 @@ pub struct BranchData {
 }
 
 impl Localizable for BranchData {
-    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+    async fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
         Ok(BranchData {
-            creator: self.creator.localize(remapper)?,
+            creator: self.creator.localize(remapper).await?,
             created_at: self.created_at,
         })
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct InvitedCache {
-    pub processed_added: usize,
-    pub processed_removed: usize,
+pub struct InvitedCache<W> {
+    pub watermark: W,
     pub sg: StateGraph<(), (), (), LocUserId, bool>,
 }
 
 #[derive(Debug, Clone)]
-pub struct DocContentCache {
-    pub processed_added: usize,
-    pub processed_removed: usize,
+pub struct DocContentCache<W> {
+    pub watermark: W,
     pub anchors: AnchorAgg,
     pub sg: StateGraph<LocDataId, LocUserId, bool, LocDataId, TextAgg>,
 }
 
 #[derive(Debug, Clone)]
-pub enum Wiki2Cache {
-    Invited(InvitedCache),
-    DocContent(DocContentCache),
+pub enum Wiki2Cache<W> {
+    Invited(InvitedCache<W>),
+    DocContent(DocContentCache<W>),
+}
+
+impl<W> CacheSer for Wiki2Cache<W> {
+    fn page_roots(&self) -> &[PageId] {
+        &[]
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -167,9 +170,9 @@ pub enum Wiki2Group {
 }
 
 impl Localizable for Wiki2Group {
-    fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
+    async fn localize<Rm: Remapper>(self, remapper: &mut Rm) -> Result<Self, Rm::Err> {
         match self {
-            Self::Branch(b) => Ok(Self::Branch(b.localize(remapper)?)),
+            Self::Branch(b) => Ok(Self::Branch(b.localize(remapper).await?)),
             Self::Doc(d) => Ok(Self::Doc(d)),
         }
     }
@@ -185,7 +188,10 @@ impl IsRuntime for Wiki2Runtime {
     type Group = Wiki2Group;
     type Body = Wiki2Body;
     type Data = BranchData;
-    type GearCache = Wiki2Cache;
+    type GearCache<W>
+        = Wiki2Cache<W>
+    where
+        W: Debug + Clone + 'static;
 
     fn hash_data(
         data: &Self::Data,
@@ -232,26 +238,24 @@ impl IsRuntime for Wiki2Runtime {
         }
     }
 
-    fn make_cache(gear: &Self::GearId) -> Self::GearCache {
+    fn make_cache<W: Debug + Clone + Default + 'static>(gear: &Self::GearId) -> Self::GearCache<W> {
         match gear {
             Wiki2Gear::Invited { .. } => Wiki2Cache::Invited(InvitedCache {
-                processed_added: 0,
-                processed_removed: 0,
+                watermark: W::default(),
                 sg: StateGraph::new(),
             }),
             Wiki2Gear::DocContent { .. } => Wiki2Cache::DocContent(DocContentCache {
-                processed_added: 0,
-                processed_removed: 0,
+                watermark: W::default(),
                 anchors: AnchorAgg::new(),
                 sg: StateGraph::new(),
             }),
         }
     }
 
-    async fn run_step(
-        ctx: &mut GearCtx<Self>,
+    async fn run_step<S: Storage<Self>>(
+        ctx: &mut GearCtx<Self, S>,
         input: GearInput,
-        cache: &mut Self::GearCache,
+        cache: &mut Self::GearCache<S::Watermark>,
     ) -> Self::GearOut {
         let GearInput::Events(group) = input else {
             return match cache {
@@ -264,17 +268,11 @@ impl IsRuntime for Wiki2Runtime {
         };
         match (ctx.gear(), cache) {
             (Wiki2Gear::Invited { branch }, Wiki2Cache::Invited(c)) => {
-                let Some((added_ids, removed_ids)) =
-                    ctx.query_events(group, (c.processed_added, c.processed_removed), |a, r| {
-                        (a.to_vec(), r.to_vec())
-                    })
-                else {
-                    return Wiki2GearOut::Invited(c.sg.as_writes());
-                };
+                let diff = ctx.storage().diff_group(group, c.watermark.clone()).await;
 
                 let core = ctx.core();
                 let store = core.group_store(group);
-                let (_, branch_data) = store.data(*branch).expect("Branch data not found");
+                let (_, branch_data) = store.data(*branch).await.expect("Branch data not found");
                 let creator = branch_data.creator;
 
                 let mut handler = async move |invitee: &LocUserId,
@@ -283,6 +281,7 @@ impl IsRuntime for Wiki2Runtime {
                     (),
                     (),
                     Self,
+                    S,
                     LocUserId,
                     bool,
                     _,
@@ -291,17 +290,19 @@ impl IsRuntime for Wiki2Runtime {
                     let stored = hctx
                         .store()
                         .stored_event(event_id.local_id())
+                        .await
                         .expect("stored event not found");
                     let sender_sid = stored.sender;
                     let sender_uid = hctx
                         .store()
                         .sender_user(sender_sid)
+                        .await
                         .expect("sender user not found");
 
                     let sender_invited = if sender_uid == creator {
                         true
                     } else {
-                        hctx.query(&sender_uid).unwrap_or(false)
+                        hctx.query(&sender_uid).await.unwrap_or(false)
                     };
 
                     if sender_invited {
@@ -309,9 +310,10 @@ impl IsRuntime for Wiki2Runtime {
                     }
                 };
 
-                let event_resolver = |local_id: GroupEventId| {
+                let event_resolver = async |local_id: GroupEventId| {
                     let stored = store
                         .stored_event(local_id)
+                        .await
                         .expect("stored event not found");
                     let sg_id = SGEventId::new(
                         SGBucketId {
@@ -324,49 +326,40 @@ impl IsRuntime for Wiki2Runtime {
 
                 let mut dep_resolver = async |_: &()| -> Timeline<(), ()> { Timeline::new() };
 
-                let added_len = added_ids.len();
-                let removed_len = removed_ids.len();
+                let watermark = diff.watermark;
+                let delta = DeltaList {
+                    removed: diff.removed,
+                    added: diff.added,
+                };
 
                 c.sg.apply(
                     &mut handler,
                     &event_resolver,
                     &mut dep_resolver,
                     &store,
-                    &DeltaList {
-                        removed: removed_ids,
-                        added: added_ids,
-                    },
+                    &delta,
                 )
                 .await;
 
-                c.processed_added += added_len;
-                c.processed_removed += removed_len;
+                c.watermark = watermark;
 
                 Wiki2GearOut::Invited(c.sg.as_writes())
             }
             (Wiki2Gear::DocContent { .. }, Wiki2Cache::DocContent(c)) => {
-                let Some((added_ids, removed_ids)) =
-                    ctx.query_events(group, (c.processed_added, c.processed_removed), |a, r| {
-                        (a.to_vec(), r.to_vec())
-                    })
-                else {
-                    return Wiki2GearOut::DocContent {
-                        anchors: c.anchors.clone(),
-                        text: c.sg.as_writes(),
-                    };
-                };
+                let diff = ctx.storage().diff_group(group, c.watermark.clone()).await;
 
                 let core = ctx.core();
                 let store = core.group_store(group);
 
                 // Update anchors
-                for &eid in &added_ids {
-                    let stored = store.stored_event(eid).expect("event not found");
+                for &eid in &diff.added {
+                    let stored = store.stored_event(eid).await.expect("event not found");
                     let attach_body = stored.body.unwrap_attach();
                     match &attach_body.payload {
                         UpdatePayload::Edit { edit } => {
                             let sender_event_id = LocSenderEventId(stored.sender, stored.tx_id);
-                            c.anchors = c.anchors.clone().apply(sender_event_id, edit, &store);
+                            c.anchors =
+                                c.anchors.clone().apply(sender_event_id, edit, &store).await;
                         }
                         UpdatePayload::Merge { .. } => {}
                     }
@@ -390,6 +383,7 @@ impl IsRuntime for Wiki2Runtime {
                     LocUserId,
                     bool,
                     Self,
+                    S,
                     LocDataId,
                     TextAgg,
                     _,
@@ -398,16 +392,21 @@ impl IsRuntime for Wiki2Runtime {
                     let stored = hctx
                         .store()
                         .stored_event(event_id.local_id())
+                        .await
                         .expect("stored event not found");
                     let sender_sid = stored.sender;
                     let sender_uid = hctx
                         .store()
                         .sender_user(sender_sid)
+                        .await
                         .expect("sender user not found");
 
                     let branch = event_body.branch;
-                    let (_, branch_data) =
-                        hctx.store().data(branch).expect("Branch data not found");
+                    let (_, branch_data) = hctx
+                        .store()
+                        .data(branch)
+                        .await
+                        .expect("Branch data not found");
                     let creator = branch_data.creator;
 
                     let is_invited = if sender_uid == creator {
@@ -417,10 +416,10 @@ impl IsRuntime for Wiki2Runtime {
                     };
 
                     if is_invited {
-                        let curr_text_agg = hctx.query(&branch).unwrap_or_default();
+                        let curr_text_agg = hctx.query(&branch).await.unwrap_or_default();
                         let next_text_agg = match &event_body.payload {
                             UpdatePayload::Merge { from } => {
-                                let from_text_agg = hctx.query(from).unwrap_or_default();
+                                let from_text_agg = hctx.query(from).await.unwrap_or_default();
                                 curr_text_agg.merge(&from_text_agg)
                             }
                             UpdatePayload::Edit { edit } => {
@@ -432,9 +431,10 @@ impl IsRuntime for Wiki2Runtime {
                     }
                 };
 
-                let event_resolver = |local_id: GroupEventId| {
+                let event_resolver = async |local_id: GroupEventId| {
                     let stored = store
                         .stored_event(local_id)
+                        .await
                         .expect("stored event not found");
                     let sg_id = SGEventId::new(
                         SGBucketId {
@@ -445,23 +445,22 @@ impl IsRuntime for Wiki2Runtime {
                     (sg_id, stored.body.unwrap_attach().clone())
                 };
 
-                let added_len = added_ids.len();
-                let removed_len = removed_ids.len();
+                let watermark = diff.watermark;
+                let delta = DeltaList {
+                    removed: diff.removed,
+                    added: diff.added,
+                };
 
                 c.sg.apply(
                     &mut handler,
                     &event_resolver,
                     &mut dep_resolver,
                     &store,
-                    &DeltaList {
-                        removed: removed_ids,
-                        added: added_ids,
-                    },
+                    &delta,
                 )
                 .await;
 
-                c.processed_added += added_len;
-                c.processed_removed += removed_len;
+                c.watermark = watermark;
 
                 Wiki2GearOut::DocContent {
                     anchors: c.anchors.clone(),
@@ -473,12 +472,15 @@ impl IsRuntime for Wiki2Runtime {
     }
 }
 
-fn add_seed_branch(tc: &mut TestCluster<Wiki2Runtime>, creator_uid: LocUserId) -> LocDataId {
+fn add_seed_branch(
+    tc: &mut TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>>,
+    creator_uid: LocUserId,
+) -> LocDataId {
     let b0 = tc.add_data(BranchData {
         creator: creator_uid,
         created_at: 1,
     });
-    tc.loc_ctx.mk_loc_group(MSG_INVITE, Wiki2Group::Branch(b0));
+    tc.mk_loc_group(MSG_INVITE, Wiki2Group::Branch(b0));
     b0
 }
 
@@ -573,7 +575,7 @@ fn count_branches(sg: &Timeline<LocDataId, TextAgg>) -> usize {
 }
 
 fn find_cross_core_doc_id(
-    tc: &TestCluster<Wiki2Runtime>,
+    tc: &TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>>,
     invited_core: u32,
     num_cores: u32,
 ) -> u64 {
@@ -597,7 +599,11 @@ fn find_cross_core_doc_id(
         .expect("should find a suitable doc_id for cross-core routing")
 }
 
-fn find_same_core_doc_id(tc: &TestCluster<Wiki2Runtime>, invited_core: u32, num_cores: u32) -> u64 {
+fn find_same_core_doc_id(
+    tc: &TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>>,
+    invited_core: u32,
+    num_cores: u32,
+) -> u64 {
     (1..10_000)
         .find(|&d| {
             let doc_gear = Wiki2Gear::DocContent { doc: Id(d) };
@@ -620,7 +626,8 @@ fn find_same_core_doc_id(tc: &TestCluster<Wiki2Runtime>, invited_core: u32, num_
 
 #[test]
 fn invited_simple_e2e() {
-    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>> =
+        TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -639,9 +646,9 @@ fn invited_simple_e2e() {
     let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
     let carol = tc.add_user(SenderPk([3u8; 32]), carol_uid);
 
-    let alice_loc_uid = tc.loc_ctx.mk_loc_user(alice_uid);
-    let bob_loc_uid = tc.loc_ctx.mk_loc_user(bob_uid);
-    let carol_loc_uid = tc.loc_ctx.mk_loc_user(carol_uid);
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.mk_loc_user(bob_uid);
+    let carol_loc_uid = tc.mk_loc_user(carol_uid);
 
     let b0 = add_seed_branch(&mut tc, alice_loc_uid);
 
@@ -673,7 +680,8 @@ fn invited_simple_e2e() {
 
 #[test]
 fn doc_content_same_core_e2e() {
-    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>> =
+        TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -692,8 +700,8 @@ fn doc_content_same_core_e2e() {
     let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
     let eve = tc.add_user(SenderPk([3u8; 32]), eve_uid);
 
-    let alice_loc_uid = tc.loc_ctx.mk_loc_user(alice_uid);
-    let bob_loc_uid = tc.loc_ctx.mk_loc_user(bob_uid);
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.mk_loc_user(bob_uid);
 
     let b0 = add_seed_branch(&mut tc, alice_loc_uid);
 
@@ -709,8 +717,7 @@ fn doc_content_same_core_e2e() {
     .route(NonZero::new(2).unwrap());
 
     let doc_id = find_same_core_doc_id(&tc, invited_core, 2);
-    tc.loc_ctx
-        .mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
+    tc.mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
 
     let text_upd = TextUpd::new(
         vec![AnchorPos::new(ROOT_ANCHOR, 0)],
@@ -749,7 +756,8 @@ fn doc_content_same_core_e2e() {
 
 #[test]
 fn doc_content_cross_core_e2e() {
-    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>> =
+        TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -763,8 +771,8 @@ fn doc_content_cross_core_e2e() {
     let alice = tc.add_user(SenderPk([1u8; 32]), alice_uid);
     let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
 
-    let alice_loc_uid = tc.loc_ctx.mk_loc_user(alice_uid);
-    let bob_loc_uid = tc.loc_ctx.mk_loc_user(bob_uid);
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.mk_loc_user(bob_uid);
 
     let b0 = add_seed_branch(&mut tc, alice_loc_uid);
 
@@ -778,8 +786,7 @@ fn doc_content_cross_core_e2e() {
     .route(NonZero::new(2).unwrap());
 
     let doc_id = find_cross_core_doc_id(&tc, invited_core, 2);
-    tc.loc_ctx
-        .mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
+    tc.mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
     eprintln!("found doc_id={doc_id} (invited → core {invited_core})");
 
     tc.post_events(vec![make_invite_event(alice, 0, b0, bob_loc_uid)], 1);
@@ -824,7 +831,8 @@ fn doc_content_cross_core_e2e() {
 
 #[test]
 fn retroactive_invite_cross_core_e2e() {
-    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>> =
+        TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -853,10 +861,10 @@ fn retroactive_invite_cross_core_e2e() {
     let dave = tc.add_user(SenderPk([4u8; 32]), dave_uid);
     let eve = tc.add_user(SenderPk([5u8; 32]), eve_uid);
 
-    let alice_loc_uid = tc.loc_ctx.mk_loc_user(alice_uid);
-    let bob_loc_uid = tc.loc_ctx.mk_loc_user(bob_uid);
-    let carol_loc_uid = tc.loc_ctx.mk_loc_user(carol_uid);
-    let dave_loc_uid = tc.loc_ctx.mk_loc_user(dave_uid);
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.mk_loc_user(bob_uid);
+    let carol_loc_uid = tc.mk_loc_user(carol_uid);
+    let dave_loc_uid = tc.mk_loc_user(dave_uid);
 
     let b0 = add_seed_branch(&mut tc, alice_loc_uid);
 
@@ -870,8 +878,7 @@ fn retroactive_invite_cross_core_e2e() {
     .route(NonZero::new(2).unwrap());
 
     let doc_id = find_cross_core_doc_id(&tc, invited_core, 2);
-    tc.loc_ctx
-        .mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
+    tc.mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
 
     tc.post_events(vec![make_invite_event(alice, 1, b0, bob_loc_uid)], 2);
 
@@ -942,7 +949,8 @@ fn retroactive_invite_cross_core_e2e() {
 
 #[test]
 fn text_agg_merge_cross_core_e2e() {
-    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>> =
+        TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -961,8 +969,8 @@ fn text_agg_merge_cross_core_e2e() {
     let carol = tc.add_user(SenderPk([2u8; 32]), carol_uid);
     let eve = tc.add_user(SenderPk([3u8; 32]), eve_uid);
 
-    let alice_loc_uid = tc.loc_ctx.mk_loc_user(alice_uid);
-    let carol_loc_uid = tc.loc_ctx.mk_loc_user(carol_uid);
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let carol_loc_uid = tc.mk_loc_user(carol_uid);
 
     let b0 = add_seed_branch(&mut tc, alice_loc_uid);
     let b1 = add_seed_branch(&mut tc, carol_loc_uid);
@@ -977,8 +985,7 @@ fn text_agg_merge_cross_core_e2e() {
     .route(NonZero::new(2).unwrap());
 
     let doc_id = find_cross_core_doc_id(&tc, invited_core, 2);
-    tc.loc_ctx
-        .mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
+    tc.mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
 
     let alice_text_upd = TextUpd::new(
         vec![AnchorPos::new(ROOT_ANCHOR, 0)],
@@ -1040,7 +1047,8 @@ fn text_agg_merge_cross_core_e2e() {
 
 #[test]
 fn multi_user_doc_assembly_cross_core_e2e() {
-    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>> =
+        TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -1069,10 +1077,10 @@ fn multi_user_doc_assembly_cross_core_e2e() {
     let dave = tc.add_user(SenderPk([4u8; 32]), dave_uid);
     let eve = tc.add_user(SenderPk([5u8; 32]), eve_uid);
 
-    let alice_loc_uid = tc.loc_ctx.mk_loc_user(alice_uid);
-    let bob_loc_uid = tc.loc_ctx.mk_loc_user(bob_uid);
-    let carol_loc_uid = tc.loc_ctx.mk_loc_user(carol_uid);
-    let dave_loc_uid = tc.loc_ctx.mk_loc_user(dave_uid);
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.mk_loc_user(bob_uid);
+    let carol_loc_uid = tc.mk_loc_user(carol_uid);
+    let dave_loc_uid = tc.mk_loc_user(dave_uid);
 
     let b0 = add_seed_branch(&mut tc, alice_loc_uid);
 
@@ -1086,8 +1094,7 @@ fn multi_user_doc_assembly_cross_core_e2e() {
     .route(NonZero::new(2).unwrap());
 
     let doc_id = find_cross_core_doc_id(&tc, invited_core, 2);
-    tc.loc_ctx
-        .mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
+    tc.mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
 
     tc.post_events(
         vec![
@@ -1174,7 +1181,8 @@ fn multi_user_doc_assembly_cross_core_e2e() {
 
 #[test]
 fn retroactive_invite_point_in_time_same_core_e2e() {
-    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>> =
+        TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -1188,8 +1196,8 @@ fn retroactive_invite_point_in_time_same_core_e2e() {
     let alice = tc.add_user(SenderPk([1u8; 32]), alice_uid);
     let bob = tc.add_user(SenderPk([2u8; 32]), bob_uid);
 
-    let alice_loc_uid = tc.loc_ctx.mk_loc_user(alice_uid);
-    let bob_loc_uid = tc.loc_ctx.mk_loc_user(bob_uid);
+    let alice_loc_uid = tc.mk_loc_user(alice_uid);
+    let bob_loc_uid = tc.mk_loc_user(bob_uid);
 
     let b0 = add_seed_branch(&mut tc, alice_loc_uid);
 
@@ -1203,8 +1211,7 @@ fn retroactive_invite_point_in_time_same_core_e2e() {
     .route(NonZero::new(2).unwrap());
 
     let doc_id = find_same_core_doc_id(&tc, invited_core, 2);
-    tc.loc_ctx
-        .mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
+    tc.mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
 
     let bob_text_upd_1 = TextUpd::new(
         vec![AnchorPos::new(ROOT_ANCHOR, 0)],

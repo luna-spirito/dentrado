@@ -12,6 +12,7 @@ use crate::{
     core::{
         core_ctx::{CoordCmd, Core, CoreCmd, InterCoreMsg, InterNodeMsg, RerouteMsg},
         gear::IsRuntime,
+        storage::Storage,
     },
     types::{GlobalCoreId, NodeId},
     wire::{MergeError, RunGearError, WireEventBody, WireLocCtx},
@@ -19,7 +20,7 @@ use crate::{
 
 pub use crate::core::doorbell::{Doorbell, DoorbellHandle};
 
-pub struct DbConfig<R: IsRuntime> {
+pub struct DbConfig<R: IsRuntime, S: Storage<R>> {
     pub num_cores: NonZero<u32>,
     pub node_id: NodeId,
     pub module: Arc<R::Module>,
@@ -27,6 +28,11 @@ pub struct DbConfig<R: IsRuntime> {
     /// One doorbell per core (the waiting side). Created by the caller,
     /// passed here so `Db::start` can use them in `core_event_loop`.
     pub doorbells: Vec<(Doorbell, DoorbellHandle)>,
+    /// Constructs a fresh storage backend for each core, **on that core's
+    /// thread**. Building on-thread (rather than moving a pre-built backend
+    /// in from the caller) means `Storage` need not be `Send` — backends are
+    /// free to hold `!Send` single-threaded types like `Rc`/`RefCell`.
+    pub make_storage: Arc<dyn Fn() -> S + Send + Sync>,
 }
 
 pub struct PeerChannels<R: IsRuntime> {
@@ -129,15 +135,18 @@ impl<R: IsRuntime> Db<R> {
     /// Start the database with no user worker function.
     /// Cores run only the core event loop.
     #[must_use]
-    pub fn start(config: DbConfig<R>) -> io::Result<Self> {
-        Self::start_with_worker(config, |_| std::future::pending::<()>())
+    pub fn start<S: Storage<R>>(config: DbConfig<R, S>) -> io::Result<Self> {
+        Self::start_with_worker::<S, _, _>(config, |_| std::future::pending::<()>())
     }
 
     /// Start the database with a user-provided worker function per core.
     #[must_use]
-    pub fn start_with_worker<W, F>(mut config: DbConfig<R>, worker_fn: W) -> io::Result<Self>
+    pub fn start_with_worker<S: Storage<R>, W, F>(
+        mut config: DbConfig<R, S>,
+        worker_fn: W,
+    ) -> io::Result<Self>
     where
-        W: Fn(Rc<Core<R>>) -> F + Clone + Send + 'static,
+        W: Fn(Rc<Core<R, S>>) -> F + Clone + Send + 'static,
         F: Future<Output = ()> + 'static,
     {
         let num_cores = config.num_cores;
@@ -230,11 +239,16 @@ impl<R: IsRuntime> Db<R> {
             let core_doorbells = doorbell_handles.clone();
 
             let worker_fn = worker_fn.clone();
+            let make_storage = config.make_storage.clone();
 
             let join = thread::Builder::new()
                 .name(format!("dentrado-core-{core_id}"))
                 // .stack_size(CORE_THREAD_STACK_SIZE)
                 .spawn(move || {
+                    // Build the storage backend on this thread so that
+                    // `!Send` single-threaded backends stay valid.
+                    let storage = make_storage();
+
                     let runtime = compio::runtime::RuntimeBuilder::new()
                         .thread_affinity(HashSet::from([core_id as usize]))
                         .build()
@@ -250,6 +264,7 @@ impl<R: IsRuntime> Db<R> {
                             reroute_senders,
                             core_doorbells,
                             inter_node_peers,
+                            storage,
                         ));
 
                         compio::runtime::spawn(worker_fn(state.clone())).detach();
@@ -357,8 +372,8 @@ impl<R: IsRuntime> Drop for Db<R> {
     }
 }
 
-async fn core_event_loop<R: IsRuntime>(
-    state: Rc<Core<R>>,
+async fn core_event_loop<R: IsRuntime, S: Storage<R>>(
+    state: Rc<Core<R, S>>,
     doorbell: Doorbell,
     cmd_rx: mpsc::Receiver<CoordCmd<R>>,
     intercore_rxs: Vec<mpsc::Receiver<InterCoreMsg<R>>>,
@@ -378,7 +393,7 @@ async fn core_event_loop<R: IsRuntime>(
                 loop {
                     match rx.try_recv() {
                         Ok(msg) => {
-                            state.handle_inter_node_msg(peer_idx, msg);
+                            state.handle_inter_node_msg(peer_idx, msg).await;
                             did_work = true;
                         }
                         Err(mpsc::TryRecvError::Empty) => break,
@@ -393,7 +408,7 @@ async fn core_event_loop<R: IsRuntime>(
             loop {
                 match rx.try_recv() {
                     Ok(msg) => {
-                        state.handle_intercore_msg(msg);
+                        state.handle_intercore_msg(msg).await;
                         did_work = true;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -418,7 +433,7 @@ async fn core_event_loop<R: IsRuntime>(
         loop {
             match cmd_rx.try_recv() {
                 Ok(CoordCmd::Op(op)) => {
-                    state.handle_client_op(op);
+                    state.handle_client_op(op).await;
                     did_work = true;
                 }
                 Ok(CoordCmd::Shutdown) => return,

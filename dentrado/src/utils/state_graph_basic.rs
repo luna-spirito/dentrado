@@ -1,23 +1,34 @@
 use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, Timeline};
 use crate::core::gear::EmptyRuntime;
-use crate::core::loc_ctx::{EventContext, GroupStore, LocCtx, StoredEvent};
-use crate::types::{GroupEventId, LocGroupId, SenderPk};
+use crate::core::loc_ctx::StoredEvent;
+use crate::core::storage::{GroupStore, InMemoryStorage, Storage};
+use crate::types::{GroupEventId, LocGroupId, LocMsgTypeId, NodeId, SenderPk};
 use im::OrdMap;
 use std::collections::BTreeMap;
 
 type SG<K, V> = StateGraph<(), (), (), K, V>;
+type Store = InMemoryStorage<EmptyRuntime>;
 
 const PK_A: SenderPk = SenderPk([0u8; 32]);
 
 /// Drive a future on a throwaway compio runtime (state_graph is async but I/O-free).
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    compio::runtime::RuntimeBuilder::new()
-        .build()
-        .expect("compio runtime build failed")
-        .block_on(fut)
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Noop;
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+    let waker = Waker::from(Arc::new(Noop));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => panic!("future yielded unexpectedly"),
+    }
 }
 
-fn gs(ctx: &LocCtx<EmptyRuntime>) -> GroupStore<'_, EmptyRuntime> {
+fn gs(ctx: &Store) -> GroupStore<'_, EmptyRuntime, Store> {
     GroupStore::new(ctx, LocGroupId(0))
 }
 
@@ -29,20 +40,21 @@ const fn lid(id: u64) -> GroupEventId {
     GroupEventId(id)
 }
 
-fn make_test_ctx(num_events: u64) -> LocCtx<EmptyRuntime> {
-    let mut ctx = LocCtx::new();
-    let sid_a = ctx.mk_loc_sender(PK_A, None);
+fn make_test_ctx(num_events: u64) -> Store {
+    let ctx = InMemoryStorage::<EmptyRuntime>::default();
+    let sid_a = block_on(ctx.mk_loc_sender(PK_A, None));
+    block_on(ctx.mk_loc_group(LocMsgTypeId(0), ()));
     for i in 0..num_events {
-        ctx.store_event(
+        block_on(ctx.store_event(
             LocGroupId(0),
             StoredEvent {
                 sender: sid_a,
                 tx_id: i as u32,
                 timestamp: 0,
-                source_node: crate::types::NodeId(0),
+                source_node: NodeId(0),
                 body: (),
             },
-        );
+        ));
     }
     ctx
 }
@@ -56,17 +68,17 @@ enum TestEvent {
 
 async fn test_handler<R: async FnMut(&()) -> Timeline<(), ()>>(
     event: &TestEvent,
-    ctx: &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &str, i32, R>,
+    ctx: &mut HandlerCtx<'_, (), (), (), EmptyRuntime, Store, &'static str, i32, R>,
 ) {
     match event {
         TestEvent::SetX(val) => ctx.update("x", *val),
         TestEvent::CopyXToY => {
-            if let Some(x) = ctx.query(&"x") {
+            if let Some(x) = ctx.query(&"x").await {
                 ctx.update("y", x + 1);
             }
         }
         TestEvent::CopyYToZ => {
-            if let Some(y) = ctx.query(&"y") {
+            if let Some(y) = ctx.query(&"y").await {
                 ctx.update("z", y + 1);
             }
         }
@@ -75,8 +87,10 @@ async fn test_handler<R: async FnMut(&()) -> Timeline<(), ()>>(
 
 type EventStore<E> = BTreeMap<u64, (u32, E)>;
 
-fn make_resolver<E: Clone>(events: &EventStore<E>) -> impl Fn(GroupEventId) -> (SGEventId, E) + '_ {
-    move |local_id: GroupEventId| {
+fn make_resolver<E: Clone>(
+    events: &EventStore<E>,
+) -> impl async Fn(GroupEventId) -> (SGEventId, E) + '_ {
+    async move |local_id: GroupEventId| {
         let (ts, e) = events
             .get(&(local_id.0 as u64))
             .expect("make_resolver: event not found");
@@ -90,10 +104,10 @@ async fn apply_added<E: Clone, H, R>(
     events: &mut EventStore<E>,
     handler: &mut H,
     r: &mut R,
-    ctx: &dyn crate::core::loc_ctx::EventStore<EmptyRuntime>,
+    store: &GroupStore<'_, EmptyRuntime, Store>,
     added: &[(u64, u32, E)],
 ) where
-    H: async FnMut(&E, &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &'static str, i32, R>),
+    H: async FnMut(&E, &mut HandlerCtx<'_, (), (), (), EmptyRuntime, Store, &'static str, i32, R>),
     R: async FnMut(&()) -> Timeline<(), ()>,
 {
     for (local_id, ts, e) in added {
@@ -103,7 +117,7 @@ async fn apply_added<E: Clone, H, R>(
         handler,
         &make_resolver(events),
         r,
-        ctx,
+        store,
         &DeltaList {
             removed: vec![],
             added: added.iter().map(|(l, _, _)| lid(*l)).collect(),
@@ -117,17 +131,18 @@ async fn apply_removed<E: Clone, H, R>(
     events: &mut EventStore<E>,
     handler: &mut H,
     r: &mut R,
-    ctx: &dyn crate::core::loc_ctx::EventStore<EmptyRuntime>,
+    store: &GroupStore<'_, EmptyRuntime, Store>,
     removed: &[u64],
 ) where
-    H: async FnMut(&E, &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &'static str, i32, R>),
+    H: async FnMut(&E, &mut HandlerCtx<'_, (), (), (), EmptyRuntime, Store, &'static str, i32, R>),
     R: async FnMut(&()) -> Timeline<(), ()>,
 {
+    let _ = events;
     sg.apply(
         handler,
         &make_resolver(events),
         r,
-        ctx,
+        store,
         &DeltaList {
             removed: removed.iter().map(|&id| lid(id)).collect(),
             added: vec![],
@@ -308,19 +323,29 @@ fn conditional_write_changes_on_re_evaluation() {
         WriteYIfXPositive,
     }
     block_on(async {
-        let handler =
-            async |ev: &E, ctx: &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &str, i32, _>| {
-                match ev {
-                    E::SetX(val) => ctx.update("x", *val),
-                    E::WriteYIfXPositive => {
-                        if let Some(x) = ctx.query(&"x") {
-                            if x > 0 {
-                                ctx.update("y", x * 2);
-                            }
+        let handler = async |ev: &E,
+                             ctx: &mut HandlerCtx<
+            '_,
+            (),
+            (),
+            (),
+            EmptyRuntime,
+            Store,
+            &str,
+            i32,
+            _,
+        >| {
+            match ev {
+                E::SetX(val) => ctx.update("x", *val),
+                E::WriteYIfXPositive => {
+                    if let Some(x) = ctx.query(&"x").await {
+                        if x > 0 {
+                            ctx.update("y", x * 2);
                         }
                     }
                 }
-            };
+            }
+        };
         let mut sg: SG<&str, i32> = SG::new();
         let mut events: EventStore<E> = EventStore::new();
         let loc = make_test_ctx(10);
@@ -364,18 +389,28 @@ fn bounded_propagation_skips_events_after_next_write() {
         ReadX(()),
     }
     block_on(async {
-        let handler =
-            async |ev: &E, ctx: &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &str, i32, _>| {
-                match ev {
-                    E::SetX(val) => ctx.update("x", *val),
-                    E::OverwriteX(val) => ctx.update("x", *val),
-                    E::ReadX(_) => {
-                        if let Some(x) = ctx.query(&"x") {
-                            ctx.update("out", x);
-                        }
+        let handler = async |ev: &E,
+                             ctx: &mut HandlerCtx<
+            '_,
+            (),
+            (),
+            (),
+            EmptyRuntime,
+            Store,
+            &str,
+            i32,
+            _,
+        >| {
+            match ev {
+                E::SetX(val) => ctx.update("x", *val),
+                E::OverwriteX(val) => ctx.update("x", *val),
+                E::ReadX(_) => {
+                    if let Some(x) = ctx.query(&"x").await {
+                        ctx.update("out", x);
                     }
                 }
-            };
+            }
+        };
         let mut sg: SG<&str, i32> = SG::new();
         let mut events: EventStore<E> = EventStore::new();
         let loc = make_test_ctx(10);
@@ -411,9 +446,9 @@ fn bounded_propagation_skips_events_after_next_write() {
             },
         )
         .await;
-        assert_eq!(sg.query_at(&"out", eid(0, 2), &ctx), Some(&20));
-        assert_eq!(sg.query_at(&"out", eid(0, 3), &ctx), Some(&20));
-        assert_eq!(sg.query_at(&"out", eid(0, 7), &ctx), Some(&99)); // NOT re-processed
+        assert_eq!(sg.query_at(&"out", eid(0, 2), &ctx).await, Some(&20));
+        assert_eq!(sg.query_at(&"out", eid(0, 3), &ctx).await, Some(&20));
+        assert_eq!(sg.query_at(&"out", eid(0, 7), &ctx).await, Some(&99)); // NOT re-processed
     });
 }
 
@@ -425,18 +460,28 @@ fn handler_query_excludes_own_write() {
         WriteAndReadX(i32),
     }
     block_on(async {
-        let handler =
-            async |ev: &E, ctx: &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &str, i32, _>| {
-                match ev {
-                    E::SetX(val) => ctx.update("x", *val),
-                    E::WriteAndReadX(val) => {
-                        ctx.update("x", *val);
-                        if let Some(prev) = ctx.query(&"x") {
-                            ctx.update("saw_prev", prev);
-                        }
+        let handler = async |ev: &E,
+                             ctx: &mut HandlerCtx<
+            '_,
+            (),
+            (),
+            (),
+            EmptyRuntime,
+            Store,
+            &str,
+            i32,
+            _,
+        >| {
+            match ev {
+                E::SetX(val) => ctx.update("x", *val),
+                E::WriteAndReadX(val) => {
+                    ctx.update("x", *val);
+                    if let Some(prev) = ctx.query(&"x").await {
+                        ctx.update("saw_prev", prev);
                     }
                 }
-            };
+            }
+        };
         let mut sg: SG<&str, i32> = SG::new();
         let mut events: EventStore<E> = EventStore::new();
         let loc = make_test_ctx(10);

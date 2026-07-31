@@ -228,8 +228,8 @@ pub(crate) struct Attestation {
 pub struct LocSenderEventId(pub LocSenderId, pub u32);
 
 impl Localizable for LocSenderEventId {
-    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
-        Ok(LocSenderEventId(self.0.localize(r)?, self.1))
+    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+        Ok(LocSenderEventId(self.0.localize(r).await?, self.1))
     }
 }
 
@@ -277,35 +277,35 @@ pub(crate) const SEGMENT_SIZE_BYTES: usize = 256 * 1024 * 1024;
 
 pub trait Remapper {
     type Err;
-    fn remap_user(&mut self, uid: LocUserId) -> Result<LocUserId, Self::Err>;
-    fn remap_sender(&mut self, sid: LocSenderId) -> Result<LocSenderId, Self::Err>;
-    fn remap_data(&mut self, did: LocDataId) -> Result<LocDataId, Self::Err>;
+    async fn remap_user(&mut self, uid: LocUserId) -> Result<LocUserId, Self::Err>;
+    async fn remap_sender(&mut self, sid: LocSenderId) -> Result<LocSenderId, Self::Err>;
+    async fn remap_data(&mut self, did: LocDataId) -> Result<LocDataId, Self::Err>;
 }
 
 pub trait Localizable: Sized {
-    fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err>;
+    async fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err>;
 }
 
 impl Localizable for LocUserId {
-    fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
-        remapper.remap_user(self)
+    async fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
+        remapper.remap_user(self).await
     }
 }
 impl Localizable for LocSenderId {
-    fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
-        remapper.remap_sender(self)
+    async fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
+        remapper.remap_sender(self).await
     }
 }
 impl Localizable for LocDataId {
-    fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
-        remapper.remap_data(self)
+    async fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
+        remapper.remap_data(self).await
     }
 }
 
 macro_rules! impl_localizable_trivial {
     ($t:ty) => {
         impl Localizable for $t {
-            fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+            async fn localize<R: Remapper>(self, _r: &mut R) -> Result<Self, R::Err> {
                 Ok(self)
             }
         }
@@ -317,9 +317,9 @@ impl_localizable_trivial!(bool);
 impl_localizable_trivial!(());
 
 impl<T: Localizable> Localizable for Box<T> {
-    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
         let (inner, b) = Box::take(self);
-        Ok(Box::write(b, inner.localize(r)?))
+        Ok(Box::write(b, inner.localize(r).await?))
     }
 }
 

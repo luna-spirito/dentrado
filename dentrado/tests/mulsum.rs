@@ -1,8 +1,10 @@
+use std::fmt::Debug;
+
 use dentrado::{
     core::{
         core_ctx::{Core, GearCtx},
         gear::{GearInput, GearMeta, IsRuntime},
-        loc_ctx::{EventContext, EventStore},
+        storage::{CacheSer, InMemoryStorage, PageId, Storage},
     },
     types::*,
     wire::WireEventBody,
@@ -19,7 +21,7 @@ pub enum MulSumGear {
 }
 
 impl Localizable for MulSumGear {
-    fn localize<Rm: Remapper>(self, _remapper: &mut Rm) -> Result<Self, Rm::Err> {
+    async fn localize<Rm: Remapper>(self, _remapper: &mut Rm) -> Result<Self, Rm::Err> {
         Ok(self)
     }
 }
@@ -31,16 +33,21 @@ pub struct MulSumBody {
 }
 
 impl Localizable for MulSumBody {
-    fn localize<Rm: Remapper>(self, _remapper: &mut Rm) -> Result<Self, Rm::Err> {
+    async fn localize<Rm: Remapper>(self, _remapper: &mut Rm) -> Result<Self, Rm::Err> {
         Ok(self)
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct MulSumCache {
-    pub processed_added: usize,
-    pub processed_removed: usize,
+pub struct MulSumCache<W> {
+    pub watermark: W,
     pub agg: i64,
+}
+
+impl<W> CacheSer for MulSumCache<W> {
+    fn page_roots(&self) -> &[PageId] {
+        &[]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +60,10 @@ impl IsRuntime for MulSumRuntime {
     type Group = i64;
     type Body = MulSumBody;
     type Data = ();
-    type GearCache = MulSumCache;
+    type GearCache<W>
+        = MulSumCache<W>
+    where
+        W: Debug + Clone + 'static;
 
     fn hash_data(
         _data: &Self::Data,
@@ -83,52 +93,50 @@ impl IsRuntime for MulSumRuntime {
         }
     }
 
-    fn make_cache(_gear: &Self::GearId) -> Self::GearCache {
+    fn make_cache<W: Debug + Clone + Default + 'static>(
+        _gear: &Self::GearId,
+    ) -> Self::GearCache<W> {
         MulSumCache {
-            processed_added: 0,
-            processed_removed: 0,
+            watermark: W::default(),
             agg: 0,
         }
     }
 
-    async fn run_step(
-        _ctx: &mut GearCtx<Self>,
+    async fn run_step<S: Storage<Self>>(
+        ctx: &mut GearCtx<Self, S>,
         input: GearInput,
-        cache: &mut Self::GearCache,
+        cache: &mut Self::GearCache<S::Watermark>,
     ) -> i64 {
         let GearInput::Events(group) = input else {
             return cache.agg;
         };
-        let Some((added_ids, removed_ids)) = _ctx.query_events(
-            group,
-            (cache.processed_added, cache.processed_removed),
-            |a, r| (a.to_vec(), r.to_vec()),
-        ) else {
-            return cache.agg;
-        };
-        let core = _ctx.core();
+        let core = ctx.core();
+        let diff = ctx
+            .storage()
+            .diff_group(group, cache.watermark.clone())
+            .await;
         let store = core.group_store(group);
 
-        for &eid in &added_ids {
-            let body = store.stored_event(eid).map(|e| e.body).unwrap();
+        for eid in &diff.added {
+            let body = store.stored_event(*eid).await.unwrap().body;
             cache.agg += body.a * body.b;
         }
-        for &eid in &removed_ids {
-            let body = store.stored_event(eid).map(|e| e.body).unwrap();
+        for eid in &diff.removed {
+            let body = store.stored_event(*eid).await.unwrap().body;
             cache.agg -= body.a * body.b;
         }
-        cache.processed_added += added_ids.len();
-        cache.processed_removed += removed_ids.len();
+        cache.watermark = diff.watermark;
         cache.agg
     }
 }
 
 #[test]
 fn mulsum_engine() {
-    let mut tc: TestCluster<MulSumRuntime> = TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<MulSumRuntime, InMemoryStorage<MulSumRuntime>> =
+        TestCluster::start(&[2, 3, 4], ());
 
     let bucket: i64 = 0;
-    tc.loc_ctx.mk_loc_group(MSG_MULSUM, bucket);
+    tc.mk_loc_group(MSG_MULSUM, bucket);
 
     let gear = MulSumGear::MulSum { bucket };
 
@@ -200,9 +208,11 @@ enum WorkerCmd {
 fn local_gear_read_and_subscribe_via_worker() {
     let (cmd_tx, cmd_rx) = flume::unbounded::<WorkerCmd>();
 
-    let worker = move |core: std::rc::Rc<Core<MulSumRuntime>>| {
+    let worker = move |core: std::rc::Rc<Core<MulSumRuntime, InMemoryStorage<MulSumRuntime>>>| {
         let cmd_rx = cmd_rx.clone();
-        let mut held: Vec<dentrado::core::core_ctx::Subscription<MulSumRuntime>> = Vec::new();
+        let mut held: Vec<
+            dentrado::core::core_ctx::Subscription<MulSumRuntime, InMemoryStorage<MulSumRuntime>>,
+        > = Vec::new();
         async move {
             while let Ok(cmd) = cmd_rx.recv_async().await {
                 match cmd {
@@ -224,17 +234,16 @@ fn local_gear_read_and_subscribe_via_worker() {
         }
     };
 
-    let mut tc: TestCluster<MulSumRuntime> = TestCluster::start_with_worker(&[1], (), worker);
+    let mut tc: TestCluster<MulSumRuntime, InMemoryStorage<MulSumRuntime>> =
+        TestCluster::start_with_worker(&[1], (), worker);
 
     let bucket: i64 = 0;
-    tc.loc_ctx.mk_loc_group(MSG_MULSUM, bucket);
-    let gear = MulSumGear::MulSum { bucket };
-
     let alice_pk = SenderPk([42u8; 32]);
     let alice_uid = UserId {
         id: 1,
         identity_server_pk: IdentityServerPk([0; 32]),
     };
+    tc.mk_loc_group(MSG_MULSUM, bucket);
     let alice = tc.add_user(alice_pk, alice_uid);
 
     // agg += 3*4 = 12
@@ -251,7 +260,9 @@ fn local_gear_read_and_subscribe_via_worker() {
 
     // read_gear recomputes fresh each call.
     let (rtx, rrx) = flume::bounded(1);
-    cmd_tx.send(WorkerCmd::Read(gear.clone(), rtx)).unwrap();
+    cmd_tx
+        .send(WorkerCmd::Read(MulSumGear::MulSum { bucket }, rtx))
+        .unwrap();
     assert_eq!(rrx.recv().unwrap(), 12);
 
     // agg += 5*2 = 10 → 22
@@ -267,13 +278,15 @@ fn local_gear_read_and_subscribe_via_worker() {
     );
 
     let (rtx, rrx) = flume::bounded(1);
-    cmd_tx.send(WorkerCmd::Read(gear.clone(), rtx)).unwrap();
+    cmd_tx
+        .send(WorkerCmd::Read(MulSumGear::MulSum { bucket }, rtx))
+        .unwrap();
     assert_eq!(rrx.recv().unwrap(), 22);
 
     // subscribe once → initial value 22; hold it.
     let (stx, srx) = flume::bounded(1);
     cmd_tx
-        .send(WorkerCmd::Subscribe(gear.clone(), stx))
+        .send(WorkerCmd::Subscribe(MulSumGear::MulSum { bucket }, stx))
         .unwrap();
     assert_eq!(srx.recv().unwrap(), 22);
 
@@ -283,6 +296,8 @@ fn local_gear_read_and_subscribe_via_worker() {
     std::thread::sleep(std::time::Duration::from_millis(20));
 
     let (rtx, rrx) = flume::bounded(1);
-    cmd_tx.send(WorkerCmd::Read(gear.clone(), rtx)).unwrap();
+    cmd_tx
+        .send(WorkerCmd::Read(MulSumGear::MulSum { bucket }, rtx))
+        .unwrap();
     assert_eq!(rrx.recv().unwrap(), 22);
 }

@@ -2,10 +2,8 @@ use im::OrdMap;
 use std::ops::Bound;
 
 use crate::core::gear::IsRuntime;
-use crate::core::loc_ctx::EventStore;
-#[cfg(test)]
-use crate::core::loc_ctx::LocCtx;
-use crate::types::GroupEventId;
+use crate::core::storage::{GroupStore, Storage};
+use crate::types::{GroupEventId, Localizable, Remapper};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SGBucketId {
@@ -82,22 +80,30 @@ impl<X> SgDiffItem<X> {
     }
 }
 
-fn cmp_tx_sender<R: IsRuntime>(
-    ctx: &dyn EventStore<R>,
+async fn cmp_tx_sender<R: IsRuntime, S: Storage<R>>(
+    store: &GroupStore<'_, R, S>,
     a: GroupEventId,
     b: GroupEventId,
 ) -> std::cmp::Ordering {
-    let a_ev = ctx.stored_event(a).expect("cmp_tx_sender: event not found");
-    let b_ev = ctx.stored_event(b).expect("cmp_tx_sender: event not found");
+    let a_ev = store
+        .stored_event(a)
+        .await
+        .expect("cmp_tx_sender: event not found");
+    let b_ev = store
+        .stored_event(b)
+        .await
+        .expect("cmp_tx_sender: event not found");
     let (a_tx, a_sender) = (a_ev.tx_id, a_ev.sender);
     let (b_tx, b_sender) = (b_ev.tx_id, b_ev.sender);
     match a_tx.cmp(&b_tx) {
         std::cmp::Ordering::Equal => {
-            let a_pk = ctx
+            let a_pk = store
                 .sender_pk(a_sender)
+                .await
                 .expect("cmp_tx_sender: sender_pk not found");
-            let b_pk = ctx
+            let b_pk = store
                 .sender_pk(b_sender)
+                .await
                 .expect("cmp_tx_sender: sender_pk not found");
             a_pk.cmp(&b_pk)
         }
@@ -105,17 +111,17 @@ fn cmp_tx_sender<R: IsRuntime>(
     }
 }
 
-fn bucket_binary_search<E, R: IsRuntime>(
+async fn bucket_binary_search<E, R: IsRuntime, S: Storage<R>>(
     entries: &[E],
     target_lid: GroupEventId,
-    ctx: &dyn EventStore<R>,
+    store: &GroupStore<'_, R, S>,
     get_local_id: impl Fn(&E) -> GroupEventId,
 ) -> Result<usize, usize> {
     let mut left = 0;
     let mut right = entries.len();
     while left < right {
         let mid = left + (right - left) / 2;
-        match cmp_tx_sender(ctx, get_local_id(&entries[mid]), target_lid) {
+        match cmp_tx_sender(store, get_local_id(&entries[mid]), target_lid).await {
             std::cmp::Ordering::Less => left = mid + 1,
             std::cmp::Ordering::Equal => return Ok(mid),
             std::cmp::Ordering::Greater => right = mid,
@@ -124,37 +130,37 @@ fn bucket_binary_search<E, R: IsRuntime>(
     Err(left)
 }
 
-fn bucket_upper_bound<E, R: IsRuntime>(
+async fn bucket_upper_bound<E, R: IsRuntime, S: Storage<R>>(
     entries: &[E],
     target_lid: GroupEventId,
-    ctx: &dyn EventStore<R>,
+    store: &GroupStore<'_, R, S>,
     get_local_id: impl Fn(&E) -> GroupEventId,
 ) -> usize {
-    match bucket_binary_search(entries, target_lid, ctx, get_local_id) {
+    match bucket_binary_search(entries, target_lid, store, get_local_id).await {
         Ok(idx) => idx + 1,
         Err(idx) => idx,
     }
 }
 
-fn bucket_lower_bound_inclusive<E, R: IsRuntime>(
+async fn bucket_lower_bound_inclusive<E, R: IsRuntime, S: Storage<R>>(
     entries: &[E],
     target_lid: GroupEventId,
-    ctx: &dyn EventStore<R>,
+    store: &GroupStore<'_, R, S>,
     get_local_id: impl Fn(&E) -> GroupEventId,
 ) -> Option<usize> {
-    match bucket_binary_search(entries, target_lid, ctx, get_local_id) {
+    match bucket_binary_search(entries, target_lid, store, get_local_id).await {
         Ok(idx) => Some(idx),
         Err(idx) => idx.checked_sub(1),
     }
 }
 
-fn bucket_lower_bound_exclusive<E, R: IsRuntime>(
+async fn bucket_lower_bound_exclusive<E, R: IsRuntime, S: Storage<R>>(
     entries: &[E],
     target_lid: GroupEventId,
-    ctx: &dyn EventStore<R>,
+    store: &GroupStore<'_, R, S>,
     get_local_id: impl Fn(&E) -> GroupEventId,
 ) -> Option<usize> {
-    match bucket_binary_search(entries, target_lid, ctx, get_local_id) {
+    match bucket_binary_search(entries, target_lid, store, get_local_id).await {
         Ok(idx) => idx.checked_sub(1),
         Err(idx) => idx.checked_sub(1),
     }
@@ -205,11 +211,11 @@ impl<X: Clone> SgOrdMap<X> {
         self.buckets.iter().map(|(_, v)| v.len()).sum()
     }
 
-    pub fn insert<R: IsRuntime>(
+    pub async fn insert<R: IsRuntime, S: Storage<R>>(
         &mut self,
         key: SGEventId,
         value: X,
-        ctx: &dyn EventStore<R>,
+        store: &GroupStore<'_, R, S>,
     ) -> Option<X> {
         let bucket = key.0;
         let new_entry = SgEntry {
@@ -220,7 +226,7 @@ impl<X: Clone> SgOrdMap<X> {
         match self.buckets.entry(bucket) {
             im::ordmap::Entry::Occupied(mut entries) => {
                 let entries = entries.get_mut();
-                match bucket_binary_search(entries, key.1, ctx, |e| e.local_id) {
+                match bucket_binary_search(entries, key.1, store, |e| e.local_id).await {
                     Ok(idx) => {
                         if entries[idx].local_id == key.1 {
                             let old = std::mem::replace(&mut entries[idx].value, new_entry.value);
@@ -267,18 +273,20 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub fn latest_at<R: IsRuntime>(
-        &self,
+    pub async fn latest_at<'a, R: IsRuntime, S: Storage<R>>(
+        &'a self,
         at: &SGEventId,
-        ctx: &dyn EventStore<R>,
-    ) -> Option<(SGEventId, &X)> {
+        store: &GroupStore<'_, R, S>,
+    ) -> Option<(SGEventId, &'a X)> {
         let bucket = at.0;
 
-        if let Some(entries) = self.buckets.get(&bucket)
-            && let Some(idx) = bucket_lower_bound_inclusive(entries, at.1, ctx, |e| e.local_id)
-            && let Some(entry) = entries.get(idx)
-        {
-            return Some((entry.to_event_id(&bucket), &entry.value));
+        if let Some(entries) = self.buckets.get(&bucket) {
+            let idx = bucket_lower_bound_inclusive(entries, at.1, store, |e| e.local_id).await;
+            if let Some(idx) = idx
+                && let Some(entry) = entries.get(idx)
+            {
+                return Some((entry.to_event_id(&bucket), &entry.value));
+            }
         }
 
         self.buckets
@@ -291,18 +299,20 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub fn latest_before<R: IsRuntime>(
-        &self,
+    pub async fn latest_before<'a, R: IsRuntime, S: Storage<R>>(
+        &'a self,
         at: &SGEventId,
-        ctx: &dyn EventStore<R>,
-    ) -> Option<(SGEventId, &X)> {
+        store: &GroupStore<'_, R, S>,
+    ) -> Option<(SGEventId, &'a X)> {
         let bucket = at.0;
 
-        if let Some(entries) = self.buckets.get(&bucket)
-            && let Some(idx) = bucket_lower_bound_exclusive(entries, at.1, ctx, |e| e.local_id)
-            && let Some(entry) = entries.get(idx)
-        {
-            return Some((entry.to_event_id(&bucket), &entry.value));
+        if let Some(entries) = self.buckets.get(&bucket) {
+            let idx = bucket_lower_bound_exclusive(entries, at.1, store, |e| e.local_id).await;
+            if let Some(idx) = idx
+                && let Some(entry) = entries.get(idx)
+            {
+                return Some((entry.to_event_id(&bucket), &entry.value));
+            }
         }
 
         self.buckets
@@ -315,15 +325,15 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub fn next_after<R: IsRuntime>(
+    pub async fn next_after<R: IsRuntime, S: Storage<R>>(
         &self,
         at: &SGEventId,
-        ctx: &dyn EventStore<R>,
+        store: &GroupStore<'_, R, S>,
     ) -> Option<SGEventId> {
         let bucket = at.0;
 
         if let Some(entries) = self.buckets.get(&bucket) {
-            let idx = bucket_upper_bound(entries, at.1, ctx, |e| e.local_id);
+            let idx = bucket_upper_bound(entries, at.1, store, |e| e.local_id).await;
             if let Some(entry) = entries.get(idx) {
                 return Some(entry.to_event_id(&bucket));
             }
@@ -361,36 +371,33 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub fn range_between<R: IsRuntime>(
+    pub async fn range_between<R: IsRuntime, S: Storage<R>>(
         &self,
         at: &SGEventId,
         upper: &SGEventId,
-        ctx: &dyn EventStore<R>,
+        store: &GroupStore<'_, R, S>,
     ) -> Vec<SGEventId> {
         let start_bucket = at.0;
         let end_bucket = upper.0;
 
         if start_bucket == end_bucket {
-            return self
-                .buckets
-                .get(&start_bucket)
-                .into_iter()
-                .flat_map(|entries| {
-                    let idx_start = bucket_upper_bound(entries, at.1, ctx, |e| e.local_id);
-                    let idx_end =
-                        bucket_lower_bound_inclusive(entries, upper.1, ctx, |e| e.local_id)
-                            .map_or(0, |i| i + 1);
-                    entries[idx_start..idx_end.max(idx_start)]
-                        .iter()
-                        .map(|e| e.to_event_id(&start_bucket))
-                })
-                .collect();
+            let mut result = Vec::new();
+            if let Some(entries) = self.buckets.get(&start_bucket) {
+                let idx_start = bucket_upper_bound(entries, at.1, store, |e| e.local_id).await;
+                let idx_end = bucket_lower_bound_inclusive(entries, upper.1, store, |e| e.local_id)
+                    .await
+                    .map_or(0, |i| i + 1);
+                for e in &entries[idx_start..idx_end.max(idx_start)] {
+                    result.push(e.to_event_id(&start_bucket));
+                }
+            }
+            return result;
         }
 
         let mut result = Vec::new();
 
         if let Some(entries) = self.buckets.get(&start_bucket) {
-            let idx = bucket_upper_bound(entries, at.1, ctx, |e| e.local_id);
+            let idx = bucket_upper_bound(entries, at.1, store, |e| e.local_id).await;
             for e in &entries[idx..] {
                 result.push(e.to_event_id(&start_bucket));
             }
@@ -406,7 +413,8 @@ impl<X: Clone> SgOrdMap<X> {
         }
 
         if let Some(entries) = self.buckets.get(&end_bucket) {
-            let idx = bucket_lower_bound_inclusive(entries, upper.1, ctx, |e| e.local_id)
+            let idx = bucket_lower_bound_inclusive(entries, upper.1, store, |e| e.local_id)
+                .await
                 .map_or(0, |i| i + 1);
             for e in &entries[..idx] {
                 result.push(e.to_event_id(&end_bucket));
@@ -417,16 +425,16 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub fn range_after<R: IsRuntime>(
+    pub async fn range_after<R: IsRuntime, S: Storage<R>>(
         &self,
         at: &SGEventId,
-        ctx: &dyn EventStore<R>,
+        store: &GroupStore<'_, R, S>,
     ) -> Vec<SGEventId> {
         let bucket = at.0;
         let mut result = Vec::new();
 
         if let Some(entries) = self.buckets.get(&bucket) {
-            let idx = bucket_upper_bound(entries, at.1, ctx, |e| e.local_id);
+            let idx = bucket_upper_bound(entries, at.1, store, |e| e.local_id).await;
             for e in &entries[idx..] {
                 result.push(e.to_event_id(&bucket));
             }
@@ -460,12 +468,18 @@ impl<X: Clone> SgOrdMap<X> {
         Ok(())
     }
 
-    pub fn try_remap_values<E>(&mut self, f: &mut dyn FnMut(X) -> Result<X, E>) -> Result<(), E> {
+    pub async fn try_remap_values<E>(
+        &mut self,
+        remapper: &mut impl Remapper<Err = E>,
+    ) -> Result<(), E>
+    where
+        X: Localizable,
+    {
         let old = std::mem::take(&mut self.buckets);
         for (bk, entries) in old {
             let mut new_entries = Vec::with_capacity(entries.len());
             for mut e in entries {
-                e.value = f(e.value)?;
+                e.value = e.value.localize(remapper).await?;
                 new_entries.push(e);
             }
             self.buckets.insert(bk, new_entries);
@@ -539,10 +553,10 @@ impl<X: Clone + Ord> Ord for SgOrdMap<X> {
 
 impl<X: Clone + PartialEq> SgOrdMap<X> {
     #[must_use]
-    pub fn diff_cloned<R: IsRuntime>(
+    pub async fn diff_cloned<R: IsRuntime, S: Storage<R>>(
         &self,
         other: &Self,
-        ctx: &dyn EventStore<R>,
+        store: &GroupStore<'_, R, S>,
     ) -> Vec<SgDiffItem<X>> {
         use im::ordmap::DiffItem;
 
@@ -567,7 +581,12 @@ impl<X: Clone + PartialEq> SgOrdMap<X> {
                     let mut oi = 0;
                     let mut ni = 0;
                     while oi < old_entries.len() && ni < new_entries.len() {
-                        match cmp_tx_sender(ctx, old_entries[oi].local_id, new_entries[ni].local_id)
+                        match cmp_tx_sender(
+                            store,
+                            old_entries[oi].local_id,
+                            new_entries[ni].local_id,
+                        )
+                        .await
                         {
                             std::cmp::Ordering::Less => {
                                 result.push(SgDiffItem::Remove(
@@ -648,8 +667,12 @@ impl SgOrdSet {
         self.0.is_empty()
     }
 
-    pub fn insert<R: IsRuntime>(&mut self, key: SGEventId, ctx: &dyn EventStore<R>) -> bool {
-        self.0.insert(key, (), ctx).is_none()
+    pub async fn insert<R: IsRuntime, S: Storage<R>>(
+        &mut self,
+        key: SGEventId,
+        store: &GroupStore<'_, R, S>,
+    ) -> bool {
+        self.0.insert(key, (), store).await.is_none()
     }
 
     pub fn remove(&mut self, key: &SGEventId) -> bool {
@@ -666,22 +689,22 @@ impl SgOrdSet {
     }
 
     #[must_use]
-    pub fn range_between<R: IsRuntime>(
+    pub async fn range_between<R: IsRuntime, S: Storage<R>>(
         &self,
         at: &SGEventId,
         upper: &SGEventId,
-        ctx: &dyn EventStore<R>,
+        store: &GroupStore<'_, R, S>,
     ) -> Vec<SGEventId> {
-        self.0.range_between(at, upper, ctx)
+        self.0.range_between(at, upper, store).await
     }
 
     #[must_use]
-    pub fn range_after<R: IsRuntime>(
+    pub async fn range_after<R: IsRuntime, S: Storage<R>>(
         &self,
         at: &SGEventId,
-        ctx: &dyn EventStore<R>,
+        store: &GroupStore<'_, R, S>,
     ) -> Vec<SGEventId> {
-        self.0.range_after(at, ctx)
+        self.0.range_after(at, store).await
     }
 
     pub fn try_remap_local_ids<E>(
@@ -696,40 +719,54 @@ impl SgOrdSet {
 mod tests {
     use super::*;
     use crate::core::gear::EmptyRuntime;
-    use crate::core::loc_ctx::{EventContext, GroupStore, StoredEvent};
+    use crate::core::loc_ctx::StoredEvent;
+    use crate::core::storage::{GroupStore, InMemoryStorage, Storage};
     use crate::types::{LocGroupId, SenderPk};
 
     const PK_A: SenderPk = SenderPk([0u8; 32]);
     const PK_B: SenderPk = SenderPk([1u8; 32]);
     const PK_C: SenderPk = SenderPk([2u8; 32]);
 
-    fn make_test_ctx() -> LocCtx<EmptyRuntime> {
-        let mut ctx = LocCtx::new();
-        let sid_a = ctx.mk_loc_sender(PK_A, None);
-        let sid_b = ctx.mk_loc_sender(PK_B, None);
-        let sid_c = ctx.mk_loc_sender(PK_C, None);
+    /// Drive a future on a throwaway compio runtime (sg_ord_map is async but
+    /// I/O-free; `InMemoryStorage` completes eagerly).
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        compio::runtime::RuntimeBuilder::new()
+            .build()
+            .expect("compio runtime build failed")
+            .block_on(fut)
+    }
+
+    async fn make_test_storage() -> InMemoryStorage<EmptyRuntime> {
+        let storage = InMemoryStorage::<EmptyRuntime>::new();
+        let sid_a = storage.mk_loc_sender(PK_A, None).await;
+        let sid_b = storage.mk_loc_sender(PK_B, None).await;
+        let sid_c = storage.mk_loc_sender(PK_C, None).await;
         for i in 0u64..10 {
             let sid = match i % 3 {
                 0 => sid_a,
                 1 => sid_b,
                 _ => sid_c,
             };
-            ctx.store_event(
-                LocGroupId(0),
-                StoredEvent {
-                    sender: sid,
-                    tx_id: i as u32,
-                    timestamp: 0,
-                    source_node: crate::types::NodeId(0),
-                    body: (),
-                },
-            );
+            storage
+                .store_event(
+                    LocGroupId(0),
+                    StoredEvent {
+                        sender: sid,
+                        tx_id: i as u32,
+                        timestamp: 0,
+                        source_node: crate::types::NodeId(0),
+                        body: (),
+                    },
+                )
+                .await;
         }
-        ctx
+        storage
     }
 
-    fn gs(ctx: &LocCtx<EmptyRuntime>) -> GroupStore<'_, EmptyRuntime> {
-        GroupStore::new(ctx, LocGroupId(0))
+    fn gs(
+        storage: &InMemoryStorage<EmptyRuntime>,
+    ) -> GroupStore<'_, EmptyRuntime, InMemoryStorage<EmptyRuntime>> {
+        GroupStore::new(storage, LocGroupId(0))
     }
 
     fn eid(ts: u32, lid: u64) -> SGEventId {
@@ -738,245 +775,275 @@ mod tests {
 
     #[test]
     fn map_insert_get_remove() {
-        let mut m = SgOrdMap::new();
-        let loc = make_test_ctx();
-        let ctx = gs(&loc);
-        let k = eid(1, 0);
-        assert!(m.insert(k, "hello", &ctx).is_none());
-        assert_eq!(m.get(&k), Some(&"hello"));
-        assert_eq!(m.remove(&k), Some("hello"));
-        assert!(m.get(&k).is_none());
+        block_on(async {
+            let mut m = SgOrdMap::new();
+            let storage = make_test_storage().await;
+            let ctx = gs(&storage);
+            let k = eid(1, 0);
+            assert!(m.insert(k, "hello", &ctx).await.is_none());
+            assert_eq!(m.get(&k), Some(&"hello"));
+            assert_eq!(m.remove(&k), Some("hello"));
+            assert!(m.get(&k).is_none());
+        })
     }
 
     #[test]
     fn map_insert_overwrite() {
-        let mut m = SgOrdMap::new();
-        let loc = make_test_ctx();
-        let ctx = gs(&loc);
-        let k = eid(1, 0);
-        assert!(m.insert(k, "old", &ctx).is_none());
-        assert_eq!(m.insert(k, "new", &ctx), Some("old"));
-        assert_eq!(m.get(&k), Some(&"new"));
+        block_on(async {
+            let mut m = SgOrdMap::new();
+            let storage = make_test_storage().await;
+            let ctx = gs(&storage);
+            let k = eid(1, 0);
+            assert!(m.insert(k, "old", &ctx).await.is_none());
+            assert_eq!(m.insert(k, "new", &ctx).await, Some("old"));
+            assert_eq!(m.get(&k), Some(&"new"));
+        })
     }
 
     #[test]
     fn map_concurrent_events_in_bucket() {
-        let mut m = SgOrdMap::new();
-        let loc = make_test_ctx();
-        let ctx = gs(&loc);
-        let ka = eid(1, 0);
-        let kb = eid(1, 1);
-        m.insert(ka, "A", &ctx);
-        m.insert(kb, "B", &ctx);
+        block_on(async {
+            let mut m = SgOrdMap::new();
+            let storage = make_test_storage().await;
+            let ctx = gs(&storage);
+            let ka = eid(1, 0);
+            let kb = eid(1, 1);
+            m.insert(ka, "A", &ctx).await;
+            m.insert(kb, "B", &ctx).await;
 
-        assert_eq!(m.get(&ka), Some(&"A"));
-        assert_eq!(m.get(&kb), Some(&"B"));
-        assert_eq!(m.len(), 2);
+            assert_eq!(m.get(&ka), Some(&"A"));
+            assert_eq!(m.get(&kb), Some(&"B"));
+            assert_eq!(m.len(), 2);
+        })
     }
 
     #[test]
     fn map_latest_at() {
-        let mut m = SgOrdMap::new();
-        let loc = make_test_ctx();
-        let ctx = gs(&loc);
-        let k1 = eid(1, 0);
-        let k2 = eid(3, 0);
-        m.insert(k1, "first", &ctx);
-        m.insert(k2, "second", &ctx);
+        block_on(async {
+            let mut m = SgOrdMap::new();
+            let storage = make_test_storage().await;
+            let ctx = gs(&storage);
+            let k1 = eid(1, 0);
+            let k2 = eid(3, 0);
+            m.insert(k1, "first", &ctx).await;
+            m.insert(k2, "second", &ctx).await;
 
-        assert_eq!(m.latest_at(&k1, &ctx), Some((k1, &"first")));
-        assert_eq!(m.latest_at(&k2, &ctx), Some((k2, &"second")));
+            assert_eq!(m.latest_at(&k1, &ctx).await, Some((k1, &"first")));
+            assert_eq!(m.latest_at(&k2, &ctx).await, Some((k2, &"second")));
 
-        let between = eid(2, 0);
-        assert_eq!(m.latest_at(&between, &ctx), Some((k1, &"first")));
+            let between = eid(2, 0);
+            assert_eq!(m.latest_at(&between, &ctx).await, Some((k1, &"first")));
 
-        let before = eid(0, 0);
-        assert!(m.latest_at(&before, &ctx).is_none());
+            let before = eid(0, 0);
+            assert!(m.latest_at(&before, &ctx).await.is_none());
+        })
     }
 
     #[test]
     fn map_latest_before() {
-        let mut m = SgOrdMap::new();
-        let loc = make_test_ctx();
-        let ctx = gs(&loc);
-        let k1 = eid(1, 0);
-        let k2 = eid(2, 0);
-        m.insert(k1, "first", &ctx);
-        m.insert(k2, "second", &ctx);
+        block_on(async {
+            let mut m = SgOrdMap::new();
+            let storage = make_test_storage().await;
+            let ctx = gs(&storage);
+            let k1 = eid(1, 0);
+            let k2 = eid(2, 0);
+            m.insert(k1, "first", &ctx).await;
+            m.insert(k2, "second", &ctx).await;
 
-        assert_eq!(m.latest_before(&k2, &ctx), Some((k1, &"first")));
-        assert!(m.latest_before(&k1, &ctx).is_none());
+            assert_eq!(m.latest_before(&k2, &ctx).await, Some((k1, &"first")));
+            assert!(m.latest_before(&k1, &ctx).await.is_none());
+        })
     }
 
     #[test]
     fn map_latest_at_same_bucket() {
-        let mut m = SgOrdMap::new();
-        let loc = make_test_ctx();
-        let ctx = gs(&loc);
-        let ka = eid(1, 0);
-        let kb = eid(1, 1);
-        m.insert(ka, "A", &ctx);
-        m.insert(kb, "B", &ctx);
+        block_on(async {
+            let mut m = SgOrdMap::new();
+            let storage = make_test_storage().await;
+            let ctx = gs(&storage);
+            let ka = eid(1, 0);
+            let kb = eid(1, 1);
+            m.insert(ka, "A", &ctx).await;
+            m.insert(kb, "B", &ctx).await;
 
-        assert_eq!(m.latest_at(&kb, &ctx), Some((kb, &"B")));
-        assert_eq!(m.latest_at(&ka, &ctx), Some((ka, &"A")));
+            assert_eq!(m.latest_at(&kb, &ctx).await, Some((kb, &"B")));
+            assert_eq!(m.latest_at(&ka, &ctx).await, Some((ka, &"A")));
+        })
     }
 
     #[test]
     fn map_next_after() {
-        let mut m = SgOrdMap::new();
-        let loc = make_test_ctx();
-        let ctx = gs(&loc);
-        let k1 = eid(1, 0);
-        let k2 = eid(2, 0);
-        let k3 = eid(2, 3);
-        m.insert(k1, "first", &ctx);
-        m.insert(k2, "second", &ctx);
-        m.insert(k3, "third", &ctx);
+        block_on(async {
+            let mut m = SgOrdMap::new();
+            let storage = make_test_storage().await;
+            let ctx = gs(&storage);
+            let k1 = eid(1, 0);
+            let k2 = eid(2, 0);
+            let k3 = eid(2, 3);
+            m.insert(k1, "first", &ctx).await;
+            m.insert(k2, "second", &ctx).await;
+            m.insert(k3, "third", &ctx).await;
 
-        assert_eq!(m.next_after(&k1, &ctx), Some(k2));
-        assert_eq!(m.next_after(&k2, &ctx), Some(k3));
-        assert!(m.next_after(&k3, &ctx).is_none());
+            assert_eq!(m.next_after(&k1, &ctx).await, Some(k2));
+            assert_eq!(m.next_after(&k2, &ctx).await, Some(k3));
+            assert!(m.next_after(&k3, &ctx).await.is_none());
+        })
     }
 
     #[test]
     fn map_iter_order() {
-        let mut m = SgOrdMap::new();
-        let loc = make_test_ctx();
-        let ctx = gs(&loc);
-        let k2 = eid(2, 0);
-        let k1 = eid(1, 0);
-        let k3 = eid(2, 3);
-        m.insert(k2, "second", &ctx);
-        m.insert(k1, "first", &ctx);
-        m.insert(k3, "third", &ctx);
+        block_on(async {
+            let mut m = SgOrdMap::new();
+            let storage = make_test_storage().await;
+            let ctx = gs(&storage);
+            let k2 = eid(2, 0);
+            let k1 = eid(1, 0);
+            let k3 = eid(2, 3);
+            m.insert(k2, "second", &ctx).await;
+            m.insert(k1, "first", &ctx).await;
+            m.insert(k3, "third", &ctx).await;
 
-        let items: Vec<_> = m.iter().collect();
-        assert_eq!(items[0], (k1, &"first"));
-        assert_eq!(items[1], (k2, &"second"));
-        assert_eq!(items[2], (k3, &"third"));
+            let items: Vec<_> = m.iter().collect();
+            assert_eq!(items[0], (k1, &"first"));
+            assert_eq!(items[1], (k2, &"second"));
+            assert_eq!(items[2], (k3, &"third"));
+        })
     }
 
     #[test]
     fn map_first_last() {
-        let mut m = SgOrdMap::new();
-        let loc = make_test_ctx();
-        let ctx = gs(&loc);
-        let k1 = eid(1, 0);
-        let k2 = eid(2, 0);
-        m.insert(k1, "first", &ctx);
-        m.insert(k2, "second", &ctx);
+        block_on(async {
+            let mut m = SgOrdMap::new();
+            let storage = make_test_storage().await;
+            let ctx = gs(&storage);
+            let k1 = eid(1, 0);
+            let k2 = eid(2, 0);
+            m.insert(k1, "first", &ctx).await;
+            m.insert(k2, "second", &ctx).await;
 
-        assert_eq!(m.first(), Some((k1, &"first")));
-        assert_eq!(m.last(), Some((k2, &"second")));
+            assert_eq!(m.first(), Some((k1, &"first")));
+            assert_eq!(m.last(), Some((k2, &"second")));
+        })
     }
 
     #[test]
     fn map_diff_cloned() {
-        let mut old = SgOrdMap::new();
-        let loc = make_test_ctx();
-        let ctx = gs(&loc);
-        let k1 = eid(1, 0);
-        let k2 = eid(2, 0);
-        old.insert(k1, "keep", &ctx);
-        old.insert(k2, "remove", &ctx);
+        block_on(async {
+            let mut old = SgOrdMap::new();
+            let storage = make_test_storage().await;
+            let ctx = gs(&storage);
+            let k1 = eid(1, 0);
+            let k2 = eid(2, 0);
+            old.insert(k1, "keep", &ctx).await;
+            old.insert(k2, "remove", &ctx).await;
 
-        let mut new = SgOrdMap::new();
-        let k3 = eid(3, 0);
-        new.insert(k1, "keep", &ctx);
-        new.insert(k3, "add", &ctx);
+            let mut new = SgOrdMap::new();
+            let k3 = eid(3, 0);
+            new.insert(k1, "keep", &ctx).await;
+            new.insert(k3, "add", &ctx).await;
 
-        let diff = old.diff_cloned(&new, &ctx);
-        assert_eq!(diff.len(), 2);
-        assert!(matches!(&diff[0], SgDiffItem::Remove(id, v) if *id == k2 && *v == "remove"));
-        assert!(matches!(&diff[1], SgDiffItem::Add(id, v) if *id == k3 && *v == "add"));
+            let diff = old.diff_cloned(&new, &ctx).await;
+            assert_eq!(diff.len(), 2);
+            assert!(matches!(&diff[0], SgDiffItem::Remove(id, v) if *id == k2 && *v == "remove"));
+            assert!(matches!(&diff[1], SgDiffItem::Add(id, v) if *id == k3 && *v == "add"));
+        })
     }
 
     #[test]
     fn map_remap_local_ids() {
-        let mut m = SgOrdMap::new();
-        let loc = make_test_ctx();
-        let ctx = gs(&loc);
-        let k1 = eid(1, 10);
-        let k2 = eid(2, 20);
-        m.insert(k1, "a", &ctx);
-        m.insert(k2, "b", &ctx);
+        block_on(async {
+            let mut m = SgOrdMap::new();
+            let storage = make_test_storage().await;
+            let ctx = gs(&storage);
+            let k1 = eid(1, 10);
+            let k2 = eid(2, 20);
+            m.insert(k1, "a", &ctx).await;
+            m.insert(k2, "b", &ctx).await;
 
-        m.try_remap_local_ids::<std::convert::Infallible>(&mut |lid| {
-            Ok(GroupEventId(lid.0 + 1000))
+            m.try_remap_local_ids::<std::convert::Infallible>(&mut |lid| {
+                Ok(GroupEventId(lid.0 + 1000))
+            })
+            .unwrap();
+
+            assert!(m.get(&k1).is_none());
+            assert!(m.get(&k2).is_none());
+
+            let new_k1 = eid(1, 1010);
+            let new_k2 = eid(2, 1020);
+            assert_eq!(m.get(&new_k1), Some(&"a"));
+            assert_eq!(m.get(&new_k2), Some(&"b"));
         })
-        .unwrap();
-
-        assert!(m.get(&k1).is_none());
-        assert!(m.get(&k2).is_none());
-
-        let new_k1 = eid(1, 1010);
-        let new_k2 = eid(2, 1020);
-        assert_eq!(m.get(&new_k1), Some(&"a"));
-        assert_eq!(m.get(&new_k2), Some(&"b"));
     }
 
     #[test]
     fn set_insert_remove_contains() {
-        let mut s = SgOrdSet::new();
-        let loc = make_test_ctx();
-        let ctx = gs(&loc);
-        let k = eid(1, 0);
-        assert!(s.insert(k, &ctx));
-        assert!(s.contains(&k));
-        assert!(!s.insert(k, &ctx));
-        assert!(s.remove(&k));
-        assert!(!s.contains(&k));
-        assert!(!s.remove(&k));
+        block_on(async {
+            let mut s = SgOrdSet::new();
+            let storage = make_test_storage().await;
+            let ctx = gs(&storage);
+            let k = eid(1, 0);
+            assert!(s.insert(k, &ctx).await);
+            assert!(s.contains(&k));
+            assert!(!s.insert(k, &ctx).await);
+            assert!(s.remove(&k));
+            assert!(!s.contains(&k));
+            assert!(!s.remove(&k));
+        })
     }
 
     #[test]
     fn set_range_between() {
-        let mut s = SgOrdSet::new();
-        let loc = make_test_ctx();
-        let ctx = gs(&loc);
-        let k1 = eid(1, 0);
-        let k2 = eid(2, 0);
-        let k3 = eid(3, 0);
-        let k4 = eid(4, 0);
-        s.insert(k1, &ctx);
-        s.insert(k2, &ctx);
-        s.insert(k3, &ctx);
-        s.insert(k4, &ctx);
+        block_on(async {
+            let mut s = SgOrdSet::new();
+            let storage = make_test_storage().await;
+            let ctx = gs(&storage);
+            let k1 = eid(1, 0);
+            let k2 = eid(2, 0);
+            let k3 = eid(3, 0);
+            let k4 = eid(4, 0);
+            s.insert(k1, &ctx).await;
+            s.insert(k2, &ctx).await;
+            s.insert(k3, &ctx).await;
+            s.insert(k4, &ctx).await;
 
-        let result = s.range_between(&k2, &k4, &ctx);
-        assert_eq!(result, vec![k3, k4]);
+            let result = s.range_between(&k2, &k4, &ctx).await;
+            assert_eq!(result, vec![k3, k4]);
+        })
     }
 
     #[test]
     fn set_range_after() {
-        let mut s = SgOrdSet::new();
-        let loc = make_test_ctx();
-        let ctx = gs(&loc);
-        let k1 = eid(1, 0);
-        let k2 = eid(2, 0);
-        let k3 = eid(3, 0);
-        s.insert(k1, &ctx);
-        s.insert(k2, &ctx);
-        s.insert(k3, &ctx);
+        block_on(async {
+            let mut s = SgOrdSet::new();
+            let storage = make_test_storage().await;
+            let ctx = gs(&storage);
+            let k1 = eid(1, 0);
+            let k2 = eid(2, 0);
+            let k3 = eid(3, 0);
+            s.insert(k1, &ctx).await;
+            s.insert(k2, &ctx).await;
+            s.insert(k3, &ctx).await;
 
-        let result = s.range_after(&k2, &ctx);
-        assert_eq!(result, vec![k3]);
+            let result = s.range_after(&k2, &ctx).await;
+            assert_eq!(result, vec![k3]);
+        })
     }
 
     #[test]
     fn set_range_between_same_bucket() {
-        let mut s = SgOrdSet::new();
-        let loc = make_test_ctx();
-        let ctx = gs(&loc);
-        let ka = eid(1, 0);
-        let kb = eid(1, 1);
-        let kc = eid(1, 2);
-        s.insert(ka, &ctx);
-        s.insert(kb, &ctx);
-        s.insert(kc, &ctx);
+        block_on(async {
+            let mut s = SgOrdSet::new();
+            let storage = make_test_storage().await;
+            let ctx = gs(&storage);
+            let ka = eid(1, 0);
+            let kb = eid(1, 1);
+            let kc = eid(1, 2);
+            s.insert(ka, &ctx).await;
+            s.insert(kb, &ctx).await;
+            s.insert(kc, &ctx).await;
 
-        let result = s.range_between(&ka, &kc, &ctx);
-        assert_eq!(result, vec![kb, kc]);
+            let result = s.range_between(&ka, &kc, &ctx).await;
+            assert_eq!(result, vec![kb, kc]);
+        })
     }
 }

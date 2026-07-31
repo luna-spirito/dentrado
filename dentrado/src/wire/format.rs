@@ -17,10 +17,10 @@ pub struct WireEventBody<K, B> {
 }
 
 impl<K: Localizable + Clone, B: Localizable + Clone> Localizable for WireEventBody<K, B> {
-    fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
-        let new_sender = r.remap_sender(self.sender)?;
-        let new_group = self.group.localize(r)?;
-        let new_body = self.body.localize(r)?;
+    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
+        let new_sender = r.remap_sender(self.sender).await?;
+        let new_group = self.group.localize(r).await?;
+        let new_body = self.body.localize(r).await?;
 
         Ok(WireEventBody {
             sender: new_sender,

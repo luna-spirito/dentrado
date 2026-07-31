@@ -22,7 +22,7 @@ use crate::{
     core::{
         gear::IsRuntime,
         loc_ctx::{EventGroup, StoreResultSuccess, StoredEvent},
-        storage::{GroupDiff, PageId, PageRooted, Storage},
+        storage::{AlignedPage, CacheSer, GroupDiff, PageHandle, PageId, Storage},
     },
     types::{
         DataId, DataVerifyError, GlobalResolver, GroupEventId, GroupRouteError, LocDataId,
@@ -46,9 +46,9 @@ struct Inner<R: IsRuntime> {
     group_by_key: HashMap<(LocMsgTypeId, R::Group), LocGroupId>,
     // gear cache: typed cache per stable R::GearId (roots live *inside* it
     // — see `PageRooted` — so no separate roots are stored here).
-    gear_cache: HashMap<R::GearId, R::GearCache>,
-    // pages: (data, child refs) — write-once, reference-counted.
-    pages: HashMap<PageId, (Vec<u8>, Vec<PageId>)>,
+    gear_cache: HashMap<R::GearId, R::GearCache<(usize, usize)>>,
+    // pages: (aligned page, child refs) — write-once, reference-counted.
+    pages: HashMap<PageId, (AlignedPage, Vec<PageId>)>,
     // page liveness: a page is live while its refcount > 0. Edges that hold a
     // ref: a parent page's `refs`, or a gear cache's declared `roots`.
     refcount: HashMap<PageId, u64>,
@@ -149,7 +149,7 @@ impl<R: IsRuntime> GlobalResolver for InMemoryStorage<R> {
 
 impl<R: IsRuntime> Storage<R> for InMemoryStorage<R>
 where
-    R::GearCache: PageRooted,
+    R::GearCache<(usize, usize)>: CacheSer,
 {
     type Watermark = (usize, usize);
 
@@ -257,13 +257,13 @@ where
         ready(self.inner.borrow().data_id_to_local.get(data_id).copied())
     }
 
-    fn fetch_data(&self, did: LocDataId) -> impl Future<Output = Option<R::Data>> {
+    fn fetch_data(&self, did: LocDataId) -> impl Future<Output = Option<(DataId, R::Data)>> {
         ready(
             self.inner
                 .borrow()
                 .data_by_id
                 .get(did.0 as usize)
-                .map(|(_, c)| c.clone()),
+                .map(|(id, c)| (*id, c.clone())),
         )
     }
 
@@ -345,11 +345,18 @@ where
 
     // ── gear cache (keyed by stable R::GearId) ────────────────────────────
 
-    fn get_cache(&self, gear: &R::GearId) -> impl Future<Output = Option<R::GearCache>> {
+    fn get_cache(
+        &self,
+        gear: &R::GearId,
+    ) -> impl Future<Output = Option<R::GearCache<Self::Watermark>>> {
         ready(self.inner.borrow().gear_cache.get(gear).cloned())
     }
 
-    fn put_cache(&self, gear: R::GearId, cache: R::GearCache) -> impl Future<Output = ()> {
+    fn put_cache(
+        &self,
+        gear: R::GearId,
+        cache: R::GearCache<Self::Watermark>,
+    ) -> impl Future<Output = ()> {
         let mut inner = self.inner.borrow_mut();
         // Roots are part of the cache (`PageRooted`), not a separate argument.
         // Derive them from the cache itself; on overwrite, re-derive the old
@@ -376,7 +383,7 @@ where
 
     // ── pages (dormant; for spill maps) ───────────────────────────────────
 
-    fn write_page(&self, data: &[u8], refs: &[PageId]) -> impl Future<Output = PageId> {
+    fn write_page(&self, data: AlignedPage, refs: &[PageId]) -> impl Future<Output = PageHandle> {
         let mut inner = self.inner.borrow_mut();
         let id = PageId(inner.next_page);
         inner.next_page += 1;
@@ -384,32 +391,36 @@ where
         for r in &refs {
             inner.incref(*r);
         }
-        inner.pages.insert(id, (data.to_vec(), refs));
-        ready(id)
+        inner.pages.insert(id, (data, refs));
+        ready(PageHandle(id))
     }
 
-    fn read_page(&self, id: PageId) -> impl Future<Output = Option<Box<[u8]>>> {
+    fn read_page(&self, id: PageId) -> impl Future<Output = AlignedPage> {
         ready(
             self.inner
                 .borrow()
                 .pages
                 .get(&id)
-                .map(|(d, _)| Box::from(d.as_slice())),
+                .map(|(d, _)| d.clone())
+                .expect("read_page on a non-live PageId is a caller bug"),
         )
     }
 
-    fn drop_page(&self, id: PageId) {
+    fn drop_page_handle(&self, handle: PageHandle) -> impl Future<Output = ()> {
         let mut inner = self.inner.borrow_mut();
         // Unconditional removal — the caller guarantees no further access to
-        // this `PageId`. Forget its own refcount and cascade-`decref` the
-        // children, so a now-unreferenced subtree is reclaimed while children
-        // still rooted elsewhere survive via their own refcounts.
+        // this page (it just dropped the handle). Forget its own refcount and
+        // cascade-`decref` the children, so a now-unreferenced subtree is
+        // reclaimed while children still rooted elsewhere survive via their
+        // own refcounts.
+        let id = handle.0;
         let Some((_, refs)) = inner.pages.remove(&id) else {
-            return;
+            return ready(());
         };
         inner.refcount.remove(&id);
         for child in refs {
             inner.decref(child);
         }
+        ready(())
     }
 }
