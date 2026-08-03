@@ -1,82 +1,83 @@
-//! HTTP/1.1 + WebSocket server, one listener per dentrado core.
+//! HTTPS (HTTP/1.1 over TLS) bootstrap server: one TCP listener per core.
 //!
-//! Each core calls [`serve`], which binds the same `(addr, port)` with
-//! `SO_REUSEPORT`. The kernel hashes each incoming connection to exactly one
-//! core, giving a true thread-per-core, shared-nothing accept model.
+//! This serves the **page** (HTTPS / HTTP/1.1) so it loads cleanly in a browser
+//! with a real lock icon (mkcert). It binds the **same** `host:port` as the
+//! QUIC endpoint — TCP and UDP are independent socket namespaces, so they
+//! coexist on `:4433`. Each core binds with `SO_REUSEPORT`; the kernel hashes
+//! each connection to one core.
 //!
-//! Request routing (per connection):
-//! - `GET /`        → `index.html` (the Leptos CSR entry point)
-//! - `GET /<asset>` → other files from the built frontend dir
-//! - `GET /ws`      → WebSocket upgrade → [`ws_loop`]
+//! This bootstrap also drives the **HTTP/1.1 → HTTP/3 upgrade**. In **pooling
+//! mode** (no `--inject-wt-hash`) the QUIC endpoint presents the same
+//! CA-trusted cert used here, so every response carries
+//! `Alt-Svc: h3="<port>"` and the browser upgrades subsequent fetches to
+//! HTTP/3 over QUIC. In **hash-pinning mode** (`--inject-wt-hash`) the QUIC
+//! endpoint presents a self-signed cert the browser can't validate for a fetch,
+//! so we emit **no `Alt-Svc`** — advertising one would only make the browser
+//! try, fail, and mark the origin's QUIC broken (which would also break
+//! WebTransport). The page stays on TCP in that mode; WebTransport owns QUIC.
 //!
-//! The WebSocket loop round-trips a [`dentrado`] gear: the client sends a
-//! command, the owning core runs it via [`Core::db_run_gear`] (routing to the
-//! correct core if this one does not own it), and replies with the result.
+//! The data channel itself is WebTransport (see [`crate::server`]).
 
-use std::{
-    collections::HashMap,
-    io,
-    path::{Path, PathBuf},
-    rc::Rc,
-};
+use std::{collections::HashMap, io, path::PathBuf, rc::Rc};
 
 use compio::{
     buf::BufResult,
-    io::{AsyncRead, AsyncWriteExt},
-    net::{TcpListener, TcpSocket, TcpStream},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, TcpSocket},
     runtime,
-    ws::{Config, WebSocketStream, tungstenite},
+    tls::TlsAcceptor,
 };
-use dentrado::{
-    core::{core_ctx::Core, storage::InMemoryStorage},
-    wire::WireLocCtx,
-};
-use futures::channel::mpsc;
-use futures::future::FutureExt;
-use futures::select;
-use futures::stream::StreamExt;
-use kolorinko_wikitext::Content;
-use log::{error, info, warn};
-use serde::{Deserialize, Serialize};
+use log::{info, warn};
 
-use crate::{
-    runtime::{GearId, GearOut, KolorinkoRT},
-    safe_path::SafePathComponent,
-    wikidot_page::RepoMeta,
-};
+use crate::assets::{load_assets, mime_for};
+use crate::tls::https_server_config;
 
-/// Minimal placeholder served when no built frontend is present, so the server
-/// is usable before `trunk build` has run.
-const PLACEHOLDER_INDEX: &str = "<!doctype html>\
-<html><head><meta charset=\"utf-8\"><title>kolorinko</title></head>\
-<body><h1>kolorinko</h1>\
-<p>No built frontend found. Build it with \
-<code>trunk build</code> in <code>apps/kolorinko-web</code>.</p></body></html>";
-
-/// Bind `addr` with `SO_REUSEPORT` and run the accept loop for this core.
+/// Bind `addr` with `SO_REUSEPORT`, wrap each connection in TLS, and serve the
+/// HTTP/1.1 page. (WebTransport is separate — see [`crate::server`].)
 ///
-/// Runs forever; only returns on a fatal listener error. Each core binds the
-/// same `(addr, port)`; the kernel hashes each incoming connection to exactly
-/// one core, preserving the thread-per-core, shared-nothing model.
-pub(crate) async fn serve(
-    core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
-    addr: &str,
-    assets_dir: PathBuf,
-    repo_meta: RepoMeta,
-) -> io::Result<()> {
-    let assets = Rc::new(load_assets(&assets_dir));
+/// Runs forever; only returns on a fatal listener error.
+pub(crate) async fn serve(addr: &str, assets_dir: PathBuf, inject_wt_hash: bool) -> io::Result<()> {
+    // Hash-pinning mode injects the WT cert hash into the cached page once
+    // here; pooling mode passes `None` (no injection).
+    let wt_hash = if inject_wt_hash {
+        Some(crate::tls::wt_cert_hash())
+    } else {
+        None
+    };
+    let assets = Rc::new(load_assets(&assets_dir, wt_hash));
+    let acceptor = TlsAcceptor::from(https_server_config()?);
     let listener = bind_reuseport(addr).await?;
     let local = listener.local_addr()?;
-    info!("kolorinko worker listening on {local} (reuse_port)");
+    info!("kolorinko https bootstrap listening on {local} (reuse_port)");
+
+    // `Alt-Svc` advertises the HTTP/3 upgrade. Only in pooling mode: there the
+    // QUIC endpoint presents the CA-trusted cert, so the browser's upgrade
+    // handshake actually validates. In hash-pinning mode the QUIC cert is
+    // self-signed; advertising an upgrade would make the browser try, fail, and
+    // mark the origin's QUIC broken (breaking WebTransport too), so we stay
+    // silent. TCP and UDP share the same `host:port`, so the advertised port is
+    // this listener's port.
+    let alt_svc = if inject_wt_hash {
+        None
+    } else {
+        Some(format!("h3=\":{}\"; ma=86400", local.port()))
+    };
 
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                let core = core.clone();
                 let assets = assets.clone();
-                let repo_meta = repo_meta.clone();
+                let acceptor = acceptor.clone();
+                let alt_svc = alt_svc.clone();
                 runtime::spawn(async move {
-                    if let Err(e) = handle_conn(stream, &core, &assets, repo_meta).await
+                    let mut stream = match acceptor.accept(stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!("tls handshake {peer}: {e}");
+                            return;
+                        }
+                    };
+                    if let Err(e) = handle_conn(&mut stream, &assets, alt_svc.as_deref()).await
                         && !is_disconnect(&e)
                     {
                         warn!("conn {peer}: {e}");
@@ -91,8 +92,6 @@ pub(crate) async fn serve(
 
 /// Create a `TcpListener` on `addr` with `SO_REUSEADDR` and `SO_REUSEPORT` set
 /// before binding, so every core can bind the same port.
-///
-/// `addr` must parse to a single `SocketAddr` (e.g. `"0.0.0.0:8080"`).
 async fn bind_reuseport(addr: &str) -> io::Result<TcpListener> {
     use std::net::SocketAddr;
     let sa: SocketAddr = addr
@@ -109,47 +108,38 @@ async fn bind_reuseport(addr: &str) -> io::Result<TcpListener> {
     sock.listen(128).await
 }
 
-/// Handle a single TCP connection: route by request line.
-async fn handle_conn(
-    mut stream: TcpStream,
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+/// Handle one TLS connection: serve a static asset. The WT cert hash (if in
+/// hash-pinning mode) was already injected into `/index.html` once at load time
+/// by [`crate::assets::load_assets`], so this just serves the cached bytes.
+async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     assets: &HashMap<String, Vec<u8>>,
-    repo_meta: RepoMeta,
+    alt_svc: Option<&str>,
 ) -> io::Result<()> {
-    let head = read_request_head(&mut stream).await?;
+    let head = read_request_head(stream).await?;
     let Some((method, path)) = parse_request_line(&head) else {
-        write_http(&mut stream, 400, "text/plain", b"bad request\n").await?;
+        write_http(stream, 400, "text/plain", b"bad request\n", alt_svc).await?;
         return Ok(());
     };
 
     if method != "GET" && method != "HEAD" {
-        write_http(&mut stream, 405, "text/plain", b"method not allowed\n").await?;
+        write_http(stream, 405, "text/plain", b"method not allowed\n", alt_svc).await?;
         return Ok(());
     }
 
-    if path == "/ws" {
-        upgrade_ws(&mut stream, &head).await?;
-        let mut ws = WebSocketStream::from_raw_socket(
-            stream,
-            tungstenite::protocol::Role::Server,
-            Config::default(),
-        )
-        .await;
-        return ws_loop(&mut ws, core, repo_meta).await;
-    }
-
-    let key = if path == "/" { "/index.html" } else { path };
-    match assets.get(key) {
-        Some(bytes) => write_http(&mut stream, 200, mime_for(key), bytes).await,
-        None => write_http(&mut stream, 404, "text/plain", b"not found\n").await,
-    }
+    // Strip the query string before asset lookup: `GET /?x=1` → `/`.
+    let path = path.split('?').next().unwrap_or(path);
+    let key: &str = if path == "/" { "/index.html" } else { path };
+    let res = match assets.get(key) {
+        Some(bytes) => write_http(stream, 200, mime_for(key), bytes, alt_svc).await,
+        None => write_http(stream, 404, "text/plain", b"not found\n", alt_svc).await,
+    };
+    let _ = stream.shutdown().await; // send close_notify for a clean TLS close
+    res
 }
 
 /// Read bytes until the end of the HTTP request head (`\r\n\r\n`).
-///
-/// Uses compio's owned-buffer [`AsyncRead`] directly so we can stop as soon as
-/// the header terminator appears without consuming any body bytes.
-async fn read_request_head(stream: &mut TcpStream) -> io::Result<String> {
+async fn read_request_head<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<String> {
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
     loop {
         let chunk: Vec<u8> = vec![0u8; 2048];
@@ -158,7 +148,6 @@ async fn read_request_head(stream: &mut TcpStream) -> io::Result<String> {
         if n == 0 {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
         }
-        // compio resizes `chunk` to exactly the `n` bytes read.
         buf.extend_from_slice(&chunk[..n]);
         if find_double_crlf(&buf).is_some() {
             break;
@@ -170,237 +159,14 @@ async fn read_request_head(stream: &mut TcpStream) -> io::Result<String> {
     String::from_utf8(buf).map_err(|_| io::Error::other("non-utf8 request head"))
 }
 
-/// Write the `101 Switching Protocols` WebSocket handshake response and flush.
-///
-/// No leftover request bytes are passed on: a WebSocket `GET` upgrade carries
-/// no body, so once `\r\n\r\n` is consumed the socket is clean for framing.
-async fn upgrade_ws(stream: &mut TcpStream, head: &str) -> io::Result<()> {
-    let key = get_header(head, "sec-websocket-key")
-        .ok_or_else(|| io::Error::other("missing Sec-WebSocket-Key"))?;
-    let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
-    let resp = format!(
-        "HTTP/1.1 101 Switching Protocols\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Accept: {accept}\r\n\r\n"
-    );
-    let BufResult(res, _) = stream.write_all(resp.into_bytes()).await;
-    res
-}
-
-/// A client request over the WebSocket.
-#[derive(Deserialize)]
-#[serde(tag = "t")]
-enum Request {
-    /// Load a parsed page: runs `GearId::Load` on the owning core.
-    #[serde(rename = "load")]
-    Load {
-        site: String,
-        category: Option<String>,
-        page: String,
-    },
-    /// Diagnostic: run `GearId::Repo` and report the resolved path.
-    #[serde(rename = "repo")]
-    Repo,
-}
-
-/// A server reply over the WebSocket.
-#[derive(Serialize)]
-#[serde(tag = "t")]
-enum Reply {
-    /// A page was loaded; `content` is the parsed Wikidot AST.
-    #[serde(rename = "page")]
-    Page { content: Content },
-    /// `GearId::Repo` ran and loaded this many pages from the repository.
-    #[serde(rename = "repo")]
-    Repo { pages: usize },
-    #[serde(rename = "error")]
-    Error { error: String },
-}
-
-impl Reply {
-    fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| "{\"t\":\"error\"}".into())
-    }
-}
-
-/// WebSocket message loop: keeps one direct subscription per page the
-/// client has asked for, for the lifetime of the connection. The client's
-/// `load` request opens (or refreshes) a subscription; a background push task
-/// per subscription forwards every new output to a single outbound channel,
-/// which is drained here alongside incoming WS messages. Dropping the
-/// connection (or a WS close/error) drops every push-task handle, which
-/// cancels the task (compio `JoinHandle` drop = cancel) and drops its
-/// `Subscription`, so the gear rebalances / evicts as interest goes away —
-/// i.e. a page is only kept hot while a client is actually viewing it.
-async fn ws_loop(
-    ws: &mut WebSocketStream<TcpStream>,
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
-    repo_meta: RepoMeta,
-) -> io::Result<()> {
-    let (tx, mut rx) = mpsc::unbounded::<Reply>();
-    // One push-task handle per subscribed page. Stored (not detached) so that
-    // dropping it on disconnect cancels the task and releases its subscription.
-    let mut subs: HashMap<PageKey, runtime::JoinHandle<()>> = HashMap::new();
-
-    loop {
-        let close = select! {
-            msg = ws.read().fuse() => match msg {
-                Ok(tungstenite::Message::Text(t)) => {
-                    handle_text(&t, &tx, &mut subs, core, &repo_meta).await;
-                    false
-                }
-                Ok(tungstenite::Message::Close(_))
-                | Ok(tungstenite::Message::Ping(_))
-                | Err(_) => true,
-                Ok(_) => false,
-            },
-            reply = rx.next() => match reply {
-                Some(r) => {
-                    send(ws, r).await;
-                    false
-                }
-                None => true,
-            },
-        };
-        if close {
-            return Ok(());
-        }
-    }
-}
-
-/// Identity of a subscribed page, used to dedup push tasks per connection.
-type PageKey = (
-    SafePathComponent,
-    Option<SafePathComponent>,
-    SafePathComponent,
-);
-
-/// Parse one WS text frame and act on it. Replies are never written directly to
-/// the socket here — they go through `tx` so they serialize with push-task
-/// updates on the `ws_loop` write side. `load` opens (or refreshes) a direct
-/// subscription and spawns a push task that forwards every new output; `repo`
-/// is a one-shot diagnostic run.
-async fn handle_text(
-    text: &str,
-    tx: &mpsc::UnboundedSender<Reply>,
-    subs: &mut HashMap<PageKey, runtime::JoinHandle<()>>,
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
-    repo_meta: &RepoMeta,
-) {
-    let req: Request = match serde_json::from_str(text) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = tx.unbounded_send(Reply::Error {
-                error: format!("bad request: {e}"),
-            });
-            return;
-        }
-    };
-    match req {
-        Request::Repo => {
-            match core
-                .db_run_gear(GearId::Repo(repo_meta.clone()), WireLocCtx::default())
-                .await
-            {
-                Ok(GearOut::RepoOut(data)) => {
-                    let _ = tx.unbounded_send(Reply::Repo {
-                        pages: data.page_count(),
-                    });
-                }
-                Ok(_) => {
-                    let _ = tx.unbounded_send(Reply::Error {
-                        error: "unexpected gear output".into(),
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.unbounded_send(Reply::Error {
-                        error: format!("gear error: {e:?}"),
-                    });
-                }
-            }
-        }
-        Request::Load {
-            site,
-            category,
-            page,
-        } => {
-            let Some(site) = SafePathComponent::new(site) else {
-                let _ = tx.unbounded_send(Reply::Error {
-                    error: "invalid site".into(),
-                });
-                return;
-            };
-            let Some(page) = SafePathComponent::new(page) else {
-                let _ = tx.unbounded_send(Reply::Error {
-                    error: "invalid page".into(),
-                });
-                return;
-            };
-            let category = match category {
-                None => None,
-                Some(c) => match SafePathComponent::new(c) {
-                    Some(sp) => Some(sp),
-                    None => {
-                        let _ = tx.unbounded_send(Reply::Error {
-                            error: "invalid category".into(),
-                        });
-                        return;
-                    }
-                },
-            };
-            let key: PageKey = (site.clone(), category.clone(), page.clone());
-            let gear = GearId::Load {
-                repo: repo_meta.clone(),
-                site,
-                slug: (category, page),
-            };
-            // Subscribe fresh (replacing any prior push task for this page, so
-            // a duplicate `load` request revives a subscription whose push task
-            // died because the gear was evicted). `subscribe_gear` awaits the
-            // first output, so `current()` is always present.
-            let sub = core.subscribe_gear(gear).await;
-            let initial = sub.current();
-            if let GearOut::LoadOut(content) = initial {
-                let _ = tx.unbounded_send(Reply::Page {
-                    content: (*content).clone(),
-                });
-            }
-            let tx = tx.clone();
-            let handle = runtime::spawn(async move {
-                while let Some(out) = sub.next().await {
-                    if let GearOut::LoadOut(content) = out {
-                        let _ = tx.unbounded_send(Reply::Page {
-                            content: (*content).clone(),
-                        });
-                    }
-                }
-            });
-            if let Some(old) = subs.insert(key, handle) {
-                // Cancel the previous push task; its subscription drops and
-                // rebalances (the new subscription keeps the gear hot).
-                drop(old);
-            }
-        }
-    }
-}
-
-/// Serialize a [`Reply`] and send it, logging (not propagating) send errors.
-async fn send(ws: &mut WebSocketStream<TcpStream>, reply: Reply) {
-    if let Err(e) = ws
-        .send(tungstenite::Message::Text(reply.to_json().into()))
-        .await
-    {
-        warn!("ws send: {e}");
-    }
-}
-
-/// Write a complete HTTP/1.1 response (head + body) and flush.
-async fn write_http(
-    stream: &mut TcpStream,
+/// Write a complete HTTP/1.1 response (head + body) and flush. `alt_svc`, when
+/// present, is sent as an `Alt-Svc` header to advertise the HTTP/3 upgrade.
+async fn write_http<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     status: u16,
     mime: &str,
     body: &[u8],
+    alt_svc: Option<&str>,
 ) -> io::Result<()> {
     let status_text = match status {
         200 => "OK",
@@ -409,23 +175,32 @@ async fn write_http(
         405 => "Method Not Allowed",
         _ => "OK",
     };
-    let head = format!(
+    let mut head = format!(
         "HTTP/1.1 {status} {status_text}\r\n\
          Content-Type: {mime}\r\n\
          Content-Length: {len}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        len = body.len()
+         Connection: close\r\n",
+        len = body.len(),
     );
+    if let Some(alt) = alt_svc {
+        head.push_str("Alt-Svc: ");
+        head.push_str(alt);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
     let mut full = Vec::with_capacity(head.len() + body.len());
     full.extend_from_slice(head.as_bytes());
     full.extend_from_slice(body);
     let BufResult(res, _) = stream.write_all(full).await;
-    res
+    res?;
+    // TLS encrypts via rustls, which buffers ciphertext; flush pushes it to the
+    // socket before the stream drops (otherwise the peer sees a truncated record).
+    stream.flush().await?;
+    Ok(())
 }
 
-// ---- small HTTP parsing helpers ------------------------------------------------
-
+/// Parse the request line into `(method, raw_path)` — `raw_path` includes any
+/// query string; callers strip it as needed.
 fn parse_request_line(head: &str) -> Option<(&str, &str)> {
     let line = head.lines().next()?;
     let mut parts = line.split_whitespace();
@@ -434,37 +209,9 @@ fn parse_request_line(head: &str) -> Option<(&str, &str)> {
     Some((method, path))
 }
 
-/// Case-insensitive header lookup over the raw request head.
-fn get_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
-    for line in head.lines().skip(1) {
-        if let Some((k, v)) = line.split_once(':')
-            && k.trim().eq_ignore_ascii_case(name)
-        {
-            return Some(v.trim());
-        }
-    }
-    None
-}
-
 /// Index of the `\r\n\r\n` terminator, if present.
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
-}
-
-/// Map a path to a MIME type by extension.
-fn mime_for(path: &str) -> &'static str {
-    match path.rsplit('.').next() {
-        Some("html") | Some("htm") => "text/html; charset=utf-8",
-        Some("js") => "text/javascript",
-        Some("mjs") => "text/javascript",
-        Some("wasm") => "application/wasm",
-        Some("css") => "text/css",
-        Some("json") => "application/json",
-        Some("svg") => "image/svg+xml",
-        Some("png") => "image/png",
-        Some("ico") => "image/x-icon",
-        _ => "application/octet-stream",
-    }
 }
 
 fn is_disconnect(e: &io::Error) -> bool {
@@ -475,45 +222,4 @@ fn is_disconnect(e: &io::Error) -> bool {
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::BrokenPipe
     )
-}
-
-// ---- frontend asset loading ---------------------------------------------------
-
-/// Load the built frontend into a `path → bytes` map, keyed by request path
-/// (e.g. `/index.html`, `/pkg/kolorinko_web.js`).
-///
-/// Done once per worker at startup. Uses blocking `std::fs` because it is a
-/// one-time read of (typically) a few small files, well under a millisecond.
-fn load_assets(dir: &Path) -> HashMap<String, Vec<u8>> {
-    let mut map = HashMap::new();
-    if dir.is_dir() {
-        walk(dir, dir, &mut map);
-    } else {
-        warn!(
-            "frontend dir {} not found; serving a placeholder page",
-            dir.display()
-        );
-    }
-    map.entry("/index.html".to_string())
-        .or_insert_with(|| PLACEHOLDER_INDEX.as_bytes().to_vec());
-    map
-}
-
-fn walk(root: &Path, dir: &Path, map: &mut HashMap<String, Vec<u8>>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk(root, &path, map);
-        } else if let Ok(rel) = path.strip_prefix(root)
-            && let Ok(bytes) = std::fs::read(&path)
-        {
-            let key = format!("/{}", rel.to_string_lossy().replace('\\', "/"));
-            map.insert(key, bytes);
-        } else if let Err(e) = path.strip_prefix(root) {
-            error!("asset {}: {e}", path.display());
-        }
-    }
 }

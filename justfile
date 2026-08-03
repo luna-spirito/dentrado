@@ -10,9 +10,24 @@
 
 # ---- config (override via env) -------------------------------------------
 
-# Host/port the dev server listens on and the browser opens.
-port := env_var_or_default("KOLORINKO_PORT", "8080")
+# Single origin for everything: TCP (HTTPS/HTTP1.1 bootstrap) and UDP
+# (QUIC/H3+WebTransport) coexist on the same `host:port`. The server default
+# is `[::1]:4433`; here we use IPv4 loopback explicitly.
+port := env_var_or_default("KOLORINKO_PORT", "4433")
 host  := "127.0.0.1"
+
+# mkcert cert the browser trusts. WebTransport cannot use a self-signed cert
+# (QUIC has no "proceed anyway" prompt), so we fail fast if the pair is
+# missing rather than silently serving a browser-refusing server. The server
+# also auto-discovers this same pair, but exporting it makes the dependency
+# explicit. Generate once (one-time, outside the nix store):
+#   mkdir -p .certs && cd .certs && mkcert localhost 127.0.0.1 ::1 \
+#     && mv localhost+2.pem localhost.pem && mv localhost+2-key.pem localhost-key.pem
+# and trust the root in the system store: mkcert -install  (then add
+# security.pki.certificateFiles = [ "~/.local/share/mkcert/rootCA.pem" ]; on
+# NixOS and rebuild so Chromium reads it).
+cert_file := env_var_or_default("KOLORINKO_CERT_FILE", justfile_directory() + "/.certs/localhost.pem")
+key_file  := env_var_or_default("KOLORINKO_KEY_FILE",  justfile_directory() + "/.certs/localhost-key.pem")
 
 # Where the Wikidot export lives. Prefers an explicit $REPO_DIR, then reuses
 # an existing clone at /tmp/kolorinko-export, else falls back to a project-local
@@ -48,11 +63,23 @@ dev: web
     #!/usr/bin/env bash
     set -uo pipefail
 
+    # WebTransport needs a browser-trusted cert; fail fast rather than serve a
+    # self-signed cert the browser will reject with CERTIFICATE_VERIFY_FAILED.
+    if [[ ! -f "{{cert_file}}" || ! -f "{{key_file}}" ]]; then
+      echo "✗ no TLS cert at {{cert_file}} (and {{key_file}})." >&2
+      echo "  Generate once:  mkdir -p .certs && cd .certs && \\" >&2
+      echo "    mkcert localhost 127.0.0.1 ::1 && \\" >&2
+      echo "    mv localhost+2.pem localhost.pem && mv localhost+2-key.pem localhost-key.pem" >&2
+      exit 1
+    fi
+
     export REPO_DIR="{{repo_dir}}"
     export REPO_INTERVAL="{{repo_interval}}"
     export KOLORINKO_BIND="{{host}}:{{port}}"
     export KOLORINKO_WEB_DIST="apps/kolorinko-web/dist"
-    url="http://{{host}}:{{port}}"
+    export KOLORINKO_CERT_FILE="{{cert_file}}"
+    export KOLORINKO_KEY_FILE="{{key_file}}"
+    url="https://{{host}}:{{port}}"
 
     echo "➜ kolorinko dev  →  $url"
     echo "   repo: $REPO_DIR   (first page load clones it if missing)"
@@ -101,11 +128,13 @@ run:
     export REPO_INTERVAL="{{repo_interval}}"
     export KOLORINKO_BIND="{{host}}:{{port}}"
     export KOLORINKO_WEB_DIST="apps/kolorinko-web/dist"
-    cargo run -p kolorinko
+    export KOLORINKO_CERT_FILE="{{cert_file}}"
+    export KOLORINKO_KEY_FILE="{{key_file}}"
+    cargo run -p kolorinko --bin kolorinko # -- --inject-wt-hash
 
 # Open the browser against an already-running server.
 open:
-    {{opener}} "http://{{host}}:{{port}}" || echo "open http://{{host}}:{{port}} manually"
+    {{opener}} "https://{{host}}:{{port}}" || echo "open https://{{host}}:{{port}} manually"
 
 # Run the whole workspace's tests.
 test:
