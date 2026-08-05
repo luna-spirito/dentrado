@@ -65,3 +65,4 @@ bridge.rs:
 
 * CRITICAL: decide what to do with NodeId and how to make u32 enough. Is this possible even?
 * Swap Event: it has internal Rc, and I don't like that >_<
+* Do we need LocMsgTypeId? It's probably obsolete by that point, overridden by the R::Group. LocGroupId merges both for quire some time already.

@@ -17,6 +17,8 @@ use crate::{
 ///   counter and rerun at most once per `period` epochs while they have
 ///   interest. They poll an outside system on that cadence — e.g. a git
 ///   `fetch` or a remote API pull.
+/// - [`GearMeta::Follow`] gears are subscribed, directly, to the result of
+///   other gear on the same core.
 #[derive(Debug, Clone)]
 pub enum GearMeta<R: IsRuntime> {
     Event {
@@ -30,6 +32,12 @@ pub enum GearMeta<R: IsRuntime> {
         /// per `period` seconds."
         period: NonZero<u64>,
     },
+    Follow {
+        gear: R::GearId,
+        /// Optimization: we bake target group here, so that the database isn't stuck
+        /// in recursion trying to figure out the root group.
+        baked_group: R::Group,
+    },
 }
 
 impl<R: IsRuntime> GearMeta<R> {
@@ -38,6 +46,7 @@ impl<R: IsRuntime> GearMeta<R> {
     pub fn group(&self) -> &R::Group {
         match self {
             GearMeta::Event { group, .. } | GearMeta::Timer { group, .. } => group,
+            GearMeta::Follow { baked_group, .. } => baked_group,
         }
     }
 }
@@ -57,9 +66,10 @@ impl<R: IsRuntime> GearMeta<R> {
 ///   limit, so a `tick = true` run is never issued more often than `period`
 ///   epochs apart.
 #[derive(Debug, Clone, Copy)]
-pub enum GearInput {
+pub enum GearInput<R: IsRuntime> {
     Events(LocGroupId),
     Timer { tick: bool },
+    Follow { out: R::GearOut },
 }
 
 pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
@@ -99,7 +109,7 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
     /// is shared between all concurrently-polled gears on this core).
     async fn run_step<S: Storage<Self>>(
         ctx: &mut GearCtx<Self, S>,
-        input: GearInput,
+        input: GearInput<Self>,
         cache: &mut Self::GearCache<S::Watermark>,
     ) -> Self::GearOut;
 }
@@ -132,7 +142,7 @@ impl IsRuntime for EmptyRuntime {
 
     async fn run_step<S: Storage<Self>>(
         _ctx: &mut crate::core::core_ctx::GearCtx<Self, S>,
-        _input: GearInput,
+        _input: GearInput<Self>,
         _cache: &mut Self::GearCache<S::Watermark>,
     ) -> Self::GearOut {
     }

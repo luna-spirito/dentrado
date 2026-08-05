@@ -194,6 +194,15 @@ pub(crate) enum GearSource {
     /// Timer-driven (oracle): rerun when the core's epoch counter reaches
     /// `next_due`. `period` is the minimum gap between two `tick = true` runs.
     Timer { period: NonZero<u64>, next_due: u64 },
+    /// Follow-driven: rerun when the followed gear's output changes. Carries
+    /// the target's arena [`GearKey`]. This is a *static* edge declared in
+    /// [`GearMeta::Follow`], distinct from the dynamic `secondary_get` edges
+    /// tracked in `dep_set`: its sole bookkeeping is the reverse entry in the
+    /// target's `local_dependents` (set at activation, torn down in
+    /// [`CoreLocCtx::evict_gear`]), so the target fans out a kick to this gear
+    /// on every new output. The runtime sees that output via
+    /// [`GearInput::Follow`].
+    Follow { target: GearKey },
 }
 
 #[derive(Debug)]
@@ -464,6 +473,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
             // due tick at the moment the run starts is what enforces the
             // `period` rate limit even if the run is cancelled or re-looped.
             let (gear_id, input) = {
+                // TODO: Move outside of loop?
                 let mut inner = self.inner.borrow_mut();
                 let epoch = inner.epoch;
                 let Some(ag) = inner.gears.get_mut(key) else {
@@ -479,6 +489,15 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                                 *next_due = epoch + period.get();
                             }
                             GearInput::Timer { tick }
+                        }
+                        GearSource::Follow { target } => {
+                            let target = *target;
+                            drop(inner);
+                            let out = self
+                                .wait_for_output_unpinned(target)
+                                .await
+                                .expect("run_loc_gear_task: followed gear evicted mid-run");
+                            GearInput::Follow { out }
                         }
                     },
                     ActiveGearExecution::Remote { .. } => {
@@ -623,6 +642,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
         enum Reg {
             Event(LocGroupId),
             Timer,
+            Follow { target: GearKey },
             Remote,
         }
         let (execution, registration) = if target_core == self.core_id {
@@ -651,6 +671,26 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                     },
                     Reg::Timer,
                 ),
+                GearMeta::Follow {
+                    gear: target,
+                    baked_group: _,
+                } => {
+                    // Co-located with the target (routing uses its group), so
+                    // the target is local: force-activate it and bake its arena
+                    // key into the source. `dep_set` is left empty — the static
+                    // follow edge is NOT a `secondary_get` dep; its only
+                    // bookkeeping is the reverse `local_dependents` entry wired
+                    // up in `Reg::Follow` below (and torn down in `evict_gear`).
+                    let target_key = Box::pin(self.force_active(&target)).await;
+                    (
+                        ActiveGearExecution::Local {
+                            source: GearSource::Follow { target: target_key },
+                            status: ActiveGearStatus::Eepy,
+                            dep_set: HashSet::new(),
+                        },
+                        Reg::Follow { target: target_key },
+                    )
+                }
             }
         } else {
             (ActiveGearExecution::Remote { target_core }, Reg::Remote)
@@ -677,6 +717,16 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 }
                 Reg::Timer => {
                     inner.timer_gears.insert(key);
+                }
+                Reg::Follow { target } => {
+                    // Reverse edge of the static follow dep: the target kicks
+                    // its `local_dependents` whenever it produces a new output —
+                    // that is what re-runs this gear. Done in the same `borrow`
+                    // as the arena insert, so both halves of the edge appear
+                    // atomically. (The forward half lives in `GearSource`.)
+                    if let Some(ag) = inner.gears.get_mut(target) {
+                        ag.local_dependents.insert(key);
+                    }
                 }
                 Reg::Remote => {}
             }
@@ -1491,6 +1541,19 @@ impl<R: IsRuntime> CoreLocCtx<R> {
                     }
                     GearSource::Timer { .. } => {
                         self.timer_gears.remove(&key);
+                    }
+                    GearSource::Follow { target } => {
+                        // Tear down the static follow edge's reverse half:
+                        // remove ourselves from the target's `local_dependents`
+                        // and rebalance it (it may lose its last dependent).
+                        // Mirrors the generic `dep_set` walk below for dynamic
+                        // edges. (If the gear also `secondary_get`s its own
+                        // target, the duplicate removal/rebalance is a harmless
+                        // no-op.)
+                        if let Some(dag) = self.gears.get_mut(target) {
+                            dag.local_dependents.remove(&key);
+                        }
+                        self.rebalance_gear(target, stop_ctx);
                     }
                 }
                 dep_set

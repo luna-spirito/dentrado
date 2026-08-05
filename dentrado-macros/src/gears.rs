@@ -70,6 +70,7 @@ impl Parse for GearsAttr {
 enum GearArg {
     Timer { period: TokenStream2 },
     Event,
+    Follow { target: TokenStream2 },
     Name(Ident),
 }
 
@@ -97,6 +98,20 @@ impl Parse for GearArg {
                 })
             }
             "event" => Ok(GearArg::Event),
+            "follow" => {
+                let inner;
+                syn::parenthesized!(inner in input);
+                let t: Ident = inner.parse()?;
+                if t != "target" {
+                    return Err(syn::Error::new(t.span(), "expected `target =`"));
+                }
+                inner.parse::<Token![=]>()?;
+                // Capture as a raw token stream (like `timer(period = …)`):
+                // the target may be arbitrarily complex, and a trailing comma
+                // would trip `Expr::parse`.
+                let target: TokenStream2 = strip_trailing_comma(inner.parse()?);
+                Ok(GearArg::Follow { target })
+            }
             "name" => {
                 input.parse::<Token![=]>()?;
                 let n: Ident = input.parse()?;
@@ -113,6 +128,7 @@ impl Parse for GearArg {
 enum KindSpec {
     Timer { period: TokenStream2 },
     Event,
+    Follow { target: TokenStream2 },
 }
 
 // ── per-gear spec extracted from a `#[gear]`-marked fn ─────────────────────
@@ -125,6 +141,12 @@ enum ParamRole {
     IdField { name: Ident, ty: Type },
     /// `tick: bool` (timer gears only). The match binds `tick` from `GearInput`.
     Tick,
+    /// The followed gear's output (follow gears only). Bound from
+    /// [`GearInput::Follow`] and destructured to its typed inner value.
+    /// Reclassified from a tentative [`ParamRole::IdField`] during the
+    /// Follow-resolution pass (matched by the target gear's output type);
+    /// only the binding name is needed thereafter.
+    FollowOut { name: Ident },
     /// `ctx: &mut GearCtx<…>`. The run call forwards `run_step`'s `ctx`.
     Ctx,
     /// `cache: &mut T`. The match binds `&mut T` from `GearCache`.
@@ -140,6 +162,10 @@ struct GearSpec {
     params: Vec<ParamRole>,
     out_ty: Type,
     kind: KindSpec,
+    /// Follow gears only: the target's `GearOut` variant (`RepoOut`), used to
+    /// destructure the followed output in `run_step`. `None` for non-follow
+    /// gears; set during the Follow-resolution pass for follow gears.
+    follow_out_variant: Option<Ident>,
 }
 
 impl GearSpec {
@@ -232,6 +258,7 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
         match arg {
             GearArg::Timer { period } => kind = Some(KindSpec::Timer { period }),
             GearArg::Event => kind = Some(KindSpec::Event),
+            GearArg::Follow { target } => kind = Some(KindSpec::Follow { target }),
             GearArg::Name(n) => name = Some(n),
         }
     }
@@ -239,7 +266,10 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
         syn::Error::new_spanned(gear_attr, "`#[gear(...)]` must set `name = <Variant>`")
     })?;
     let kind = kind.ok_or_else(|| {
-        syn::Error::new_spanned(gear_attr, "`#[gear(...)]` must set `timer(...)` or `event`")
+        syn::Error::new_spanned(
+            gear_attr,
+            "`#[gear(...)]` must set `timer(...)`, `event`, or `follow(target = …)`",
+        )
     })?;
 
     let is_async = fn_item.sig.asyncness.is_some();
@@ -298,6 +328,12 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
                 "event gear fn must not take a `tick` param",
             ));
         }
+        KindSpec::Follow { .. } if params.iter().any(|p| matches!(p, ParamRole::Tick)) => {
+            return Err(syn::Error::new_spanned(
+                &fn_item.sig,
+                "follow gear fn must not take a `tick` param",
+            ));
+        }
         _ => {}
     }
 
@@ -316,7 +352,62 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
         params,
         out_ty,
         kind,
+        follow_out_variant: None,
     })
+}
+
+/// Extract the `GearId` variant name from a `follow(target = …)` payload. The
+/// target must be a `GearId::<Variant>(…)` / `GearId::<Variant> { … }`
+/// construction; we read the variant off the call/struct path so the
+/// Follow-resolution pass can look up the target gear's output type.
+fn follow_target_variant(target: &TokenStream2) -> syn::Result<Ident> {
+    let expr: syn::Expr = syn::parse2(target.clone())?;
+    let path = match &expr {
+        syn::Expr::Call(c) => match c.func.as_ref() {
+            syn::Expr::Path(p) => &p.path,
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    c,
+                    "follow target must be a `GearId::<Variant>(…)` construction",
+                ));
+            }
+        },
+        syn::Expr::Struct(s) => &s.path,
+        _ => {
+            return Err(syn::Error::new_spanned(
+                expr,
+                "follow target must be a `GearId::<Variant>(…)` construction",
+            ));
+        }
+    };
+    path.segments
+        .last()
+        .map(|s| s.ident.clone())
+        .ok_or_else(|| syn::Error::new_spanned(path, "follow target must name a `GearId` variant"))
+}
+
+/// Collect every identifier appearing in `ts`, recursing into groups so that
+/// names nested in `(…)`, `{…}`, `[…]` (e.g. the field inside `GearId::Repo(repo)`)
+/// are seen. Used to learn which id-field names a `follow(target = …)` expression
+/// actually references.
+fn collect_ident_strings(ts: &TokenStream2) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    collect_ident_strings_into(ts.clone(), &mut out);
+    out
+}
+
+fn collect_ident_strings_into(ts: TokenStream2, out: &mut std::collections::HashSet<String>) {
+    for tt in ts {
+        match tt {
+            proc_macro2::TokenTree::Ident(i) => {
+                out.insert(i.to_string());
+            }
+            proc_macro2::TokenTree::Group(g) => {
+                collect_ident_strings_into(g.stream(), out);
+            }
+            _ => {}
+        }
+    }
 }
 
 // ── codegen ───────────────────────────────────────────────────────────────
@@ -348,6 +439,75 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             &item_mod,
             "`#[gears]` module must contain at least one `#[gear]` fn",
         ));
+    }
+
+    // Follow resolution: each follow gear's `target` must name a known gear
+    // variant; exactly one of its by-value params must then match the target's
+    // output type and is reclassified as the followed-output binding. Also
+    // rejects direct self-follow (which would infinitely recurse in `meta`).
+    {
+        let target_info: std::collections::HashMap<String, (Type, Ident)> = specs
+            .iter()
+            .map(|g| {
+                (
+                    g.name.to_string(),
+                    (g.out_ty.clone(), format_ident!("{}Out", g.name)),
+                )
+            })
+            .collect();
+        for g in &mut specs {
+            let KindSpec::Follow { target } = &g.kind else {
+                continue;
+            };
+            let variant = follow_target_variant(target)?;
+            if variant == g.name {
+                return Err(syn::Error::new_spanned(
+                    &variant,
+                    "a gear cannot follow itself",
+                ));
+            }
+            let (out_ty, out_variant) = target_info.get(&variant.to_string()).ok_or_else(|| {
+                syn::Error::new_spanned(
+                    &variant,
+                    format!("follow target `GearId::{variant}` is not a known gear"),
+                )
+            })?;
+            // Compare types by their stringified token streams: neither
+            // `syn::Type` nor `proc_macro2::TokenStream` has `PartialEq`
+            // without extra feature flags, but two identical type spellings
+            // stringify identically.
+            let out_ty_q = quote!(#out_ty).to_string();
+            let matches: Vec<usize> = g
+                .params
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| match p {
+                    ParamRole::IdField { ty, .. } if quote!(#ty).to_string() == out_ty_q => Some(i),
+                    _ => None,
+                })
+                .collect();
+            let idx = match matches.as_slice() {
+                [] => {
+                    return Err(syn::Error::new_spanned(
+                        &g.fn_name,
+                        "follow gear must take a param of the target gear's output type",
+                    ));
+                }
+                [single] => *single,
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        &g.fn_name,
+                        "follow gear has multiple params matching the target output type \
+                         — disambiguate the types",
+                    ));
+                }
+            };
+            let ParamRole::IdField { name, .. } = &g.params[idx] else {
+                unreachable!("matched an IdField above");
+            };
+            g.params[idx] = ParamRole::FollowOut { name: name.clone() };
+            g.follow_out_variant = Some(out_variant.clone());
+        }
     }
 
     let id_variants = specs.iter().map(|g| {
@@ -410,6 +570,48 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
                     }
                 }
             },
+            KindSpec::Follow { target } => {
+                // `meta` receives `&GearId`, so a plain match binds id fields by
+                // reference — but the target expression constructs the target
+                // `GearId` by *value* (e.g. `GearId::Repo(repo)`). Re-bind an
+                // owned clone and match only the fields the target names (+`..`),
+                // so the user never needs `repo.clone()` and unused fields don't
+                // trip unused-variable warnings.
+                let referenced: std::collections::HashSet<String> = collect_ident_strings(target);
+                let bound: Vec<&Ident> = field_names
+                    .iter()
+                    .filter(|f| referenced.contains(&f.to_string()))
+                    .collect();
+                let outer_pat = if fields.len() == 1 {
+                    quote! { #id_variant(..) }
+                } else {
+                    quote! { #id_variant { .. } }
+                };
+                let inner_pat = if fields.len() == 1 {
+                    quote! { #id_variant(#( #bound ),*) }
+                } else {
+                    quote! { #id_variant { #( #bound ),*, .. } }
+                };
+                quote! {
+                    GearId::#outer_pat => {
+                        // Co-located with the target: the group *is* the target's
+                        // own group (resolved via its `meta`), so this gear
+                        // routes to the same core and can follow it locally. The
+                        // id fields are not hashed here — `baked_group` is
+                        // authoritative.
+                        let __g = (*gear).clone();
+                        let GearId::#inner_pat = __g else { ::core::unreachable!() };
+                        let __target = #target;
+                        ::dentrado::core::gear::GearMeta::Follow {
+                            baked_group: ::dentrado::core::gear::GearMeta::group(
+                                &<Self as ::dentrado::core::gear::IsRuntime>::meta(&__target),
+                            )
+                            .clone(),
+                            gear: __target,
+                        }
+                    }
+                }
+            }
         }
     });
 
@@ -446,6 +648,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         let call_args = g.params.iter().map(|p| match p {
             ParamRole::IdField { name, .. } => quote! { #name },
             ParamRole::Tick => quote! { tick },
+            ParamRole::FollowOut { name, .. } => quote! { #name },
             ParamRole::Ctx => quote! { ctx },
             ParamRole::Cache { .. } => quote! { #cache_binding },
         });
@@ -457,9 +660,39 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             quote! { let tick = ::core::matches!(input, ::dentrado::core::gear::GearInput::Timer { tick: true }); }
         });
 
+        // For follow gears, pull the followed gear's output out of `input` and
+        // destructure it to the typed inner value, binding it to the param the
+        // Follow-resolution pass reclassified.
+        let follow_bind = if let (KindSpec::Follow { .. }, Some(out_v)) =
+            (&g.kind, &g.follow_out_variant)
+        {
+            let name = g
+                .params
+                .iter()
+                .find_map(|p| match p {
+                    ParamRole::FollowOut { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .expect("resolved above");
+            quote! {
+                let #name = match input {
+                    ::dentrado::core::gear::GearInput::Follow { out } => match out {
+                        GearOut::#out_v(__followed) => __followed,
+                        _ => ::core::unreachable!(
+                            "follow target produced an unexpected GearOut variant"
+                        ),
+                    },
+                    _ => ::core::unreachable!("follow gear received a non-Follow input"),
+                };
+            }
+        } else {
+            quote! {}
+        };
+
         quote! {
             (#id_pat, GearCache::#cv(#cache_binding)) => {
                 #tick_bind
+                #follow_bind
                 GearOut::#out_v(#run_call)
             }
         }
@@ -562,7 +795,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
 
             async fn run_step<S: ::dentrado::core::storage::Storage<Self>>(
                 ctx: &mut ::dentrado::core::core_ctx::GearCtx<Self, S>,
-                input: ::dentrado::core::gear::GearInput,
+                input: ::dentrado::core::gear::GearInput<Self>,
                 cache: &mut Self::GearCache<S::Watermark>,
             ) -> Self::GearOut {
                 match (ctx.gear().clone(), cache) {

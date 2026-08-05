@@ -250,7 +250,7 @@ impl IsRuntime for Wiki2Runtime {
 
     async fn run_step<S: Storage<Self>>(
         ctx: &mut GearCtx<Self, S>,
-        input: GearInput,
+        input: GearInput<Self>,
         cache: &mut Self::GearCache<S::Watermark>,
     ) -> Self::GearOut {
         let GearInput::Events(group) = input else {

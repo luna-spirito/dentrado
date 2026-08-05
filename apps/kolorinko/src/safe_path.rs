@@ -1,4 +1,4 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado::types::Localizable)]
 pub(crate) struct SafePathComponent(String);
