@@ -10,7 +10,8 @@ use dentrado::core::{core_ctx::GearCtx, storage::Storage};
 /// fn inside the `#[gears]` module below. The `#[gears]` aggregator reads each
 /// `#[gear]`-marked fn's signature to derive the `GearId` / `GearOut` /
 /// `GearCache` / `Group` enums, the `IsRuntime` impl, the `GlobalHash` impl for
-/// `Group`, and the typed dependency accessors. The *implementations* live in
+/// `Group`, and the per-gear `GearQuery` builders (the typed dependency
+/// layer). The *implementations* live in
 /// domain modules (`wikidot_page::repo`, `wikidot_page::load_page`, …) — so a
 /// gear's signature is stated once here (as the wiring manifest) and the body
 /// lives next to the helpers it calls.
@@ -58,4 +59,4 @@ pub(crate) mod gears {
     }
 }
 
-pub(crate) use gears::{GearId, GearOut, dep_repo};
+pub(crate) use gears::{GearId, GearOut, repo};

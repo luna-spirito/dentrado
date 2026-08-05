@@ -114,6 +114,49 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
     ) -> Self::GearOut;
 }
 
+/// A deferred, composable read against a gear's output — the typed layer over
+/// the raw `GearCtx::secondary_get` (which returns an untyped `GearOut`).
+///
+/// `id` names the gear (with its id fields); `getter` extracts `Out` out of the
+/// matching `GearOut` variant. The `#[gears]` macro pairs them per variant, so
+/// by construction `getter` is always fed the variant it matches — the
+/// `unreachable!` arm in it is a defensive invariant, not an expected path.
+///
+/// Built by the `#[gears]` macro as one fn per gear, e.g.
+/// `pub fn repo(repo_meta: RepoMeta) -> GearQuery<R, Arc<RepoData>>`; methods
+/// like [`GearQuery::secondary_get`] are the composable surface.
+pub struct GearQuery<R: IsRuntime, Out> {
+    /// Queried gear.
+    pub id: R::GearId,
+    /// Getter that extracts `Out` out of the result. Must be used with the
+    /// response provided by `id`, else panics.
+    pub getter: fn(R::GearOut) -> Out,
+}
+
+// Manual (not derived) so we don't add `Out: Clone` / `R: Clone` bounds: the
+// id is `Clone` via the `IsRuntime` associated-type bound and a `fn` pointer
+// is `Copy`, which is all `clone` needs.
+impl<R: IsRuntime, Out> Clone for GearQuery<R, Out> {
+    fn clone(&self) -> Self {
+        GearQuery {
+            id: self.id.clone(),
+            getter: self.getter,
+        }
+    }
+}
+
+impl<R: IsRuntime, Out> GearQuery<R, Out> {
+    /// Declare a dependency on this gear's output and pull its current value
+    /// (awaiting it if not yet computed) — the raw `GearCtx::secondary_get`
+    /// followed by the per-variant extraction.
+    pub async fn secondary_get<S: Storage<R>>(&self, ctx: &GearCtx<R, S>) -> Out
+    where
+        Out: Send,
+    {
+        (self.getter)(ctx.secondary_get(self.id.clone()).await)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct EmptyRuntime;
 impl IsRuntime for EmptyRuntime {

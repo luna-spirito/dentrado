@@ -565,7 +565,7 @@ pub(crate) async fn load_page<S: Storage<KolorinkoRT>>(
     ctx: &mut GearCtx<KolorinkoRT, S>,
     cache: &mut LoadCache,
 ) -> Arc<Content> {
-    let data = crate::runtime::dep_repo(ctx, meta.clone()).await;
+    let data = crate::runtime::repo(meta.clone()).secondary_get(ctx).await;
     let Some(text) = data.get(site, slug) else {
         // Page no longer present in the dataset: drop any stale cached parse
         // and return empty content.

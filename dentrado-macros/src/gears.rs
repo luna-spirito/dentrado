@@ -1,7 +1,8 @@
 //! The `#[gears]` module attribute + `#[gear]` fn marker: define a runtime's
 //! gears as plain `async fn`s and let the macro generate the `GearId` /
 //! `GearOut` / `GearCache` / `Group` enums, the `IsRuntime` impl, the
-//! `GlobalHash` impl for `Group`, and the typed dependency accessors.
+//! `GlobalHash` impl for `Group`, and the per-gear `GearQuery` builders (the
+//! typed dependency layer).
 //!
 //! Each gear is one function — its signature *is* the gear spec:
 //!
@@ -26,7 +27,7 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    FnArg, Ident, Item, ItemMod, Pat, ReturnType, Token, Type,
+    FnArg, Ident, Item, ItemMod, Pat, ReturnType, Token, Type, Visibility,
     parse::{Parse, ParseStream, Parser},
     punctuated::Punctuated,
 };
@@ -158,6 +159,9 @@ struct GearSpec {
     name: Ident,
     /// The fn's own name (`repo`, `load_page`).
     fn_name: Ident,
+    /// The fn's declared visibility — reused for the generated `GearQuery`
+    /// builder so it matches the gear fn's exposure.
+    vis: Visibility,
     is_async: bool,
     params: Vec<ParamRole>,
     out_ty: Type,
@@ -348,6 +352,7 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
     Ok(GearSpec {
         name,
         fn_name: fn_item.sig.ident.clone(),
+        vis: fn_item.vis.clone(),
         is_async,
         params,
         out_ty,
@@ -416,10 +421,11 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
     let runtime = &attr.runtime;
 
     // Walk the module's items, collecting gear specs from `#[gear]`-marked
-    // fns. The fns themselves are left in place (the `#[gear]` identity macro
-    // strips its own attribute after this aggregator runs). Only an immutable
-    // borrow is needed to read the signatures; it ends with this block,
-    // before the mutable extend below.
+    // fns. The fns themselves are kept; a later pass renames each to
+    // `<fn>_step` (freeing the gear's name for the generated `GearQuery`
+    // builder), and the `#[gear]` identity macro strips its own attribute in a
+    // subsequent expansion. Only an immutable borrow is needed to read the
+    // signatures; it ends with this block, before the rename + extend below.
     let mut specs: Vec<GearSpec> = Vec::new();
     {
         let content = item_mod.content.as_ref().ok_or_else(|| {
@@ -507,6 +513,22 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             };
             g.params[idx] = ParamRole::FollowOut { name: name.clone() };
             g.follow_out_variant = Some(out_variant.clone());
+        }
+    }
+
+    // Rename each `#[gear]` impl fn to `<fn_name>_step`. The impl is only
+    // ever called by the generated `run_step` (which uses the `__step` name);
+    // the gear's original name is then free for the `GearQuery` builder emitted
+    // below. The `#[gear]` attribute is left in place for the identity macro to
+    // strip in its own expansion pass.
+    {
+        let content = item_mod.content.as_mut().expect("checked inline above");
+        for item in &mut content.1 {
+            if let Item::Fn(fn_item) = item
+                && fn_item.attrs.iter().any(is_gear_attr)
+            {
+                fn_item.sig.ident = format_ident!("{}_step", fn_item.sig.ident);
+            }
         }
     }
 
@@ -652,9 +674,9 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             ParamRole::Ctx => quote! { ctx },
             ParamRole::Cache { .. } => quote! { #cache_binding },
         });
-        let fn_name = &g.fn_name;
+        let step_ident = format_ident!("{}_step", g.fn_name);
         let await_dot = g.is_async.then(|| quote! { .await });
-        let run_call = quote! { #fn_name(#( #call_args ),*) #await_dot };
+        let run_call = quote! { #step_ident(#( #call_args ),*) #await_dot };
 
         let tick_bind = matches!(g.kind, KindSpec::Timer { .. }).then(|| {
             quote! { let tick = ::core::matches!(input, ::dentrado::core::gear::GearInput::Timer { tick: true }); }
@@ -698,9 +720,14 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         }
     });
 
-    // Typed dep accessors (one free fn per gear).
-    let dep_fns = specs.iter().map(|g| {
-        let fn_name = format_ident!("dep_{}", g.name.to_string().to_lowercase());
+    // One `GearQuery` builder per gear: `#vis fn <fn_name>(<id fields>) ->
+    // GearQuery<R, Out>`. The async gear impl is renamed `<fn_name>_step`
+    // (see the rename pass above), so the builder takes the gear's own name.
+    // The per-variant extraction lives in a nested fn so the module surface is
+    // exactly one builder per gear.
+    let builders = specs.iter().map(|g| {
+        let builder = &g.fn_name;
+        let vis = &g.vis;
         let out_v = format_ident!("{}Out", g.name);
         let out_t = &g.out_ty;
         let id_variant = &g.name;
@@ -712,15 +739,21 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         } else {
             quote! { GearId::#id_variant { #( #param_names ),* } }
         };
+        let getter = format_ident!("__dentrado_get_{}", g.fn_name);
         let msg = format!("{} gear produces GearOut::{}", g.name, out_v);
         quote! {
-            pub(crate) async fn #fn_name<S: ::dentrado::core::storage::Storage<#runtime>>(
-                ctx: &::dentrado::core::core_ctx::GearCtx<#runtime, S>,
-                #( #param_decls ),*
-            ) -> #out_t {
-                match ctx.secondary_get(#id_construct).await {
-                    GearOut::#out_v(out) => out,
-                    _ => ::core::unreachable!(#msg),
+            #vis fn #builder(#( #param_decls ),*)
+                -> ::dentrado::core::gear::GearQuery<#runtime, #out_t>
+            {
+                fn #getter(out: GearOut) -> #out_t {
+                    match out {
+                        GearOut::#out_v(__o) => __o,
+                        _ => ::core::unreachable!(#msg),
+                    }
+                }
+                ::dentrado::core::gear::GearQuery {
+                    id: #id_construct,
+                    getter: #getter,
                 }
             }
         }
@@ -805,7 +838,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             }
         }
 
-        #( #dep_fns )*
+        #( #builders )*
     };
 
     // Append the generated items to the module body, right after the user's
