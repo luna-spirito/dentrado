@@ -3,7 +3,7 @@ use std::{fmt::Debug, num::NonZero};
 use dentrado::{
     core::{
         core_ctx::GearCtx,
-        gear::{GearInput, GearMeta, IsRuntime},
+        gear::{GearInput, GearMeta, GearResult, IsRuntime},
         storage::{CacheSer, InMemoryStorage, PageId, Storage},
     },
     types::*,
@@ -212,6 +212,7 @@ pub struct Wiki2Runtime;
 impl IsRuntime for Wiki2Runtime {
     type GearId = Wiki2Gear;
     type GearOut = Wiki2GearOut;
+    type GearOutLocal = ();
     type Module = ();
     type Group = Wiki2Group;
     type Body = Wiki2Body;
@@ -252,14 +253,14 @@ impl IsRuntime for Wiki2Runtime {
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
         cache: &mut Self::GearCache<S::Watermark>,
-    ) -> Self::GearOut {
+    ) -> GearResult<Self> {
         let GearInput::Events(group) = input else {
             return match cache {
-                Wiki2Cache::Invited(c) => Wiki2GearOut::Invited(c.sg.as_writes()),
-                Wiki2Cache::DocContent(c) => Wiki2GearOut::DocContent {
+                Wiki2Cache::Invited(c) => GearResult::Ship(Wiki2GearOut::Invited(c.sg.as_writes())),
+                Wiki2Cache::DocContent(c) => GearResult::Ship(Wiki2GearOut::DocContent {
                     anchors: c.anchors.clone(),
                     text: c.sg.as_writes(),
-                },
+                }),
             };
         };
         match (ctx.gear(), cache) {
@@ -339,7 +340,7 @@ impl IsRuntime for Wiki2Runtime {
 
                 c.watermark = watermark;
 
-                Wiki2GearOut::Invited(c.sg.as_writes())
+                GearResult::Ship(Wiki2GearOut::Invited(c.sg.as_writes()))
             }
             (Wiki2Gear::DocContent { .. }, Wiki2Cache::DocContent(c)) => {
                 let diff = ctx.storage().diff_group(group, c.watermark.clone()).await;
@@ -368,7 +369,7 @@ impl IsRuntime for Wiki2Runtime {
                         .secondary_get(Wiki2Gear::Invited { branch: *branch })
                         .await
                     {
-                        Wiki2GearOut::Invited(timeline) => timeline,
+                        GearResult::Ship(Wiki2GearOut::Invited(timeline)) => timeline,
                         _ => panic!("Expected Invited output"),
                     }
                 };
@@ -458,10 +459,10 @@ impl IsRuntime for Wiki2Runtime {
 
                 c.watermark = watermark;
 
-                Wiki2GearOut::DocContent {
+                GearResult::Ship(Wiki2GearOut::DocContent {
                     anchors: c.anchors.clone(),
                     text: c.sg.as_writes(),
-                }
+                })
             }
             _ => panic!("Mismatched gear and cache"),
         }

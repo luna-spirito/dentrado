@@ -167,6 +167,9 @@ impl std::error::Error for MergeError {
 pub enum RunGearError {
     Merge(MergeError),
     Route(crate::types::GroupRouteError),
+    /// The gear produced a non-shippable (core-local) output, which cannot be
+    /// returned across the `RunGear` reply channel (a thread boundary).
+    NotShippable,
 }
 
 impl std::fmt::Display for RunGearError {
@@ -174,6 +177,7 @@ impl std::fmt::Display for RunGearError {
         match self {
             Self::Merge(e) => write!(f, "wire context merge failed: {e}"),
             Self::Route(e) => write!(f, "group route failed: {e}"),
+            Self::NotShippable => write!(f, "gear produced a non-shippable (local) output"),
         }
     }
 }
@@ -183,6 +187,7 @@ impl std::error::Error for RunGearError {
         match self {
             Self::Merge(e) => Some(e),
             Self::Route(e) => Some(e),
+            Self::NotShippable => None,
         }
     }
 }

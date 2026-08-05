@@ -65,17 +65,91 @@ impl<R: IsRuntime> GearMeta<R> {
 ///   don't hit the outside system. The runtime enforces the `period` rate
 ///   limit, so a `tick = true` run is never issued more often than `period`
 ///   epochs apart.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum GearInput<R: IsRuntime> {
     Events(LocGroupId),
     Timer { tick: bool },
-    Follow { out: R::GearOut },
+    Follow { out: GearResult<R> },
+}
+
+/// The result of running a gear, tagging whether the output is **shippable**
+/// across cores ([`Ship`](GearResult::Ship) — `R::GearOut`, which is
+/// `Send + Localizable`) or **pinned to its owning core**
+/// ([`Local`](GearResult::Local) — `R::GearOutLocal`, which is *not* required
+/// to be `Send` or [`Localizable`]).
+///
+/// This is what [`IsRuntime::run_step`] returns and what flows through every
+/// on-core path (`ActiveGear::output`, `secondary_get`, [`GearInput::Follow`],
+/// the worker read APIs). The cross-core/wire boundary carries only `R::GearOut`
+/// — extracted via [`GearResult::into_ship`] — so a `Local` output physically
+/// cannot enter a `Send`-typed channel (`InterCoreMsg`, the `RunGear` reply).
+///
+/// `Clone`/`Debug` are implemented manually (not derived) so they don't add a
+/// spurious `R: Clone`/`R: Debug` bound beyond what [`IsRuntime`] already
+/// requires; only the associated output types need it.
+pub enum GearResult<R: IsRuntime> {
+    /// A shippable output — crosses cores, is `Send + Localizable`.
+    Ship(R::GearOut),
+    /// A core-local output — never serialized, never sent across a thread.
+    Local(R::GearOutLocal),
+}
+
+impl<R: IsRuntime> Clone for GearResult<R> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Ship(o) => Self::Ship(o.clone()),
+            Self::Local(o) => Self::Local(o.clone()),
+        }
+    }
+}
+
+impl<R: IsRuntime> Debug for GearResult<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ship(o) => f.debug_tuple("Ship").field(o).finish(),
+            Self::Local(o) => f.debug_tuple("Local").field(o).finish(),
+        }
+    }
+}
+
+impl<R: IsRuntime> GearResult<R> {
+    /// The shippable payload, if this is a [`Ship`](GearResult::Ship) result.
+    /// Used at the cross-core boundary to extract the value that actually goes
+    /// on the wire / through the `RunGear` reply channel.
+    pub fn into_ship(self) -> Option<R::GearOut> {
+        match self {
+            Self::Ship(o) => Some(o),
+            Self::Local(_) => None,
+        }
+    }
+
+    /// The shippable payload, panicking if this is a `Local` result. For tests
+    /// and call sites that statically know the gear is shippable.
+    ///
+    /// # Panics
+    ///
+    /// If this is a [`Local`](GearResult::Local) result.
+    pub fn expect_ship(self) -> R::GearOut {
+        match self {
+            Self::Ship(o) => o,
+            Self::Local(_) => panic!("expected a shippable GearResult, got Local"),
+        }
+    }
 }
 
 pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
     type GearId: Debug + Hash + Eq + Clone + Send + 'static + Localizable;
 
     type GearOut: Debug + Clone + Send + 'static + Localizable;
+
+    /// Output of a gear that is **pinned to its owning core**: it never crosses
+    /// a thread or core boundary, so (unlike [`GearOut`](IsRuntime::GearOut))
+    /// it need not be `Send` or [`Localizable`]. `run_step` returns a
+    /// [`GearResult`] that tags which family a given output belongs to. The
+    /// runtime guarantees a `Local` output is never routed off its core (a
+    /// remote subscription / cross-core `RunGear` against such a gear is a
+    /// routing error, surfaced at the wire boundary).
+    type GearOutLocal: Debug + Clone + 'static;
 
     type Module: Debug + Send + Sync + 'static;
 
@@ -111,7 +185,7 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
         cache: &mut Self::GearCache<S::Watermark>,
-    ) -> Self::GearOut;
+    ) -> GearResult<Self>;
 }
 
 /// A deferred, composable read against a gear's output — the typed layer over
@@ -130,7 +204,7 @@ pub struct GearQuery<R: IsRuntime, Out> {
     pub id: R::GearId,
     /// Getter that extracts `Out` out of the result. Must be used with the
     /// response provided by `id`, else panics.
-    pub getter: fn(R::GearOut) -> Out,
+    pub getter: fn(GearResult<R>) -> Out,
 }
 
 // Manual (not derived) so we don't add `Out: Clone` / `R: Clone` bounds: the
@@ -162,6 +236,7 @@ pub(crate) struct EmptyRuntime;
 impl IsRuntime for EmptyRuntime {
     type GearId = ();
     type GearOut = ();
+    type GearOutLocal = ();
     type Module = ();
     type Group = ();
     type Body = ();
@@ -187,6 +262,7 @@ impl IsRuntime for EmptyRuntime {
         _ctx: &mut crate::core::core_ctx::GearCtx<Self, S>,
         _input: GearInput<Self>,
         _cache: &mut Self::GearCache<S::Watermark>,
-    ) -> Self::GearOut {
+    ) -> GearResult<Self> {
+        GearResult::Ship(())
     }
 }

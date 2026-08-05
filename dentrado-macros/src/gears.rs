@@ -550,6 +550,12 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         quote! { #[localizable(skip)] #v(#t) }
     });
 
+    // `GearOutLocal` variants: populated only by `#[gear(local)]` gears (none
+    // yet), so the enum is uninhabited and `GearResult::Local` is unreachable
+    // for this runtime. Deliberately NOT `Localizable`/`Send` — that's the
+    // whole point of the local-output family.
+    let out_local_variants: Vec<TokenStream2> = Vec::new();
+
     let cache_variants = specs.iter().map(|g| {
         let v = &g.name;
         let t = g.cache_ty().expect("validated above");
@@ -699,9 +705,9 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             quote! {
                 let #name = match input {
                     ::dentrado::core::gear::GearInput::Follow { out } => match out {
-                        GearOut::#out_v(__followed) => __followed,
+                        ::dentrado::core::gear::GearResult::Ship(GearOut::#out_v(__followed)) => __followed,
                         _ => ::core::unreachable!(
-                            "follow target produced an unexpected GearOut variant"
+                            "follow target produced an unexpected output"
                         ),
                     },
                     _ => ::core::unreachable!("follow gear received a non-Follow input"),
@@ -715,7 +721,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             (#id_pat, GearCache::#cv(#cache_binding)) => {
                 #tick_bind
                 #follow_bind
-                GearOut::#out_v(#run_call)
+                ::dentrado::core::gear::GearResult::Ship(GearOut::#out_v(#run_call))
             }
         }
     });
@@ -745,9 +751,9 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             #vis fn #builder(#( #param_decls ),*)
                 -> ::dentrado::core::gear::GearQuery<#runtime, #out_t>
             {
-                fn #getter(out: GearOut) -> #out_t {
+                fn #getter(out: ::dentrado::core::gear::GearResult<#runtime>) -> #out_t {
                     match out {
-                        GearOut::#out_v(__o) => __o,
+                        ::dentrado::core::gear::GearResult::Ship(GearOut::#out_v(__o)) => __o,
                         _ => ::core::unreachable!(#msg),
                     }
                 }
@@ -768,6 +774,15 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         #[derive(Debug, Clone, dentrado::types::Localizable)]
         pub(crate) enum GearOut {
             #( #out_variants, )*
+        }
+
+        // Core-local outputs (never serialized, never sent across a thread).
+        // Empty until a gear is marked `#[gear(local)]`; `GearResult::Local` is
+        // then uninhabited for this runtime, so every wire/narrowing `Local`
+        // arm is dead by construction.
+        #[derive(Debug, Clone)]
+        pub(crate) enum GearOutLocal {
+            #( #out_local_variants, )*
         }
 
         #[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado::types::Localizable)]
@@ -803,6 +818,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         impl ::dentrado::core::gear::IsRuntime for #runtime {
             type GearId = GearId;
             type GearOut = GearOut;
+            type GearOutLocal = GearOutLocal;
             type Module = ();
             type Group = Group;
             type Body = ();
@@ -830,7 +846,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
                 ctx: &mut ::dentrado::core::core_ctx::GearCtx<Self, S>,
                 input: ::dentrado::core::gear::GearInput<Self>,
                 cache: &mut Self::GearCache<S::Watermark>,
-            ) -> Self::GearOut {
+            ) -> ::dentrado::core::gear::GearResult<Self> {
                 match (ctx.gear().clone(), cache) {
                     #( #run_arms )*
                     _ => ::core::unreachable!("gear id and cache variants always agree"),

@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use dentrado::{
     core::{
         core_ctx::GearCtx,
-        gear::{GearInput, GearMeta, IsRuntime},
+        gear::{GearInput, GearMeta, GearResult, IsRuntime},
         storage::{CacheSer, InMemoryStorage, PageId, Storage},
     },
     types::*,
@@ -74,6 +74,7 @@ pub struct WikiCounterRuntime;
 impl IsRuntime for WikiCounterRuntime {
     type GearId = WikiGear;
     type GearOut = i64;
+    type GearOutLocal = ();
     type Module = ();
     type Group = LocDataId;
     type Body = LocUserId;
@@ -105,9 +106,9 @@ impl IsRuntime for WikiCounterRuntime {
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
         cache: &mut Self::GearCache<S::Watermark>,
-    ) -> i64 {
+    ) -> GearResult<Self> {
         let GearInput::Events(group) = input else {
-            return cache.out;
+            return GearResult::Ship(cache.out);
         };
         let diff = ctx
             .storage()
@@ -116,7 +117,7 @@ impl IsRuntime for WikiCounterRuntime {
         cache.out += diff.added.len() as i64;
         cache.out -= diff.removed.len() as i64;
         cache.watermark = diff.watermark;
-        cache.out
+        GearResult::Ship(cache.out)
     }
 }
 

@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use dentrado::{
     core::{
         core_ctx::{Core, GearCtx},
-        gear::{GearInput, GearMeta, IsRuntime},
+        gear::{GearInput, GearMeta, GearResult, IsRuntime},
         storage::{CacheSer, InMemoryStorage, PageId, Storage},
     },
     types::*,
@@ -56,6 +56,7 @@ pub struct MulSumRuntime;
 impl IsRuntime for MulSumRuntime {
     type GearId = MulSumGear;
     type GearOut = i64;
+    type GearOutLocal = ();
     type Module = ();
     type Group = i64;
     type Body = MulSumBody;
@@ -87,9 +88,9 @@ impl IsRuntime for MulSumRuntime {
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
         cache: &mut Self::GearCache<S::Watermark>,
-    ) -> i64 {
+    ) -> GearResult<Self> {
         let GearInput::Events(group) = input else {
-            return cache.agg;
+            return GearResult::Ship(cache.agg);
         };
         let core = ctx.core();
         let diff = ctx
@@ -107,7 +108,7 @@ impl IsRuntime for MulSumRuntime {
             cache.agg -= body.a * body.b;
         }
         cache.watermark = diff.watermark;
-        cache.agg
+        GearResult::Ship(cache.agg)
     }
 }
 
@@ -198,12 +199,12 @@ fn local_gear_read_and_subscribe_via_worker() {
             while let Ok(cmd) = cmd_rx.recv_async().await {
                 match cmd {
                     WorkerCmd::Read(gear, reply) => {
-                        let v = core.read_gear(gear).await;
+                        let v = core.read_gear(gear).await.expect_ship();
                         let _ = reply.send(v);
                     }
                     WorkerCmd::Subscribe(gear, reply) => {
                         let sub = core.subscribe_gear(gear).await;
-                        let v = sub.current();
+                        let v = sub.current().expect_ship();
                         held.push(sub);
                         let _ = reply.send(v);
                     }

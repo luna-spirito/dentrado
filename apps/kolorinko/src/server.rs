@@ -44,7 +44,7 @@ use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 
 use dentrado::{
-    core::{core_ctx::Core, storage::InMemoryStorage},
+    core::{core_ctx::Core, gear::GearResult, storage::InMemoryStorage},
     wire::WireLocCtx,
 };
 use kolorinko_wikitext::Content;
@@ -411,7 +411,7 @@ async fn handle_text(
                 slug: (category, page),
             };
             let sub = core.subscribe_gear(gear).await;
-            if let GearOut::LoadOut(content) = sub.current() {
+            if let GearResult::Ship(GearOut::LoadOut(content)) = sub.current() {
                 let _ = tx.unbounded_send(Reply::Page {
                     content: (*content).clone(),
                 });
@@ -419,7 +419,7 @@ async fn handle_text(
             let tx = tx.clone();
             let handle = runtime::spawn(async move {
                 while let Some(out) = sub.next().await {
-                    if let GearOut::LoadOut(content) = out {
+                    if let GearResult::Ship(GearOut::LoadOut(content)) = out {
                         let _ = tx.unbounded_send(Reply::Page {
                             content: (*content).clone(),
                         });

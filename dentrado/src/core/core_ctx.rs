@@ -17,7 +17,7 @@ use crate::{
     core::{
         db,
         doorbell::DoorbellHandle,
-        gear::{GearInput, GearMeta, IsRuntime},
+        gear::{GearInput, GearMeta, GearResult, IsRuntime},
         storage::{GroupStore, Storage},
     },
     types::{GlobalCoreId, GlobalHash, LocGroupId, NodeId},
@@ -228,7 +228,7 @@ pub(crate) struct ActiveGear<R: IsRuntime> {
     /// The gear's public `R::GearId`. Kept here so the arena can recover the
     /// wire-facing identity for wire remap / `gear_index` reverse lookup.
     pub(crate) id: R::GearId,
-    pub(crate) output: Option<R::GearOut>,
+    pub(crate) output: Option<GearResult<R>>,
     pub(crate) execution: ActiveGearExecution,
     /// Gears (on this core) that depend on this one (forward gear-dep index).
     /// For a remote gear, these are local gears that read it via `secondary_get`.
@@ -581,9 +581,21 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 self.rebalance_key(*dep);
             }
 
-            // Push the new output to every remote subscriber.
-            for target in &remote_subs {
-                self.push_remote_update(&gear_id, &output, *target).await;
+            // Push the new output to every remote subscriber. A `Local` output
+            // never ships (it is pinned to this core), so by construction it has
+            // no remote subscribers — only the `Ship` arm can reach the wire.
+            match &output {
+                GearResult::Ship(o) => {
+                    for target in &remote_subs {
+                        self.push_remote_update(&gear_id, o, *target).await;
+                    }
+                }
+                GearResult::Local(_) => {
+                    debug_assert!(
+                        remote_subs.is_empty(),
+                        "local gear output has remote subscribers — routing bug"
+                    );
+                }
             }
 
             // Cascade reruns to local dependents.
@@ -760,7 +772,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
     /// edges, `remote_subscribers` for cross-core subs, `direct_subscriber_count`
     /// via [`Subscription`] for worker reads) **before** awaiting. See
     /// `secondary_get_impl` / `StartSubscription` / `subscribe_gear*`.
-    async fn wait_for_output_unpinned(self: &Rc<Self>, key: GearKey) -> Option<R::GearOut> {
+    async fn wait_for_output_unpinned(self: &Rc<Self>, key: GearKey) -> Option<GearResult<R>> {
         loop {
             let listener = {
                 let inner = self.inner.borrow();
@@ -787,7 +799,11 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
     /// `evict_gear` still walks a `dep_set` that includes every dependency we
     /// declared this run — so no reverse edge is left orphaned in a dependency
     /// we never reconciled.
-    async fn secondary_get_impl(self: &Rc<Self>, caller: R::GearId, gear: R::GearId) -> R::GearOut {
+    async fn secondary_get_impl(
+        self: &Rc<Self>,
+        caller: R::GearId,
+        gear: R::GearId,
+    ) -> GearResult<R> {
         let gear_key = self.force_active(&gear).await;
         {
             let mut inner = self.inner.borrow_mut();
@@ -808,7 +824,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
             .expect("secondary_get_impl: dependency evicted while awaiting its output")
     }
 
-    fn current_output_key(&self, key: GearKey) -> Option<R::GearOut> {
+    fn current_output_key(&self, key: GearKey) -> Option<GearResult<R>> {
         let inner = self.inner.borrow();
         inner.gears.get(key).and_then(|ag| ag.output.clone())
     }
@@ -974,7 +990,12 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
             let mut merger = WireLocCtxMerger::new(wire_ctx, &self.storage);
             merger.remap(gear).await.map_err(RunGearError::Merge)?
         };
-        Ok(self.read_gear(gear).await)
+        // The reply crosses a thread (flume); it must be the shippable type. A
+        // local gear reached via `RunGear` is a routing error.
+        self.read_gear(gear)
+            .await
+            .into_ship()
+            .ok_or(RunGearError::NotShippable)
     }
 
     /// Handle a `ClientOp` (received from a channel that is).
@@ -1054,7 +1075,19 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                     let output = this.wait_for_output_unpinned(key).await.expect(
                         "StartSubscription: gear evicted while a remote subscriber was attached",
                     );
-                    this.push_remote_update(&gear, &output, from_core).await;
+                    // A remote subscription can only be satisfied by a shippable
+                    // output; a `Local` gear reached this way is a routing bug.
+                    match &output {
+                        GearResult::Ship(o) => {
+                            this.push_remote_update(&gear, o, from_core).await;
+                        }
+                        GearResult::Local(_) => {
+                            debug_assert!(
+                                false,
+                                "StartSubscription for a non-shippable (local) gear — routing bug"
+                            );
+                        }
+                    }
                 })
                 .detach();
             }
@@ -1083,7 +1116,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                     let Some(ag) = inner.gears.get_mut(key) else {
                         return;
                     };
-                    ag.output = Some(output);
+                    ag.output = Some(GearResult::Ship(output));
                     ag.changed.notify_all();
                     ag.local_dependents.iter().copied().collect::<Vec<_>>()
                 };
@@ -1331,7 +1364,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
 
     /// Read a gear's current output once (fresh). Implemented as a short-lived
     /// subscription.
-    pub async fn read_gear(self: &Rc<Self>, gear: R::GearId) -> R::GearOut {
+    pub async fn read_gear(self: &Rc<Self>, gear: R::GearId) -> GearResult<R> {
         let sub = self.subscribe_gear(gear).await;
         let out = sub.current();
         drop(sub);
@@ -1340,7 +1373,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
 
     /// Read a gear's current output once (stale — does not wait for in-flight
     /// runs). Implemented as a short-lived subscription.
-    pub async fn read_gear_stale(self: &Rc<Self>, gear: R::GearId) -> R::GearOut {
+    pub async fn read_gear_stale(self: &Rc<Self>, gear: R::GearId) -> GearResult<R> {
         let sub = self.subscribe_gear_stale(gear).await;
         let out = sub.current();
         drop(sub);
@@ -1368,7 +1401,7 @@ impl<R: IsRuntime, S: Storage<R>> Subscription<R, S> {
     /// Read the gear's currently-cached output. The value is guaranteed to be
     /// present (subscribe awaits the first computation).
     #[must_use]
-    pub fn current(&self) -> R::GearOut {
+    pub fn current(&self) -> GearResult<R> {
         let inner = self.core.inner.borrow();
         inner
             .gears
@@ -1380,7 +1413,7 @@ impl<R: IsRuntime, S: Storage<R>> Subscription<R, S> {
     /// Wait for the next output update (the gear's `changed` event fires after
     /// each completed run / `SubscriptionUpdate`) and return the new value, or
     /// `None` if the gear was evicted.
-    pub async fn next(&self) -> Option<R::GearOut> {
+    pub async fn next(&self) -> Option<GearResult<R>> {
         let listener = {
             let inner = self.core.inner.borrow();
             let Some(ag) = inner.gears.get(self.key) else {
@@ -1452,7 +1485,7 @@ impl<R: IsRuntime, S: Storage<R>> GearCtx<R, S> {
     /// (both the forward `deps` entry here and the reverse
     /// `dep.local_dependents` entry in the core) so that when `dep` changes,
     /// this gear reruns.
-    pub async fn secondary_get(&self, dep: R::GearId) -> R::GearOut {
+    pub async fn secondary_get(&self, dep: R::GearId) -> GearResult<R> {
         self.deps.borrow_mut().insert(dep.clone());
         self.core.secondary_get_impl(self.gear.clone(), dep).await
     }
