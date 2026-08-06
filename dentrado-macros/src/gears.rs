@@ -31,7 +31,7 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    FnArg, Ident, Item, ItemMod, Pat, ReturnType, Token, Type, Visibility,
+    FnArg, Ident, Item, ItemMod, LitStr, Pat, ReturnType, Token, Type, Visibility,
     parse::{Parse, ParseStream, Parser},
     punctuated::Punctuated,
 };
@@ -55,28 +55,50 @@ pub(crate) fn gears_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 // ── attribute arg parsing ─────────────────────────────────────────────────
 
-/// `runtime = <Type>` (the only key for now).
+/// `runtime = <Type>` (required by `#[gears]`) and `file = "…"` (reads the
+/// gear declarations from a shared file instead of the inline module body).
+/// `#[gears_schema]` uses only `file = "…"`.
 struct GearsAttr {
-    runtime: Type,
+    runtime: Option<Type>,
+    file: Option<LitStr>,
 }
 
 impl Parse for GearsAttr {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let kw: Ident = input.parse()?;
-        if kw != "runtime" {
-            return Err(syn::Error::new(kw.span(), "expected `runtime =`"));
+        let mut runtime = None;
+        let mut file = None;
+        while !input.is_empty() {
+            let kw: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match kw.to_string().as_str() {
+                "runtime" => runtime = Some(input.parse()?),
+                "file" => file = Some(input.parse()?),
+                _ => {
+                    return Err(syn::Error::new(
+                        kw.span(),
+                        "expected `runtime =` or `file =`",
+                    ));
+                }
+            }
+            let _ = input.parse::<Token![,]>();
         }
-        input.parse::<Token![=]>()?;
-        let runtime: Type = input.parse()?;
-        Ok(GearsAttr { runtime })
+        Ok(GearsAttr { runtime, file })
     }
 }
 
 enum GearArg {
-    Timer { period: TokenStream2 },
+    Timer {
+        period: TokenStream2,
+    },
     Event,
-    Follow { target: TokenStream2 },
+    Follow {
+        target: TokenStream2,
+    },
     Local,
+    /// `wire_skip(a, b, …)` — id fields excluded from the wire schema (server
+    /// config the client never supplies, e.g. `repo_meta`). Ignored by the
+    /// runtime expansion; the schema expansion drops these fields.
+    WireSkip(Vec<Ident>),
     Name(Ident),
 }
 
@@ -119,6 +141,12 @@ impl Parse for GearArg {
                 Ok(GearArg::Follow { target })
             }
             "local" => Ok(GearArg::Local),
+            "wire_skip" => {
+                let inner;
+                syn::parenthesized!(inner in input);
+                let names = Punctuated::<Ident, Token![,]>::parse_terminated(&inner)?;
+                Ok(GearArg::WireSkip(names.into_iter().collect()))
+            }
             "name" => {
                 input.parse::<Token![=]>()?;
                 let n: Ident = input.parse()?;
@@ -185,6 +213,10 @@ struct GearSpec {
     /// `GearResult::Local(GearOutLocal::<Variant>(…))` instead of
     /// `GearResult::Ship(GearOut::<Variant>(…))`.
     follow_out_local: bool,
+    /// Id-field names excluded from the wire schema (`#[gear(wire_skip(…))]`).
+    /// The runtime expansion keeps them as real id fields; the schema expansion
+    /// drops them.
+    wire_skip: std::collections::HashSet<String>,
 }
 
 impl GearSpec {
@@ -274,12 +306,16 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
     let mut name: Option<Ident> = None;
     let mut kind: Option<KindSpec> = None;
     let mut is_local = false;
+    let mut wire_skip = std::collections::HashSet::new();
     for arg in args {
         match arg {
             GearArg::Timer { period } => kind = Some(KindSpec::Timer { period }),
             GearArg::Event => kind = Some(KindSpec::Event),
             GearArg::Follow { target } => kind = Some(KindSpec::Follow { target }),
             GearArg::Local => is_local = true,
+            GearArg::WireSkip(v) => {
+                wire_skip = v.into_iter().map(|i| i.to_string()).collect();
+            }
             GearArg::Name(n) => name = Some(n),
         }
     }
@@ -377,6 +413,7 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
         kind,
         follow_out_variant: None,
         follow_out_local: false,
+        wire_skip,
     })
 }
 
@@ -434,35 +471,55 @@ fn collect_ident_strings_into(ts: TokenStream2, out: &mut std::collections::Hash
     }
 }
 
-// ── codegen ───────────────────────────────────────────────────────────────
+// ── source resolution (shared by runtime + schema expansions) ───────────
 
-fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
-    let runtime = &attr.runtime;
+/// Load and parse a gear-declaration file (relative to `CARGO_MANIFEST_DIR`),
+/// returning its items plus a rebuild-tracking token. The same file is read by
+/// both `#[gears]` (runtime) and `#[gears_schema]` (wire schema), so a gear is
+/// declared exactly once.
+///
+/// Rebuild tracking uses an emitted `include_str!` of the file's absolute path
+/// rather than the nightly `proc_macro::tracked::path` API: the latter is not
+/// implemented by the rust-analyzer proc-macro server and crashes its
+/// expansion. The emitted const is read by both rustc (which rebuilds on
+/// change) and rust-analyzer.
+fn load_gear_file(rel: &LitStr) -> syn::Result<(Vec<Item>, TokenStream2)> {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")
+        .map_err(|_| syn::Error::new(rel.span(), "`file = …` requires `CARGO_MANIFEST_DIR`"))?;
+    let full = std::path::Path::new(&manifest).join(rel.value());
+    if !full.exists() {
+        return Err(syn::Error::new(
+            rel.span(),
+            format!("gear file not found: {}", full.display()),
+        ));
+    }
+    let src = std::fs::read_to_string(&full)
+        .map_err(|e| syn::Error::new(rel.span(), format!("read {}: {e}", full.display())))?;
+    let items = syn::parse_file(&src)
+        .map_err(|e| syn::Error::new(rel.span(), format!("parse {}: {e}", full.display())))?
+        .items;
+    let abs = full.to_string_lossy().into_owned();
+    let track = quote! { const _: &str = include_str!(#abs); };
+    Ok((items, track))
+}
 
-    // Walk the module's items, collecting gear specs from `#[gear]`-marked
-    // fns. The fns themselves are kept; a later pass renames each to
-    // `<fn>_step` (freeing the gear's name for the generated `GearQuery`
-    // builder), and the `#[gear]` identity macro strips its own attribute in a
-    // subsequent expansion. Only an immutable borrow is needed to read the
-    // signatures; it ends with this block, before the rename + extend below.
+/// Extract gear specs from the `#[gear]`-marked fns in `items`, then resolve
+/// every `follow` target (reclassifying the followed-output param so it is no
+/// longer treated as a user-supplied id field). Shared by the runtime and
+/// wire-schema expansions.
+fn collect_specs(items: &[Item]) -> syn::Result<Vec<GearSpec>> {
     let mut specs: Vec<GearSpec> = Vec::new();
-    {
-        let content = item_mod.content.as_ref().ok_or_else(|| {
-            syn::Error::new_spanned(&item_mod, "`#[gears]` needs an inline module body")
-        })?;
-        for item in &content.1 {
-            if let Item::Fn(fn_item) = item
-                && fn_item.attrs.iter().any(is_gear_attr)
-            {
-                specs.push(extract_gear(fn_item)?);
-            }
+    for item in items {
+        if let Item::Fn(fn_item) = item
+            && fn_item.attrs.iter().any(is_gear_attr)
+        {
+            specs.push(extract_gear(fn_item)?);
         }
     }
-
     if specs.is_empty() {
-        return Err(syn::Error::new_spanned(
-            &item_mod,
-            "`#[gears]` module must contain at least one `#[gear]` fn",
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "no `#[gear]` fn found",
         ));
     }
 
@@ -470,88 +527,132 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
     // variant; exactly one of its by-value params must then match the target's
     // output type and is reclassified as the followed-output binding. Also
     // rejects direct self-follow (which would infinitely recurse in `meta`).
-    {
-        let target_info: std::collections::HashMap<String, (Type, Ident, bool)> = specs
-            .iter()
-            .map(|g| {
-                (
-                    g.name.to_string(),
-                    (g.out_ty.clone(), format_ident!("{}Out", g.name), g.is_local),
+    let target_info: std::collections::HashMap<String, (Type, Ident, bool)> = specs
+        .iter()
+        .map(|g| {
+            (
+                g.name.to_string(),
+                (g.out_ty.clone(), format_ident!("{}Out", g.name), g.is_local),
+            )
+        })
+        .collect();
+    for g in &mut specs {
+        let KindSpec::Follow { target } = &g.kind else {
+            continue;
+        };
+        let variant = follow_target_variant(target)?;
+        if variant == g.name {
+            return Err(syn::Error::new_spanned(
+                &variant,
+                "a gear cannot follow itself",
+            ));
+        }
+        let (out_ty, out_variant, target_local) =
+            target_info.get(&variant.to_string()).ok_or_else(|| {
+                syn::Error::new_spanned(
+                    &variant,
+                    format!("follow target `GearId::{variant}` is not a known gear"),
                 )
+            })?;
+        // Compare types by their stringified token streams: neither `syn::Type`
+        // nor `proc_macro2::TokenStream` has `PartialEq` without extra feature
+        // flags, but two identical type spellings stringify identically.
+        let out_ty_q = quote!(#out_ty).to_string();
+        let matches: Vec<usize> = g
+            .params
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| match p {
+                ParamRole::IdField { ty, .. } if quote!(#ty).to_string() == out_ty_q => Some(i),
+                _ => None,
             })
             .collect();
-        for g in &mut specs {
-            let KindSpec::Follow { target } = &g.kind else {
-                continue;
-            };
-            let variant = follow_target_variant(target)?;
-            if variant == g.name {
+        let idx = match matches.as_slice() {
+            [] => {
                 return Err(syn::Error::new_spanned(
-                    &variant,
-                    "a gear cannot follow itself",
+                    &g.fn_name,
+                    "follow gear must take a param of the target gear's output type",
                 ));
             }
-            let (out_ty, out_variant, target_local) =
-                target_info.get(&variant.to_string()).ok_or_else(|| {
-                    syn::Error::new_spanned(
-                        &variant,
-                        format!("follow target `GearId::{variant}` is not a known gear"),
-                    )
-                })?;
-            // Compare types by their stringified token streams: neither
-            // `syn::Type` nor `proc_macro2::TokenStream` has `PartialEq`
-            // without extra feature flags, but two identical type spellings
-            // stringify identically.
-            let out_ty_q = quote!(#out_ty).to_string();
-            let matches: Vec<usize> = g
-                .params
-                .iter()
-                .enumerate()
-                .filter_map(|(i, p)| match p {
-                    ParamRole::IdField { ty, .. } if quote!(#ty).to_string() == out_ty_q => Some(i),
-                    _ => None,
-                })
-                .collect();
-            let idx = match matches.as_slice() {
-                [] => {
-                    return Err(syn::Error::new_spanned(
-                        &g.fn_name,
-                        "follow gear must take a param of the target gear's output type",
-                    ));
-                }
-                [single] => *single,
-                _ => {
-                    return Err(syn::Error::new_spanned(
-                        &g.fn_name,
-                        "follow gear has multiple params matching the target output type \
-                         — disambiguate the types",
-                    ));
-                }
-            };
-            let ParamRole::IdField { name, .. } = &g.params[idx] else {
-                unreachable!("matched an IdField above");
-            };
-            g.params[idx] = ParamRole::FollowOut { name: name.clone() };
-            g.follow_out_variant = Some(out_variant.clone());
-            g.follow_out_local = *target_local;
-        }
+            [single] => *single,
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    &g.fn_name,
+                    "follow gear has multiple params matching the target output type \
+                     — disambiguate the types",
+                ));
+            }
+        };
+        let ParamRole::IdField { name, .. } = &g.params[idx] else {
+            unreachable!("matched an IdField above");
+        };
+        g.params[idx] = ParamRole::FollowOut { name: name.clone() };
+        g.follow_out_variant = Some(out_variant.clone());
+        g.follow_out_local = *target_local;
     }
 
-    // Rename each `#[gear]` impl fn to `<fn_name>_step`. The impl is only
-    // ever called by the generated `run_step` (which uses the `__step` name);
-    // the gear's original name is then free for the `GearQuery` builder emitted
-    // below. The `#[gear]` attribute is left in place for the identity macro to
-    // strip in its own expansion pass.
-    {
-        let content = item_mod.content.as_mut().expect("checked inline above");
-        for item in &mut content.1 {
-            if let Item::Fn(fn_item) = item
-                && fn_item.attrs.iter().any(is_gear_attr)
-            {
-                fn_item.sig.ident = format_ident!("{}_step", fn_item.sig.ident);
-            }
+    Ok(specs)
+}
+
+/// Rename each `#[gear]` fn to `<name>_step`, freeing the gear's name for the
+/// generated `GearQuery` builder. The `#[gear]` attribute is left in place for
+/// the identity macro to strip in its own expansion pass.
+fn rename_gear_steps(items: &mut [Item]) {
+    for item in items {
+        if let Item::Fn(fn_item) = item
+            && fn_item.attrs.iter().any(is_gear_attr)
+        {
+            fn_item.sig.ident = format_ident!("{}_step", fn_item.sig.ident);
         }
     }
+}
+
+/// Resolve gear specs from either an inline module body or a `file = …`, and
+/// in the file case inject the (renamed) declared fns into the module so the
+/// generated `run_step` can call them.
+fn resolve_specs(
+    attr: &GearsAttr,
+    item_mod: &mut ItemMod,
+) -> syn::Result<(Vec<GearSpec>, TokenStream2)> {
+    Ok(match &attr.file {
+        Some(rel) => {
+            let (mut file_items, track) = load_gear_file(rel)?;
+            let specs = collect_specs(&file_items)?;
+            rename_gear_steps(&mut file_items);
+            if let Some(content) = item_mod.content.as_mut() {
+                content.1.extend(file_items);
+            } else {
+                item_mod.content = Some((syn::token::Brace::default(), file_items));
+            }
+            (specs, track)
+        }
+        None => {
+            let content = item_mod.content.as_ref().ok_or_else(|| {
+                syn::Error::new_spanned(
+                    &*item_mod,
+                    "`#[gears]` needs an inline module body or `file = …`",
+                )
+            })?;
+            let specs = collect_specs(&content.1)?;
+            if let Some(content) = item_mod.content.as_mut() {
+                rename_gear_steps(&mut content.1);
+            }
+            (specs, quote! {})
+        }
+    })
+}
+
+// ── codegen ───────────────────────────────────────────────────────────────
+
+fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
+    let runtime = attr.runtime.as_ref().ok_or_else(|| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`#[gears]` requires `runtime = <Type>`",
+        )
+    })?;
+
+    let (specs, track) = resolve_specs(&attr, &mut item_mod)?;
 
     let id_variants = specs.iter().map(|g| {
         let v = &g.name;
@@ -809,6 +910,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
     });
 
     let generated = quote! {
+        #track
         // The concrete `GearId` is an internal implementation detail of the
         // runtime: it is not re-exported (the `gears` module is private), so
         // callers can never name it — gear ids are constructed only through the
@@ -914,6 +1016,114 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         content.1.extend(file.items);
     }
 
+    Ok(quote! { #item_mod })
+}
+
+/// Emit a **wasm-safe, dentrado-free** wire schema — serde `GearId` / `GearOut`
+/// / `GearQuery` — from the same gear-declaration file `#[gears]` reads, so a
+/// gear is declared exactly once. `#[gear(local)]` gears (core-pinned, no
+/// shippable output) and `#[gear(wire_skip(…))]` id fields are omitted: the
+/// client never supplies server config like `repo_meta`.
+pub(crate) fn gears_schema_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attr: GearsAttr = syn::parse_macro_input!(attr);
+    let item: ItemMod = syn::parse_macro_input!(item);
+    expand_schema(attr, item)
+        .unwrap_or_else(|e| e.to_compile_error())
+        .into()
+}
+
+/// Id fields of `g` with its `wire_skip` names removed. The followed-output
+/// param is already reclassified out of `IdField` by [`collect_specs`], so it
+/// is excluded here for free.
+fn wire_fields(g: &GearSpec) -> Vec<(Ident, Type)> {
+    g.id_fields()
+        .into_iter()
+        .filter(|(n, _)| !g.wire_skip.contains(&n.to_string()))
+        .collect()
+}
+
+fn expand_schema(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
+    let rel = attr.file.as_ref().ok_or_else(|| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`#[gears_schema]` requires `file = \"…\"`",
+        )
+    })?;
+    let (file_items, track) = load_gear_file(rel)?;
+    let specs = collect_specs(&file_items)?;
+    let shippable: Vec<&GearSpec> = specs.iter().filter(|g| !g.is_local).collect();
+
+    let id_variants = shippable.iter().map(|g| {
+        let v = &g.name;
+        let fields = wire_fields(g);
+        if fields.len() == 1 {
+            let (_, ty) = &fields[0];
+            quote! { #v(#ty) }
+        } else {
+            let fs = fields.iter().map(|(f, t)| quote! { #f: #t });
+            quote! { #v { #( #fs ),* } }
+        }
+    });
+
+    let out_variants = shippable.iter().map(|g| {
+        let v = format_ident!("{}Out", g.name);
+        let t = &g.out_ty;
+        quote! { #v(#t) }
+    });
+
+    let builders = shippable.iter().map(|g| {
+        let builder = &g.fn_name;
+        let out_v = format_ident!("{}Out", g.name);
+        let out_t = &g.out_ty;
+        let id_variant = &g.name;
+        let fields = wire_fields(g);
+        let param_decls = fields.iter().map(|(f, t)| quote! { #f: #t });
+        let param_names: Vec<Ident> = fields.iter().map(|(f, _)| f.clone()).collect();
+        let id_construct: TokenStream2 = if fields.len() == 1 {
+            quote! { GearId::#id_variant(#( #param_names ),*) }
+        } else {
+            quote! { GearId::#id_variant { #( #param_names ),* } }
+        };
+        let getter = format_ident!("__getter_{}", g.fn_name);
+        let msg = format!("{} gear produces GearOut::{}", g.name, out_v);
+        quote! {
+            pub fn #builder(#( #param_decls ),*) -> GearQuery<#out_t> {
+                fn #getter(out: GearOut) -> #out_t {
+                    match out {
+                        GearOut::#out_v(__o) => __o,
+                        _ => ::core::unreachable!(#msg),
+                    }
+                }
+                GearQuery { id: #id_construct, getter: #getter }
+            }
+        }
+    });
+
+    let generated = quote! {
+        #track
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize)]
+        pub enum GearId {
+            #( #id_variants, )*
+        }
+
+        #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize)]
+        pub enum GearOut {
+            #( #out_variants, )*
+        }
+
+        #[derive(Clone)]
+        pub struct GearQuery<Out> {
+            pub id: GearId,
+            pub getter: fn(GearOut) -> Out,
+        }
+
+        #( #builders )*
+    };
+
+    let file: syn::File = syn::parse2(generated)?;
+    if let Some(content) = item_mod.content.as_mut() {
+        content.1.extend(file.items);
+    }
     Ok(quote! { #item_mod })
 }
 

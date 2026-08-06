@@ -1512,6 +1512,7 @@ dependencies = [
  "h3-webtransport",
  "http",
  "im",
+ "kolorinko-rt",
  "kolorinko-wikitext",
  "log",
  "rcgen",
@@ -1521,6 +1522,16 @@ dependencies = [
  "serde_json",
  "time",
  "toml",
+]
+
+[[package]]
+name = "kolorinko-rt"
+version = "0.1.0"
+dependencies = [
+ "dentrado",
+ "dentrado-macros",
+ "kolorinko-wikitext",
+ "serde",
 ]
 
 [[package]]

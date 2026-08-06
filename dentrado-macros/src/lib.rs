@@ -33,6 +33,15 @@ pub fn gears(attr: TokenStream, item: TokenStream) -> TokenStream {
     gears::gears_impl(attr, item)
 }
 
+/// Emit a **wasm-safe, dentrado-free** wire schema (serde `GearId` / `GearOut` /
+/// `GearQuery`) from the same gear-declaration file, for the client side. The
+/// server's [`gears`] macro and this macro read one shared file so a gear is
+/// declared exactly once. See [`gears`].
+#[proc_macro_attribute]
+pub fn gears_schema(attr: TokenStream, item: TokenStream) -> TokenStream {
+    gears::gears_schema_impl(attr, item)
+}
+
 /// `#[gear]` marker attribute on a gear fn. Consumed by [`gears`]; expands to
 /// its input unchanged so the attribute is a known, importable name while the
 /// real codegen happens in the [`gears`] aggregator.

@@ -22,7 +22,7 @@ use std::{
 
 use compio::rustls::ServerConfig;
 use log::{info, warn};
-use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
 /// `Some((cert, key))` when both PEM paths exist on disk, else `None`.
 fn existing_pair(cert: &str, key: &str) -> Option<(PathBuf, PathBuf)> {

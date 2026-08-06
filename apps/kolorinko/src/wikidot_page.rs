@@ -33,14 +33,14 @@
 //!   include as a dependency makes the result reactive: an edit to any page in
 //!   the transitive include cone re-runs this gear.
 
-use crate::{
-    safe_path::SafePathComponent,
-    wikidot_parser::parse,
-};
+use crate::wikidot_parser::parse;
 use dentrado::core::{core_ctx::GearCtx, storage::Storage};
 use git2::{Oid, Repository};
 use im::HashMap as ImHashMap;
-use kolorinko_wikitext::{ArticleMeta, ArticleView, Content, Node, PageRef, RevMeta};
+use kolorinko_rt::SafePathComponent;
+use kolorinko_wikitext::{
+    ArticleLatest, ArticleMeta, ArticleView, Content, Node, PageRef, RevMeta,
+};
 use log::error;
 use std::{
     cell::RefCell,
@@ -70,7 +70,11 @@ pub(crate) struct RepoMeta {
 impl RepoMeta {
     #[must_use]
     pub(crate) const fn new(url: &'static str, path: &'static Path, interval: u32) -> Self {
-        Self { url, path, interval }
+        Self {
+            url,
+            path,
+            interval,
+        }
     }
 
     #[must_use]
@@ -90,7 +94,11 @@ type Slug = (Option<SafePathComponent>, SafePathComponent);
 /// `(site, Option<category>, name)` — the full address of a page within the
 /// dataset. Used both as the include-resolution visited key and as the
 /// incremental-update reverse-index value (`_meta` path → its nested-map key).
-type Key = (SafePathComponent, Option<SafePathComponent>, SafePathComponent);
+type Key = (
+    SafePathComponent,
+    Option<SafePathComponent>,
+    SafePathComponent,
+);
 
 /// All sites mirrored out of the repository at one point in time. A persistent
 /// [`im::HashMap`] so cloning the [`Rc`]`<RepoData>` is O(1) and an update is
@@ -104,11 +112,7 @@ impl RepoData {
     /// Look up one page by `(site, slug)`.
     #[must_use]
     fn article(&self, site: &SafePathComponent, slug: &Slug) -> Option<&Article> {
-        self.sites
-            .get(site)?
-            .articles
-            .get(&slug.0)?
-            .get(&slug.1)
+        self.sites.get(site)?.articles.get(&slug.0)?.get(&slug.1)
     }
 }
 
@@ -130,16 +134,6 @@ pub(crate) struct Article {
     /// postponed `repo_l_article_revision` gear.
     #[allow(dead_code)]
     bodies: ImHashMap<u64, Rc<str>>,
-}
-
-/// Shippable projection of one page: metadata, the latest revision's raw body,
-/// and the revision-history summary (no bodies). Owned `String`s — no `Rc`/`Arc`
-/// — because it crosses cores.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ArticleLatest {
-    pub(crate) meta: ArticleMeta,
-    pub(crate) body: String,
-    pub(crate) revisions: Vec<RevMeta>,
 }
 
 // =========================================================================
@@ -296,8 +290,10 @@ fn build_all(root: &Path) -> (RepoData, Index) {
         else {
             continue;
         };
-        let mut articles: ImHashMap<Option<SafePathComponent>, ImHashMap<SafePathComponent, Article>> =
-            ImHashMap::new();
+        let mut articles: ImHashMap<
+            Option<SafePathComponent>,
+            ImHashMap<SafePathComponent, Article>,
+        > = ImHashMap::new();
         for meta_file in walk_files(&site_path.join("_meta")) {
             let Some(article) = build_article(&meta_file, &site_path) else {
                 continue;
@@ -454,7 +450,12 @@ fn parse_meta(text: &str) -> ParsedMeta {
             }
         }
     }
-    ParsedMeta { slug, title, tags, revisions }
+    ParsedMeta {
+        slug,
+        title,
+        tags,
+        revisions,
+    }
 }
 
 /// Split a canonical slug into `(Option<category>, name)`: `help:foo` →
@@ -493,10 +494,18 @@ fn incremental_update(old: &RepoData, index: &mut Index, affected: HashSet<PathB
         if let Some(old_key) = index.remove(&meta_path) {
             remove_page(&mut sites, &old_key);
         }
-        let Some(site_dir) = meta_path_site_dir(&meta_path) else { continue };
-        let Some(article) = build_article(&meta_path, &site_dir) else { continue };
-        let Some(site) = meta_path_site(&meta_path) else { continue };
-        let Some((cat, name)) = slug_to_key(&article.meta.slug) else { continue };
+        let Some(site_dir) = meta_path_site_dir(&meta_path) else {
+            continue;
+        };
+        let Some(article) = build_article(&meta_path, &site_dir) else {
+            continue;
+        };
+        let Some(site) = meta_path_site(&meta_path) else {
+            continue;
+        };
+        let Some((cat, name)) = slug_to_key(&article.meta.slug) else {
+            continue;
+        };
         index.insert(meta_path, (site.clone(), cat.clone(), name.clone()));
         insert_page(&mut sites, site, cat, name, article);
     }
@@ -830,11 +839,7 @@ fn substitute_includes(
         match node {
             Node::Include(inc) => {
                 let resolved = include_target(&inc.source, current_site)
-                    .and_then(|(s, slug)| {
-                        fetched
-                            .get(&(s, slug.0, slug.1))
-                            .map(Content::as_slice)
-                    });
+                    .and_then(|(s, slug)| fetched.get(&(s, slug.0, slug.1)).map(Content::as_slice));
                 match resolved {
                     Some(nodes) => out.extend_from_slice(nodes),
                     None => out.push(Node::Include(inc)),
@@ -901,7 +906,10 @@ fn substitute_includes(
 /// and the trailing path → name. Cross-site includes (`space` = another site)
 /// are not yet supported. Unresolvable targets (bad path component) return
 /// `None` and the directive is left in place.
-fn include_target(src: &PageRef, current_site: &SafePathComponent) -> Option<(SafePathComponent, Slug)> {
+fn include_target(
+    src: &PageRef,
+    current_site: &SafePathComponent,
+) -> Option<(SafePathComponent, Slug)> {
     let name = SafePathComponent::new(src.path.last()?.clone())?;
     let category = match &src.space {
         Some(cat) => Some(SafePathComponent::new(cat.clone())?),

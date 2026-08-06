@@ -367,3 +367,13 @@ pub struct ArticleView {
     pub revisions: Vec<RevMeta>,
     pub content: Content,
 }
+
+/// Shippable projection of one page: metadata, the latest revision's raw body,
+/// and the revision-history summary (no resolved content, no revision bodies).
+/// Owned `String`s — no `Rc`/`Arc` — because it crosses cores.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ArticleLatest {
+    pub meta: ArticleMeta,
+    pub body: String,
+    pub revisions: Vec<RevMeta>,
+}

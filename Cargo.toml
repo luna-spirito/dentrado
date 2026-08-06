@@ -3,6 +3,7 @@ members = [
   "dentrado",
   "dentrado-macros",
   "apps/kolorinko",
+  "apps/kolorinko-rt",
   "apps/kolorinko-wikitext",
 ]
 resolver = "2"

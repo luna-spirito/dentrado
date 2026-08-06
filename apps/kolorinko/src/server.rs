@@ -49,9 +49,9 @@ use kolorinko_wikitext::ArticleView;
 use crate::{
     assets::{load_assets, mime_for},
     runtime::{GearOut, KolorinkoRT, article_latest},
-    safe_path::SafePathComponent,
     wikidot_page::RepoMeta,
 };
+use kolorinko_rt::SafePathComponent;
 
 /// Max concurrent WebTransport sessions advertised per HTTP/3 connection
 /// (`SETTINGS_H3_WEBTRANSPORT_MAX_SESSIONS`). Default-0 means "none", which

@@ -20,7 +20,6 @@ use std::{
 use crate::runtime::KolorinkoRT;
 mod assets;
 mod runtime;
-mod safe_path;
 mod server;
 mod tls;
 mod web;
