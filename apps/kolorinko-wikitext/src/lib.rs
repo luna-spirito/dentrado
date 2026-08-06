@@ -1,4 +1,6 @@
-//! Abstract syntax tree for Wikidot page markup.
+//! Abstract syntax tree for Wikidot page markup, plus the page-delivery
+//! payload types ([`ArticleView`] / [`ArticleMeta`] / [`RevMeta`]) shared by
+//! the kolorinko server and its wasm client.
 //!
 //! Translated from the PureScript modules `Pagx.Hered.Tipoj` and
 //! `Pagx.Hered.Analiz`.
@@ -325,4 +327,43 @@ pub struct ListOrder {
     /// Sort key (`"name"`, `"created_at"`, `"rating"`, …).
     pub by: String,
     pub ascending: bool,
+}
+
+// ── page-delivery payload ─────────────────────────────────────────────────
+//
+// The gear layer renders a page into [`Content`] and ships it to the client
+// together with the page's metadata and edit-history summary. These types are
+// the wire payload of a page subscription, shared (via this crate) between the
+// server and the wasm frontend so neither side re-declares the shape.
+
+/// Metadata of a single page, as recorded in the export's `_meta` file.
+/// `slug` is the canonical Wikidot fullname (`category:name` or just `name`);
+/// `category`/`name` are derivable from it but carried explicitly for the
+/// client.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ArticleMeta {
+    pub title: String,
+    pub tags: Vec<String>,
+    pub slug: String,
+    /// Wikidot numeric page id (e.g. `"1305054470"`).
+    pub page_id: String,
+}
+
+/// One entry of a page's edit history (no revision body — bodies are fetched
+/// on demand by the postponed revision gear).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevMeta {
+    pub revision: u64,
+    pub revision_id: String,
+    pub timestamp: i64,
+    pub author: String,
+}
+
+/// A fully rendered page: metadata, edit-history summary, and the resolved
+/// [`Content`] (all `[[include]]` directives expanded).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArticleView {
+    pub meta: ArticleMeta,
+    pub revisions: Vec<RevMeta>,
+    pub content: Content,
 }

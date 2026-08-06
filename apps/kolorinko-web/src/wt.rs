@@ -18,7 +18,7 @@
 //! acceptance like `wss://`). Local testing needs a *trusted* cert (e.g.
 //! `mkcert localhost`) on the server.
 
-use kolorinko_wikitext::Content;
+use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::{JsCast, JsValue};
@@ -61,7 +61,7 @@ enum Request {
 #[serde(tag = "t")]
 enum Reply {
     #[serde(rename = "page")]
-    Page { content: Content },
+    Page { article: ArticleView },
     #[serde(rename = "error")]
     Error { error: String },
 }
@@ -71,8 +71,7 @@ enum Reply {
 /// task and leaks the `WebTransport` handle so the session outlives this call
 /// (same trick as the WS client's `mem::forget`).
 pub(crate) async fn connect_wt(
-    set_page: WriteSignal<Option<Content>>,
-    set_title: WriteSignal<String>,
+    set_article: WriteSignal<Option<ArticleView>>,
     set_status: WriteSignal<String>,
 ) -> Result<(), JsValue> {
     set_status.set("connecting (wt)…".into());
@@ -108,7 +107,6 @@ pub(crate) async fn connect_wt(
     // Wait for the session to be ready (TLS + QUIC handshake + WT CONNECT).
     JsFuture::from(wt.ready()).await?;
 
-    set_title.set("Лекция Синтаксис".into());
     set_status.set("loading…".into());
 
     // Open the single bidi stream the server expects.
@@ -161,8 +159,8 @@ pub(crate) async fn connect_wt(
                     continue;
                 }
                 match serde_json::from_str::<Reply>(line) {
-                    Ok(Reply::Page { content }) => {
-                        set_page.set(Some(content));
+                    Ok(Reply::Page { article }) => {
+                        set_article.set(Some(article));
                         set_status.set(String::new());
                     }
                     Ok(Reply::Error { error }) => {

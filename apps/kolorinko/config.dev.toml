@@ -1,0 +1,21 @@
+# Dev config — what `just dev` / `just run` run against. Paths are relative to
+# the workspace root (cargo's CWD). For a real deploy, copy config.example.toml
+# and edit it.
+
+[repo]
+url = "https://github.com/luna-spirito/wikidot-kolorinko-export.git"
+# Auto-created on first page load if missing.
+dir = ".kolorinko/repo"
+# Seconds between forced `git pull`s of the backup repository.
+interval = 900
+
+[server]
+bind = "127.0.0.1:4433"
+web_dist = "apps/kolorinko-web/dist"
+inject_wt_hash = false
+# Browser-trusted mkcert pair (shared by the TCP bootstrap and the H3/WT
+# endpoint in pooling mode). Generate once:
+#   mkdir -p .certs && cd .certs && mkcert localhost 127.0.0.1 ::1 \
+#     && mv localhost+2.pem localhost.pem && mv localhost+2-key.pem localhost-key.pem
+cert_file = ".certs/localhost.pem"
+key_file = ".certs/localhost-key.pem"

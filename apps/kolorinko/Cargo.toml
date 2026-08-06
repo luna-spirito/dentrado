@@ -41,6 +41,7 @@ log = "0.4.32"
 rcgen = "0.14"
 rustls-pki-types = "1.15"
 serde = "1.0.228"
+toml = "0.8"
 
 [[bin]]
 name = "kolorinko"

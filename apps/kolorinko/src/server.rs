@@ -44,11 +44,11 @@ use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 
 use dentrado::core::{core_ctx::Core, gear::GearResult, storage::InMemoryStorage};
-use kolorinko_wikitext::Content;
+use kolorinko_wikitext::ArticleView;
 
 use crate::{
     assets::{load_assets, mime_for},
-    runtime::{GearOut, KolorinkoRT, load},
+    runtime::{GearOut, KolorinkoRT, article_latest},
     safe_path::SafePathComponent,
     wikidot_page::RepoMeta,
 };
@@ -326,7 +326,7 @@ enum Request {
 #[serde(tag = "t")]
 enum Reply {
     #[serde(rename = "page")]
-    Page { content: Content },
+    Page { article: ArticleView },
     #[serde(rename = "error")]
     Error { error: String },
 }
@@ -381,21 +381,17 @@ async fn handle_text(
             // The typed builder owns the `GearId` construction (and the
             // subscription): the concrete id type is an internal detail of the
             // runtime.
-            let sub = load(repo_meta.clone(), site, (category, page))
+            let sub = article_latest(repo_meta.clone(), site, (category, page))
                 .subscribe(core)
                 .await;
-            if let GearResult::Ship(GearOut::LoadOut(content)) = sub.current() {
-                let _ = tx.unbounded_send(Reply::Page {
-                    content: (*content).clone(),
-                });
+            if let GearResult::Ship(GearOut::ArticleLatestOut(article)) = sub.current() {
+                let _ = tx.unbounded_send(Reply::Page { article });
             }
             let tx = tx.clone();
             let handle = runtime::spawn(async move {
                 while let Some(out) = sub.next().await {
-                    if let GearResult::Ship(GearOut::LoadOut(content)) = out {
-                        let _ = tx.unbounded_send(Reply::Page {
-                            content: (*content).clone(),
-                        });
+                    if let GearResult::Ship(GearOut::ArticleLatestOut(article)) = out {
+                        let _ = tx.unbounded_send(Reply::Page { article });
                     }
                 }
             });

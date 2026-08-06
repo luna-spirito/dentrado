@@ -22,7 +22,7 @@ use std::{
 
 use compio::rustls::ServerConfig;
 use log::{info, warn};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
 /// `Some((cert, key))` when both PEM paths exist on disk, else `None`.
 fn existing_pair(cert: &str, key: &str) -> Option<(PathBuf, PathBuf)> {
@@ -41,16 +41,25 @@ fn default_mkcert_pair() -> Option<(PathBuf, PathBuf)> {
     )
 }
 
+/// Configured browser-trusted cert+key paths, set once at startup from the
+/// `.toml` config. `load_cert_key` prefers these, then the default `.certs/`
+/// pair, then a self-signed fallback.
+static CERT_PATHS: OnceLock<(Option<PathBuf>, Option<PathBuf>)> = OnceLock::new();
+
+/// Set the cert+key paths from config. Called once from `main`; later calls
+/// are ignored (the process has one TLS identity).
+pub(crate) fn set_cert_paths(cert: Option<PathBuf>, key: Option<PathBuf>) {
+    let _ = CERT_PATHS.set((cert, key));
+}
+
 /// Load the server cert + key.
 pub(crate) fn load_cert_key() -> io::Result<(
     Vec<compio::rustls::pki_types::CertificateDer<'static>>,
     compio::rustls::pki_types::PrivateKeyDer<'static>,
 )> {
-    use std::env::var;
-    let cert_env = var("KOLORINKO_CERT_FILE").or_else(|_| var("KOLORINKO_WT_CERT_FILE"));
-    let key_env = var("KOLORINKO_KEY_FILE").or_else(|_| var("KOLORINKO_WT_KEY_FILE"));
-    let paths = match (cert_env, key_env) {
-        (Ok(cert), Ok(key)) => Some((PathBuf::from(cert), PathBuf::from(key))),
+    let (cert_cfg, key_cfg) = CERT_PATHS.get().cloned().unwrap_or((None, None));
+    let paths = match (cert_cfg, key_cfg) {
+        (Some(cert), Some(key)) => Some((cert, key)),
         _ => default_mkcert_pair(),
     };
     match paths {
@@ -87,7 +96,7 @@ pub(crate) fn load_cert_key() -> io::Result<(
         }
         None => {
             warn!(
-                "no TLS cert found — set KOLORINKO_CERT_FILE/KOLORINKO_KEY_FILE or place the \
+                "no TLS cert found — set [server] cert_file/key_file in the config or place the \
                  mkcert pair at .certs/{{localhost.pem,localhost-key.pem}}. Generating a \
                  self-signed cert, which browsers will refuse."
             );
