@@ -10,6 +10,8 @@ mod wt;
 use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
 
+// TODO: CRITICAL: DEAL WITH LOCALIZABLE IN SERVER<->CLIENT INTERACTION!
+
 #[component]
 fn App() -> impl IntoView {
     let (article, set_article) = signal::<Option<ArticleView>>(None);

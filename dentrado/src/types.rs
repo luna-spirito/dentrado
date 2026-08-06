@@ -1,5 +1,12 @@
 use std::{mem::size_of, num::NonZero};
 
+// Wire-localization contract + local-id newtypes live in `dentrado-types`
+// (compio-free, client-reachable); re-exported so `dentrado::types::*` keeps
+// resolving.
+pub use dentrado_types::{
+    LocDataId, LocSenderEventId, LocSenderId, LocUserId, Localizable, Remapper,
+};
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
@@ -13,40 +20,6 @@ pub struct NodeId(pub u32);
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GroupEventId(pub u64);
-
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LocSenderId(pub(crate) u64);
-
-impl LocSenderId {
-    #[must_use]
-    pub const fn new_debug(id: u64) -> Self {
-        Self(id)
-    }
-}
-
-#[repr(transparent)]
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
-pub struct LocUserId(pub(crate) u64);
-
-impl LocUserId {
-    #[must_use]
-    pub const fn new_debug(id: u64) -> Self {
-        Self(id)
-    }
-}
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -183,29 +156,6 @@ impl std::error::Error for DataVerifyError {
     rkyv::Serialize,
     rkyv::Deserialize,
 )]
-pub struct LocDataId(pub(crate) u64);
-
-impl LocDataId {
-    #[must_use]
-    pub const fn new_debug(id: u64) -> Self {
-        Self(id)
-    }
-}
-
-#[repr(transparent)]
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
 pub struct Id(pub u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -231,15 +181,6 @@ pub(crate) struct Attestation {
     pub(crate) timestamp: u64,
     pub(crate) serial: u64,
     pub(crate) signature: Ed25519Signature,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LocSenderEventId(pub LocSenderId, pub u32);
-
-impl Localizable for LocSenderEventId {
-    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
-        Ok(LocSenderEventId(self.0.localize(r).await?, self.1))
-    }
 }
 
 #[repr(C, packed)]
@@ -284,22 +225,6 @@ const _: () = assert!(size_of::<MetaGroupHeader>() == 12);
 #[allow(dead_code)]
 pub(crate) const SEGMENT_SIZE_BYTES: usize = 256 * 1024 * 1024;
 
-pub trait Remapper {
-    type Err;
-    async fn remap_user(&mut self, uid: LocUserId) -> Result<LocUserId, Self::Err>;
-    async fn remap_sender(&mut self, sid: LocSenderId) -> Result<LocSenderId, Self::Err>;
-    async fn remap_data(&mut self, did: LocDataId) -> Result<LocDataId, Self::Err>;
-}
-
-pub trait Localizable: Sized {
-    async fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err>;
-}
-
-/// Re-export the derive macro so it lives at the same path as the trait
-/// (`dentrado::types::Localizable` is both the trait and the derive, in their
-/// respective namespaces — same convention as `serde::Serialize`).
-pub use dentrado_macros::Localizable;
-
 /// A value that knows its own global content hash.
 ///
 /// Supertrait of [`Localizable`] because anything content-addressed or
@@ -343,74 +268,6 @@ impl GlobalHash for i64 {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&self.to_le_bytes());
         Ok(*hasher.finalize().as_bytes())
-    }
-}
-
-impl Localizable for LocUserId {
-    async fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
-        remapper.remap_user(self).await
-    }
-}
-impl Localizable for LocSenderId {
-    async fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
-        remapper.remap_sender(self).await
-    }
-}
-impl Localizable for LocDataId {
-    async fn localize<R: Remapper>(self, remapper: &mut R) -> Result<Self, R::Err> {
-        remapper.remap_data(self).await
-    }
-}
-
-macro_rules! impl_localizable_trivial {
-    ($t:ty) => {
-        impl Localizable for $t {
-            async fn localize<R: Remapper>(self, _r: &mut R) -> Result<Self, R::Err> {
-                Ok(self)
-            }
-        }
-    };
-}
-
-impl_localizable_trivial!(i64);
-impl_localizable_trivial!(bool);
-impl_localizable_trivial!(());
-impl_localizable_trivial!(u32);
-impl_localizable_trivial!(u64);
-impl_localizable_trivial!(usize);
-impl_localizable_trivial!(String);
-impl_localizable_trivial!(&'static str);
-impl_localizable_trivial!(&'static std::path::Path);
-
-impl<T: Localizable> Localizable for Option<T> {
-    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
-        match self {
-            Some(t) => Ok(Some(t.localize(r).await?)),
-            None => Ok(None),
-        }
-    }
-}
-
-impl<A: Localizable, B: Localizable> Localizable for (A, B) {
-    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
-        Ok((self.0.localize(r).await?, self.1.localize(r).await?))
-    }
-}
-
-impl<A: Localizable, B: Localizable, C: Localizable> Localizable for (A, B, C) {
-    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
-        Ok((
-            self.0.localize(r).await?,
-            self.1.localize(r).await?,
-            self.2.localize(r).await?,
-        ))
-    }
-}
-
-impl<T: Localizable> Localizable for Box<T> {
-    async fn localize<R: Remapper>(self, r: &mut R) -> Result<Self, R::Err> {
-        let (inner, b) = Box::take(self);
-        Ok(Box::write(b, inner.localize(r).await?))
     }
 }
 

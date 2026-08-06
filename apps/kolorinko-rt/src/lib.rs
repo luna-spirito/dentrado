@@ -11,12 +11,21 @@
 use std::path::{Component, Path};
 
 /// A single validated path component (a Wikidot site/category/page-name
-/// segment). On the wire it serializes as a plain string; on the server (with
-/// the `runtime` feature) it also derives [`Localizable`](dentrado::types::Localizable)
-/// so it can be a runtime `GearId` field.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// segment). On the wire it serializes as a plain string; it derives
+/// [`Localizable`](dentrado_types::Localizable) so it can appear as a runtime
+/// `GearId` field on the server and be repackaged by the wire-localization
+/// contract on the client.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    dentrado_types::Localizable,
+)]
 #[serde(transparent)]
-#[cfg_attr(feature = "runtime", derive(dentrado::types::Localizable))]
 pub struct SafePathComponent(String);
 
 impl SafePathComponent {

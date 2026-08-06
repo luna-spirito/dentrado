@@ -1,0 +1,10 @@
+[package]
+name = "dentrado-types"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Wire-localization contract (Localizable / Remapper / local-id types) shared by dentrado and its clients"
+
+[dependencies]
+rkyv = { version = "0.8", features = ["bytecheck"] }
+dentrado-macros = { path = "../dentrado-macros" }

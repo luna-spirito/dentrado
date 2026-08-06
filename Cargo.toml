@@ -2,6 +2,7 @@
 members = [
   "dentrado",
   "dentrado-macros",
+  "dentrado-types",
   "apps/kolorinko",
   "apps/kolorinko-rt",
   "apps/kolorinko-wikitext",
@@ -12,13 +13,13 @@ resolver = "2"
 compio = { git = "https://github.com/compio-rs/compio", rev = "b14eefa7b57a90acd2ae64bf26d555e9241c9cb5" }
 compio-buf = { git = "https://github.com/compio-rs/compio", rev = "b14eefa7b57a90acd2ae64bf26d555e9241c9cb5" }
 compio-driver = { git = "https://github.com/compio-rs/compio", rev = "b14eefa7b57a90acd2ae64bf26d555e9241c9cb5" }
-compio-executor = { git = "https://github.com/compio-rs/compio" , rev = "b14eefa7b57a90acd2ae64bf26d555e9241c9cb5" }
+compio-executor = { git = "https://github.com/compio-rs/compio", rev = "b14eefa7b57a90acd2ae64bf26d555e9241c9cb5" }
 compio-fs = { git = "https://github.com/compio-rs/compio", rev = "b14eefa7b57a90acd2ae64bf26d555e9241c9cb5" }
 compio-io = { git = "https://github.com/compio-rs/compio", rev = "b14eefa7b57a90acd2ae64bf26d555e9241c9cb5" }
 compio-log = { git = "https://github.com/compio-rs/compio", rev = "b14eefa7b57a90acd2ae64bf26d555e9241c9cb5" }
 compio-macros = { git = "https://github.com/compio-rs/compio", rev = "b14eefa7b57a90acd2ae64bf26d555e9241c9cb5" }
 compio-net = { git = "https://github.com/compio-rs/compio", rev = "b14eefa7b57a90acd2ae64bf26d555e9241c9cb5" }
 compio-quic = { git = "https://github.com/compio-rs/compio", rev = "b14eefa7b57a90acd2ae64bf26d555e9241c9cb5" }
-compio-runtime = { git = "https://github.com/compio-rs/compio" , rev = "b14eefa7b57a90acd2ae64bf26d555e9241c9cb5" }
+compio-runtime = { git = "https://github.com/compio-rs/compio", rev = "b14eefa7b57a90acd2ae64bf26d555e9241c9cb5" }
 compio-tls = { git = "https://github.com/compio-rs/compio", rev = "b14eefa7b57a90acd2ae64bf26d555e9241c9cb5" }
 compio-ws = { git = "https://github.com/compio-rs/compio", rev = "b14eefa7b57a90acd2ae64bf26d555e9241c9cb5" }

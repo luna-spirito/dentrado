@@ -24,13 +24,14 @@ compio = { version = "0.19.1", features = [
 # `h3` feature; the direct dep gives us `compio_quic::{ServerBuilder, Connection, ...}`.
 compio-quic = "0.8"
 dentrado = { path = "../../dentrado" }
+dentrado-types = { path = "../../dentrado-types" }
 env_logger = "0.11.10"
 futures = "0.3.31"
 h3 = "0.0.8"
 h3-webtransport = "0.1"
 http = "1"
 im = "15.1.0"
-kolorinko-rt = { path = "../kolorinko-rt", features = ["runtime"] }
+kolorinko-rt = { path = "../kolorinko-rt" }
 kolorinko-wikitext = { path = "../kolorinko-wikitext" }
 # `ring` (also pulled by compio/quic) gives the SHA-256 for the WebTransport
 # cert hash; `time` sets the short validity browsers require.

@@ -62,7 +62,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             let ident = tp.ident.clone();
             where_clause
                 .predicates
-                .push(parse_quote! { #ident: dentrado::types::Localizable });
+                .push(parse_quote! { #ident: dentrado_types::Localizable });
         }
     }
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
@@ -118,8 +118,8 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
     Ok(quote! {
         #[automatically_derived]
-        impl #impl_generics dentrado::types::Localizable for #name #ty_generics #where_clause {
-            async fn localize<R: dentrado::types::Remapper>(
+        impl #impl_generics dentrado_types::Localizable for #name #ty_generics #where_clause {
+            async fn localize<R: dentrado_types::Remapper>(
                 self,
                 r: &mut R,
             ) -> ::core::result::Result<Self, R::Err> {

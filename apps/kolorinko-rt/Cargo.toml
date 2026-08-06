@@ -6,14 +6,7 @@ license = "AGPL-3.0-or-later"
 description = "Shared gear schema + wire protocol for the kolorinko server and web client"
 
 [dependencies]
-dentrado = { path = "../../dentrado", optional = true }
+dentrado-types = { path = "../../dentrado-types" }
 dentrado-macros = { path = "../../dentrado-macros" }
 kolorinko-wikitext = { path = "../kolorinko-wikitext" }
 serde = { version = "1", features = ["derive"] }
-
-[features]
-# Enables the dentrado `Localizable` derive on shared id types, so they can
-# appear in the server's runtime `GearId`. Off by default: the web client (and
-# the wire schema) stay dentrado-free / wasm-safe.
-default = []
-runtime = ["dep:dentrado"]

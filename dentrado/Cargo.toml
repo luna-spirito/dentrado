@@ -21,6 +21,7 @@ serde_json = "1"
 base64 = "0.22"
 similar = { version = "3", default-features = false, features = ["std"] }
 dentrado-macros = { path = "../dentrado-macros" }
+dentrado-types = { path = "../dentrado-types" }
 
 [dev-dependencies]
 tempfile = "3"

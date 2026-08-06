@@ -830,6 +830,7 @@ dependencies = [
  "compio",
  "crc32fast",
  "dentrado-macros",
+ "dentrado-types",
  "flume 0.11.1",
  "futures",
  "im",
@@ -850,6 +851,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "dentrado-types"
+version = "0.1.0"
+dependencies = [
+ "dentrado-macros",
+ "rkyv",
 ]
 
 [[package]]
@@ -1505,6 +1514,7 @@ dependencies = [
  "compio",
  "compio-quic",
  "dentrado",
+ "dentrado-types",
  "env_logger",
  "futures",
  "git2",
@@ -1528,8 +1538,8 @@ dependencies = [
 name = "kolorinko-rt"
 version = "0.1.0"
 dependencies = [
- "dentrado",
  "dentrado-macros",
+ "dentrado-types",
  "kolorinko-wikitext",
  "serde",
 ]

@@ -917,12 +917,12 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         // per-gear `GearQuery` builders below. It stays `pub(crate)`-declared
         // because `IsRuntime`'s associated type is reached through pub(crate)
         // APIs (`Core::subscribe_gear`, `GearResult`, …).
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado::types::Localizable)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado_types::Localizable)]
         pub(crate) enum GearId {
             #( #id_variants, )*
         }
 
-        #[derive(Debug, Clone, dentrado::types::Localizable)]
+        #[derive(Debug, Clone, dentrado_types::Localizable)]
         pub(crate) enum GearOut {
             #( #out_variants, )*
         }
@@ -936,7 +936,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             #( #out_local_variants, )*
         }
 
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado::types::Localizable)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado_types::Localizable)]
         pub(crate) enum Group {
             Phantom(u32),
         }
