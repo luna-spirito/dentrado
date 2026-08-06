@@ -378,13 +378,11 @@ async fn push(
             out: to_wire_out(out),
         });
     }
-    while let Some(res) = s.next().await {
-        if let Some(out) = res.into_ship() {
-            let _ = tx.unbounded_send(ServerMsg::Update {
-                sub,
-                out: to_wire_out(out),
-            });
-        }
+    while let Some(out) = s.next().await.into_ship() {
+        let _ = tx.unbounded_send(ServerMsg::Update {
+            sub,
+            out: to_wire_out(out),
+        });
     }
     let _ = tx.unbounded_send(ServerMsg::Dropped { sub });
 }

@@ -1411,19 +1411,22 @@ impl<R: IsRuntime, S: Storage<R>> Subscription<R, S> {
     }
 
     /// Wait for the next output update (the gear's `changed` event fires after
-    /// each completed run / `SubscriptionUpdate`) and return the new value, or
-    /// `None` if the gear was evicted.
-    pub async fn next(&self) -> Option<GearResult<R>> {
+    /// each completed run / `SubscriptionUpdate`) and return the new value
+    pub async fn next(&self) -> GearResult<R> {
         let listener = {
             let inner = self.core.inner.borrow();
             let Some(ag) = inner.gears.get(self.key) else {
-                return None;
+                unreachable!("ActiveGear dropped even though we're subscribed to it");
             };
             ag.changed.listen()
         };
         listener.await;
         let inner = self.core.inner.borrow();
-        inner.gears.get(self.key).and_then(|ag| ag.output.clone())
+        inner
+            .gears
+            .get(self.key)
+            .and_then(|ag| ag.output.clone())
+            .expect("No output found")
     }
 }
 
