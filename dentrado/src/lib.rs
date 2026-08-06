@@ -1,4 +1,4 @@
-#![feature(box_take, async_trait_bounds)]
+#![feature(async_trait_bounds)]
 #![warn(clippy::pedantic)]
 #![deny(unsafe_code)]
 

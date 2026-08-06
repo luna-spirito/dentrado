@@ -41,17 +41,18 @@ use futures::{
     stream::StreamExt,
 };
 use log::{error, info, warn};
-use serde::{Deserialize, Serialize};
 
-use dentrado::core::{core_ctx::Core, gear::GearResult, storage::InMemoryStorage};
-use kolorinko_wikitext::ArticleView;
+use dentrado::core::{
+    core_ctx::{Core, Subscription},
+    storage::InMemoryStorage,
+};
+use kolorinko_rt::wire::{self, ClientMsg, ServerMsg};
 
 use crate::{
     assets::{load_assets, mime_for},
-    runtime::{GearOut, KolorinkoRT, article_latest},
+    runtime::{GearOut, KolorinkoRT, article_latest, article_latest_parsed, repo_l_article_latest},
     wikidot_page::RepoMeta,
 };
-use kolorinko_rt::SafePathComponent;
 
 /// Max concurrent WebTransport sessions advertised per HTTP/3 connection
 /// (`SETTINGS_H3_WEBTRANSPORT_MAX_SESSIONS`). Default-0 means "none", which
@@ -257,19 +258,21 @@ async fn run_session(
     // which our request/reply cadence never needs to overlap.
     let (reader, writer) = bidi.split();
 
-    let (tx_cmd, mut rx_cmd) = mpsc::unbounded::<Request>();
-    let (tx_push, mut rx_push) = mpsc::unbounded::<Reply>();
-    // One push-task handle per subscribed page; dropping on disconnect cancels
-    // the task and releases its subscription.
-    let mut subs: HashMap<PageKey, runtime::JoinHandle<()>> = HashMap::new();
+    let (tx_cmd, mut rx_cmd) = mpsc::unbounded::<ClientMsg>();
+    let (tx_msg, mut rx_msg) = mpsc::unbounded::<ServerMsg>();
+    // One push task per active `sub` handle; dropping the `JoinHandle` (on
+    // `Cancel` or at disconnect) cancels the task and releases its
+    // `Subscription`, so a disconnected client's gears lose interest
+    // automatically.
+    let mut subs: HashMap<u64, runtime::JoinHandle<()>> = HashMap::new();
 
     let reader_task = runtime::spawn(async move {
         let mut r = reader;
         let mut line = Vec::<u8>::new();
         loop {
             match read_frame(&mut r, &mut line).await {
-                Ok(Some(req)) => {
-                    if tx_cmd.unbounded_send(req).is_err() {
+                Ok(Some(msg)) => {
+                    if tx_cmd.unbounded_send(msg).is_err() {
                         return; // main loop gone
                     }
                 }
@@ -287,119 +290,103 @@ async fn run_session(
     loop {
         let close = select! {
             cmd = rx_cmd.next() => match cmd {
-                Some(req) => {
-                    handle_text(&req, &tx_push, &mut subs, core, repo_meta).await;
+                Some(ClientMsg::Subscribe { sub, id }) => {
+                    // Replace any existing subscription under this handle.
+                    drop(subs.remove(&sub));
+                    let core = core.clone();
+                    let repo_meta = repo_meta.clone();
+                    let tx = tx_msg.clone();
+                    let handle = runtime::spawn(async move {
+                        push(sub, id, repo_meta, &core, tx).await;
+                    });
+                    subs.insert(sub, handle);
                     false
                 }
-                None => true, // reader ended -> client gone
+                Some(ClientMsg::Cancel { sub }) => {
+                    subs.remove(&sub); // drop → cancel task + release subscription
+                    false
+                }
+                None => true, // reader ended → client gone
             },
-            reply = rx_push.next() => match reply {
-                Some(r) => match write_frame(&mut writer, &r).await {
+            msg = rx_msg.next() => match msg {
+                Some(m) => match write_frame(&mut writer, &m).await {
                     Ok(()) => false,
                     Err(e) => { warn!("wt write: {e}"); true }
                 },
-                None => true, // tx_push dropped -> unreachable (we hold one)
+                None => true, // tx_msg dropped → unreachable (we hold one)
             },
         };
         if close {
             break;
         }
     }
+    // `subs` drops here: every push task is cancelled, every `Subscription`
+    // released — disconnected clients stop subscribing automatically.
 }
 
-// ---- wire protocol -----------------------------------------------------------
+// ---- wire dispatch ----------------------------------------------------------
+//
+// Wire `GearId` (no `repo_meta`) → runtime `GearId` (with the server's
+// configured `repo_meta`) → `Subscription`. The runtime builders construct the
+// full runtime `GearId` internally; the server only injects `repo_meta` and
+// forwards the client-supplied id fields. Runtime `GearOut` → wire `GearOut` is
+// a plain variant-by-variant relabel (same payloads, same variant names).
 
-/// A client request over the WebTransport stream.
-#[derive(Deserialize)]
-#[serde(tag = "t")]
-enum Request {
-    #[serde(rename = "load")]
-    Load {
-        site: String,
-        category: Option<String>,
-        page: String,
-    },
-}
-
-/// A server reply over the WebTransport stream.
-#[derive(Serialize)]
-#[serde(tag = "t")]
-enum Reply {
-    #[serde(rename = "page")]
-    Page { article: ArticleView },
-    #[serde(rename = "error")]
-    Error { error: String },
-}
-
-/// Identity of a subscribed page, used to dedup push tasks per connection.
-type PageKey = (
-    SafePathComponent,
-    Option<SafePathComponent>,
-    SafePathComponent,
-);
-
-/// Parse one request frame and act on it. Replies (initial + pushes) always go
-/// through `tx_push` so they serialize on the writer side.
-async fn handle_text(
-    req: &Request,
-    tx: &mpsc::UnboundedSender<Reply>,
-    subs: &mut HashMap<PageKey, runtime::JoinHandle<()>>,
+async fn subscribe_wire(
+    id: wire::GearId,
+    repo_meta: RepoMeta,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
-    repo_meta: &RepoMeta,
-) {
-    match req {
-        Request::Load {
-            site,
-            category,
-            page,
-        } => {
-            let Some(site) = SafePathComponent::new(site.clone()) else {
-                let _ = tx.unbounded_send(Reply::Error {
-                    error: "invalid site".into(),
-                });
-                return;
-            };
-            let Some(page) = SafePathComponent::new(page.clone()) else {
-                let _ = tx.unbounded_send(Reply::Error {
-                    error: "invalid page".into(),
-                });
-                return;
-            };
-            let category = match category {
-                None => None,
-                Some(c) => match SafePathComponent::new(c.clone()) {
-                    Some(sp) => Some(sp),
-                    None => {
-                        let _ = tx.unbounded_send(Reply::Error {
-                            error: "invalid category".into(),
-                        });
-                        return;
-                    }
-                },
-            };
-            let key: PageKey = (site.clone(), category.clone(), page.clone());
-            // The typed builder owns the `GearId` construction (and the
-            // subscription): the concrete id type is an internal detail of the
-            // runtime.
-            let sub = article_latest(repo_meta.clone(), site, (category, page))
+) -> Subscription<KolorinkoRT, InMemoryStorage<KolorinkoRT>> {
+    match id {
+        wire::GearId::ArticleLatest { site, slug } => {
+            article_latest(repo_meta, site, slug).subscribe(core).await
+        }
+        wire::GearId::ArticleLatestParsed { site, slug } => {
+            article_latest_parsed(repo_meta, site, slug)
                 .subscribe(core)
-                .await;
-            if let GearResult::Ship(GearOut::ArticleLatestOut(article)) = sub.current() {
-                let _ = tx.unbounded_send(Reply::Page { article });
-            }
-            let tx = tx.clone();
-            let handle = runtime::spawn(async move {
-                while let Some(out) = sub.next().await {
-                    if let GearResult::Ship(GearOut::ArticleLatestOut(article)) = out {
-                        let _ = tx.unbounded_send(Reply::Page { article });
-                    }
-                }
-            });
-            if let Some(old) = subs.insert(key, handle) {
-                drop(old); // cancel the previous push task for this page
-            }
+                .await
+        }
+        wire::GearId::RepoLArticleLatest { site, slug } => {
+            repo_l_article_latest(repo_meta, site, slug)
+                .subscribe(core)
+                .await
         }
     }
+}
+
+fn to_wire_out(out: GearOut) -> wire::GearOut {
+    match out {
+        GearOut::ArticleLatestOut(a) => wire::GearOut::ArticleLatestOut(a),
+        GearOut::ArticleLatestParsedOut(a) => wire::GearOut::ArticleLatestParsedOut(a),
+        GearOut::RepoLArticleLatestOut(a) => wire::GearOut::RepoLArticleLatestOut(a),
+    }
+}
+
+/// Drive one subscription: ship the current output, then every subsequent
+/// update, then a final `Dropped`.
+async fn push(
+    sub: u64,
+    id: wire::GearId,
+    repo_meta: RepoMeta,
+    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    tx: mpsc::UnboundedSender<ServerMsg>,
+) {
+    let s = subscribe_wire(id, repo_meta, core).await;
+    if let Some(out) = s.current().into_ship() {
+        let _ = tx.unbounded_send(ServerMsg::Update {
+            sub,
+            out: to_wire_out(out),
+        });
+    }
+    while let Some(res) = s.next().await {
+        if let Some(out) = res.into_ship() {
+            let _ = tx.unbounded_send(ServerMsg::Update {
+                sub,
+                out: to_wire_out(out),
+            });
+        }
+    }
+    let _ = tx.unbounded_send(ServerMsg::Dropped { sub });
 }
 
 // ---- newline-delimited JSON (NDJSON) framing ---------------------------------
@@ -411,17 +398,20 @@ async fn handle_text(
 async fn read_frame<R: AsyncRead + Unpin>(
     r: &mut R,
     line: &mut Vec<u8>,
-) -> io::Result<Option<Request>> {
+) -> io::Result<Option<ClientMsg>> {
     loop {
         if let Some(nl) = line.iter().position(|&b| b == b'\n') {
             let req_bytes: Vec<u8> = line.drain(..=nl).collect();
             let body = &req_bytes[..req_bytes.len() - 1]; // strip the '\n'
             if !body.is_empty() {
-                let req = serde_json::from_slice::<Request>(body)
-                    .map_err(|e| io::Error::other(format!("bad request: {e}")))?;
-                return Ok(Some(req));
+                match serde_json::from_slice::<ClientMsg>(body) {
+                    Ok(msg) => return Ok(Some(msg)),
+                    // Skip a malformed line (e.g. a path component that failed
+                    // validation) without tearing down the whole session.
+                    Err(e) => warn!("wt bad frame: {e}"),
+                }
             }
-            continue; // blank line
+            continue; // blank line, or skipped frame
         }
         let mut chunk = [0u8; 4096];
         match r.read(&mut chunk).await {
@@ -432,9 +422,9 @@ async fn read_frame<R: AsyncRead + Unpin>(
     }
 }
 
-async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, reply: &Reply) -> io::Result<()> {
+async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, msg: &ServerMsg) -> io::Result<()> {
     let json =
-        serde_json::to_vec(reply).map_err(|e| io::Error::other(format!("encode reply: {e}")))?;
+        serde_json::to_vec(msg).map_err(|e| io::Error::other(format!("encode reply: {e}")))?;
     w.write_all(&json).await?;
     w.write_all(b"\n").await?;
     w.flush().await?;

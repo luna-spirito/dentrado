@@ -6,7 +6,7 @@
 //! depends on it directly to derive [`Localizable`] on its wire types, while
 //! the `dentrado` runtime re-exports everything here as `dentrado::types::*`.
 
-#![feature(box_take, async_trait_bounds)]
+#![feature(box_take)]
 
 #[repr(transparent)]
 #[derive(

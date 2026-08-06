@@ -1,16 +1,21 @@
 //! Leptos CSR client for kolorinko.
 //!
 //! The page itself is served over HTTP/3 by the kolorinko server (same
-//! origin). On load it opens a WebTransport session and streams the page
-//! content/edits. See [`wt`] for the wire protocol.
+//! origin). On load it opens a WebTransport session ([`wt::connect_wt`]),
+//! subscribes to the default page via a typed [`wire::GearQuery`], and renders
+//! the streamed [`ArticleView`]. See [`wt`] for the wire protocol.
 
 mod render;
 mod wt;
 
+use kolorinko_rt::wire;
+use kolorinko_rt::SafePathComponent;
 use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
 
-// TODO: CRITICAL: DEAL WITH LOCALIZABLE IN SERVER<->CLIENT INTERACTION!
+/// Default page requested on connect: the Obscurative syntax lecture.
+const DEFAULT_SITE: &str = "obscurative";
+const DEFAULT_PAGE: &str = "syntax";
 
 #[component]
 fn App() -> impl IntoView {
@@ -19,8 +24,21 @@ fn App() -> impl IntoView {
 
     Effect::new(move |_| {
         wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = wt::connect_wt(set_article, set_status).await {
-                set_status.set(format!("wt error: {e:?}"));
+            match wt::connect_wt(set_status).await {
+                Ok(c) => {
+                    let query = wire::article_latest(
+                        SafePathComponent::new(DEFAULT_SITE.into()).unwrap(),
+                        (None, SafePathComponent::new(DEFAULT_PAGE.into()).unwrap()),
+                    );
+                    c.subscribe(query, move |a: ArticleView| {
+                        set_article.set(Some(a));
+                        set_status.set(String::new());
+                    });
+                    // Keep the client alive for the page lifetime so future
+                    // navigation can `subscribe`/`cancel` more pages.
+                    std::mem::forget(c);
+                }
+                Err(e) => set_status.set(format!("wt error: {e:?}")),
             }
         });
     });

@@ -1,36 +1,40 @@
 //! WebTransport client for kolorinko.
 //!
-//! The whole site is one origin — `https://<host>:<port>` (default
-//! `https://localhost:4433`). The page loads over HTTP/1.1-over-TLS on the
-//! first visit, then over HTTP/3 once the browser caches the `Alt-Svc` hint.
-//! This module opens a WebTransport session to that **same origin**
-//! (`window.location.origin`), requests the default page over one
-//! bidirectional stream, and streams newline-delimited JSON replies (initial
-//! content + live pushes).
+//! The whole site is one origin — `https://<host>:<port>`. The page loads over
+//! HTTP/1.1-over-TLS on the first visit, then over HTTP/3 once the browser
+//! caches the `Alt-Svc` hint. This module opens a WebTransport session to that
+//! **same origin** (`window.location.origin`) over one bidirectional stream
+//! and speaks the dumb subscribe/cancel/push envelope from
+//! [`kolorinko_rt::wire`].
+//!
+//! The client owns every `sub` handle (a monotonic `u64`): [`WtClient::subscribe`]
+//! registers a typed callback under a fresh handle, sends `Subscribe { sub, id }`,
+//! and the read loop decodes each `Update { sub, out }` via the `GearQuery`'s
+//! `getter` before invoking the callback. [`WtClient::cancel`] sends `Cancel` and
+//! drops the callback. The server tears down all of a disconnecting client's
+//! subscriptions automatically.
 //!
 //! `allowPooling: true` *hints* the browser to run this session on an existing
-//! HTTP/3 connection to the origin (e.g. the one that loaded the page) instead
-//! of opening a fresh QUIC connection. It's only a hint — browsers may still
-//! use a dedicated connection.
+//! HTTP/3 connection to the origin instead of opening a fresh QUIC connection.
+//! It's only a hint — browsers may still use a dedicated connection.
 //!
 //! # Browser caveat
 //! WebTransport rejects self-signed certificates outright (no interactive
 //! acceptance like `wss://`). Local testing needs a *trusted* cert (e.g.
-//! `mkcert localhost`) on the server.
+//! `mkcert localhost`) on the server, *or* the bootstrap-injected cert hash.
 
-use kolorinko_wikitext::ArticleView;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use kolorinko_rt::wire::{ClientMsg, GearOut, GearQuery, ServerMsg};
 use leptos::prelude::*;
-use serde::{Deserialize, Serialize};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
     ReadableStreamDefaultReader, WebTransport, WebTransportBidirectionalStream,
     WebTransportOptions, WritableStreamDefaultWriter,
 };
-
-/// Default page requested on connect: the Obscurative syntax lecture.
-const DEFAULT_SITE: &str = "obscurative";
-const DEFAULT_PAGE: &str = "syntax";
 
 /// Read `window.__WT_CERT_HASH__` (a `Uint8Array` injected by the bootstrap) if
 /// present, for WebTransport `serverCertificateHashes`.
@@ -43,93 +47,101 @@ fn cert_hash_from_window(window: &web_sys::Window) -> Option<js_sys::Uint8Array>
     val.dyn_into::<js_sys::Uint8Array>().ok()
 }
 
-/// A client request (mirrors the server's `Request`).
-#[derive(Serialize)]
-#[serde(tag = "t")]
-enum Request {
-    #[serde(rename = "load")]
-    Load {
-        site: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        category: Option<String>,
-        page: String,
-    },
+/// A typed update callback: decodes a raw `GearOut` via the `GearQuery`'s
+/// `getter` and hands the typed value to the subscriber.
+type UpdateCb = Rc<dyn Fn(GearOut)>;
+
+/// A live WebTransport session with a registry of active subscriptions.
+///
+/// One instance per page (see [`connect_wt`]); share it across components via a
+/// leptos signal/context. The read loop owns a clone of `subs` and routes every
+/// `Update` to its callback; writes (subscribe/cancel) are fire-and-forget on
+/// the shared writer — the JS `WritableStream` serializes queued writes, and
+/// `spawn_local` schedules them in call order.
+pub struct WtClient {
+    writer: Rc<WritableStreamDefaultWriter>,
+    next_sub: Cell<u64>,
+    subs: Rc<RefCell<HashMap<u64, UpdateCb>>>,
 }
 
-/// A server reply (mirrors the server's `Reply`).
-#[derive(Deserialize)]
-#[serde(tag = "t")]
-enum Reply {
-    #[serde(rename = "page")]
-    Page { article: ArticleView },
-    #[serde(rename = "error")]
-    Error { error: String },
+impl WtClient {
+    /// Subscribe to a gear query: register `on_update` under a fresh `sub`
+    /// handle and send `Subscribe`. Returns the handle (for [`cancel`](Self::cancel)).
+    pub fn subscribe<Out: 'static>(
+        &self,
+        query: GearQuery<Out>,
+        on_update: impl Fn(Out) + 'static,
+    ) -> u64 {
+        let sub = self.next_sub.get();
+        self.next_sub.set(sub.wrapping_add(1));
+        let getter = query.getter;
+        let cb: UpdateCb = Rc::new(move |out| on_update(getter(out)));
+        self.subs.borrow_mut().insert(sub, cb);
+        self.send(ClientMsg::Subscribe { sub, id: query.id });
+        sub
+    }
+
+    /// Stop a subscription: send `Cancel` and drop the callback.
+    pub fn cancel(&self, sub: u64) {
+        self.subs.borrow_mut().remove(&sub);
+        self.send(ClientMsg::Cancel { sub });
+    }
+
+    fn send(&self, msg: ClientMsg) {
+        let Ok(json) = serde_json::to_string(&msg) else {
+            return;
+        };
+        let frame = format!("{json}\n");
+        let chunk = js_sys::Uint8Array::from(frame.as_bytes());
+        let writer = self.writer.clone();
+        spawn_local(async move {
+            let _ = JsFuture::from(writer.write_with_chunk(&chunk)).await;
+        });
+    }
 }
 
-/// Open a WebTransport session, request the default page, and route replies
-/// into the provided signals. Runs the read loop in a detached `spawn_local`
-/// task and leaks the `WebTransport` handle so the session outlives this call
-/// (same trick as the WS client's `mem::forget`).
+/// Open a WebTransport session to the page origin and return a [`WtClient`].
+///
+/// `set_status` receives connection-lifecycle messages; per-subscription content
+/// arrives through callbacks registered via [`WtClient::subscribe`].
 pub(crate) async fn connect_wt(
-    set_article: WriteSignal<Option<ArticleView>>,
     set_status: WriteSignal<String>,
-) -> Result<(), JsValue> {
+) -> Result<Rc<WtClient>, JsValue> {
     set_status.set("connecting (wt)…".into());
 
     let Some(window) = web_sys::window() else {
         set_status.set("no window".into());
         return Err(JsValue::from_str("no window"));
     };
-    // Same origin the page loaded from (`https://<host>:<port>`); both the
-    // HTTPS bootstrap and the H3+WT server live on this one origin.
     let url = window.location().origin()?;
     let options = WebTransportOptions::new();
-    // Pin the server's short-lived self-signed cert by SHA-256: browsers won't
-    // honor a local CA for the WebTransport QUIC handshake, so the bootstrap
-    // page injects the cert hash as `window.__WT_CERT_HASH__` (a Uint8Array)
-    // and we hand it to `serverCertificateHashes`, bypassing CA validation.
     if let Some(hash) = cert_hash_from_window(&window) {
         // Hash pinning and connection pooling are mutually exclusive (the cert
         // hash is only meaningful on a dedicated connection), so pin WITHOUT
-        // pooling. Some Chromium versions reject `serverCertificateHashes` +
-        // `allowPooling: true` outright.
+        // pooling.
         options.set_allow_pooling(false);
         let entry = web_sys::WebTransportHash::new();
         entry.set_algorithm("sha-256");
         entry.set_value_u8_array(&hash);
         options.set_server_certificate_hashes(&[entry]);
     } else {
-        // No hash available: rely on normal CA trust (production / real cert)
-        // and allow the browser to pool onto an existing H3 connection.
+        // No hash available: rely on normal CA trust and allow the browser to
+        // pool onto an existing H3 connection.
         options.set_allow_pooling(true);
     }
-    let wt = WebTransport::new_with_options(&url, &options)?;;;
-    // Wait for the session to be ready (TLS + QUIC handshake + WT CONNECT).
+    let wt = WebTransport::new_with_options(&url, &options)?;
     JsFuture::from(wt.ready()).await?;
 
     set_status.set("loading…".into());
 
-    // Open the single bidi stream the server expects.
     let bi_js = JsFuture::from(wt.create_bidirectional_stream()).await?;
     let bi: WebTransportBidirectionalStream = bi_js.dyn_into()?;
     let reader = ReadableStreamDefaultReader::new(&bi.readable())?;
     let writer = WritableStreamDefaultWriter::new(&bi.writable())?;
+    let writer = Rc::new(writer);
 
-    // Kick off the default page load.
-    send_request(
-        &writer,
-        &Request::Load {
-            site: DEFAULT_SITE.into(),
-            category: None,
-            page: DEFAULT_PAGE.into(),
-        },
-    )
-    .await?;
-    // The writer is no longer needed for the default flow; releasing its lock
-    // keeps the underlying writable side open.
-    writer.release_lock();
-
-    // Detached read loop: reassemble NDJSON frames and route replies.
+    let subs: Rc<RefCell<HashMap<u64, UpdateCb>>> = Rc::new(RefCell::new(HashMap::new()));
+    let route_subs = subs.clone();
     spawn_local(async move {
         let mut buf = String::new();
         loop {
@@ -158,13 +170,17 @@ pub(crate) async fn connect_wt(
                 if line.is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<Reply>(line) {
-                    Ok(Reply::Page { article }) => {
-                        set_article.set(Some(article));
-                        set_status.set(String::new());
+                match serde_json::from_str::<ServerMsg>(line) {
+                    Ok(ServerMsg::Update { sub, out }) => {
+                        // Clone the `Rc` out of the borrow before calling, so a
+                        // callback that (un)subscribes doesn't deadlock the map.
+                        let cb = route_subs.borrow().get(&sub).cloned();
+                        if let Some(cb) = cb {
+                            cb(out);
+                        }
                     }
-                    Ok(Reply::Error { error }) => {
-                        set_status.set(format!("error: {error}"));
+                    Ok(ServerMsg::Dropped { sub }) => {
+                        route_subs.borrow_mut().remove(&sub);
                     }
                     Err(e) => set_status.set(format!("decode: {e}")),
                 }
@@ -174,18 +190,9 @@ pub(crate) async fn connect_wt(
 
     // Keep the session alive for the page lifetime.
     std::mem::forget(wt);
-    Ok(())
-}
-
-/// Serialize a `Request` and write it as one `json + '\n'` frame.
-async fn send_request(
-    writer: &WritableStreamDefaultWriter,
-    req: &Request,
-) -> Result<(), JsValue> {
-    let json = serde_json::to_string(req)
-        .map_err(|e| JsValue::from_str(&format!("encode request: {e}")))?;
-    let frame = format!("{json}\n");
-    let chunk = js_sys::Uint8Array::from(frame.as_bytes());
-    JsFuture::from(writer.write_with_chunk(&chunk)).await?;
-    Ok(())
+    Ok(Rc::new(WtClient {
+        writer,
+        next_sub: Cell::new(1),
+        subs,
+    }))
 }
