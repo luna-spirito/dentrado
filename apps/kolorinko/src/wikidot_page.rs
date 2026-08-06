@@ -49,7 +49,8 @@ use git2::{ObjectType, Oid, Repository, Tree, TreeWalkMode};
 use im::HashMap as ImHashMap;
 use kolorinko_rt::SafePathComponent;
 use kolorinko_wikitext::{
-    ArticleLatest, ArticleMeta, ArticleView, Content, Node, PageRef, RevMeta,
+    ArticleLatest, ArticleMeta, ArticleView, BlockCell, BlockRow, BlockTable, ContainerKind,
+    Content, Include, ListPages, Node, PageRef, RevMeta, Tab, TableCell, TextObj,
 };
 use log::error;
 use std::{
@@ -885,6 +886,7 @@ pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
     let mut visited = HashSet::new();
     visited.insert((site.clone(), slug.0.clone(), slug.1.clone()));
     let content = resolve(content, &site, meta, &mut visited, ctx).await;
+    let content = apply_include_vars(content, &HashMap::new());
     ArticleView {
         meta: page_meta,
         revisions,
@@ -959,6 +961,14 @@ fn collect_include_targets(
                     }
                 }
             }
+            Node::BlockTable(t) => {
+                for row in &t.rows {
+                    collect_include_targets(&row.content, current_site, visited, out);
+                }
+            }
+            Node::BlockCell(c) => {
+                collect_include_targets(&c.content, current_site, visited, out);
+            }
             Node::SupSubscript { sup, sub } => {
                 collect_include_targets(sup, current_site, visited, out);
                 collect_include_targets(sub, current_site, visited, out);
@@ -997,7 +1007,7 @@ fn substitute_includes(
                 let resolved = include_target(&inc.source, current_site)
                     .and_then(|(s, slug)| fetched.get(&(s, slug.0, slug.1)).map(Content::as_slice));
                 match resolved {
-                    Some(nodes) => out.extend_from_slice(nodes),
+                    Some(nodes) => out.extend(apply_include_vars(nodes.to_vec(), &inc.vars)),
                     None => out.push(Node::Include(inc)),
                 }
             }
@@ -1023,6 +1033,22 @@ fn substitute_includes(
                     })
                     .collect(),
             )),
+            Node::BlockTable(t) => out.push(Node::BlockTable(BlockTable {
+                params: t.params,
+                rows: t
+                    .rows
+                    .into_iter()
+                    .map(|r| BlockRow {
+                        params: r.params,
+                        content: substitute_includes(r.content, current_site, fetched),
+                    })
+                    .collect(),
+            })),
+            Node::BlockCell(c) => out.push(Node::BlockCell(BlockCell {
+                header: c.header,
+                params: c.params,
+                content: substitute_includes(c.content, current_site, fetched),
+            })),
             Node::SupSubscript { sup, sub } => out.push(Node::SupSubscript {
                 sup: substitute_includes(sup, current_site, fetched),
                 sub: substitute_includes(sub, current_site, fetched),
@@ -1054,6 +1080,192 @@ fn substitute_includes(
         }
     }
     out
+}
+
+/// Replace every [`TextObj::IncludeVar`] in `content` using `vars`: a standalone
+/// variable expands to its (recursively substituted) [`Content`]; inside an
+/// attribute or image source it is flattened to plain text. An unresolved
+/// variable falls back to its `//default`, or to nothing when it has none.
+fn apply_include_vars(content: Content, vars: &HashMap<String, Content>) -> Content {
+    content
+        .into_iter()
+        .flat_map(|n| subst_node(n, vars))
+        .collect()
+}
+
+fn subst_node(node: Node, vars: &HashMap<String, Content>) -> Content {
+    match node {
+        Node::Text(TextObj::IncludeVar { name, default }) => match vars.get(&name) {
+            Some(v) => apply_include_vars(v.clone(), vars),
+            None => default
+                .map(|d| apply_include_vars(d, vars))
+                .unwrap_or_default(),
+        },
+        Node::Text(other) => vec![Node::Text(other)],
+        Node::Container { kind, content } => vec![Node::Container {
+            kind: subst_kind(kind, vars),
+            content: apply_include_vars(content, vars),
+        }],
+        Node::Heading { level, content } => vec![Node::Heading {
+            level,
+            content: apply_include_vars(content, vars),
+        }],
+        Node::Image {
+            align,
+            source,
+            params,
+        } => vec![Node::Image {
+            align,
+            source: subst_textobjs(source, vars),
+            params: subst_params(params, vars),
+        }],
+        Node::Table(rows) => vec![Node::Table(
+            rows.into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|c| TableCell {
+                            colspan: c.colspan,
+                            header: c.header,
+                            align: c.align,
+                            content: apply_include_vars(c.content, vars),
+                        })
+                        .collect()
+                })
+                .collect(),
+        )],
+        Node::BlockTable(t) => vec![Node::BlockTable(BlockTable {
+            params: subst_params(t.params, vars),
+            rows: t
+                .rows
+                .into_iter()
+                .map(|r| BlockRow {
+                    params: subst_params(r.params, vars),
+                    content: apply_include_vars(r.content, vars),
+                })
+                .collect(),
+        })],
+        Node::BlockCell(c) => vec![Node::BlockCell(BlockCell {
+            header: c.header,
+            params: subst_params(c.params, vars),
+            content: apply_include_vars(c.content, vars),
+        })],
+        Node::SupSubscript { sup, sub } => vec![Node::SupSubscript {
+            sup: apply_include_vars(sup, vars),
+            sub: apply_include_vars(sub, vars),
+        }],
+        Node::Link { target, text } => vec![Node::Link {
+            target,
+            text: apply_include_vars(text, vars),
+        }],
+        Node::Include(inc) => vec![Node::Include(Include {
+            source: inc.source,
+            vars: inc
+                .vars
+                .into_iter()
+                .map(|(k, v)| (k, apply_include_vars(v, vars)))
+                .collect(),
+        })],
+        Node::ListPages(lp) => vec![Node::ListPages(ListPages {
+            params: lp.params,
+            prepend: apply_include_vars(lp.prepend, vars),
+            repeat: apply_include_vars(lp.repeat, vars),
+            append: apply_include_vars(lp.append, vars),
+        })],
+        Node::Footnote(c) => vec![Node::Footnote(apply_include_vars(c, vars))],
+        Node::Tabview(tabs) => vec![Node::Tabview(
+            tabs.into_iter()
+                .map(|t| Tab {
+                    name: apply_include_vars(t.name, vars),
+                    content: apply_include_vars(t.content, vars),
+                })
+                .collect(),
+        )],
+        Node::Date { .. } | Node::HorizontalRule | Node::Raw(_) | Node::Stylesheet(_) => {
+            vec![node]
+        }
+    }
+}
+
+fn subst_kind(kind: ContainerKind, vars: &HashMap<String, Content>) -> ContainerKind {
+    match kind {
+        ContainerKind::Div { inline, params } => ContainerKind::Div {
+            inline,
+            params: subst_params(params, vars),
+        },
+        other => other,
+    }
+}
+
+fn subst_params(
+    params: HashMap<String, Vec<TextObj>>,
+    vars: &HashMap<String, Content>,
+) -> HashMap<String, Vec<TextObj>> {
+    params
+        .into_iter()
+        .map(|(k, v)| (k, subst_textobjs(v, vars)))
+        .collect()
+}
+
+fn subst_textobjs(objs: Vec<TextObj>, vars: &HashMap<String, Content>) -> Vec<TextObj> {
+    let mut out: Vec<TextObj> = Vec::new();
+    for o in objs {
+        let resolved: Vec<TextObj> = match o {
+            TextObj::IncludeVar { name, default } => match vars.get(&name) {
+                Some(v) => flatten_textobjs(&apply_include_vars(v.clone(), vars)),
+                None => match default {
+                    Some(d) => flatten_textobjs(&apply_include_vars(d, vars)),
+                    None => Vec::new(),
+                },
+            },
+            other => vec![other],
+        };
+        for r in resolved {
+            match (&r, out.last_mut()) {
+                (TextObj::Plain(s), Some(TextObj::Plain(prev))) => prev.push_str(s),
+                _ => out.push(r),
+            }
+        }
+    }
+    out
+}
+
+/// Flatten parsed [`Content`] back into plain [`TextObj`] text for the contexts
+/// (attribute values, image sources) that only carry text.
+fn flatten_textobjs(content: &Content) -> Vec<TextObj> {
+    let mut s = String::new();
+    collect_plain(content, &mut s);
+    if s.is_empty() {
+        Vec::new()
+    } else {
+        vec![TextObj::Plain(s)]
+    }
+}
+
+fn collect_plain(content: &Content, out: &mut String) {
+    for n in content {
+        match n {
+            Node::Text(TextObj::Plain(s)) => out.push_str(s),
+            Node::Text(TextObj::IncludeVar { default, .. }) => {
+                if let Some(d) = default {
+                    collect_plain(d, out);
+                }
+            }
+            Node::Text(TextObj::ModuleVar { default, .. }) => {
+                if let Some(d) = default {
+                    out.push_str(d);
+                }
+            }
+            Node::Container { content, .. }
+            | Node::Heading { content, .. }
+            | Node::Footnote(content) => collect_plain(content, out),
+            Node::Link { text, .. } => collect_plain(text, out),
+            Node::SupSubscript { sup, sub } => {
+                collect_plain(sup, out);
+                collect_plain(sub, out);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Resolve an include's [`PageRef`] to `(site, slug)` on the current site.
@@ -1231,6 +1443,75 @@ mod tests {
         assert_eq!(
             repo_l_article_latest(&next, &site("scp"), &root_slug("bar")).body,
             "Bar v1"
+        );
+    }
+
+    fn plain(s: &str) -> Content {
+        vec![Node::Text(TextObj::Plain(s.to_string()))]
+    }
+
+    fn ivar(name: &str) -> Node {
+        Node::Text(TextObj::IncludeVar {
+            name: name.to_string(),
+            default: None,
+        })
+    }
+
+    #[test]
+    fn include_var_resolves_to_value() {
+        let mut vars = HashMap::new();
+        vars.insert("align".to_string(), plain("right"));
+        let out = apply_include_vars(vec![ivar("align")], &vars);
+        assert_eq!(out, plain("right"));
+    }
+
+    #[test]
+    fn unresolved_include_var_uses_default() {
+        let node = Node::Text(TextObj::IncludeVar {
+            name: "x".to_string(),
+            default: Some(plain("fallback")),
+        });
+        let out = apply_include_vars(vec![node], &HashMap::new());
+        assert_eq!(out, plain("fallback"));
+    }
+
+    #[test]
+    fn unresolved_include_var_without_default_vanishes() {
+        let out = apply_include_vars(vec![ivar("x")], &HashMap::new());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn include_var_in_div_param_flattens_to_text() {
+        let div = Node::Container {
+            kind: ContainerKind::Div {
+                inline: false,
+                params: HashMap::from([(
+                    "style".to_string(),
+                    vec![
+                        TextObj::Plain("text-align: ".to_string()),
+                        TextObj::IncludeVar {
+                            name: "align".to_string(),
+                            default: None,
+                        },
+                    ],
+                )]),
+            },
+            content: vec![],
+        };
+        let mut vars = HashMap::new();
+        vars.insert("align".to_string(), plain("right"));
+        let out = apply_include_vars(vec![div], &vars);
+        let Node::Container {
+            kind: ContainerKind::Div { params, .. },
+            ..
+        } = &out[0]
+        else {
+            panic!("expected a div")
+        };
+        assert_eq!(
+            params.get("style"),
+            Some(&vec![TextObj::Plain("text-align: right".to_string())])
         );
     }
 }

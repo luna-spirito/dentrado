@@ -87,7 +87,7 @@ a.newpage{
 
 
 /*
-* 		LAYOUT 
+* 		LAYOUT
 */
 
 #container-wrap-wrap {
@@ -95,7 +95,7 @@ a.newpage{
 }
 
 #page-content{
-	
+
 }
 
 #container {
@@ -140,7 +140,7 @@ a.newpage{
 	padding: 1em;
 	margin: 0 0 1em 0;
 	clear: left;
-	
+
 }
 
 #side-bar ul{
@@ -199,25 +199,25 @@ a.newpage{
 	font-size: 85%;
 }
 
-/* footer */ 
+/* footer */
 
 #footer{
 	margin-top: 5px;
 	padding: 3px 10px;
-	clear: both; 
-	overflow: hidden; 
+	clear: both;
+	overflow: hidden;
 }
 
 #footer .options{
 	float: right;
 	font-size: 90%;
 	padding: 1px 0;
-	
+
 }
 
 #footer p {
 	margin: 0.2em 0;
-	padding: 0;	
+	padding: 0;
 }
 
 #license-area {
@@ -238,7 +238,7 @@ a.newpage{
 	right: 1em;
 	top: 3em;
 	z-index:10;
-	
+
 }
 
 #search-top-box input.empty{
@@ -265,10 +265,10 @@ a.newpage{
     text-decoration: blink;
 
     /* WebKit */
-    -webkit-animation-name: blinker;  
-    -webkit-animation-iteration-count: infinite;  
+    -webkit-animation-name: blinker;
+    -webkit-animation-iteration-count: infinite;
     -webkit-animation-timing-function: cubic-bezier(1.0, 0, 0, 1.0);
-    -webkit-animation-duration: 1s; 
+    -webkit-animation-duration: 1s;
 }
 
 #account-options{
@@ -336,7 +336,7 @@ a.newpage{
 	float:left;
 	margin: 0 5px;
 	padding:0;
-	
+
 }
 #top-bar li ul{
 	padding: 0;
@@ -365,7 +365,7 @@ a.newpage{
 #top-bar a:hover {
 	background-color: #FFF;
 	text-decoration: underline;
-}	
+}
 
 #top-bar li ul li a{
 	width: 10em;
@@ -391,15 +391,15 @@ a.newpage{
 /* side-bar */
 
 
-/* 
-*		INTERFACE ELEMENTS 
+/*
+*		INTERFACE ELEMENTS
 */
 
 .edit-section-button{
 	margin-top: 0.7em;margin-right: 0.5em;
 	padding: 0 0.5em;
 	float:right;
-	
+
 	background-color: #FFF;
 }
 
@@ -427,11 +427,11 @@ a.newpage{
 }
 
 .page-watch-options a{
-	text-decoration: none;	
+	text-decoration: none;
 }
 
 .page-watch-options a:hover{
-	text-decoration: underline;	
+	text-decoration: underline;
 }
 
 .change-textarea-size{
@@ -513,8 +513,8 @@ a.action-area-close:hover{
 
 
 
-/* 
-*		WIKI-SPECIFIC ELEMENTS 
+/*
+*		WIKI-SPECIFIC ELEMENTS
 */
 
 
@@ -542,7 +542,7 @@ table.wiki-content-table th{
 	border: 1px dashed gray;
 	background-color: #F7F7F7;
 	display: table;
-	
+
 }
 
 #toc .title {
@@ -569,7 +569,7 @@ table.wiki-content-table th{
 }
 
 tt{
-	font-family: 'Andale Mono', 'Courier New', Courier, monospace; 
+	font-family: 'Andale Mono', 'Courier New', Courier, monospace;
 	font-size: 98%;
 }
 
@@ -578,7 +578,7 @@ pre{
 	font-family: 'Andale Mono', 'Courier New', Courier, monospace;
 }
 
-.code { 
+.code {
 	border: 1px dashed #DDD;
 	background-color: #F7F7F7;
 	font-family: 'Andale Mono', 'Courier New', Courier, monospace;
@@ -671,7 +671,7 @@ a.footnoteref{
 
 a.bibcite{
 	display: inline-block;
-}	
+}
 
 .image-container{
 	padding: 1em;
@@ -741,7 +741,7 @@ a.bibcite{
 
 
 .gallery-item.thumbnail td{
-	
+
 }
 
 .gallery-box .gallery-item table, .gallery-box .gallery-item .td{
@@ -751,7 +751,7 @@ a.bibcite{
 }
 
 .new-page-box{
-	text-align: center; 
+	text-align: center;
 	margin: 1em 0;
 }
 
@@ -797,7 +797,7 @@ table.page-history td.optionstd a{
 	white-space: pre-wrap;
 }
 
-/* --------------------------------------------------------------------------------------------- 
+/* ---------------------------------------------------------------------------------------------
 
 .Differences {
 	width: 100%;
@@ -950,7 +950,7 @@ table.page-compare td, table.page-compare th{
 	border: 1px solid #333;
 }
 .pager .target {
-	
+
 }
 
 /* page files & files upload */
@@ -1021,13 +1021,13 @@ a.avatar-hover div div{
 	background-color: white;
 	opacity: 0.9;
 	filter: alpha(opacity=90);
-	
+
 }
 
 a.avatar-hover div span{
 	padding: 0.5em 1em;
 	margin: 0 1em;
-	
+
 	background-color: white;
 	opacity: 0.9;
 	filter: alpha(opacity=90);
@@ -1048,7 +1048,7 @@ a.avatar-hover div span{
 /* inline widgets */
 
 .wait-block{
-	padding-left: 20px; 
+	padding-left: 20px;
 	background-repeat: no-repeat;
 	background-image: url(../images/progress/progresscircle.gif)
 }
@@ -1179,7 +1179,7 @@ div.buttons{
 }
 
 div.buttons.alignleft{
-	text-align: left; 
+	text-align: left;
 }
 
 div.buttons input, input.button, button, file, a.button{
@@ -1261,7 +1261,7 @@ div.site-list-item .name{
 	font-weight: bold;
 }
 div.site-list-item .subtitle{
-}	
+}
 div.site-list-item .description{
 	font-style: italic;
 	padding-left: 2em;
@@ -1525,7 +1525,7 @@ version: 2.3.1
 .yui-navset .yui-navset-bottom .yui-nav li {
     display:inline-block;
     display:-moz-inline-stack;
-    *display:inline; /* IE */
+    display:inline; /* IE */
     vertical-align:bottom; /* safari: for overlap */
     cursor:pointer; /* gecko: due to -moz-inline-stack on anchor */
     zoom:1; /* IE: kill space between horizontal tabs */
@@ -1566,7 +1566,7 @@ version: 2.3.1
 .yui-navset-left .yui-nav,
 .yui-navset-right .yui-nav {
    position:absolute;
-   z-index:1; 
+   z-index:1;
 }
 
 .yui-navset-top .yui-nav,
@@ -1603,7 +1603,7 @@ version: 2.3.1
 }
 
 .yui-navset .yui-nav .selected,
-.yui-navset .yui-navset-top .yui-nav .selected { 
+.yui-navset .yui-navset-top .yui-nav .selected {
     margin:0 0.16em -1px 0; /* for overlap */
 }
 
@@ -1688,11 +1688,11 @@ version: 2.3.1
 }
 
 .yui-navset-left .yui-nav .selected,
-.yui-navset .yui-navset-left .yui-nav .selected { 
+.yui-navset .yui-navset-left .yui-nav .selected {
     margin:0 -1px 0.16em 0;
 }
 
-.yui-navset-right .yui-nav .selected { 
+.yui-navset-right .yui-nav .selected {
     margin:0 0 0.16em -1px;
 }
 
@@ -1740,18 +1740,18 @@ version: 2.3.1
 }
 
 .yui-navset .yui-navset-bottom .yui-nav .selected,
-.yui-navset-bottom .yui-nav .selected { 
+.yui-navset-bottom .yui-nav .selected {
     margin:-1px 0.16em 0 0; /* for overlap */
 }
 
 .yui-navset .yui-navset-bottom .yui-nav li,
-.yui-navset-bottom .yui-nav li { 
+.yui-navset-bottom .yui-nav li {
     padding:0 0 1px 0; /* gecko: make room for overflow */
     vertical-align:top;
 }
 
 .yui-navset .yui-navset-bottom .yui-nav li a,
-.yui-navset-bottom .yui-nav li a { 
+.yui-navset-bottom .yui-nav li a {
 }
 
 .yui-navset .yui-navset-bottom .yui-nav a em,
@@ -1817,7 +1817,7 @@ version: 2.3.1
     color: #949;
 	font-weight: bold;
 }
-.hl-main { 
+.hl-main {
    /* background-color: White;*/
 }
 .hl-gutter {
@@ -1825,7 +1825,7 @@ version: 2.3.1
     color: White
 }
 .hl-table {
-  
+
 }
 
 /* autocomplete.css */
@@ -1977,7 +1977,7 @@ version: 2.3.1
 
 .forum-category-box table{
 	width: 100%;
-	
+
 	border-collapse: separate;
 	border-spacing: 1px;
 	border: 1px solid #BBB;
@@ -2046,7 +2046,7 @@ version: 2.3.1
 
 .forum-thread-box{
 	margin: 0.5em 0;
-	
+
 }
 
 .forum-thread-box  .description-block{
@@ -2098,7 +2098,7 @@ version: 2.3.1
 	background-color: #EEE;
 }
 .thread-container .post  .long  .head .options{
-	float: right;	
+	float: right;
 	margin:0; padding: 0;
 }
 
@@ -2162,15 +2162,15 @@ version: 2.3.1
 	color: #77A;
 	float: right;
 	margin:0; padding:0;
-}	
+}
 
 .thread-container .post .signature {
-	font-size: 85%;	
+	font-size: 85%;
 }
 .thread-container .post .signature hr.signature-separator {
 	margin: 2px auto 2px 0;
 	padding: 0;
-	width: 15em;	
+	width: 15em;
 }
 
 
@@ -2216,7 +2216,7 @@ div.new-post a{
 
 .forum-mini-stat .item .info{
 	color: #777;
-	font-size: 80%;	
+	font-size: 80%;
 }
 
 /* editor.css */
@@ -2245,7 +2245,7 @@ div.new-post a{
 
 	float: left;
 	list-style: none;
-}	
+}
 .wd-editor-toolbar-panel ul li{
 	padding: 0; margin: 1px;
 	float: left;
@@ -2320,16 +2320,16 @@ a.weditor-strikethrough{
 }
 a.weditor-teletype{
 	background-position: -220px 0;
-}	
+}
 a.weditor-quote{
 	background-position: -242px 0;
-}	
+}
 a.weditor-superscript{
 	background-position: -264px 0;
 }
 a.weditor-subscript{
 	background-position: -286px 0;
-}	
+}
 a.weditor-raw{
 	background-position: -308px 0;
 }
@@ -2552,7 +2552,7 @@ table#odialog-box-container td div{
 	width: auto;
 }
 .owindow.owait .content{
-	
+
 	margin: 10px;
 	padding: 0 50px 20px 50px;
 	background-repeat: no-repeat;
@@ -2661,13 +2661,13 @@ table#odialog-box-container td div{
 	display: block;
 }
 
-#lightbox-nav-btnPrev { 
-	left: 0; 
+#lightbox-nav-btnPrev {
+	left: 0;
 	float: left;
 }
 
-#lightbox-nav-btnNext { 
-	right: 0; 
+#lightbox-nav-btnNext {
+	right: 0;
 	float: right;
 }
 
@@ -2682,28 +2682,28 @@ table#odialog-box-container td div{
 }
 
 #lightbox-container-image-data {
-	padding: 0 10px; 
-	color: #666; 
+	padding: 0 10px;
+	color: #666;
 }
 
-#lightbox-container-image-data #lightbox-image-details { 
-	width: 70%; 
-	float: left; 
-	text-align: left; 
-}	
+#lightbox-container-image-data #lightbox-image-details {
+	width: 70%;
+	float: left;
+	text-align: left;
+}
 
 #lightbox-image-details-caption { font-weight: bold; }
 
 #lightbox-image-details-currentNumber {
-	display: block; 
-	clear: left; 
-	padding-bottom: 1.0em;	
-}			
+	display: block;
+	clear: left;
+	padding-bottom: 1.0em;
+}
 
 #lightbox-secNav-btnClose {
-	width: 66px; 
+	width: 66px;
 	float: right;
-	padding-bottom: 0.7em;	
+	padding-bottom: 0.7em;
 }
 
 /* Navi bar */
@@ -2939,10 +2939,10 @@ iframe.html-block-iframe {
     margin: 0 auto !important;
 }
 
-/*  
+/*
 awesome buttons are based on a blog post by ZERB
 Read there blog post for more information:
-"Super awesome Buttons with CSS3 and RGBA":http://www.zurb.com/article/266/super-awesome-buttons-with-css3-and-rgba 
+"Super awesome Buttons with CSS3 and RGBA":http://www.zurb.com/article/266/super-awesome-buttons-with-css3-and-rgba
 
 this buttons are even more awesome, as the need only one color for all three states,
 and have an super awesome onclick state
@@ -2959,24 +2959,24 @@ and have an super awesome onclick state
 .awesome:active	{ padding: 6px 10px 5px; }
 
 /* Touch the rest at your onw risk. */
-.awesome { 
-    border: 0 !important; 
-    cursor: pointer !important; 
-    font-style: normal !important; 
-    font-weight: bold !important; 
-    line-height: 1 !important; 
-    position: relative !important; 
+.awesome {
+    border: 0 !important;
+    cursor: pointer !important;
+    font-style: normal !important;
+    font-weight: bold !important;
+    line-height: 1 !important;
+    position: relative !important;
     text-align: cente !important;
-    text-decoration: none !important; 
+    text-decoration: none !important;
 
     /* vertical margin is the oposite of button's awesomeness */
     margin-top: 0 !important;
     margin-bottom: 0 !important;
 
     /* not all browser support these, but who cares? */
-    text-shadow: 0 -1px 1px rgba(0,0,0,0.25), -2px 0 1px rgba(0,0,0,0.25) !important; 
+    text-shadow: 0 -1px 1px rgba(0,0,0,0.25), -2px 0 1px rgba(0,0,0,0.25) !important;
 
-    border-radius: 6px; 
+    border-radius: 6px;
     -moz-border-radius: 6px;
     -webkit-border-radius: 6px;
     box-shadow: 0 1px 2px rgba(0,0,0,0.5);
@@ -2993,12 +2993,12 @@ and have an super awesome onclick state
     background-image: -moz-linear-gradient(top, rgba(255,255,255,.2), rgba(150,150,150,.2), rgba(0,0,0,.0)) !important;
     background-image: -webkit-gradient(linear, 0% 0%, 0% 100%, from(rgba(255,255,255,.2)), color-stop(0.5, rgba(150,150,150,.2)), to(rgba(0,0,0,.0))) !important;
 
-    /* cross browser inline block hack 
+    /* cross browser inline block hack
     see http://blog.mozilla.com/webdev/2009/02/20/cross-browser-inline-block/ */
     display: -moz-inline-stack;
     display: inline-block;
     vertical-align: middle !important;
-    *display: inline !important;
+    display: inline !important;
     position: relative;
 
     /*disable text selection (Firefox only)*/
@@ -3030,13 +3030,13 @@ if there is no border set, Opera shows a transparent background-color if border-
     background-image: -moz-linear-gradient(top, rgba(255,255,255,.4), rgba(150,150,150,.3), rgba(0,0,0,.0)) !important;
     background-image: -webkit-gradient(linear, 0% 0%, 0% 100%, from(rgba(255,255,255,.4)), color-stop(0.5, rgba(150,150,150,.3)), to(rgba(0,0,0,.0))) !important;
 }
-.awesome:active	{ 
+.awesome:active	{
     background-image: linear-gradient(top, rgba(0,0,0,.2), rgba(150,150,150,.2), rgba(255,255,255,.2)) !important;
     background-image: -moz-linear-gradient(top, rgba(0,0,0,.2), rgba(150,150,150,.2), rgba(255,255,255,.2)) !important;
     background-image: -webkit-gradient(linear, 0% 0%, 0% 100%, from(rgba(0,0,0,.2)), color-stop(0.5, rgba(150,150,150,.2)), to(rgba(255,255,255,.2))) !important;
 
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.7) !important;
-    -moz-box-shadow: inset 0 1px 2px rgba(0,0,0,0.7) !important; 
+    -moz-box-shadow: inset 0 1px 2px rgba(0,0,0,0.7) !important;
     -webkit-box-shadow: inset 0 1px 2px rgba(0,0,0,0.7) !important;
 }
 
@@ -3058,7 +3058,7 @@ if there is no border set, Opera shows a transparent background-color if border-
 
 /* Safari doesn't support inset box shadow, so we better remove it */
 @media screen and (-webkit-min-device-pixel-ratio:0){
-    .awesome:active	{ 
+    .awesome:active	{
         -webkit-box-shadow: none;
     }
 }
@@ -3201,15 +3201,15 @@ table.guest-commenting td label.hint {
 }
 
 /* Webkit Hacks  */
-@media screen and (-webkit-min-device-pixel-ratio:0) {	
+@media screen and (-webkit-min-device-pixel-ratio:0) {
 	#tiptip_content {
 		padding: 4px 8px 5px 8px;
 		background-color: rgba(45,45,45,0.88);
 	}
-	#tiptip_holder.tip_bottom #tiptip_arrow_inner { 
+	#tiptip_holder.tip_bottom #tiptip_arrow_inner {
 		border-bottom-color: rgba(45,45,45,0.88);
 	}
-	#tiptip_holder.tip_top #tiptip_arrow_inner { 
+	#tiptip_holder.tip_top #tiptip_arrow_inner {
 		border-top-color: rgba(20,20,20,0.92);
 	}
 }
@@ -3277,7 +3277,7 @@ table.guest-commenting td label.hint {
 /* Moved from FileUploadModule.css */
 
 #upload-file-list table .progress .progress-bar {
-	width: 200px;	
+	width: 200px;
 	left:0;margin:0;
 	position: relative;
 	height: 1.5em;

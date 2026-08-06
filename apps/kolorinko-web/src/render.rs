@@ -7,7 +7,8 @@
 //! instead of Wikidot's per-site subdomains.
 
 use kolorinko_wikitext::{
-    Align, AlignSide, ContainerKind, Content, LinkTarget, Node, TableCell, TextStyle, TextObj,
+    Align, AlignSide, BlockCell, BlockTable, ContainerKind, Content, LinkTarget, Node, TableCell,
+    TextStyle, TextObj,
 };
 use leptos::prelude::*;
 
@@ -49,6 +50,8 @@ fn is_block(node: &Node) -> bool {
         node,
         Node::Heading { .. }
             | Node::Table(_)
+            | Node::BlockTable(_)
+            | Node::BlockCell(_)
             | Node::Image { .. }
             | Node::HorizontalRule
             | Node::Tabview(_)
@@ -74,6 +77,10 @@ fn render_node(site: &str, node: &Node) -> AnyView {
         Node::Container { kind, content } => render_container(site, kind, content),
         Node::Heading { level, content } => render_heading(site, *level, content),
         Node::Table(rows) => render_table(site, rows),
+        Node::BlockTable(table) => render_grid_table(site, table),
+        Node::BlockCell(cell) => {
+            view! { <>{render_inline(site, &cell.content)}</> }.into_any()
+        }
         Node::Image { align, source, params } => render_image(align, source, params),
         Node::Link { target, text } => render_link(site, target, text),
         Node::SupSubscript { sup, sub } => view! {
@@ -100,7 +107,25 @@ fn render_node(site: &str, node: &Node) -> AnyView {
 
 fn render_text_obj(t: &TextObj) -> AnyView {
     match t {
-        TextObj::Plain(s) => view! { {s.clone()} }.into_any(),
+        TextObj::Plain(s) => {
+            if s.contains('\n') {
+                let parts: Vec<AnyView> = s
+                    .split('\n')
+                    .enumerate()
+                    .flat_map(|(i, seg)| {
+                        let mut v: Vec<AnyView> = Vec::new();
+                        if i > 0 {
+                            v.push(view! { <br /> }.into_any());
+                        }
+                        v.push(view! { {seg.to_string()} }.into_any());
+                        v
+                    })
+                    .collect();
+                view! { <>{parts}</> }.into_any()
+            } else {
+                view! { {s.clone()} }.into_any()
+            }
+        }
         TextObj::ModuleVar { name, default } => {
             let shown = default.clone().unwrap_or_else(|| format!("%%{name}%%"));
             view! { <span class="modulevar">{shown}</span> }.into_any()
@@ -210,6 +235,58 @@ fn render_table(site: &str, rows: &[Vec<TableCell>]) -> AnyView {
         </table>
     }
     .into_any()
+}
+
+/// `[[table]]` / `[[row]]` / `[[cell]]` grid table. Cells are gathered from
+/// each row's body — descending into `[[iftags]]` wrappers (kolorinko renders
+/// every conditional branch) — so the mixed wrapped/bare layout real templates
+/// use is handled uniformly. Cell content renders inline (no `<p>`), and no
+/// `<tbody>` is emitted, matching Wikidot.
+fn render_grid_table(site: &str, table: &BlockTable) -> AnyView {
+    let (class, style) = params_to_class_style(&table.params);
+    let rows: Vec<AnyView> = table
+        .rows
+        .iter()
+        .map(|row| {
+            let (rclass, rstyle) = params_to_class_style(&row.params);
+            let cells: Vec<AnyView> = collect_grid_cells(&row.content)
+                .iter()
+                .map(|cell| render_grid_cell(site, cell))
+                .collect();
+            view! { <tr class=rclass style=rstyle>{cells}</tr> }.into_any()
+        })
+        .collect();
+    view! {
+        <table class=class style=style>{rows}</table>
+    }
+    .into_any()
+}
+
+/// Collect every [`Node::BlockCell`] in `content`, descending into `[[iftags]]`
+/// wrappers so conditionally-included cells are emitted.
+fn collect_grid_cells(content: &Content) -> Vec<&BlockCell> {
+    let mut out = Vec::new();
+    for node in content {
+        match node {
+            Node::BlockCell(c) => out.push(c),
+            Node::Container {
+                kind: ContainerKind::IfTags { .. },
+                content,
+            } => out.extend(collect_grid_cells(content)),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn render_grid_cell(site: &str, cell: &BlockCell) -> AnyView {
+    let (class, style) = params_to_class_style(&cell.params);
+    let inner = render_inline(site, &cell.content);
+    if cell.header {
+        view! { <th class=class style=style>{inner}</th> }.into_any()
+    } else {
+        view! { <td class=class style=style>{inner}</td> }.into_any()
+    }
 }
 
 fn render_image(

@@ -35,8 +35,8 @@ use chumsky::{input::InputRef, prelude::*};
 use std::collections::HashMap;
 
 use crate::wikidot_parser::types::{
-    Align, AlignSide, ContainerKind, Content, Include, LinkTarget, ListPages, ListPagesParams,
-    Node, PageRef, TableCell, TextObj, TextStyle,
+    Align, AlignSide, BlockCell, BlockRow, BlockTable, ContainerKind, Content, Include, LinkTarget,
+    ListPages, ListPagesParams, Node, PageRef, TableCell, TextObj, TextStyle,
 };
 
 pub mod types;
@@ -608,6 +608,8 @@ fn bracket_syntax<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
         // `[[[target|text]]]` / `[[[target]]]`. The third `[` is consumed here.
         just('[').ignore_then(link(element.clone())),
         div_span_block(element.clone()),
+        grid_table_block(element.clone()),
+        grid_cell_block(element.clone()),
         align_block(element.clone()),
         size_block(element.clone()),
         iftags_block(element.clone()),
@@ -664,6 +666,82 @@ fn div_span_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
             content,
         });
     div.or(span)
+}
+
+/// `[[table …]] … [[row …]] … [[/row]] … [[/table]]` grid table. The leading
+/// `[[` of `[[table]]` is consumed by [`bracket_syntax`]; each `[[row]]` opener
+/// consumes its own `[[`. A row's body is generic content in which
+/// `[[cell]]` / `[[hcell]]` appear as [`Node::BlockCell`] nodes — often wrapped
+/// in `[[iftags]]` conditionals — produced by [`grid_cell_block`].
+fn grid_table_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+    element: P,
+) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
+    let ws = choice((just(' ').ignored(), just('\n').ignored()))
+        .repeated()
+        .ignored();
+    let row = just("[[")
+        .ignore_then(spaces())
+        .ignore_then(kw_ci("row".into()))
+        .ignore_then(params_block())
+        .then_ignore(spaces())
+        .then_ignore(just("]]"))
+        .then(content_until(
+            element.clone(),
+            tag_close("row").to(ContentExitReason::Eof),
+        ))
+        .map(|(params, (content, _))| BlockRow { params, content });
+    container_open("table")
+        .then(
+            ws.clone()
+                .ignore_then(row.separated_by(ws.clone()).collect::<Vec<_>>())
+                .then_ignore(ws),
+        )
+        .then_ignore(tag_close("table"))
+        .map(|(params, rows)| Node::BlockTable(BlockTable { params, rows }))
+}
+
+/// `[[cell …]] … [[/cell]]` (`<td>`) or `[[hcell …]] … [[/hcell]]` (`<th>`),
+/// closed by either `[[/cell]]` or `[[/hcell]]`. Registered in
+/// [`bracket_syntax`] (not just inside the table) so that cells are recognised
+/// when wrapped in `[[iftags]]` conditionals within a grid-table row.
+fn grid_cell_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+    element: P,
+) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
+    let cell_close = just("[[")
+        .ignore_then(spaces())
+        .ignore_then(just('/'))
+        .ignore_then(spaces())
+        .ignore_then(choice((kw_ci("cell".into()), kw_ci("hcell".into()))))
+        .ignore_then(spaces())
+        .ignore_then(just("]]"))
+        .to(ContentExitReason::Eof);
+    choice((
+        kw_ci("hcell".into()).to(true),
+        kw_ci("cell".into()).to(false),
+    ))
+    .then(params_block())
+    .then_ignore(spaces())
+    .then_ignore(just("]]"))
+    .then(content_until(element, cell_close))
+    .map(|((header, params), (content, _))| {
+        Node::BlockCell(BlockCell {
+            header,
+            params,
+            content,
+        })
+    })
+}
+
+/// `[[/KW]]` closing tag, tolerant of inner whitespace.
+fn tag_close<'a>(kw: &'static str) -> impl Parser<'a, In<'a>, (), E<'a>> + Clone + 'a {
+    just("[[")
+        .ignore_then(spaces())
+        .ignore_then(just('/'))
+        .ignore_then(spaces())
+        .ignore_then(kw_ci(kw.to_string()))
+        .ignore_then(spaces())
+        .ignore_then(just("]]"))
+        .to(())
 }
 
 /// Parse `[[KW _? params ]]` for an inline/block container, returning the
@@ -853,16 +931,111 @@ fn include_block<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
         .ignore_then(read_until(&["]]"]))
         .then_ignore(just("]]"))
         .map(|raw: &str| {
-            let mut parts = raw.split_whitespace();
-            let source = parts.next().map(parse_page_ref).unwrap_or(PageRef {
-                space: None,
-                path: Vec::new(),
-            });
-            Node::Include(Include {
-                source,
-                vars: HashMap::new(),
-            })
+            let (source, vars) = parse_include_args(raw);
+            Node::Include(Include { source, vars })
         })
+}
+
+/// Split the body of a `[[include …]]` into the source page reference and its
+/// variable substitution map.
+///
+/// Two assignment syntaxes are recognised:
+/// • pipe-separated — `source | k1=v1 | k2=v2` (a value runs to the next `|`,
+///   so it may contain spaces); this is what component templates use, e.g.
+///   `component:rate-base activity={$activity}|activity=none|…`.
+/// • space-separated — `source k1="v1" k2="v2"` (quoted or bare values).
+///
+/// A later assignment to the same key overwrites the earlier one, so the idiom
+/// `k={$k}|k=default` resolves to `default` when `{$k}` is itself unbound.
+/// Each value becomes a single [`TextObj::Plain`] (rich markup inside values is
+/// not yet supported). Only ASCII bytes act as delimiters, so every slice lands
+/// on a UTF-8 character boundary.
+fn parse_include_args(raw: &str) -> (PageRef, HashMap<String, Content>) {
+    let b = raw.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    while i < n && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let src_start = i;
+    while i < n && !b[i].is_ascii_whitespace() && b[i] != b'|' {
+        i += 1;
+    }
+    let source = parse_page_ref(&raw[src_start..i]);
+    let remainder = &raw[i..];
+    let vars = if remainder.contains('|') {
+        parse_pipe_vars(remainder)
+    } else {
+        parse_space_vars(remainder)
+    };
+    (source, vars)
+}
+
+fn var_plain(value: &str) -> Content {
+    vec![Node::Text(TextObj::Plain(value.to_string()))]
+}
+
+fn parse_pipe_vars(remainder: &str) -> HashMap<String, Content> {
+    let mut vars = HashMap::new();
+    for seg in remainder.split('|') {
+        let Some(eq) = seg.find('=') else {
+            continue;
+        };
+        let key = seg[..eq].trim();
+        if key.is_empty() {
+            continue;
+        }
+        let mut value = seg[eq + 1..].trim();
+        if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+            value = &value[1..value.len() - 1];
+        }
+        vars.insert(key.to_string(), var_plain(value));
+    }
+    vars
+}
+
+fn parse_space_vars(remainder: &str) -> HashMap<String, Content> {
+    let b = remainder.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    let mut vars: HashMap<String, Content> = HashMap::new();
+    while i < n {
+        while i < n && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let key_start = i;
+        while i < n && b[i] != b'=' && !b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let key_end = i;
+        if key_start == key_end || i >= n || b[i] != b'=' {
+            while i < n && !b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+        let value = if i < n && b[i] == b'"' {
+            i += 1;
+            let v_start = i;
+            while i < n && b[i] != b'"' {
+                i += 1;
+            }
+            let v = remainder[v_start..i].to_string();
+            if i < n {
+                i += 1;
+            }
+            v
+        } else {
+            let v_start = i;
+            while i < n && !b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            remainder[v_start..i].to_string()
+        };
+        vars.insert(remainder[key_start..key_end].to_string(), var_plain(&value));
+    }
+    vars
 }
 
 /// `[[image SOURCE attr="val" …]]` with optional `f<`/`f>`/`<`/`>`/`=` prefix.
@@ -1352,6 +1525,22 @@ fn map_node_content<F: Fn(Content) -> Content>(node: Node, f: F) -> Node {
                 })
                 .collect(),
         ),
+        Node::BlockTable(t) => Node::BlockTable(BlockTable {
+            params: t.params,
+            rows: t
+                .rows
+                .into_iter()
+                .map(|r| BlockRow {
+                    params: r.params,
+                    content: f(r.content),
+                })
+                .collect(),
+        }),
+        Node::BlockCell(c) => Node::BlockCell(BlockCell {
+            header: c.header,
+            params: c.params,
+            content: f(c.content),
+        }),
         Node::SupSubscript { sup, sub } => Node::SupSubscript {
             sup: f(sup),
             sub: f(sub),
@@ -1385,6 +1574,25 @@ mod tests {
 
     fn txt(s: &str) -> Node {
         Node::Text(TextObj::Plain(s.to_string()))
+    }
+
+    /// Concatenate the plain-text content of an optional attribute value.
+    fn plain_of(objs: Option<&Vec<TextObj>>) -> String {
+        objs.unwrap_or(&vec![])
+            .iter()
+            .map(|o| match o {
+                TextObj::Plain(s) => s.as_str(),
+                _ => "",
+            })
+            .collect()
+    }
+
+    /// Extract the single plain-text value of an include variable.
+    fn var_str(vars: &HashMap<String, Content>, key: &str) -> Option<String> {
+        vars.get(key).and_then(|v| match v.as_slice() {
+            [Node::Text(TextObj::Plain(s))] => Some(s.clone()),
+            _ => None,
+        })
     }
 
     #[test]
@@ -1493,6 +1701,73 @@ mod tests {
     }
 
     #[test]
+    fn grid_table_block() {
+        let c = parse(concat!(
+            "[[table class=\"t\"]]\n",
+            "[[row class=\"r\"]]\n",
+            "[[cell class=\"c\" style=\"display: none\"]]body[[/cell]]\n",
+            "[[hcell]]head[[/cell]]\n",
+            "[[/row]]\n",
+            "[[/table]]",
+        ));
+        let Node::BlockTable(t) = &c[0] else {
+            panic!("expected block table, got {:?}", c[0]);
+        };
+        assert_eq!(plain_of(t.params.get("class")), "t");
+        assert_eq!(t.rows.len(), 1);
+        let row = &t.rows[0];
+        assert_eq!(plain_of(row.params.get("class")), "r");
+        let cells: Vec<&BlockCell> = row
+            .content
+            .iter()
+            .filter_map(|n| match n {
+                Node::BlockCell(cell) => Some(cell),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cells.len(), 2);
+        assert!(!cells[0].header);
+        assert!(cells[1].header);
+        assert_eq!(plain_of(cells[0].params.get("style")), "display: none");
+    }
+
+    #[test]
+    fn grid_table_iftags_wrapped_cell() {
+        // A cell wrapped in [[iftags]] (the rate-module pattern) must parse
+        // without leaking, sitting inside the row alongside bare cells.
+        let c = parse(concat!(
+            "[[table]]\n",
+            "[[row]]\n",
+            "[[iftags top10]]\n",
+            "[[cell class=\"badge\"]]A[[/cell]]\n",
+            "[[/iftags]]\n",
+            "[[cell]]B[[/cell]]\n",
+            "[[/row]]\n",
+            "[[/table]]",
+        ));
+        let Node::BlockTable(t) = &c[0] else {
+            panic!("expected block table, got {:?}", c[0]);
+        };
+        assert_eq!(t.rows.len(), 1);
+        let row = &t.rows[0];
+        // The bare cell is a direct child; the iftags-wrapped cell is nested.
+        let bare = row
+            .content
+            .iter()
+            .filter(|n| matches!(n, Node::BlockCell(_)))
+            .count();
+        assert_eq!(bare, 1);
+        let wrapped = row.content.iter().any(|n| match n {
+            Node::Container {
+                kind: ContainerKind::IfTags { .. },
+                content,
+            } => content.iter().any(|m| matches!(m, Node::BlockCell(_))),
+            _ => false,
+        });
+        assert!(wrapped, "iftags should wrap a cell");
+    }
+
+    #[test]
     fn blockquote_and_color() {
         let c = parse("> quoted text\n> more\n##red|red text##");
         assert!(matches!(
@@ -1534,6 +1809,26 @@ mod tests {
             }
             other => panic!("expected include, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn include_pipe_vars() {
+        // Pipe syntax: a later assignment to the same key wins, so the
+        // `k={$k}|k=default` idiom resolves to the default.
+        let c = parse(concat!(
+            "[[include component:rate-base ",
+            "align={$align}|align=right|",
+            "votes={$votes}|votes=right|",
+            "stars={$stars}]]",
+        ));
+        let Node::Include(Include { source, vars }) = &c[0] else {
+            panic!("expected include, got {:?}", c[0]);
+        };
+        assert_eq!(source.path, vec!["rate-base".to_string()]);
+        assert_eq!(var_str(vars, "align"), Some("right".to_string()));
+        assert_eq!(var_str(vars, "votes"), Some("right".to_string()));
+        // No default for stars — the passthrough literal is kept.
+        assert_eq!(var_str(vars, "stars"), Some("{$stars}".to_string()));
     }
 
     #[test]

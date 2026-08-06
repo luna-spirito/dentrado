@@ -169,6 +169,18 @@ pub enum Node {
     /// `|| cell || cell ||` table. PureScript `Tabel`.
     Table(Vec<Vec<TableCell>>),
 
+    /// `[[table]]` grid table — the bracketed, nestable form. The table holds
+    /// explicit `[[row]]` blocks; each row's body is generic [`Content`] in
+    /// which `[[cell]]` / `[[hcell]]` appear as [`Node::BlockCell`] nodes (often
+    /// wrapped in `[[iftags]]` conditionals).
+    BlockTable(BlockTable),
+
+    /// `[[cell …]] … [[/cell]]` (`header == false`, `<td>`) or `[[hcell …]] …
+    /// [[/hcell]]` (`header == true`, `<th>`). Parsed anywhere (so it can sit
+    /// inside an `[[iftags]]` wrapper within a grid-table row) and gathered into
+    /// `<tr>` cells at render time.
+    BlockCell(BlockCell),
+
     /// `^sup^` / `,sub,` — superscript and subscript, parsed together.
     /// PureScript `SupSub`.
     SupSubscript { sup: Content, sub: Content },
@@ -221,6 +233,31 @@ pub struct TableCell {
     pub header: bool,
     /// Optional cell-level alignment (`<`, `=`, `>`).
     pub align: Option<Align>,
+    pub content: Content,
+}
+
+/// `[[table]]` grid table — the bracketed, nestable form. Each level carries
+/// arbitrary `key="value"` attributes; cells are normal (`[[cell]]` → `<td>`)
+/// or header (`[[hcell]]` → `<th>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockTable {
+    pub params: HashMap<String, Vec<TextObj>>,
+    pub rows: Vec<BlockRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockRow {
+    pub params: HashMap<String, Vec<TextObj>>,
+    /// Row body: cells ([`Node::BlockCell`]) possibly wrapped in `[[iftags]]`
+    /// or other containers, plus inter-cell whitespace.
+    pub content: Content,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockCell {
+    /// `true` for `[[hcell]]` (renders `<th>`), `false` for `[[cell]]` (`<td>`).
+    pub header: bool,
+    pub params: HashMap<String, Vec<TextObj>>,
     pub content: Content,
 }
 
