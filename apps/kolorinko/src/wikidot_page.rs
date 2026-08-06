@@ -14,13 +14,23 @@
 //! by one TAB-separated `revision  revision_id  timestamp  author` row per
 //! revision.
 //!
+//! # Storage model
+//! The dataset never materialises body text. It is built by walking the git
+//! **object database** pinned to a commit tip, storing each body as its blob
+//! `Oid` (cheap, content-addressed, immutable). Text is paged in lazily by the
+//! [`repo_l_article_latest`] lens — the only stage co-located with the
+//! `!Send` [`git2::Repository`] — through a shared bounded hot cache ([`Odb`]).
+//! Memory thus tracks the rendered working set, not the repository size, and a
+//! moving tip never tears a live snapshot: its Oids stay valid in the odb.
+//!
 //! # Gears
 //! - [`repo`] (`local` oracle): polls the git remote on a timer and rebuilds
-//!   the whole in-memory dataset as [`Rc`]`<`[`RepoData`]`>`. Pinned to one
-//!   core; never crosses a thread, so it may (and does) hold `Rc`/`!Send` data.
+//!   the dataset as [`Rc`]`<`[`RepoData`]`>` of blob Oids. Pinned to one core;
+//!   never crosses a thread, so it holds the `!Send` [`Odb`] via an [`Rc`].
 //! - [`repo_l_article_latest`] (`follow` lens over `repo`): projects one page
 //!   into an owned [`ArticleLatest`] (metadata + latest body + revision list,
-//!   no bodies). Shippable, so `Send` (owned `String`s, no `Rc`/`Arc`).
+//!   no bodies). Shippable, so `Send` (owned `String`s, no `Rc`/`Arc`); the one
+//!   place a body blob is read out of the odb.
 //! - [`article_latest_parsed`] (`event`): parses the latest body into
 //!   [`ArticleView`] with `[[include]]` directives **left unresolved**. Kept
 //!   separate from [`article_latest`] so the parse gears never depend on one
@@ -35,7 +45,7 @@
 
 use crate::wikidot_parser::parse;
 use dentrado::core::{core_ctx::GearCtx, storage::Storage};
-use git2::{Oid, Repository};
+use git2::{ObjectType, Oid, Repository, Tree, TreeWalkMode};
 use im::HashMap as ImHashMap;
 use kolorinko_rt::SafePathComponent;
 use kolorinko_wikitext::{
@@ -44,8 +54,8 @@ use kolorinko_wikitext::{
 use log::error;
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
-    fs,
+    collections::{HashMap, HashSet, VecDeque},
+    fmt,
     path::{Path, PathBuf},
     rc::Rc,
 };
@@ -103,9 +113,20 @@ type Key = (
 /// All sites mirrored out of the repository at one point in time. A persistent
 /// [`im::HashMap`] so cloning the [`Rc`]`<RepoData>` is O(1) and an update is
 /// non-destructive (dependents holding a prior snapshot see a stable view).
-#[derive(Default, Clone, Debug)]
+/// Carries the [`!Send`](Odb) odb handle so the [`repo_l_article_latest`] lens
+/// — the only co-located consumer — can materialise bodies on demand.
+#[derive(Default, Clone)]
 pub(crate) struct RepoData {
     sites: ImHashMap<SafePathComponent, WDWebsite>,
+    odb: Option<Odb>,
+}
+
+impl fmt::Debug for RepoData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RepoData")
+            .field("sites", &self.sites)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RepoData {
@@ -122,18 +143,76 @@ pub(crate) struct WDWebsite {
     articles: ImHashMap<Option<SafePathComponent>, ImHashMap<SafePathComponent, Article>>,
 }
 
-/// One page: metadata, the full revision-history summary, the latest revision's
-/// body, and **every** revision body (loaded eagerly per the design so the
-/// postponed revision gear can project any revision as a trivial lens).
+/// One page: metadata, the full revision-history summary, and blob Oids for the
+/// latest body and **every** revision body. Bodies are never materialised here
+/// — they live in the git object database, paged in lazily via [`Odb::blob`].
 #[derive(Clone, Debug)]
 pub(crate) struct Article {
     meta: ArticleMeta,
-    latest_body: Rc<str>,
+    latest_body: Oid,
     revisions: Vec<RevMeta>,
-    /// Every revision body. Loaded eagerly (per design) but only read by the
+    /// Every revision body's blob Oid (cheap; not text). Read on demand by the
     /// postponed `repo_l_article_revision` gear.
     #[allow(dead_code)]
-    bodies: ImHashMap<u64, Rc<str>>,
+    bodies: ImHashMap<u64, Oid>,
+}
+
+/// Shared, lazily-materialised view over the git object database on the
+/// [`repo`] oracle's core: one [`Repository`] handle plus a bounded hot cache of
+/// already-read body blobs. `!Send` — it never leaves the oracle's core, so both
+/// the oracle (build/diff) and the [`repo_l_article_latest`] lens (body
+/// materialisation) reach it through the [`Rc`] cloned into every [`RepoData`].
+pub(crate) type Odb = Rc<OdbInner>;
+
+pub(crate) struct OdbInner {
+    repo: Repository,
+    blobs: RefCell<Blobs>,
+}
+
+struct Blobs {
+    map: HashMap<Oid, Rc<str>>,
+    order: VecDeque<Oid>,
+}
+
+impl OdbInner {
+    /// Soft cap on the hot blob cache. Beyond it the oldest inserted blob is
+    /// evicted (FIFO) — memory stays bounded to the rendered working set, not
+    /// the whole repository.
+    const CAP: usize = 8192;
+
+    fn new(repo: Repository) -> Self {
+        Self {
+            repo,
+            blobs: RefCell::new(Blobs {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+            }),
+        }
+    }
+
+    /// Read body blob `oid` from the object database as a frontmatter-stripped
+    /// `Rc<str>`, caching it. Content-addressed and immutable, so the cache is
+    /// sound for the Oid's lifetime. `None` if the blob is missing or not valid
+    /// UTF-8.
+    fn blob(&self, oid: Oid) -> Option<Rc<str>> {
+        {
+            let b = self.blobs.borrow();
+            if let Some(s) = b.map.get(&oid) {
+                return Some(Rc::clone(s));
+            }
+        }
+        let raw = blob_str(&self.repo, oid)?;
+        let s: Rc<str> = Rc::from(revision_body(&raw));
+        let mut b = self.blobs.borrow_mut();
+        b.map.insert(oid, Rc::clone(&s));
+        b.order.push_back(oid);
+        if b.order.len() > Self::CAP
+            && let Some(old) = b.order.pop_front()
+        {
+            b.map.remove(&old);
+        }
+        Some(s)
+    }
 }
 
 // =========================================================================
@@ -146,60 +225,72 @@ pub(crate) struct Article {
 /// slug changed or it was deleted.
 type Index = HashMap<PathBuf, Key>;
 
-/// Per-instance cache for [`repo`]: the opened `git2::Repository` (kept across
-/// ticks), the last commit tip, the last-built dataset, and the reverse
-/// [`Index`]. Wrapped in `Rc<RefCell<…>>` so the cache (which must be
-/// `Clone + Debug`) is a cheap refcount bump and need not require
-/// `Repository: Debug`.
+/// Per-instance cache for [`repo`]: the shared [`Odb`] (opened `Repository` +
+/// blob cache, kept across ticks), the last commit tip, the last-built dataset,
+/// and the reverse [`Index`]. Wrapped in `Rc<RefCell<…>>` so the cache (which
+/// must be `Clone + Debug`) is a cheap refcount bump.
 #[derive(Default, Clone)]
 pub(crate) struct RepoCache(Rc<RefCell<RepoInner>>);
 
 #[derive(Default)]
 struct RepoInner {
-    repo: Option<Repository>,
+    odb: Option<Odb>,
     last_tip: Option<Oid>,
     data: Option<Rc<RepoData>>,
     index: Index,
 }
 
-impl std::fmt::Debug for RepoCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for RepoCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("RepoCache").finish()
     }
 }
 
 /// Run the [`repo`] oracle. On a tick: open/clone lazily, fetch + hard-reset,
 /// and on a moved tip patch the dataset **incrementally** — only the pages the
-/// `old_tip → new_tip` git diff touched are re-read, producing a new
-/// [`Rc`]`<`[`RepoData`]`>` that structurally shares almost all of the old one
-/// (and reuses the unaffected pages' `Rc<str>` bodies). Falls back to a full
-/// [`build_all`] on the first build or when the diff can't be computed (e.g.
-/// a force-push garbage-collected the old tip). A same-tip or non-tick run
-/// returns the previously built dataset unchanged.
+/// `old_tip → new_tip` git diff touched are re-read (as blob Oids) from the new
+/// tip's tree, producing a new [`Rc`]`<`[`RepoData`]`>` that structurally shares
+/// almost all of the old one. Falls back to a full [`build_from_tree`] on the
+/// first build or when the diff can't be computed (e.g. a force-push
+/// garbage-collected the old tip). A same-tip or non-tick run returns the
+/// previously built dataset unchanged.
 pub(crate) fn repo(meta: &RepoMeta, tick: bool, cache: &mut RepoCache) -> Rc<RepoData> {
     let mut inner = cache.0.borrow_mut();
-    if inner.repo.is_none() {
-        inner.repo = open_or_clone(meta.url, meta.path);
+    if inner.odb.is_none() {
+        inner.odb = open_or_clone(meta.url, meta.path).map(|r| Rc::new(OdbInner::new(r)));
     }
+    // Clone the odb handle out so git ops below never borrow `inner` (the pulls,
+    // diffs, and tree reads are synchronous, but this keeps the borrows trivial).
+    let odb = inner.odb.clone();
     if tick
-        && let Some((r, outcome)) = inner.repo.as_ref().zip(pull_for_diff(inner.repo.as_ref()))
-        && let PullOutcome::Updated { new_tip } = outcome
+        && let Some(odb) = odb.as_ref()
+        && let Some(PullOutcome::Updated { new_tip }) = pull_for_diff(Some(&odb.repo))
     {
         let prev_tip = inner.last_tip;
         let prev_data = inner.data.clone();
         let rebuilt: Option<(RepoData, Index)> = match (prev_tip, prev_data.as_ref()) {
             (Some(old_tip), Some(old_data)) if old_tip != new_tip => {
-                match diff_affected_meta_paths(r, old_tip, new_tip, meta.path) {
+                match diff_affected_meta_paths(&odb.repo, old_tip, new_tip, meta.path) {
                     Some(affected) if affected.is_empty() => None,
                     Some(affected) => {
                         let mut index = inner.index.clone();
-                        let data = incremental_update(old_data, &mut index, affected);
+                        let new_tree = odb
+                            .repo
+                            .find_commit(new_tip)
+                            .ok()
+                            .and_then(|c| odb.repo.find_tree(c.tree_id()).ok());
+                        let data = match new_tree.as_ref() {
+                            Some(t) => incremental_update(
+                                &odb.repo, t, meta.path, old_data, &mut index, affected,
+                            ),
+                            None => build_from_tree(odb, new_tip, meta.path).0,
+                        };
                         Some((data, index))
                     }
-                    None => Some(build_all(meta.path)),
+                    None => Some(build_from_tree(odb, new_tip, meta.path)),
                 }
             }
-            _ => Some(build_all(meta.path)),
+            _ => Some(build_from_tree(odb, new_tip, meta.path)),
         };
         inner.last_tip = Some(new_tip);
         if let Some((data, index)) = rebuilt {
@@ -208,8 +299,12 @@ pub(crate) fn repo(meta: &RepoMeta, tick: bool, cache: &mut RepoCache) -> Rc<Rep
         }
     }
     if inner.data.is_none() {
-        let (data, index) = build_all(meta.path);
-        inner.last_tip = current_tip(inner.repo.as_ref());
+        let tip = current_tip(odb.as_ref().map(|o| &o.repo));
+        let (data, index) = match (odb.as_ref(), tip) {
+            (Some(o), Some(t)) => build_from_tree(o, t, meta.path),
+            _ => (RepoData::default(), inner.index.clone()),
+        };
+        inner.last_tip = tip;
         inner.data = Some(Rc::new(data));
         inner.index = index;
     }
@@ -269,131 +364,177 @@ fn open_or_clone(url: &str, path: &Path) -> Option<Repository> {
 }
 
 // =========================================================================
-// Repository walk → RepoData
+// Tree walk → RepoData (blob Oids only; no body text materialised)
 // =========================================================================
 
-/// Walk the whole working tree and build a [`RepoData`]: for each site, every
-/// `_meta/<p1>/<p2>/<pageid>` file yields one [`Article`] (metadata from the
-/// file, bodies from the sibling `_pages_by_id` directory).
-fn build_all(root: &Path) -> (RepoData, Index) {
-    let mut sites = ImHashMap::new();
+/// Walk the commit's tree at `tip` and build a [`RepoData`]: for each site,
+/// every `_meta/<p1>/<p2>/<pageid>` blob yields one [`Article`] (metadata parsed
+/// from the blob, body blob Oids recorded from the sibling `_pages_by_id`
+/// subtree). Bodies stay as Oids — never read into memory here.
+fn build_from_tree(odb: &Odb, tip: Oid, root: &Path) -> (RepoData, Index) {
+    let repo = &odb.repo;
+    let mut sites: ImHashMap<SafePathComponent, WDWebsite> = ImHashMap::new();
     let mut index: Index = HashMap::new();
-    let Ok(site_entries) = fs::read_dir(root) else {
-        return (RepoData::default(), index);
-    };
-    for site_entry in site_entries.flatten() {
-        let site_path = site_entry.path();
-        if !site_path.is_dir() {
-            continue;
+    let root_tree = match repo
+        .find_commit(tip)
+        .and_then(|c| repo.find_tree(c.tree_id()))
+    {
+        Ok(t) => t,
+        Err(_) => {
+            return (
+                RepoData {
+                    sites,
+                    odb: Some(Rc::clone(odb)),
+                },
+                index,
+            );
         }
-        let Some(site) = SafePathComponent::new(site_entry.file_name().to_string_lossy().into())
-        else {
+    };
+    // `(site, p1, p2, id)` keyed: the `_meta` blob Oid + per-revision body Oids.
+    let mut metas: HashMap<(String, String, String, String), Oid> = HashMap::new();
+    let mut bodies: HashMap<(String, String, String, String), ImHashMap<u64, Oid>> = HashMap::new();
+    root_tree
+        .walk(TreeWalkMode::PreOrder, |dir, entry| {
+            if entry.kind() != Some(ObjectType::Blob) {
+                return 0;
+            }
+            let Ok(name) = entry.name() else {
+                return 0;
+            };
+            let path = format!("{dir}{name}");
+            let comps: Vec<&str> = path.split('/').collect();
+            match comps.as_slice() {
+                [site, "_meta", p1, p2, id] => {
+                    metas.insert(
+                        ((*site).into(), (*p1).into(), (*p2).into(), (*id).into()),
+                        entry.id(),
+                    );
+                }
+                [site, "_pages_by_id", p1, p2, id, rfile] => {
+                    if let Some(n) = rev_number(rfile) {
+                        bodies
+                            .entry(((*site).into(), (*p1).into(), (*p2).into(), (*id).into()))
+                            .or_default()
+                            .insert(n, entry.id());
+                    }
+                }
+                _ => {}
+            }
+            0
+        })
+        .ok();
+    for (key, meta_oid) in metas {
+        let (site, p1, p2, id) = &key;
+        let Some(site_c) = SafePathComponent::new(site.clone()) else {
             continue;
         };
-        let mut articles: ImHashMap<
-            Option<SafePathComponent>,
-            ImHashMap<SafePathComponent, Article>,
-        > = ImHashMap::new();
-        for meta_file in walk_files(&site_path.join("_meta")) {
-            let Some(article) = build_article(&meta_file, &site_path) else {
-                continue;
-            };
-            let Some((category, name)) = slug_to_key(&article.meta.slug) else {
-                continue;
-            };
-            index.insert(
-                meta_file.clone(),
-                (site.clone(), category.clone(), name.clone()),
-            );
-            articles
-                .entry(category)
-                .or_insert_with(ImHashMap::new)
-                .insert(name, article);
-        }
-        if !articles.is_empty() {
-            sites.insert(site, WDWebsite { articles });
-        }
+        let Some(meta_text) = blob_str(repo, meta_oid) else {
+            continue;
+        };
+        let pm = parse_meta(&meta_text);
+        let body_map = bodies.remove(&key).unwrap_or_default();
+        let Some(latest) = body_map.keys().max().copied() else {
+            continue;
+        };
+        let Some(&latest_body) = body_map.get(&latest) else {
+            continue;
+        };
+        let Some((cat, name)) = slug_to_key(&pm.slug) else {
+            continue;
+        };
+        let article = Article {
+            meta: ArticleMeta {
+                title: pm.title,
+                tags: pm.tags,
+                slug: pm.slug,
+                page_id: format!("{p1}{p2}{id}"),
+            },
+            latest_body,
+            revisions: pm.revisions,
+            bodies: body_map,
+        };
+        let meta_path = root.join(site).join("_meta").join(p1).join(p2).join(id);
+        index.insert(meta_path, (site_c.clone(), cat.clone(), name.clone()));
+        insert_page(&mut sites, site_c, cat, name, article);
     }
-    (RepoData { sites }, index)
+    (
+        RepoData {
+            sites,
+            odb: Some(Rc::clone(odb)),
+        },
+        index,
+    )
 }
 
-/// Build one [`Article`] from its `_meta` file: parse the metadata, derive
-/// `(category, name)` from the slug, and read every revision body from the
-/// matching `_pages_by_id` directory.
-fn build_article(meta_file: &Path, site_path: &Path) -> Option<Article> {
-    let text = fs::read_to_string(meta_file).ok()?;
-    let pm = parse_meta(&text);
-    // `_meta/<p1>/<p2>/<id>` → `_pages_by_id/<p1>/<p2>/<id>` (same suffix).
-    let rel = meta_file.strip_prefix(site_path).ok()?;
-    let bodies_dir = site_path
-        .join("_pages_by_id")
-        .join(rel.strip_prefix("_meta").ok()?);
-    let bodies = read_bodies(&bodies_dir);
-    let latest = *bodies.keys().max()?;
-    let latest_body = bodies.get(&latest)?.clone();
-    // page id = the joined `<p1><p2><id>` tail of the `_meta` path.
-    let page_id: String = rel
-        .components()
-        .skip(1)
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    let meta = ArticleMeta {
-        title: pm.title,
-        tags: pm.tags,
-        slug: pm.slug,
-        page_id,
-    };
+/// Read one [`Article`] out of `tree` at `(site, p1, p2, id)`: parse the `_meta`
+/// blob and record every `r{N}.txt` body blob Oid from the matching
+/// `_pages_by_id` subtree. Used by the incremental path to re-read only the
+/// pages a git diff touched.
+fn read_page(
+    repo: &Repository,
+    tree: &Tree,
+    site: &str,
+    p1: &str,
+    p2: &str,
+    id: &str,
+) -> Option<Article> {
+    let meta_rel = format!("{site}/_meta/{p1}/{p2}/{id}");
+    let meta_oid = tree.get_path(Path::new(&meta_rel)).ok()?.id();
+    let pm = parse_meta(&blob_str(repo, meta_oid)?);
+    let body_map = enumerate_bodies(repo, tree, &format!("{site}/_pages_by_id/{p1}/{p2}/{id}"));
+    let latest = body_map.keys().max().copied()?;
+    let latest_body = *body_map.get(&latest)?;
     Some(Article {
-        meta,
+        meta: ArticleMeta {
+            title: pm.title,
+            tags: pm.tags,
+            slug: pm.slug,
+            page_id: format!("{p1}{p2}{id}"),
+        },
         latest_body,
         revisions: pm.revisions,
-        bodies,
+        bodies: body_map,
     })
 }
 
-/// Every file reachable below `dir`, recursively (used to enumerate `_meta`
-/// page-id files at arbitrary nesting).
-fn walk_files(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    walk_into(dir, &mut out);
-    out
-}
-
-fn walk_into(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk_into(&path, out);
-        } else {
-            out.push(path);
-        }
-    }
-}
-
-/// Read every `r{N}.txt` in `dir` into `{N → body}` (frontmatter stripped).
-fn read_bodies(dir: &Path) -> ImHashMap<u64, Rc<str>> {
+/// Every `r{N}.txt` blob Oid directly under `dir_rel` in `tree`, as `{N → oid}`.
+fn enumerate_bodies(repo: &Repository, tree: &Tree, dir_rel: &str) -> ImHashMap<u64, Oid> {
     let mut map = ImHashMap::new();
-    let Ok(entries) = fs::read_dir(dir) else {
+    let Ok(entry) = tree.get_path(Path::new(dir_rel)) else {
         return map;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+    let Ok(obj) = entry.to_object(repo) else {
+        return map;
+    };
+    let Some(dir_tree) = obj.as_tree() else {
+        return map;
+    };
+    for e in dir_tree.iter() {
+        if e.kind() != Some(ObjectType::Blob) {
+            continue;
+        }
+        let Ok(name) = e.name() else {
             continue;
         };
-        let Some(num) = name.strip_prefix('r').and_then(|s| s.strip_suffix(".txt")) else {
-            continue;
-        };
-        let Ok(n) = num.parse::<u64>() else { continue };
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        map.insert(n, Rc::from(revision_body(&text)));
+        if let Some(n) = rev_number(name) {
+            map.insert(n, e.id());
+        }
     }
     map
+}
+
+/// Parse the revision number out of a body file name: `r12.txt` → `12`.
+fn rev_number(name: &str) -> Option<u64> {
+    name.strip_prefix('r')
+        .and_then(|s| s.strip_suffix(".txt"))
+        .and_then(|s| s.parse().ok())
+}
+
+/// Read a blob by Oid straight from the odb as an owned `String` (uncached —
+/// used for the small `_meta` blobs at build time).
+fn blob_str(repo: &Repository, oid: Oid) -> Option<String> {
+    let blob = repo.find_blob(oid).ok()?;
+    std::str::from_utf8(blob.content()).ok().map(String::from)
 }
 
 /// Strip a revision file's `---\n…\n---\n` frontmatter, returning the body.
@@ -468,7 +609,7 @@ fn slug_parts(slug: &str) -> (Option<String>, String) {
 }
 
 /// `(Option<category>, name)` as validated [`SafePathComponent`]s, or `None` if
-/// either segment is unsafe (the page is dropped, as in [`build_all`]).
+/// either segment is unsafe (the page is dropped, as in [`build_from_tree`]).
 fn slug_to_key(slug: &str) -> Option<(Option<SafePathComponent>, SafePathComponent)> {
     let (cat, name) = slug_parts(slug);
     let name = SafePathComponent::new(name)?;
@@ -485,38 +626,48 @@ fn slug_to_key(slug: &str) -> Option<(Option<SafePathComponent>, SafePathCompone
 
 /// Patch [`old`] for exactly the pages in [`affected`] (each an absolute
 /// `_meta` path). For each: drop the old nested-map entry (if any, via the
-/// [`Index`]), then re-read the page and re-insert under its current slug.
-/// Unaffected pages are structurally shared from [`old`] (`im::HashMap`), so
-/// only the touched pages' files are re-read.
-fn incremental_update(old: &RepoData, index: &mut Index, affected: HashSet<PathBuf>) -> RepoData {
+/// [`Index`]), then re-read the page (as blob Oids) from the new tip's `tree`
+/// and re-insert under its current slug. Unaffected pages are structurally
+/// shared from [`old`] (`im::HashMap`), so only the touched pages are re-read.
+fn incremental_update(
+    repo: &Repository,
+    tree: &Tree,
+    root: &Path,
+    old: &RepoData,
+    index: &mut Index,
+    affected: HashSet<PathBuf>,
+) -> RepoData {
     let mut sites = old.sites.clone();
     for meta_path in affected {
         if let Some(old_key) = index.remove(&meta_path) {
             remove_page(&mut sites, &old_key);
         }
-        let Some(site_dir) = meta_path_site_dir(&meta_path) else {
+        let Some((site, p1, p2, id)) = meta_page_parts(&meta_path, root) else {
             continue;
         };
-        let Some(article) = build_article(&meta_path, &site_dir) else {
+        let Some(article) = read_page(repo, tree, &site, &p1, &p2, &id) else {
             continue;
         };
-        let Some(site) = meta_path_site(&meta_path) else {
+        let Some(site_c) = SafePathComponent::new(site) else {
             continue;
         };
         let Some((cat, name)) = slug_to_key(&article.meta.slug) else {
             continue;
         };
-        index.insert(meta_path, (site.clone(), cat.clone(), name.clone()));
-        insert_page(&mut sites, site, cat, name, article);
+        index.insert(meta_path, (site_c.clone(), cat.clone(), name.clone()));
+        insert_page(&mut sites, site_c, cat, name, article);
     }
-    RepoData { sites }
+    RepoData {
+        sites,
+        odb: old.odb.clone(),
+    }
 }
 
 /// The set of `_meta` paths changed between two tips. Each git-diff delta path
 /// (old and new side) is normalized via [`normalize_meta_path`]; non-page paths
 /// (e.g. `files/…`, top-level docs) are dropped. `None` if either tree is
 /// unreachable (force-push GC of the old tip) — the caller falls back to
-/// [`build_all`].
+/// [`build_from_tree`].
 fn diff_affected_meta_paths(
     repo: &Repository,
     old_tip: Oid,
@@ -569,16 +720,17 @@ fn normalize_meta_path(rel: &Path, root: &Path) -> Option<PathBuf> {
     Some(meta)
 }
 
-/// `<root>/<site>/_meta/<p1>/<p2>/<id>` → `<root>/<site>` (the site dir), via
-/// the 4 ancestors above the file. Used as `build_article`'s site root.
-fn meta_path_site_dir(meta_path: &Path) -> Option<PathBuf> {
-    meta_path.ancestors().nth(4).map(Path::to_path_buf)
-}
-
-/// The site [`SafePathComponent`] of a `_meta` path (the dir name 4 levels up).
-fn meta_path_site(meta_path: &Path) -> Option<SafePathComponent> {
-    let site_dir = meta_path.ancestors().nth(4)?;
-    SafePathComponent::new(site_dir.file_name()?.to_string_lossy().into())
+/// `<root>/<site>/_meta/<p1>/<p2>/<id>` → `(site, p1, p2, id)`, stripping the
+/// root and the `_meta` kind segment. Used to re-read one page from the tree.
+fn meta_page_parts(meta_path: &Path, root: &Path) -> Option<(String, String, String, String)> {
+    let rel = meta_path.strip_prefix(root).ok()?;
+    let mut c = rel.components();
+    let site = c.next()?.as_os_str().to_str()?.to_string();
+    let _kind = c.next()?.as_os_str().to_str()?; // "_meta"
+    let p1 = c.next()?.as_os_str().to_str()?.to_string();
+    let p2 = c.next()?.as_os_str().to_str()?.to_string();
+    let id = c.next()?.as_os_str().to_str()?.to_string();
+    Some((site, p1, p2, id))
 }
 
 /// Remove `(site, cat, name)` from the nested map, pruning a now-empty
@@ -637,18 +789,22 @@ fn strip_quotes(s: &str) -> &str {
 #[derive(Default, Clone, Debug)]
 pub(crate) struct RepoLArticleCache;
 
-/// Project one page out of `repo`'s dataset into a shippable [`ArticleLatest`].
-/// A missing page yields an empty [`ArticleLatest`] (the page renders blank).
+/// Project one page out of `repo`'s dataset into a shippable [`ArticleLatest`],
+/// materialising the latest body blob out of the odb. A missing page (or an
+/// unopenable repository) yields an empty [`ArticleLatest`] (blank render).
 pub(crate) fn repo_l_article_latest(
     data: &RepoData,
     site: &SafePathComponent,
     slug: &Slug,
 ) -> ArticleLatest {
     data.article(site, slug)
-        .map(|a| ArticleLatest {
-            meta: a.meta.clone(),
-            body: (*a.latest_body).to_string(),
-            revisions: a.revisions.clone(),
+        .and_then(|a| {
+            let body = data.odb.as_ref()?.blob(a.latest_body)?;
+            Some(ArticleLatest {
+                meta: a.meta.clone(),
+                body: (*body).to_string(),
+                revisions: a.revisions.clone(),
+            })
         })
         .unwrap_or_default()
 }
@@ -916,4 +1072,165 @@ fn include_target(
         None => None,
     };
     Some((current_site.clone(), (category, name)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use git2::{IndexAddOption, Signature};
+    use std::fs;
+
+    /// Write one page (`_meta` + a single `r{rev}.txt` body) into the export
+    /// layout under `root/<site>/…`, returning the relative paths committed.
+    fn write_page(
+        root: &Path,
+        site: &str,
+        p1: &str,
+        p2: &str,
+        id: &str,
+        slug: &str,
+        rev: u64,
+        body: &str,
+    ) {
+        let base = root.join(site);
+        let meta = format!("slug: \"{slug}\"\ntitle: \"T\"\ntags: []\n{rev}\trid\t1\ta\n");
+        let meta_path = base.join("_meta").join(p1).join(p2).join(id);
+        fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        fs::write(&meta_path, meta).unwrap();
+        let body_dir = base.join("_pages_by_id").join(p1).join(p2).join(id);
+        fs::create_dir_all(&body_dir).unwrap();
+        fs::write(body_dir.join(format!("r{rev}.txt")), body).unwrap();
+    }
+
+    /// Stage everything under the worktree and commit (first commit if empty).
+    fn commit(repo: &Repository, msg: &str, parents: &[&git2::Commit]) -> Oid {
+        let sig = Signature::now("t", "t@t").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_all(["*"], IndexAddOption::DEFAULT, None).unwrap();
+        idx.write().unwrap();
+        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, parents)
+            .unwrap()
+    }
+
+    fn site(s: &str) -> SafePathComponent {
+        SafePathComponent::new(s.into()).unwrap()
+    }
+
+    fn root_slug(name: &str) -> Slug {
+        (None, SafePathComponent::new(name.into()).unwrap())
+    }
+
+    #[test]
+    fn build_and_materialise_from_odb() {
+        let dir = std::env::temp_dir().join(format!("kolorinko_odb_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let repo = Repository::init(&dir).unwrap();
+        write_page(
+            &dir,
+            "scp",
+            "13",
+            "05",
+            "054470",
+            "foo",
+            1,
+            "---\nx:1\n---\nFoo body",
+        );
+        write_page(
+            &dir,
+            "scp",
+            "13",
+            "05",
+            "054471",
+            "bar",
+            1,
+            "---\nx:1\n---\nBar body",
+        );
+        let tip = commit(&repo, "c1", &[]);
+
+        let odb: Odb = Rc::new(OdbInner::new(repo));
+        let (data, index) = build_from_tree(&odb, tip, &dir);
+
+        // Two pages indexed; bodies stay as Oids until projected through the lens.
+        assert_eq!(index.len(), 2);
+        let foo = repo_l_article_latest(&data, &site("scp"), &root_slug("foo"));
+        assert_eq!(foo.body, "Foo body");
+        assert_eq!(foo.meta.slug, "foo");
+        assert_eq!(foo.meta.page_id, "1305054470");
+        assert_eq!(
+            repo_l_article_latest(&data, &site("scp"), &root_slug("bar")).body,
+            "Bar body"
+        );
+    }
+
+    #[test]
+    fn incremental_patch_on_tip_move() {
+        let dir = std::env::temp_dir().join(format!("kolorinko_inc_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let repo = Repository::init(&dir).unwrap();
+        write_page(
+            &dir,
+            "scp",
+            "13",
+            "05",
+            "054470",
+            "foo",
+            1,
+            "---\nx:1\n---\nFoo v1",
+        );
+        write_page(
+            &dir,
+            "scp",
+            "13",
+            "05",
+            "054471",
+            "bar",
+            1,
+            "---\nx:1\n---\nBar v1",
+        );
+        let tip1 = commit(&repo, "c1", &[]);
+
+        let odb: Odb = Rc::new(OdbInner::new(repo));
+        let (data, mut index) = build_from_tree(&odb, tip1, &dir);
+        assert_eq!(
+            repo_l_article_latest(&data, &site("scp"), &root_slug("foo")).body,
+            "Foo v1"
+        );
+
+        // Edit only `foo` (new revision → moved blob Oid) and advance the tip.
+        write_page(
+            &dir,
+            "scp",
+            "13",
+            "05",
+            "054470",
+            "foo",
+            2,
+            "---\nx:1\n---\nFoo v2",
+        );
+        let parent = odb.repo.find_commit(tip1).unwrap();
+        let tip2 = commit(&odb.repo, "c2", &[&parent]);
+
+        let affected = diff_affected_meta_paths(&odb.repo, tip1, tip2, &dir).unwrap();
+        let tree2 = odb
+            .repo
+            .find_commit(tip2)
+            .and_then(|c| odb.repo.find_tree(c.tree_id()))
+            .unwrap();
+        let next = incremental_update(&odb.repo, &tree2, &dir, &data, &mut index, affected);
+
+        // `bar` is structurally shared from the old snapshot; `foo` re-read.
+        assert_eq!(
+            repo_l_article_latest(&next, &site("scp"), &root_slug("foo")).body,
+            "Foo v2"
+        );
+        assert_eq!(
+            repo_l_article_latest(&next, &site("scp"), &root_slug("bar")).body,
+            "Bar v1"
+        );
+    }
 }
