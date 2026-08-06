@@ -928,7 +928,7 @@ fn tabview_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
 fn include_block<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
     kw_ci("include".into())
         .ignore_then(spaces1())
-        .ignore_then(read_until(&["]]"]))
+        .ignore_then(read_include_body())
         .then_ignore(just("]]"))
         .map(|raw: &str| {
             let (source, vars) = parse_include_args(raw);
@@ -936,20 +936,63 @@ fn include_block<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
         })
 }
 
-/// Split the body of a `[[include …]]` into the source page reference and its
-/// variable substitution map.
+/// Read the body of a `[[include ...]]`, tracking `[[`/`]]` nesting so a `]]`
+/// that belongs to a nested construct (an `[[image ...]]` inside a value, a
+/// `[[[link]]]`, ...) does not prematurely close the directive. Returns the body
+/// up to (not consuming) the balanced closing `]]`; the caller consumes it.
+/// Non-overlapping scan keeps `[[[...]]]` (one `[[` + one literal `[`, then one
+/// `]]` + one literal `]`) depth-balanced. Only ASCII delimiters are touched,
+/// so every slice lands on a UTF-8 boundary. If no balanced close is found the
+/// whole remainder is returned leniently (the trailing `]]` consume then fails
+/// and the directive falls through to literal text).
+fn read_include_body<'a>() -> impl Parser<'a, In<'a>, &'a str, E<'a>> + Clone + 'a {
+    custom(move |inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let full = inp.full_slice();
+        let start = *inp.cursor().inner();
+        let rest = &full[start..];
+        let b = rest.as_bytes();
+        let mut i = 0usize;
+        let mut depth: i32 = 1;
+        while i + 1 < b.len() {
+            if b[i] == b'[' && b[i + 1] == b'[' {
+                depth += 1;
+                i += 2;
+            } else if b[i] == b']' && b[i + 1] == b']' {
+                depth -= 1;
+                if depth == 0 {
+                    let body = &rest[..i];
+                    for _ in body.chars() {
+                        let _ = inp.next();
+                    }
+                    return Ok(body);
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        for _ in rest.chars() {
+            let _ = inp.next();
+        }
+        Ok(rest)
+    })
+}
+
+/// Split the body of a `[[include ...]]` into the source page reference and
+/// its variable substitution map. Values are parsed as real wikitext markup
+/// ([`Content`]), so `{$x}` becomes an [`TextObj::IncludeVar`] node (enabling
+/// nested passthrough) and `[[image ...]]` becomes an [`Node::Image`].
 ///
-/// Two assignment syntaxes are recognised:
-/// • pipe-separated — `source | k1=v1 | k2=v2` (a value runs to the next `|`,
-///   so it may contain spaces); this is what component templates use, e.g.
-///   `component:rate-base activity={$activity}|activity=none|…`.
-/// • space-separated — `source k1="v1" k2="v2"` (quoted or bare values).
+/// Two assignment syntaxes are recognised, distinguished by a depth-0 `|`:
+/// • pipe-separated — `source | k1=v1 | k2=v2` (a value runs to the next
+///   depth-0 `|`, so it may contain spaces and balanced `[[...]]` markup).
+/// • space-separated — `source k1="v1" k2=v2` (quoted values, or bare values
+///   running to the next depth-0 whitespace).
 ///
-/// A later assignment to the same key overwrites the earlier one, so the idiom
-/// `k={$k}|k=default` resolves to `default` when `{$k}` is itself unbound.
-/// Each value becomes a single [`TextObj::Plain`] (rich markup inside values is
-/// not yet supported). Only ASCII bytes act as delimiters, so every slice lands
-/// on a UTF-8 character boundary.
+/// A later assignment to the same key overwrites the earlier one. Only ASCII
+/// bytes act as delimiters and bracket pairs are scanned non-overlapping, so
+/// every slice lands on a UTF-8 character boundary and `[[[...]]]` stays
+/// depth-balanced (one `[[`/`]]` pair plus a literal `[`/`]`).
 fn parse_include_args(raw: &str) -> (PageRef, HashMap<String, Content>) {
     let b = raw.as_bytes();
     let n = b.len();
@@ -963,7 +1006,7 @@ fn parse_include_args(raw: &str) -> (PageRef, HashMap<String, Content>) {
     }
     let source = parse_page_ref(&raw[src_start..i]);
     let remainder = &raw[i..];
-    let vars = if remainder.contains('|') {
+    let vars = if has_depth0_pipe(remainder) {
         parse_pipe_vars(remainder)
     } else {
         parse_space_vars(remainder)
@@ -971,26 +1014,109 @@ fn parse_include_args(raw: &str) -> (PageRef, HashMap<String, Content>) {
     (source, vars)
 }
 
-fn var_plain(value: &str) -> Content {
-    vec![Node::Text(TextObj::Plain(value.to_string()))]
+/// Strip one layer of surrounding double quotes, if present.
+fn unquote(value: &str) -> &str {
+    let t = value.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        &t[1..t.len() - 1]
+    } else {
+        t
+    }
+}
+
+/// Record a `key=value` segment: split on the first `=`, parse the value as
+/// wikitext markup. Quoted values are unwrapped first.
+fn insert_kv(seg: &str, vars: &mut HashMap<String, Content>) {
+    let Some(eq) = seg.find('=') else {
+        return;
+    };
+    let key = seg[..eq].trim();
+    if key.is_empty() {
+        return;
+    }
+    vars.insert(key.to_string(), parse(unquote(&seg[eq + 1..])));
+}
+
+/// Track `[[`/`]]` depth (and skip over `"..."` quotes) across `s`; return
+/// whether a `|` occurs at bracket depth 0 outside quotes — the marker of the
+/// pipe-separated assignment syntax.
+fn has_depth0_pipe(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut depth = 0i32;
+    let mut quote = false;
+    while i < b.len() {
+        if quote {
+            if b[i] == b'"' {
+                quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if i + 1 < b.len() && b[i] == b'[' && b[i + 1] == b'[' {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if i + 1 < b.len() && b[i] == b']' && b[i + 1] == b']' {
+            if depth > 0 {
+                depth -= 1;
+            }
+            i += 2;
+            continue;
+        }
+        if b[i] == b'"' {
+            quote = true;
+            i += 1;
+            continue;
+        }
+        if depth == 0 && b[i] == b'|' {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn parse_pipe_vars(remainder: &str) -> HashMap<String, Content> {
+    let b = remainder.as_bytes();
     let mut vars = HashMap::new();
-    for seg in remainder.split('|') {
-        let Some(eq) = seg.find('=') else {
-            continue;
-        };
-        let key = seg[..eq].trim();
-        if key.is_empty() {
+    let mut seg_start = 0;
+    let mut i = 0;
+    let mut depth = 0i32;
+    let mut quote = false;
+    while i < b.len() {
+        if quote {
+            if b[i] == b'"' {
+                quote = false;
+            }
+            i += 1;
             continue;
         }
-        let mut value = seg[eq + 1..].trim();
-        if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
-            value = &value[1..value.len() - 1];
+        if i + 1 < b.len() && b[i] == b'[' && b[i + 1] == b'[' {
+            depth += 1;
+            i += 2;
+            continue;
         }
-        vars.insert(key.to_string(), var_plain(value));
+        if i + 1 < b.len() && b[i] == b']' && b[i + 1] == b']' {
+            if depth > 0 {
+                depth -= 1;
+            }
+            i += 2;
+            continue;
+        }
+        if b[i] == b'"' {
+            quote = true;
+            i += 1;
+            continue;
+        }
+        if depth == 0 && b[i] == b'|' {
+            insert_kv(&remainder[seg_start..i], &mut vars);
+            seg_start = i + 1;
+        }
+        i += 1;
     }
+    insert_kv(&remainder[seg_start..], &mut vars);
     vars
 }
 
@@ -1002,6 +1128,9 @@ fn parse_space_vars(remainder: &str) -> HashMap<String, Content> {
     while i < n {
         while i < n && b[i].is_ascii_whitespace() {
             i += 1;
+        }
+        if i >= n {
+            break;
         }
         let key_start = i;
         while i < n && b[i] != b'=' && !b[i].is_ascii_whitespace() {
@@ -1028,12 +1157,31 @@ fn parse_space_vars(remainder: &str) -> HashMap<String, Content> {
             v
         } else {
             let v_start = i;
-            while i < n && !b[i].is_ascii_whitespace() {
+            let mut depth = 0i32;
+            while i < n {
+                if i + 1 < n && b[i] == b'[' && b[i + 1] == b'[' {
+                    depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if i + 1 < n && b[i] == b']' && b[i + 1] == b']' {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if depth == 0 && b[i].is_ascii_whitespace() {
+                    break;
+                }
                 i += 1;
             }
             remainder[v_start..i].to_string()
         };
-        vars.insert(remainder[key_start..key_end].to_string(), var_plain(&value));
+        let key = remainder[key_start..key_end].trim();
+        if !key.is_empty() {
+            vars.insert(key.to_string(), parse(value.trim()));
+        }
     }
     vars
 }
@@ -1188,7 +1336,7 @@ fn include_var<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
         .map(|raw: &str| match raw.split_once("//") {
             Some((n, d)) => Node::Text(TextObj::IncludeVar {
                 name: n.to_string(),
-                default: Some(vec![Node::Text(TextObj::Plain(d.to_string()))]),
+                default: Some(parse(d)),
             }),
             None => Node::Text(TextObj::IncludeVar {
                 name: raw.to_string(),
@@ -1380,7 +1528,7 @@ fn read_include_var<'a, 'b>(
         if matches!(inp.peek(), Some('}')) {
             inp.next();
         }
-        Some(vec![Node::Text(TextObj::Plain(d))])
+        Some(parse(&d))
     } else {
         if matches!(inp.peek(), Some('}')) {
             inp.next();
@@ -1827,8 +1975,41 @@ mod tests {
         assert_eq!(source.path, vec!["rate-base".to_string()]);
         assert_eq!(var_str(vars, "align"), Some("right".to_string()));
         assert_eq!(var_str(vars, "votes"), Some("right".to_string()));
-        // No default for stars — the passthrough literal is kept.
-        assert_eq!(var_str(vars, "stars"), Some("{$stars}".to_string()));
+        // No default for stars — the passthrough value is an IncludeVar node
+        // (a real reference to the outer `stars` var), not a literal string.
+        let stars = vars.get("stars").expect("stars var");
+        assert!(matches!(
+            stars.as_slice(),
+            [Node::Text(TextObj::IncludeVar { name, .. })] if name == "stars"
+        ));
+    }
+
+    #[test]
+    fn include_value_with_nested_brackets() {
+        // The translationblock value carries three `[[image ...]]` blocks; the
+        // balanced reader must NOT close the include at the first image's `]]`.
+        // The directive ends at the `]]` that returns bracket depth to 0.
+        let c = parse(concat!(
+            "[[include component:rate ten=show|",
+            "translationblock=[[image http://a/c.png link=\"http://x/1\"]] ",
+            "[[image http://a/p.png link=\"http://x/2\"]] ",
+            "[[image http://a/ar.png link=\"http://x/3\"]]]]",
+        ));
+        let Node::Include(Include { source, vars }) = &c[0] else {
+            panic!("expected include, got {:?}", c[0]);
+        };
+        assert_eq!(source.path, vec!["rate".to_string()]);
+        assert_eq!(var_str(vars, "ten"), Some("show".to_string()));
+        // The translationblock value is parsed markup: three image nodes (plus
+        // whitespace text between them), not a truncated string.
+        let tb = vars.get("translationblock").expect("translationblock var");
+        let images = tb
+            .iter()
+            .filter(|n| matches!(n, Node::Image { .. }))
+            .count();
+        assert_eq!(images, 3, "translationblock = {:#?}", tb);
+        // Nothing leaks after the directive.
+        assert_eq!(c.len(), 1, "trailing nodes leaked: {:#?}", &c[1..]);
     }
 
     #[test]
