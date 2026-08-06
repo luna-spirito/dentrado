@@ -9,19 +9,23 @@
 //! ```ignore
 //! #[gears(runtime = KolorinkoRT)]
 //! pub(crate) mod gears {
-//!     #[gear(timer(period = secs(900)), name = Repo)]
+//!     #[gear(timer(period = secs(900)), local, name = Repo)]
 //!     pub(crate) async fn repo<S: Storage<KolorinkoRT>>(
 //!         repo_meta: RepoMeta,   // id field → GearId::Repo(RepoMeta)
 //!         tick: bool,            // timer tick
 //!         cache: &mut RepoCache, // → GearCache::Repo(RepoCache)
-//!     ) -> Arc<RepoData> {}      // → GearOut::RepoOut(Arc<RepoData>)
+//!     ) -> Arc<RepoData> {}      // → GearOutLocal::RepoOut(Arc<RepoData>)
 //! }
 //! ```
 //!
 //! The `#[gear]` marker carries only the metadata the signature cannot express
-//! (kind: timer/event, the period expression, and the enum *variant* base
-//! name). The id fields, cache type, and output type are all read straight off
-//! the `fn`, so there is no DSL restating them.
+//! (kind: timer/event/follow, the period expression, `local`, and the enum
+//! *variant* base name). The id fields, cache type, and output type are all read
+//! straight off the `fn`, so there is no DSL restating them.
+//!
+//! `local` marks a gear whose output is pinned to its owning core: it goes to
+//! `GearOutLocal` (not `Send`/`Localizable`), gets no `GearQuery` builder, and
+//! is readable only through a `follow` gear placed on the same core.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -72,6 +76,7 @@ enum GearArg {
     Timer { period: TokenStream2 },
     Event,
     Follow { target: TokenStream2 },
+    Local,
     Name(Ident),
 }
 
@@ -113,6 +118,7 @@ impl Parse for GearArg {
                 let target: TokenStream2 = strip_trailing_comma(inner.parse()?);
                 Ok(GearArg::Follow { target })
             }
+            "local" => Ok(GearArg::Local),
             "name" => {
                 input.parse::<Token![=]>()?;
                 let n: Ident = input.parse()?;
@@ -163,6 +169,10 @@ struct GearSpec {
     /// builder so it matches the gear fn's exposure.
     vis: Visibility,
     is_async: bool,
+    /// `#[gear(local)]`: the output is pinned to the owning core — it goes to
+    /// `GearOutLocal` (never `Send`/`Localizable`) and is reachable only
+    /// through the `follow` mechanism. No `GearQuery` builder is emitted.
+    is_local: bool,
     params: Vec<ParamRole>,
     out_ty: Type,
     kind: KindSpec,
@@ -170,6 +180,11 @@ struct GearSpec {
     /// destructure the followed output in `run_step`. `None` for non-follow
     /// gears; set during the Follow-resolution pass for follow gears.
     follow_out_variant: Option<Ident>,
+    /// Follow gears only: whether the followed gear is `#[gear(local)]`. When
+    /// true, the followed output arrives in `GearInput::Follow` as
+    /// `GearResult::Local(GearOutLocal::<Variant>(…))` instead of
+    /// `GearResult::Ship(GearOut::<Variant>(…))`.
+    follow_out_local: bool,
 }
 
 impl GearSpec {
@@ -258,11 +273,13 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
 
     let mut name: Option<Ident> = None;
     let mut kind: Option<KindSpec> = None;
+    let mut is_local = false;
     for arg in args {
         match arg {
             GearArg::Timer { period } => kind = Some(KindSpec::Timer { period }),
             GearArg::Event => kind = Some(KindSpec::Event),
             GearArg::Follow { target } => kind = Some(KindSpec::Follow { target }),
+            GearArg::Local => is_local = true,
             GearArg::Name(n) => name = Some(n),
         }
     }
@@ -354,10 +371,12 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
         fn_name: fn_item.sig.ident.clone(),
         vis: fn_item.vis.clone(),
         is_async,
+        is_local,
         params,
         out_ty,
         kind,
         follow_out_variant: None,
+        follow_out_local: false,
     })
 }
 
@@ -452,12 +471,12 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
     // output type and is reclassified as the followed-output binding. Also
     // rejects direct self-follow (which would infinitely recurse in `meta`).
     {
-        let target_info: std::collections::HashMap<String, (Type, Ident)> = specs
+        let target_info: std::collections::HashMap<String, (Type, Ident, bool)> = specs
             .iter()
             .map(|g| {
                 (
                     g.name.to_string(),
-                    (g.out_ty.clone(), format_ident!("{}Out", g.name)),
+                    (g.out_ty.clone(), format_ident!("{}Out", g.name), g.is_local),
                 )
             })
             .collect();
@@ -472,12 +491,13 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
                     "a gear cannot follow itself",
                 ));
             }
-            let (out_ty, out_variant) = target_info.get(&variant.to_string()).ok_or_else(|| {
-                syn::Error::new_spanned(
-                    &variant,
-                    format!("follow target `GearId::{variant}` is not a known gear"),
-                )
-            })?;
+            let (out_ty, out_variant, target_local) =
+                target_info.get(&variant.to_string()).ok_or_else(|| {
+                    syn::Error::new_spanned(
+                        &variant,
+                        format!("follow target `GearId::{variant}` is not a known gear"),
+                    )
+                })?;
             // Compare types by their stringified token streams: neither
             // `syn::Type` nor `proc_macro2::TokenStream` has `PartialEq`
             // without extra feature flags, but two identical type spellings
@@ -513,6 +533,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             };
             g.params[idx] = ParamRole::FollowOut { name: name.clone() };
             g.follow_out_variant = Some(out_variant.clone());
+            g.follow_out_local = *target_local;
         }
     }
 
@@ -544,17 +565,22 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         }
     });
 
-    let out_variants = specs.iter().map(|g| {
+    let out_variants = specs.iter().filter(|g| !g.is_local).map(|g| {
         let v = format_ident!("{}Out", g.name);
         let t = &g.out_ty;
         quote! { #[localizable(skip)] #v(#t) }
     });
 
-    // `GearOutLocal` variants: populated only by `#[gear(local)]` gears (none
-    // yet), so the enum is uninhabited and `GearResult::Local` is unreachable
-    // for this runtime. Deliberately NOT `Localizable`/`Send` — that's the
-    // whole point of the local-output family.
-    let out_local_variants: Vec<TokenStream2> = Vec::new();
+    // `GearOutLocal` variants: exactly the `#[gear(local)]` gears. This enum is
+    // deliberately NOT `Localizable`/`Send` — that's the whole point of the
+    // local-output family. `GearOut` (shippable) only ever carries the non-local
+    // gears' variants, so a local gear has no `GearOut` variant and no
+    // `GearQuery` builder: the typed `secondary_get` layer cannot reach it.
+    let out_local_variants = specs.iter().filter(|g| g.is_local).map(|g| {
+        let v = format_ident!("{}Out", g.name);
+        let t = &g.out_ty;
+        quote! { #v(#t) }
+    });
 
     let cache_variants = specs.iter().map(|g| {
         let v = &g.name;
@@ -690,7 +716,8 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
 
         // For follow gears, pull the followed gear's output out of `input` and
         // destructure it to the typed inner value, binding it to the param the
-        // Follow-resolution pass reclassified.
+        // Follow-resolution pass reclassified. The followed value lives in
+        // `GearResult::Local` iff the *target* is `#[gear(local)]`.
         let follow_bind = if let (KindSpec::Follow { .. }, Some(out_v)) =
             (&g.kind, &g.follow_out_variant)
         {
@@ -702,10 +729,15 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
                     _ => None,
                 })
                 .expect("resolved above");
+            let followed_out = if g.follow_out_local {
+                quote! { ::dentrado::core::gear::GearResult::Local(GearOutLocal::#out_v(__followed)) }
+            } else {
+                quote! { ::dentrado::core::gear::GearResult::Ship(GearOut::#out_v(__followed)) }
+            };
             quote! {
                 let #name = match input {
                     ::dentrado::core::gear::GearInput::Follow { out } => match out {
-                        ::dentrado::core::gear::GearResult::Ship(GearOut::#out_v(__followed)) => __followed,
+                        #followed_out => __followed,
                         _ => ::core::unreachable!(
                             "follow target produced an unexpected output"
                         ),
@@ -717,21 +749,30 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             quote! {}
         };
 
+        let result = if g.is_local {
+            quote! { ::dentrado::core::gear::GearResult::Local(GearOutLocal::#out_v(#run_call)) }
+        } else {
+            quote! { ::dentrado::core::gear::GearResult::Ship(GearOut::#out_v(#run_call)) }
+        };
+
         quote! {
             (#id_pat, GearCache::#cv(#cache_binding)) => {
                 #tick_bind
                 #follow_bind
-                ::dentrado::core::gear::GearResult::Ship(GearOut::#out_v(#run_call))
+                #result
             }
         }
     });
 
-    // One `GearQuery` builder per gear: `#vis fn <fn_name>(<id fields>) ->
-    // GearQuery<R, Out>`. The async gear impl is renamed `<fn_name>_step`
-    // (see the rename pass above), so the builder takes the gear's own name.
-    // The per-variant extraction lives in a nested fn so the module surface is
+    // One `GearQuery` builder per **shippable** gear: `#vis fn <fn_name>(<id
+    // fields>) -> GearQuery<R, Out>`. The async gear impl is renamed
+    // `<fn_name>_step` (see the rename pass above), so the builder takes the
+    // gear's own name. Local gears get no builder — `GearQuery::secondary_get`
+    // is the shippable-only typed layer, so a local output has no query handle
+    // by construction (it is read through `follow` gears instead). The
+    // per-variant extraction lives in a nested fn so the module surface is
     // exactly one builder per gear.
-    let builders = specs.iter().map(|g| {
+    let builders = specs.iter().filter(|g| !g.is_local).map(|g| {
         let builder = &g.fn_name;
         let vis = &g.vis;
         let out_v = format_ident!("{}Out", g.name);
@@ -751,9 +792,11 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             #vis fn #builder(#( #param_decls ),*)
                 -> ::dentrado::core::gear::GearQuery<#runtime, #out_t>
             {
-                fn #getter(out: ::dentrado::core::gear::GearResult<#runtime>) -> #out_t {
+                fn #getter(
+                    out: <#runtime as ::dentrado::core::gear::IsRuntime>::GearOut,
+                ) -> #out_t {
                     match out {
-                        ::dentrado::core::gear::GearResult::Ship(GearOut::#out_v(__o)) => __o,
+                        GearOut::#out_v(__o) => __o,
                         _ => ::core::unreachable!(#msg),
                     }
                 }
@@ -766,6 +809,12 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
     });
 
     let generated = quote! {
+        // The concrete `GearId` is an internal implementation detail of the
+        // runtime: it is not re-exported (the `gears` module is private), so
+        // callers can never name it — gear ids are constructed only through the
+        // per-gear `GearQuery` builders below. It stays `pub(crate)`-declared
+        // because `IsRuntime`'s associated type is reached through pub(crate)
+        // APIs (`Core::subscribe_gear`, `GearResult`, …).
         #[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado::types::Localizable)]
         pub(crate) enum GearId {
             #( #id_variants, )*
@@ -776,10 +825,10 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             #( #out_variants, )*
         }
 
-        // Core-local outputs (never serialized, never sent across a thread).
-        // Empty until a gear is marked `#[gear(local)]`; `GearResult::Local` is
-        // then uninhabited for this runtime, so every wire/narrowing `Local`
-        // arm is dead by construction.
+        // Core-local outputs (never serialized, never sent across a thread):
+        // exactly the `#[gear(local)]` gears. `GearOut` (shippable) has no
+        // variant for them, so `GearResult::Local` is reachable only on-core.
+        // Same `pub(crate)`-declared-but-unreachable status as `GearId`.
         #[derive(Debug, Clone)]
         pub(crate) enum GearOutLocal {
             #( #out_local_variants, )*
@@ -894,6 +943,15 @@ mod parse_tests {
         let arg: GearArg =
             syn::parse_str(src).unwrap_or_else(|e| panic!("no-trailing-comma failed: {e}"));
         assert!(matches!(arg, GearArg::Timer { .. }));
+    }
+
+    #[test]
+    fn gear_arg_local() {
+        let src = "local, name = Repo,";
+        let args = parse_gear_args(src).unwrap_or_else(|e| panic!("local failed: {e}"));
+        assert_eq!(args.len(), 2);
+        assert!(matches!(args[0], GearArg::Local));
+        assert!(matches!(args[1], GearArg::Name(_)));
     }
 
     #[test]

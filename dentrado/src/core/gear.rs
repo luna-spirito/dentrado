@@ -1,7 +1,10 @@
 use std::{fmt::Debug, hash::Hash, num::NonZero};
 
 use crate::{
-    core::{core_ctx::GearCtx, storage::Storage},
+    core::{
+        core_ctx::{Core, GearCtx, Subscription},
+        storage::Storage,
+    },
     types::{GlobalHash, LocGroupId, LocMsgTypeId, Localizable},
 };
 
@@ -192,9 +195,11 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
 /// the raw `GearCtx::secondary_get` (which returns an untyped `GearOut`).
 ///
 /// `id` names the gear (with its id fields); `getter` extracts `Out` out of the
-/// matching `GearOut` variant. The `#[gears]` macro pairs them per variant, so
-/// by construction `getter` is always fed the variant it matches — the
-/// `unreachable!` arm in it is a defensive invariant, not an expected path.
+/// matching shippable `GearOut` variant. The `#[gears]` macro pairs them per
+/// variant, so by construction `getter` is always fed the variant it matches —
+/// the `unreachable!` arm in it is a defensive invariant, not an expected path.
+/// Local (`#[gear(local)]`) outputs are deliberately outside this layer: they
+/// have no builder and are read only through `follow` gears.
 ///
 /// Built by the `#[gears]` macro as one fn per gear, e.g.
 /// `pub fn repo(repo_meta: RepoMeta) -> GearQuery<R, Arc<RepoData>>`; methods
@@ -202,9 +207,12 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
 pub struct GearQuery<R: IsRuntime, Out> {
     /// Queried gear.
     pub id: R::GearId,
-    /// Getter that extracts `Out` out of the result. Must be used with the
+    /// Getter that extracts `Out` out of the gear's **shippable** output.
+    /// `GearQuery` is the typed `secondary_get` layer, and that layer only
+    /// ever sees `R::GearOut` — a `Local` output is pinned to its core and is
+    /// reachable only through the `follow` mechanism. Must be used with the
     /// response provided by `id`, else panics.
-    pub getter: fn(GearResult<R>) -> Out,
+    pub getter: fn(R::GearOut) -> Out,
 }
 
 // Manual (not derived) so we don't add `Out: Clone` / `R: Clone` bounds: the
@@ -222,12 +230,29 @@ impl<R: IsRuntime, Out> Clone for GearQuery<R, Out> {
 impl<R: IsRuntime, Out> GearQuery<R, Out> {
     /// Declare a dependency on this gear's output and pull its current value
     /// (awaiting it if not yet computed) — the raw `GearCtx::secondary_get`
-    /// followed by the per-variant extraction.
+    /// followed by the per-variant extraction. Only shippable outputs can be
+    /// reached this way: a `Local` result is a routing bug (it should have been
+    /// read through a `follow` gear on its own core).
     pub async fn secondary_get<S: Storage<R>>(&self, ctx: &GearCtx<R, S>) -> Out
     where
         Out: Send,
     {
-        (self.getter)(ctx.secondary_get(self.id.clone()).await)
+        let out = ctx.secondary_get(self.id.clone()).await;
+        (self.getter)(
+            out.into_ship()
+                .expect("secondary_get: local gear output reached through the typed query layer"),
+        )
+    }
+
+    /// Subscribe to this gear's output (worker-facing push mode). The id is
+    /// owned internally, so the caller never names the concrete `R::GearId`
+    /// type. The returned [`Subscription`] yields raw [`GearResult`]s; the
+    /// per-variant extraction is up to the caller (e.g. via [`GearOut`]).
+    pub async fn subscribe<S: Storage<R>>(
+        &self,
+        core: &std::rc::Rc<Core<R, S>>,
+    ) -> Subscription<R, S> {
+        core.subscribe_gear(self.id.clone()).await
     }
 }
 

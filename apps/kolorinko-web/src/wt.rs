@@ -56,15 +56,12 @@ enum Request {
     },
 }
 
-/// A server reply (mirrors the server's `Reply` — note `Repo { pages }`,
-/// matching the server, unlike the legacy WS client's `Repo { path }`).
+/// A server reply (mirrors the server's `Reply`).
 #[derive(Deserialize)]
 #[serde(tag = "t")]
 enum Reply {
     #[serde(rename = "page")]
     Page { content: Content },
-    #[serde(rename = "repo")]
-    Repo { pages: usize },
     #[serde(rename = "error")]
     Error { error: String },
 }
@@ -167,9 +164,6 @@ pub(crate) async fn connect_wt(
                     Ok(Reply::Page { content }) => {
                         set_page.set(Some(content));
                         set_status.set(String::new());
-                    }
-                    Ok(Reply::Repo { pages }) => {
-                        set_status.set(format!("repo pages: {pages}"));
                     }
                     Ok(Reply::Error { error }) => {
                         set_status.set(format!("error: {error}"));

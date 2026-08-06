@@ -43,15 +43,12 @@ use futures::{
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 
-use dentrado::{
-    core::{core_ctx::Core, gear::GearResult, storage::InMemoryStorage},
-    wire::WireLocCtx,
-};
+use dentrado::core::{core_ctx::Core, gear::GearResult, storage::InMemoryStorage};
 use kolorinko_wikitext::Content;
 
 use crate::{
     assets::{load_assets, mime_for},
-    runtime::{GearId, GearOut, KolorinkoRT},
+    runtime::{GearOut, KolorinkoRT, load},
     safe_path::SafePathComponent,
     wikidot_page::RepoMeta,
 };
@@ -322,8 +319,6 @@ enum Request {
         category: Option<String>,
         page: String,
     },
-    #[serde(rename = "repo")]
-    Repo,
 }
 
 /// A server reply over the WebTransport stream.
@@ -332,8 +327,6 @@ enum Request {
 enum Reply {
     #[serde(rename = "page")]
     Page { content: Content },
-    #[serde(rename = "repo")]
-    Repo { pages: usize },
     #[serde(rename = "error")]
     Error { error: String },
 }
@@ -355,26 +348,6 @@ async fn handle_text(
     repo_meta: &RepoMeta,
 ) {
     match req {
-        Request::Repo => match core
-            .db_run_gear(GearId::Repo(repo_meta.clone()), WireLocCtx::default())
-            .await
-        {
-            Ok(GearOut::RepoOut(data)) => {
-                let _ = tx.unbounded_send(Reply::Repo {
-                    pages: data.page_count(),
-                });
-            }
-            Ok(_) => {
-                let _ = tx.unbounded_send(Reply::Error {
-                    error: "unexpected gear output".into(),
-                });
-            }
-            Err(e) => {
-                let _ = tx.unbounded_send(Reply::Error {
-                    error: format!("gear error: {e:?}"),
-                });
-            }
-        },
         Request::Load {
             site,
             category,
@@ -405,12 +378,12 @@ async fn handle_text(
                 },
             };
             let key: PageKey = (site.clone(), category.clone(), page.clone());
-            let gear = GearId::Load {
-                repo: repo_meta.clone(),
-                site,
-                slug: (category, page),
-            };
-            let sub = core.subscribe_gear(gear).await;
+            // The typed builder owns the `GearId` construction (and the
+            // subscription): the concrete id type is an internal detail of the
+            // runtime.
+            let sub = load(repo_meta.clone(), site, (category, page))
+                .subscribe(core)
+                .await;
             if let GearResult::Ship(GearOut::LoadOut(content)) = sub.current() {
                 let _ = tx.unbounded_send(Reply::Page {
                     content: (*content).clone(),

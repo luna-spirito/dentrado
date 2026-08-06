@@ -88,12 +88,6 @@ pub(crate) struct RepoData {
 }
 
 impl RepoData {
-    /// Number of pages held in the structure (diagnostic).
-    #[must_use]
-    pub(crate) fn page_count(&self) -> usize {
-        self.pages.len()
-    }
-
     /// Look up a page's raw body text by `(site, category, name)`.
     #[must_use]
     pub(crate) fn get(
@@ -539,25 +533,45 @@ fn strip_quotes(s: &str) -> &str {
     }
 }
 
-/// `load_page` gear cache: the last `Arc<str>` we indexed out of `repo`'s
-/// [`RepoData`] and the [`Content`] we parsed from it. Because `repo`'s map is
-/// persistent ([`im::HashMap`]), unchanged pages keep their *original*
-/// `Arc<str>` allocation across snapshots, so a page that didn't change since
-/// last run is recognised by [`Arc::ptr_eq`] in O(1) and its cached parse is
-/// reused — only a genuinely-changed page is re-parsed.
+/// Trivial cache for the `repo_l_article` lens gear: the lens is a pure
+/// projection of `repo`'s [`RepoData`] (a map lookup), recomputed on every
+/// `follow` kick — there is no incremental state to carry.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct RepoLArticleCache;
+
+/// The `repo_l_article` lens: project `repo`'s local dataset down to the raw
+/// body text of the page's latest revision, as a shippable `Arc<str>`. Returns
+/// the same shared allocation `repo`'s persistent map stores, so a dependent
+/// can recognise an unchanged page by pointer identity.
+pub(crate) fn repo_l_article(
+    data: &RepoData,
+    site: &SafePathComponent,
+    slug: &(Option<SafePathComponent>, SafePathComponent),
+    _cache: &mut RepoLArticleCache,
+) -> Arc<str> {
+    data.get(site, slug).unwrap_or_else(|| Arc::from(""))
+}
+
+/// `load_page` gear cache: the last `Arc<str>` we got from the
+/// `repo_l_article` lens and the [`Content`] we parsed from it. Because the
+/// lens hands out the very `Arc<str>` stored in `repo`'s persistent map
+/// ([`im::HashMap`]), unchanged pages keep their *original* allocation across
+/// snapshots, so a page that didn't change since last run is recognised by
+/// [`Arc::ptr_eq`] in O(1) and its cached parse is reused — only a
+/// genuinely-changed page is re-parsed.
 #[derive(Default, Clone, Debug)]
 pub(crate) struct LoadCache {
     text: Option<Arc<str>>,
     content: Option<Arc<Content>>,
 }
 
-/// Load a single page: depend on the `repo` oracle, look the page's raw body
-/// text up in the dataset it built, parse it into [`Content`], and cache the
-/// result. No filesystem access — the working tree is touched only by the
-/// `repo` gear. Parsing is deferred here rather than in `repo` so only
-/// pages actually viewed are ever parsed, and a page whose text is unchanged
-/// since last run is not re-parsed (pointer-identity check on the persistent
-/// map's shared `Arc<str>`).
+/// Load a single page: depend on the `repo_l_article` lens (which reads the
+/// local `repo` oracle's dataset and projects the page's raw body text),
+/// parse that text into [`Content`], and cache the result. No filesystem
+/// access — the working tree is touched only by the `repo` gear. Parsing is
+/// deferred here rather than in `repo` so only pages actually viewed are ever
+/// parsed, and a page whose text is unchanged since last run is not re-parsed
+/// (pointer-identity check on the lens's shared `Arc<str>`).
 pub(crate) async fn load_page<S: Storage<KolorinkoRT>>(
     meta: &RepoMeta,
     site: &SafePathComponent,
@@ -565,17 +579,13 @@ pub(crate) async fn load_page<S: Storage<KolorinkoRT>>(
     ctx: &mut GearCtx<KolorinkoRT, S>,
     cache: &mut LoadCache,
 ) -> Arc<Content> {
-    let data = crate::runtime::repo(meta.clone()).secondary_get(ctx).await;
-    let Some(text) = data.get(site, slug) else {
-        // Page no longer present in the dataset: drop any stale cached parse
-        // and return empty content.
-        *cache = LoadCache::default();
-        return Arc::new(Content::new());
-    };
-    // Incremental invalidation by pointer identity. `repo`'s persistent map
-    // shares unchanged `Arc<str>` entries across snapshots, so if the current
-    // text is the *same allocation* we parsed last time, the cached parse is
-    // still valid — reuse it. Only a genuinely-changed page re-parses.
+    let text = crate::runtime::repo_l_article(meta.clone(), site.clone(), slug.clone())
+        .secondary_get(ctx)
+        .await;
+    // Incremental invalidation by pointer identity. The lens returns the same
+    // `Arc<str>` allocation stored in `repo`'s persistent map, so if the
+    // current text is the *same allocation* we parsed last time, the cached
+    // parse is still valid — reuse it. Only a genuinely-changed page re-parses.
     if let Some(prev) = &cache.text
         && Arc::ptr_eq(prev, &text)
     {

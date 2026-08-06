@@ -28,7 +28,8 @@ mod web;
 mod wikidot_page;
 pub mod wikidot_parser;
 
-/// The export repo served by [`runtime::GearId::Repo`].
+/// The export repo mirrored by the local `repo` oracle gear (read through the
+/// `repo_l_article` lens).
 const REPO_URL: &str = "https://github.com/luna-spirito/wikidot-kolorinko-export.git";
 /// Default seconds between forced `git pull`s of the repo (15 minutes).
 const DEFAULT_REPO_INTERVAL: u32 = 900;
