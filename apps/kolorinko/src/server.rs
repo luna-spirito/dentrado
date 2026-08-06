@@ -49,7 +49,7 @@ use dentrado::core::{
 use kolorinko_rt::wire::{self, ClientMsg, ServerMsg};
 
 use crate::{
-    assets::{load_assets, mime_for},
+    assets::{load_assets, looks_like_asset, mime_for},
     runtime::{GearOut, KolorinkoRT, article_latest, article_latest_parsed, repo_l_article_latest},
     wikidot_page::RepoMeta,
 };
@@ -200,6 +200,11 @@ async fn handle_conn(
             let key: &str = if path == "/" { "/index.html" } else { &path };
             let (status, mime, body): (u16, &'static str, Bytes) = match assets.get(key) {
                 Some(b) => (200, mime_for(key), Bytes::from(b.clone())),
+                None if !looks_like_asset(key) => (
+                    200,
+                    "text/html; charset=utf-8",
+                    Bytes::from(assets.get("/index.html").cloned().unwrap_or_default()),
+                ),
                 None => (404, "text/plain", Bytes::from_static(b"not found\n")),
             };
             let resp = http::Response::builder()

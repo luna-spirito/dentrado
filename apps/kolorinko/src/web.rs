@@ -29,7 +29,7 @@ use compio::{
 };
 use log::{info, warn};
 
-use crate::assets::{load_assets, mime_for};
+use crate::assets::{load_assets, looks_like_asset, mime_for};
 use crate::tls::https_server_config;
 
 /// Bind `addr` with `SO_REUSEPORT`, wrap each connection in TLS, and serve the
@@ -132,6 +132,13 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
     let key: &str = if path == "/" { "/index.html" } else { path };
     let res = match assets.get(key) {
         Some(bytes) => write_http(stream, 200, mime_for(key), bytes, alt_svc).await,
+        None if !looks_like_asset(key) => {
+            let idx = assets
+                .get("/index.html")
+                .map(Vec::as_slice)
+                .unwrap_or(crate::assets::PLACEHOLDER_INDEX.as_bytes());
+            write_http(stream, 200, "text/html; charset=utf-8", idx, alt_svc).await
+        }
         None => write_http(stream, 404, "text/plain", b"not found\n", alt_svc).await,
     };
     let _ = stream.shutdown().await; // send close_notify for a clean TLS close

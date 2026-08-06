@@ -82,6 +82,24 @@ pub(crate) fn mime_for(path: &str) -> &'static str {
     }
 }
 
+/// Whether a path looks like a static asset (a known file extension) rather
+/// than a client-side route. Used for the SPA fallback: a missing asset 404s,
+/// but a missing *route* (`/obscurative/syntax`, …) serves `index.html` so the
+/// wasm app boots and the router takes over.
+pub(crate) fn looks_like_asset(path: &str) -> bool {
+    let Some(ext) = path
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.rsplit_once('.').map(|x| x.1))
+    else {
+        return false;
+    };
+    matches!(
+        ext,
+        "html" | "htm" | "js" | "mjs" | "wasm" | "css" | "json" | "svg" | "png" | "ico"
+    )
+}
+
 // ---- WebTransport cert-hash injection (hash-pinning mode) -------------------
 //
 // Done once into the cached `index.html` (see [`load_assets`]), not per request.
