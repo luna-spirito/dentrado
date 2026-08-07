@@ -49,8 +49,6 @@
             ];
             targets = [ "wasm32-unknown-unknown" ];
           };
-
-          haskPkgs = pkgs.haskell.packages.ghc912;
         in
         {
           pre-commit.settings.hooks = {
@@ -82,10 +80,6 @@
               pkgs.cargo-watch
               pkgs.cargo-deny
 
-              haskPkgs.ghc
-              haskPkgs.cabal-install
-              haskPkgs.haskell-language-server
-
               pkgs.typst
 
               # libgit2 TLS backend: `git2`'s `https` feature links against
@@ -105,10 +99,6 @@
               pkgs.cargo-nextest
               pkgs.cargo-watch
               pkgs.cargo-deny
-
-              haskPkgs.ghc
-              haskPkgs.cabal-install
-              haskPkgs.haskell-language-server
 
               pkgs.trunk
               pkgs.just
