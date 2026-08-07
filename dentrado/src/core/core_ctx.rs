@@ -484,11 +484,13 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                     ActiveGearExecution::Local { source, .. } => match source {
                         GearSource::Events(group) => GearInput::Events(*group),
                         GearSource::Timer { period, next_due } => {
-                            let tick = *next_due <= epoch;
-                            if tick {
+                            let do_tick = ag.output.is_some();
+                            if do_tick {
                                 *next_due = epoch + period.get();
+                                GearInput::Timer { tick: true }
+                            } else {
+                                GearInput::Timer { tick: false }
                             }
-                            GearInput::Timer { tick }
                         }
                         GearSource::Follow { target } => {
                             let target = *target;
