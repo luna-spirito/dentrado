@@ -50,6 +50,32 @@ pub fn render_block(site: &str, content: &Content) -> Vec<AnyView> {
                     ParaToken::Break => flush(&mut para, &mut out),
                 }
             }
+        } else if let Node::Container {
+            kind:
+                ContainerKind::Div {
+                    inline: true,
+                    block: false,
+                    params,
+                },
+            content,
+        } = node
+        {
+            // `[[span]]`: blank lines inside the body end the enclosing
+            // paragraph, so each run becomes its own `<p><span>…</span></p>`.
+            let runs = paragraph_runs(content);
+            if runs.len() > 1 {
+                flush(&mut para, &mut out);
+                let (class, style) = params_to_class_style(params);
+                for run in runs {
+                    let inner = render_inline(site, &run);
+                    out.push(
+                        view! { <p><span class=class.clone() style=style.clone()>{inner}</span></p> }
+                            .into_any(),
+                    );
+                }
+            } else {
+                para.push(render_node(site, node));
+            }
         } else {
             para.push(render_node(site, node));
         }
@@ -115,6 +141,134 @@ fn flush(para: &mut Vec<AnyView>, out: &mut Vec<AnyView>) {
         let p = std::mem::take(para);
         out.push(view! { <p>{p}</p> }.into_any());
     }
+}
+
+/// Blank-line runs inside a plain-text run: a single newline stays inside the
+/// paragraph (it becomes a `<br>` later), a blank line (two or more newlines,
+/// possibly with intervening spaces/tabs) is a paragraph boundary.
+enum BlankTok {
+    Raw(String),
+    Break,
+}
+
+fn blank_tokens(s: &str) -> Vec<BlankTok> {
+    let b = s.as_bytes();
+    let n = b.len();
+    let mut toks = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < n {
+        if b[i] == b'\n' {
+            let mut k = i;
+            let mut newlines = 0;
+            loop {
+                if k < n && b[k] == b'\n' {
+                    newlines += 1;
+                    k += 1;
+                    while k < n && matches!(b[k], b' ' | b'\t' | b'\r') {
+                        k += 1;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if newlines >= 2 {
+                if i > start {
+                    toks.push(BlankTok::Raw(s[start..i].to_string()));
+                }
+                toks.push(BlankTok::Break);
+                start = k;
+                i = k;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if start < n {
+        let rest = &s[start..];
+        if !rest.is_empty() {
+            toks.push(BlankTok::Raw(rest.to_string()));
+        }
+    }
+    toks
+}
+
+/// Split inline container content into paragraph runs at blank lines, keeping
+/// single newlines inside each run (they render as `<br>`). Non-text nodes are
+/// opaque and never split a run.
+fn paragraph_runs(content: &[Node]) -> Vec<Vec<Node>> {
+    let mut runs: Vec<Vec<Node>> = Vec::new();
+    let mut cur: Vec<Node> = Vec::new();
+    for node in content {
+        match node {
+            Node::Text(TextObj::Plain(s)) => {
+                for tok in blank_tokens(s) {
+                    match tok {
+                        BlankTok::Raw(t) => {
+                            cur.push(Node::Text(TextObj::Plain(t)));
+                        }
+                        BlankTok::Break => {
+                            if !cur.is_empty() {
+                                runs.push(std::mem::take(&mut cur));
+                            }
+                        }
+                    }
+                }
+            }
+            other => cur.push(other.clone()),
+        }
+    }
+    if !cur.is_empty() {
+        runs.push(cur);
+    }
+    runs
+}
+
+/// Trim whitespace (including newlines) from the edges of a content slice —
+/// deeper than [`trim_ws`], which only drops whitespace-only nodes.
+fn trim_edges(content: &[Node]) -> Vec<Node> {
+    let mut v: Vec<Node> = content.to_vec();
+    loop {
+        let Some(first) = v.first_mut() else { break };
+        let remove = match first {
+            Node::Text(TextObj::Plain(s)) => {
+                let t = s.trim_start().to_string();
+                if t.is_empty() {
+                    true
+                } else {
+                    *s = t;
+                    false
+                }
+            }
+            _ => false,
+        };
+        if remove {
+            v.remove(0);
+        } else {
+            break;
+        }
+    }
+    loop {
+        let Some(last) = v.last_mut() else { break };
+        let remove = match last {
+            Node::Text(TextObj::Plain(s)) => {
+                let t = s.trim_end().to_string();
+                if t.is_empty() {
+                    true
+                } else {
+                    *s = t;
+                    false
+                }
+            }
+            _ => false,
+        };
+        if remove {
+            v.pop();
+        } else {
+            break;
+        }
+    }
+    v
 }
 
 fn is_block(node: &Node) -> bool {
@@ -257,16 +411,42 @@ fn render_container(site: &str, kind: &ContainerKind, content: &Content) -> AnyV
             params,
         } => {
             let (class, style) = params_to_class_style(params);
-            let inner = if *block {
-                render_block(site, content)
-            } else {
-                render_inline(site, trim_ws(content))
-            };
-            if *inline {
-                view! { <span class=class style=style>{inner}</span> }.into_any()
-            } else {
-                view! { <div class=class style=style>{inner}</div> }.into_any()
+            if *block {
+                let inner = render_block(site, content);
+                return view! { <div class=class style=style>{inner}</div> }.into_any();
             }
+            // `[[div_]]` / `[[span]]`: inline body, auto-paragraphed at blank
+            // lines. Wikidot trims the body edges for `[[div_]]` (no `<br>` at
+            // the rim) and wraps only interior runs in `<p>`; `[[span]]` keeps
+            // its edge newlines (they become `<br>`) and is handled by
+            // [`render_block`] when its runs split into paragraphs.
+            let runs = paragraph_runs(content);
+            if runs.is_empty() {
+                return view! { <></> }.into_any();
+            }
+            if *inline {
+                let inner = render_inline(site, content);
+                return view! { <span class=class style=style>{inner}</span> }.into_any();
+            }
+            let runs: Vec<Vec<Node>> = runs
+                .iter()
+                .map(|r| trim_edges(r))
+                .filter(|r| !r.is_empty())
+                .collect();
+            let last = runs.len() - 1;
+            let parts: Vec<AnyView> = runs
+                .iter()
+                .enumerate()
+                .map(|(i, run)| {
+                    let inner = render_inline(site, run);
+                    if runs.len() > 1 && i > 0 && i < last {
+                        view! { <p>{inner}</p> }.into_any()
+                    } else {
+                        view! { <>{inner}</> }.into_any()
+                    }
+                })
+                .collect();
+            view! { <div class=class style=style>{parts}</div> }.into_any()
         }
         ContainerKind::Color(c) => view! {
             <span style=format!("color: {c}")>{render_inline(site, content)}</span>

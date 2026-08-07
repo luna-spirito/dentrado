@@ -48,6 +48,9 @@ toml = "0.8"
 clap = { version = "4.6.6", features = ["derive"] }
 clap_derive = { version = "4.6.4" }
 
+[dev-dependencies]
+leptos = { version = "0.8", features = ["ssr"] }
+
 [[bin]]
 name = "kolorinko"
 path = "src/main.rs"

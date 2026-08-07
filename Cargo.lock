@@ -1895,6 +1895,7 @@ dependencies = [
  "kolorinko-render",
  "kolorinko-rt",
  "kolorinko-wikitext",
+ "leptos",
  "log",
  "rcgen",
  "ring",
