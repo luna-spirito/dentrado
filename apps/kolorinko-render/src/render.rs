@@ -17,7 +17,9 @@ pub(crate) fn render_inline(site: &str, content: &Content) -> Vec<AnyView> {
 }
 
 /// Render `#page-content`: top-level inline runs are grouped into `<p>`,
-/// block nodes render standalone — exactly as Wikidot's renderer does.
+/// block nodes render standalone — exactly as Wikidot's renderer does. A run of
+/// blank lines inside a text node is a paragraph break; single newlines stay
+/// inside their paragraph as soft breaks (`<br>`).
 pub fn render_block(site: &str, content: &Content) -> Vec<AnyView> {
     let mut out: Vec<AnyView> = Vec::with_capacity(content.len());
     let mut para: Vec<AnyView> = Vec::new();
@@ -25,17 +27,71 @@ pub fn render_block(site: &str, content: &Content) -> Vec<AnyView> {
         if is_block(node) {
             flush(&mut para, &mut out);
             out.push(render_node(site, node));
-        } else if let Node::Text(TextObj::Plain(t)) = node
-            && t.trim().is_empty()
-            && t.contains('\n')
-        {
-            flush(&mut para, &mut out);
+        } else if let Node::Text(TextObj::Plain(t)) = node {
+            for tok in para_tokens(t) {
+                match tok {
+                    ParaToken::Text(s) => para.push(render_plain(&s)),
+                    ParaToken::Break => flush(&mut para, &mut out),
+                }
+            }
         } else {
             para.push(render_node(site, node));
         }
     }
     flush(&mut para, &mut out);
     out
+}
+
+/// Split a text run into paragraph tokens: a blank line — two or more newlines
+/// separated only by spaces/tabs — is a [`ParaToken::Break`] (paragraph
+/// boundary); everything else is a text segment whose single newlines remain
+/// as soft breaks. Segment edges are trimmed to match Wikidot's clean `<p>`s.
+enum ParaToken {
+    Text(String),
+    Break,
+}
+
+fn para_tokens(s: &str) -> Vec<ParaToken> {
+    let b = s.as_bytes();
+    let n = b.len();
+    let mut toks = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < n {
+        if b[i] == b'\n' {
+            // Consume a blank-line run: `\n (\s* \n)*`  (two or more newlines).
+            let mut k = i;
+            let mut newlines = 0;
+            loop {
+                if k < n && b[k] == b'\n' {
+                    newlines += 1;
+                    k += 1;
+                    while k < n && matches!(b[k], b' ' | b'\t' | b'\r') {
+                        k += 1;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if newlines >= 2 {
+                if i > start {
+                    toks.push(ParaToken::Text(s[start..i].trim().to_string()));
+                }
+                toks.push(ParaToken::Break);
+                start = k;
+                i = k;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if start < n {
+        let rest = s[start..].trim();
+        if !rest.is_empty() {
+            toks.push(ParaToken::Text(rest.to_string()));
+        }
+    }
+    toks
 }
 
 fn flush(para: &mut Vec<AnyView>, out: &mut Vec<AnyView>) {
@@ -67,6 +123,7 @@ fn is_block(node: &Node) -> bool {
             | Node::Stylesheet(_)
             | Node::Include(_)
             | Node::Raw(_)
+            | Node::Code(_)
     )
 }
 
@@ -106,30 +163,20 @@ fn render_node(site: &str, node: &Node) -> AnyView {
         Node::Date { timestamp, .. } => {
             view! { <span class="odate">{format!("#{timestamp}")}</span> }.into_any()
         }
+        Node::Module(_) => {
+            let _: () = view! { <></> };
+            ().into_any()
+        }
+        Node::Code(s) => view! {
+            <div class="code"><pre><code>{s.clone()}</code></pre></div>
+        }
+        .into_any(),
     }
 }
 
 fn render_text_obj(t: &TextObj) -> AnyView {
     match t {
-        TextObj::Plain(s) => {
-            if s.contains('\n') {
-                let parts: Vec<AnyView> = s
-                    .split('\n')
-                    .enumerate()
-                    .flat_map(|(i, seg)| {
-                        let mut v: Vec<AnyView> = Vec::new();
-                        if i > 0 {
-                            v.push(view! { <br /> }.into_any());
-                        }
-                        v.push(view! { {seg.to_string()} }.into_any());
-                        v
-                    })
-                    .collect();
-                view! { <>{parts}</> }.into_any()
-            } else {
-                view! { {s.clone()} }.into_any()
-            }
-        }
+        TextObj::Plain(s) => render_plain(s),
         TextObj::ModuleVar { name, default } => {
             let shown = default.clone().unwrap_or_else(|| format!("%%{name}%%"));
             view! { <span class="modulevar">{shown}</span> }.into_any()
@@ -146,6 +193,27 @@ fn render_text_obj(t: &TextObj) -> AnyView {
                 .unwrap_or_else(|| format!("{{${name}}}"));
             view! { <span class="includevar">{shown}</span> }.into_any()
         }
+    }
+}
+
+/// A plain-text run: single newlines become `<br>` (soft line breaks).
+fn render_plain(s: &str) -> AnyView {
+    if s.contains('\n') {
+        let parts: Vec<AnyView> = s
+            .split('\n')
+            .enumerate()
+            .flat_map(|(i, seg)| {
+                let mut v: Vec<AnyView> = Vec::new();
+                if i > 0 {
+                    v.push(view! { <br /> }.into_any());
+                }
+                v.push(view! { {seg.to_string()} }.into_any());
+                v
+            })
+            .collect();
+        view! { <>{parts}</> }.into_any()
+    } else {
+        view! { {s.to_string()} }.into_any()
     }
 }
 
@@ -302,23 +370,58 @@ fn render_image(
     source: &[TextObj],
     params: &std::collections::HashMap<String, Vec<TextObj>>,
 ) -> AnyView {
-    let mut classes = vec!["image-container".to_string()];
-    let mut img_style = String::new();
-    if let Some(a) = align {
-        classes.push(image_container_class(a));
-        img_style.push_str(&format!("float: {};", side_to_float(a.side)));
-    }
     let src = text_objs_to_string(source);
-    let alt = params
-        .get("alt")
+    let alt = param_or(params, "alt", || filename_of(&src));
+    let class = param_or(params, "class", || "image".to_string());
+    let style = params
+        .get("style")
         .map(|v| text_objs_to_string(v))
-        .unwrap_or_default();
-    view! {
-        <div class=classes.join(" ")>
-            <img class="image" src=src alt=alt style=img_style />
-        </div>
+        .filter(|s| !s.is_empty());
+    let width = params
+        .get("width")
+        .map(|v| text_objs_to_string(v))
+        .filter(|s| !s.is_empty());
+    let height = params
+        .get("height")
+        .map(|v| text_objs_to_string(v))
+        .filter(|s| !s.is_empty());
+    let img = view! { <img class=class src=src alt=alt style=style width=width height=height /> };
+    match align {
+        // Alignment / float → wrap in the `image-container <floatclass>` div
+        // Wikidot uses; the float is expressed via the container class.
+        Some(a) => {
+            let container = format!("image-container {}", image_container_class(a));
+            view! { <div class=container>{img}</div> }.into_any()
+        }
+        // No alignment → a bare `<img>`; `link=` wraps it in an anchor.
+        None => {
+            let link = param_or(params, "link", String::new);
+            if link.is_empty() {
+                img.into_any()
+            } else {
+                view! { <a href=link>{img}</a> }.into_any()
+            }
+        }
     }
-    .into_any()
+}
+
+/// Resolve `params[key]` to a string, falling back to `default` when absent or
+/// blank (so an explicit empty `alt=""` still yields the filename-derived alt).
+fn param_or(
+    params: &std::collections::HashMap<String, Vec<TextObj>>,
+    key: &str,
+    default: impl FnOnce() -> String,
+) -> String {
+    params
+        .get(key)
+        .map(|v| text_objs_to_string(v))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(default)
+}
+
+/// Last path segment of a URL — Wikidot's default image `alt`.
+fn filename_of(url: &str) -> String {
+    url.rsplit('/').next().unwrap_or(url).to_string()
 }
 
 fn render_link(site: &str, target: &LinkTarget, text: &Content) -> AnyView {
@@ -370,7 +473,7 @@ fn render_tabview(site: &str, tabs: &[kolorinko_wikitext::Tab]) -> AnyView {
 
 fn params_to_class_style(
     params: &std::collections::HashMap<String, Vec<TextObj>>,
-) -> (String, String) {
+) -> (String, Option<String>) {
     let class = params
         .get("class")
         .map(|v| text_objs_to_string(v))
@@ -390,7 +493,7 @@ fn params_to_class_style(
         style.push(':');
         style.push_str(&text_objs_to_string(v));
     }
-    (class, style)
+    (class, (!style.is_empty()).then_some(style))
 }
 
 pub(crate) fn text_objs_to_string(objs: &[TextObj]) -> String {
@@ -436,14 +539,6 @@ fn side_to_css(s: AlignSide) -> &'static str {
         AlignSide::Center => "center",
         AlignSide::Right => "right",
         AlignSide::Justify => "justify",
-    }
-}
-
-fn side_to_float(s: AlignSide) -> &'static str {
-    match s {
-        AlignSide::Left => "left",
-        AlignSide::Right => "right",
-        _ => "none",
     }
 }
 

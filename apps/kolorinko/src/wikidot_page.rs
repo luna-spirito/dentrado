@@ -1180,7 +1180,12 @@ fn subst_node(node: Node, vars: &HashMap<String, Content>) -> Content {
                 })
                 .collect(),
         )],
-        Node::Date { .. } | Node::HorizontalRule | Node::Raw(_) | Node::Stylesheet(_) => {
+        Node::Date { .. }
+        | Node::HorizontalRule
+        | Node::Raw(_)
+        | Node::Stylesheet(_)
+        | Node::Module(_)
+        | Node::Code(_) => {
             vec![node]
         }
     }

@@ -258,6 +258,29 @@ fn read_until<'a>(delims: &'a [&'a str]) -> impl Parser<'a, In<'a>, &'a str, E<'
     })
 }
 
+/// Like [`read_until`] but does not stop at newlines — for block-level raw
+/// bodies (`[[code]]`, `[[module css]]`) that span multiple lines.
+fn read_until_lines<'a>(
+    delims: &'a [&'a str],
+) -> impl Parser<'a, In<'a>, &'a str, E<'a>> + Clone + 'a {
+    custom(move |inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let full = inp.full_slice();
+        let start = *inp.cursor().inner();
+        let rest = &full[start..];
+        let mut end = rest.len();
+        for d in delims {
+            if let Some(p) = rest.find(d) {
+                end = end.min(p);
+            }
+        }
+        let consumed = &rest[..end];
+        for _ in consumed.chars() {
+            let _ = inp.next();
+        }
+        Ok(consumed)
+    })
+}
+
 /// Case-insensitive ASCII keyword (PureScript `slosxilVort`). Consumes the
 /// keyword on match.
 fn kw_ci<'a>(kw: String) -> impl Parser<'a, In<'a>, (), E<'a>> + Clone + 'a {
@@ -617,6 +640,8 @@ fn bracket_syntax<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
         tabview_block(element.clone()),
         include_block(),
         image_block(),
+        code_block(),
+        collapsible_block(element.clone()),
     ))
 }
 
@@ -830,6 +855,43 @@ fn iftags_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
         })
 }
 
+/// `[[collapsible show="…" hide="…"]] … [[/collapsible]]`. The body is parsed
+/// wikitext, shown expanded (a static mirror has no JS); `show`/`hide` labels
+/// are discarded. Modelled as a `collapsible-block` div so user themes apply.
+fn collapsible_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+    element: P,
+) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
+    let close = tag_close("collapsible").to(ContentExitReason::Eof);
+    kw_ci("collapsible".to_string())
+        .ignore_then(params_block())
+        .then_ignore(spaces())
+        .then_ignore(just("]]"))
+        .ignore_then(content_until(element, close))
+        .map(|(content, _)| Node::Container {
+            kind: ContainerKind::Div {
+                inline: false,
+                params: [(
+                    "class".to_string(),
+                    vec![TextObj::Plain("collapsible-block".to_string())],
+                )]
+                .into(),
+            },
+            content,
+        })
+}
+
+/// `[[code]] … [[/code]]` — verbatim source, taken raw (no wikitext parsing)
+/// up to the closer. Optional `type="lang"` and other params on the open tag
+/// are skipped.
+fn code_block<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
+    kw_ci("code".into())
+        .ignore_then(read_until(&["]]"]).ignored())
+        .then_ignore(just("]]"))
+        .ignore_then(read_until_lines(&["[[/code"]).map(|s| s.to_string()))
+        .then_ignore(choice((just("[[/code]]").ignored(), end())))
+        .map(|s| Node::Code(s.trim().to_string()))
+}
+
 /// `[[module NAME …]] … [[/module]]`. Dispatches `css` (raw stylesheet) and
 /// `ListPages` (template); other modules fall through to raw text.
 fn module_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
@@ -838,7 +900,7 @@ fn module_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
     let css = kw_ci("css".into())
         .ignore_then(read_until(&["]]"]).ignored())
         .then_ignore(just("]]"))
-        .ignore_then(read_until(&["[[/module"]).map(|s| s.to_string()))
+        .ignore_then(read_until_lines(&["[[/module"]).map(|s| s.to_string()))
         .then_ignore(choice((just("[[/module]]").ignored(), end())))
         .map(Node::Stylesheet);
 
@@ -847,9 +909,27 @@ fn module_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
         .then_ignore(just("]]"))
         .ignore_then(listpages_body(element));
 
+    // Any other single-tag module (`[[module Rate]]`, `[[module PageTree …]]`,
+    // …) with no `[[/module]]` closer: consume its name + params up to `]]`
+    // and emit a suppressed [`Node::Module`]. These are dynamic and have no
+    // static representation.
+    let inline = module_name()
+        .then_ignore(read_until(&["]]"]).ignored())
+        .then_ignore(just("]]").or_not())
+        .map(Node::Module);
+
     kw_ci("module".into())
         .ignore_then(spaces1())
-        .ignore_then(css.or(listpages))
+        .ignore_then(css.or(listpages).or(inline))
+}
+
+/// A single word (module name): letters/digits, case-insensitive-friendly.
+fn module_name<'a>() -> impl Parser<'a, In<'a>, String, E<'a>> + Clone + 'a {
+    any::<In<'a>, E<'a>>()
+        .filter(|c: &char| c.is_ascii_alphabetic())
+        .repeated()
+        .at_least(1)
+        .collect::<String>()
 }
 
 /// Body of a `[[module ListPages …]]`: everything up to `[[/module]]`.
@@ -2022,8 +2102,8 @@ mod tests {
         // Should parse to several distinct nodes, not collapse to a single text
         // blob (which would indicate the parser gave up).
         assert!(c.len() > 4, "len = {}, nodes = {:#?}", c.len(), c);
-        // The unknown `[[module Rate]]` self-closing tag reassembles to text.
-        assert!(matches!(c[0], Node::Text(_)));
+        // The unknown `[[module Rate]]` becomes a suppressed Module node.
+        assert!(matches!(c[0], Node::Module(_)));
         // A div container appears somewhere.
         assert!(
             c.iter()
@@ -2041,11 +2121,49 @@ mod tests {
     }
 
     #[test]
-    fn self_closing_module_is_text() {
-        // `[[module Rate]]` is not a known module; it must not be eaten as a
-        // half-parsed block — it should fall through to a single text node.
+    fn self_closing_module_is_suppressed() {
+        // `[[module Rate]]` is not a known module; it is consumed (not leaked
+        // as text) and represented as a suppressed Module node.
         let c = parse("[[module Rate]]");
-        assert_eq!(c, vec![txt("[[module Rate]]")]);
+        assert_eq!(c, vec![Node::Module("Rate".to_string())]);
+    }
+
+    #[test]
+    fn code_block_is_raw() {
+        // `[[code]]` body is verbatim (not parsed as wikitext): the `>` stays
+        // literal rather than becoming a blockquote, and the body is trimmed.
+        let c = parse("[[code]]\n> line one\n**not bold**\n[[/code]]");
+        assert_eq!(c, vec![Node::Code("> line one\n**not bold**".to_string())]);
+    }
+
+    #[test]
+    fn collapsible_is_div_container() {
+        let c = parse("[[collapsible show=\"+\" hide=\"-\"]]\nbody **bold**\n[[/collapsible]]");
+        let Node::Container { kind, content } = &c[0] else {
+            panic!("expected container, got {c:#?}");
+        };
+        let ContainerKind::Div { inline, params } = kind else {
+            panic!("expected div, got {kind:#?}");
+        };
+        assert!(!inline);
+        assert_eq!(
+            params
+                .get("class")
+                .and_then(|v| v.first())
+                .and_then(|t| match t {
+                    TextObj::Plain(s) => Some(s.as_str()),
+                    _ => None,
+                }),
+            Some("collapsible-block")
+        );
+        // The body parsed as wikitext (bold span present).
+        assert!(content.iter().any(|n| matches!(
+            n,
+            Node::Container {
+                kind: ContainerKind::Style(TextStyle::Bold),
+                ..
+            }
+        )));
     }
 
     #[test]

@@ -222,6 +222,15 @@ pub enum Node {
 
     /// `----` horizontal rule. PureScript `Hr`.
     HorizontalRule,
+
+    /// A single-tag `[[module Name …]]` with no `[[/module]]` closer (Rate,
+    /// PageTree, …). These are interactive/dynamic and have no static body;
+    /// the renderer suppresses them (emits nothing).
+    Module(String),
+
+    /// `[[code]] … [[/code]]` — verbatim preformatted source (not parsed as
+    /// wikitext). Rendered as Wikidot's `<div class="code"><pre><code>…` block.
+    Code(String),
 }
 
 /// One cell of a [`Node::Table`]. Corresponds to PureScript `TabelEl`.
