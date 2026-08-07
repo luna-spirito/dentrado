@@ -92,6 +92,11 @@ impl RepoMeta {
     pub(crate) const fn interval(&self) -> u32 {
         self.interval
     }
+
+    #[must_use]
+    pub(crate) const fn path(&self) -> &'static Path {
+        self.path
+    }
 }
 
 // =========================================================================
@@ -138,10 +143,12 @@ impl RepoData {
     }
 }
 
-/// One mirrored site: its pages nested by category.
+/// One mirrored site: its pages nested by category, plus the site's theme roots
+/// (from `<site>/_meta/theme_roots`, one URL per line) applied by the client.
 #[derive(Default, Clone, Debug)]
 pub(crate) struct WDWebsite {
     articles: ImHashMap<Option<SafePathComponent>, ImHashMap<SafePathComponent, Article>>,
+    theme_roots: Vec<String>,
 }
 
 /// One page: metadata, the full revision-history summary, and blob Oids for the
@@ -394,6 +401,7 @@ fn build_from_tree(odb: &Odb, tip: Oid, root: &Path) -> (RepoData, Index) {
     // `(site, p1, p2, id)` keyed: the `_meta` blob Oid + per-revision body Oids.
     let mut metas: HashMap<(String, String, String, String), Oid> = HashMap::new();
     let mut bodies: HashMap<(String, String, String, String), ImHashMap<u64, Oid>> = HashMap::new();
+    let mut theme_roots: HashMap<String, Oid> = HashMap::new();
     root_tree
         .walk(TreeWalkMode::PreOrder, |dir, entry| {
             if entry.kind() != Some(ObjectType::Blob) {
@@ -418,6 +426,9 @@ fn build_from_tree(odb: &Odb, tip: Oid, root: &Path) -> (RepoData, Index) {
                             .or_default()
                             .insert(n, entry.id());
                     }
+                }
+                [site, "_meta", "theme_roots"] => {
+                    theme_roots.insert((*site).into(), entry.id());
                 }
                 _ => {}
             }
@@ -457,6 +468,24 @@ fn build_from_tree(odb: &Odb, tip: Oid, root: &Path) -> (RepoData, Index) {
         let meta_path = root.join(site).join("_meta").join(p1).join(p2).join(id);
         index.insert(meta_path, (site_c.clone(), cat.clone(), name.clone()));
         insert_page(&mut sites, site_c, cat, name, article);
+    }
+    for (site, oid) in theme_roots {
+        let Some(site_c) = SafePathComponent::new(site.clone()) else {
+            continue;
+        };
+        let Some(text) = blob_str(repo, oid) else {
+            continue;
+        };
+        let roots: Vec<String> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        if let Some(mut w) = sites.get(&site_c).cloned() {
+            w.theme_roots = roots;
+            sites.insert(site_c, w);
+        }
     }
     (
         RepoData {
@@ -790,6 +819,10 @@ fn strip_quotes(s: &str) -> &str {
 #[derive(Default, Clone, Debug)]
 pub(crate) struct RepoLArticleCache;
 
+/// Trivial lens cache, same projection semantics as [`RepoLArticleCache`].
+#[derive(Default, Clone, Debug)]
+pub(crate) struct RepoLThemeRootsCache;
+
 /// Project one page out of `repo`'s dataset into a shippable [`ArticleLatest`],
 /// materialising the latest body blob out of the odb. A missing page (or an
 /// unopenable repository) yields an empty [`ArticleLatest`] (blank render).
@@ -807,6 +840,14 @@ pub(crate) fn repo_l_article_latest(
                 revisions: a.revisions.clone(),
             })
         })
+        .unwrap_or_default()
+}
+
+/// Project the site's theme-root URLs out of `repo`'s dataset.
+pub(crate) fn repo_l_theme_roots(data: &RepoData, site: &SafePathComponent) -> Vec<String> {
+    data.sites
+        .get(site)
+        .map(|w| w.theme_roots.clone())
         .unwrap_or_default()
 }
 

@@ -21,6 +21,7 @@ use std::{
 use crate::runtime::KolorinkoRT;
 mod assets;
 mod render_cli;
+mod repo;
 mod runtime;
 mod server;
 mod tls;
@@ -160,7 +161,7 @@ fn run_server(config: Config) -> anyhow::Result<()> {
                 .detach();
             }
             // Every core serves the HTTPS bootstrap over TCP.
-            if let Err(e) = web::serve(&bind, dist, inject_wt_hash).await {
+            if let Err(e) = web::serve(&bind, dist, meta, inject_wt_hash).await {
                 error!("https bootstrap exited: {e}");
             }
         }

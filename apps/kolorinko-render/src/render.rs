@@ -12,6 +12,8 @@ use kolorinko_wikitext::{
 };
 use leptos::prelude::*;
 
+use crate::{asset_url, rewrite};
+
 pub(crate) fn render_inline(site: &str, content: &[Node]) -> Vec<AnyView> {
     content.iter().map(|n| render_node(site, n)).collect()
 }
@@ -311,7 +313,7 @@ fn render_node(site: &str, node: &Node) -> AnyView {
             align,
             source,
             params,
-        } => render_image(align, source, params),
+        } => render_image(site, align, source, params),
         Node::Link { target, text } => render_link(site, target, text),
         Node::SupSubscript { sup, sub } => view! {
             <>
@@ -321,7 +323,10 @@ fn render_node(site: &str, node: &Node) -> AnyView {
         }
         .into_any(),
         Node::HorizontalRule => view! { <hr /> }.into_any(),
-        Node::Stylesheet(css) => view! { <style>{css.clone()}</style> }.into_any(),
+        Node::Stylesheet(css) => {
+            let css = rewrite(css, None, site, "files");
+            view! { <style>{css}</style> }.into_any()
+        }
         Node::Footnote(content) => view! {
             <sup class="footnoteref">{render_inline(site, content)}</sup>
         }
@@ -596,11 +601,13 @@ fn render_grid_cell(site: &str, cell: &BlockCell) -> AnyView {
 }
 
 fn render_image(
+    site: &str,
     align: &Option<Align>,
     source: &[TextObj],
     params: &std::collections::HashMap<String, Vec<TextObj>>,
 ) -> AnyView {
     let src = text_objs_to_string(source);
+    let src = asset_url(site, "files", &src).unwrap_or(src);
     let alt = param_or(params, "alt", || filename_of(&src));
     let class = param_or(params, "class", || "image".to_string());
     let style = params
@@ -629,6 +636,7 @@ fn render_image(
             if link.is_empty() {
                 img.into_any()
             } else {
+                let link = asset_url(site, "files", &link).unwrap_or(link);
                 view! { <a href=link>{img}</a> }.into_any()
             }
         }
@@ -656,7 +664,7 @@ fn filename_of(url: &str) -> String {
 
 fn render_link(site: &str, target: &LinkTarget, text: &Content) -> AnyView {
     let href = match target {
-        LinkTarget::Url(u) => u.clone(),
+        LinkTarget::Url(u) => asset_url(site, "files", u).unwrap_or_else(|| u.clone()),
         LinkTarget::Page(p) => {
             let rest = p.path.join("/");
             match &p.space {

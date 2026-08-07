@@ -46,6 +46,20 @@ pub(crate) async fn repo_l_article_latest(
 }
 
 #[dentrado::gear(
+    follow(target = GearId::Repo(_repo_meta)),
+    name = RepoLThemeRoots,
+    wire_skip(_repo_meta),
+)]
+pub(crate) async fn repo_l_theme_roots(
+    _repo_meta: RepoMeta,
+    site: SafePathComponent,
+    repo_data: Rc<RepoData>,
+    _cache: &mut RepoLThemeRootsCache,
+) -> Vec<String> {
+    crate::wikidot_page::repo_l_theme_roots(&repo_data, &site)
+}
+
+#[dentrado::gear(
     event,
     name = ArticleLatestParsed,
     wire_skip(repo_meta),

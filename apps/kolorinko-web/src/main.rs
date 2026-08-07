@@ -14,12 +14,16 @@ mod menu;
 mod router;
 mod wt;
 
-use kolorinko_render::render_block;
+use kolorinko_render::{asset_url, render_block};
 use kolorinko_rt::wire;
 use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
 use std::{cell::Cell, rc::Rc};
+use wasm_bindgen::JsCast;
 use wt::WtClient;
+
+/// `<link id>` of the per-site theme stylesheet injected into `<head>`.
+const THEME_LINK_ID: &str = "kolorinko-site-theme";
 
 #[component]
 fn App() -> impl IntoView {
@@ -49,10 +53,10 @@ fn App() -> impl IntoView {
 /// The effect re-runs whenever `make_query` reads a changed signal (route
 /// site/slug), cancelling the previous handle and subscribing to the new one;
 /// the result lands in the returned signal on every server push.
-fn subscribe(
+fn subscribe<Out: Send + Sync + 'static>(
     client: Rc<WtClient>,
-    make_query: impl Fn() -> wire::GearQuery<ArticleView> + 'static,
-) -> ReadSignal<Option<ArticleView>> {
+    make_query: impl Fn() -> wire::GearQuery<Out> + 'static,
+) -> ReadSignal<Option<Out>> {
     let (rx, wx) = signal(None);
     let prev = Cell::new(None::<u64>);
     Effect::new(move |_| {
@@ -60,7 +64,7 @@ fn subscribe(
             client.cancel(p);
         }
         wx.set(None);
-        let sub = client.subscribe(make_query(), move |v: ArticleView| wx.set(Some(v)));
+        let sub = client.subscribe(make_query(), move |v: Out| wx.set(Some(v)));
         prev.set(Some(sub));
     });
     rx
@@ -76,8 +80,35 @@ fn layout(client: Rc<WtClient>) -> AnyView {
     let nav_side = subscribe(client.clone(), move || {
         wire::article_latest(site.get(), router::nav_slug("side"))
     });
+    let theme_roots = subscribe(client.clone(), move || wire::repo_l_theme_roots(site.get()));
     let nav_top =
         subscribe(client, move || wire::article_latest(site.get(), router::nav_slug("top")));
+
+    // Keep one theme `<link>` in `<head>` for the current site. Re-runs on site
+    // change and on repo updates; the stylesheet is served (and its `@import`/
+    // `url()` references rewritten) by the kolorinko origin.
+    let theme_site = site;
+    Effect::new(move |_| {
+        let Some(window) = web_sys::window() else { return };
+        let Some(doc) = window.document() else { return };
+        let Ok(Some(head)) = doc.query_selector("head") else { return };
+        if let Some(old) = doc.get_element_by_id(THEME_LINK_ID) {
+            let _ = old.remove();
+        }
+        let Some(Some(root)) = theme_roots.get().map(|r| r.first().cloned()) else {
+            return;
+        };
+        let s = theme_site.get().as_ref().to_string_lossy().to_string();
+        let Some(href) = asset_url(&s, "theme", &root) else { return };
+        if let Ok(el) = doc.create_element("link") {
+            let _ = el.set_attribute("id", THEME_LINK_ID);
+            let _ = el.set_attribute("rel", "stylesheet");
+            let _ = el.set_attribute("href", &href);
+            if let Ok(node) = el.dyn_into::<web_sys::Node>() {
+                let _ = head.append_child(&node);
+            }
+        }
+    });
 
     view! {
         <div id="container-wrap-wrap">

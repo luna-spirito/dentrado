@@ -50,7 +50,11 @@ use kolorinko_rt::wire::{self, ClientMsg, ServerMsg};
 
 use crate::{
     assets::{load_assets, looks_like_asset, mime_for},
-    runtime::{GearOut, KolorinkoRT, article_latest, article_latest_parsed, repo_l_article_latest},
+    repo,
+    runtime::{
+        GearOut, KolorinkoRT, article_latest, article_latest_parsed, repo_l_article_latest,
+        repo_l_theme_roots,
+    },
     wikidot_page::RepoMeta,
 };
 
@@ -194,25 +198,43 @@ async fn handle_conn(
         // HTTP/3 request — serve a static asset on this stream; the connection
         // stays open for further multiplexed requests.
         let assets = assets.clone();
+        let repo_root = repo_meta.path();
         runtime::spawn(async move {
             let mut stream = stream;
             let path = req.uri().path().to_string();
+            let full = req
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_else(|| path.clone());
             let key: &str = if path == "/" { "/index.html" } else { &path };
-            let (status, mime, body): (u16, &'static str, Bytes) = match assets.get(key) {
-                Some(b) => (200, mime_for(key), Bytes::from(b.clone())),
-                None if !looks_like_asset(key) => (
-                    200,
-                    "text/html; charset=utf-8",
-                    Bytes::from(assets.get("/index.html").cloned().unwrap_or_default()),
-                ),
-                None => (404, "text/plain", Bytes::from_static(b"not found\n")),
-            };
-            let resp = http::Response::builder()
+            let (status, mime, body, location): (u16, &'static str, Bytes, Option<String>) =
+                match assets.get(key) {
+                    Some(b) => (200, mime_for(key), Bytes::from(b.clone()), None),
+                    None => match repo::serve(&full, repo_root).await {
+                        Some(repo::RepoResp::Ok { mime, body }) => {
+                            (200, mime, Bytes::from(body), None)
+                        }
+                        Some(repo::RepoResp::Redirect { location }) => {
+                            (302, "text/plain", Bytes::new(), Some(location))
+                        }
+                        None if !looks_like_asset(key) => (
+                            200,
+                            "text/html; charset=utf-8",
+                            Bytes::from(assets.get("/index.html").cloned().unwrap_or_default()),
+                            None,
+                        ),
+                        None => (404, "text/plain", Bytes::from_static(b"not found\n"), None),
+                    },
+                };
+            let mut b = http::Response::builder()
                 .status(status)
                 .header("content-type", mime)
-                .header("content-length", body.len().to_string())
-                .body(())
-                .unwrap();
+                .header("content-length", body.len().to_string());
+            if let Some(loc) = location {
+                b = b.header("location", loc);
+            }
+            let resp = b.body(()).unwrap();
             if let Err(e) = stream.send_response(resp).await {
                 warn!("h3 send_response: {e}");
                 return;
@@ -356,6 +378,9 @@ async fn subscribe_wire(
                 .subscribe(core)
                 .await
         }
+        wire::GearId::RepoLThemeRoots(site) => {
+            repo_l_theme_roots(repo_meta, site).subscribe(core).await
+        }
     }
 }
 
@@ -364,6 +389,7 @@ fn to_wire_out(out: GearOut) -> wire::GearOut {
         GearOut::ArticleLatestOut(a) => wire::GearOut::ArticleLatestOut(a),
         GearOut::ArticleLatestParsedOut(a) => wire::GearOut::ArticleLatestParsedOut(a),
         GearOut::RepoLArticleLatestOut(a) => wire::GearOut::RepoLArticleLatestOut(a),
+        GearOut::RepoLThemeRootsOut(a) => wire::GearOut::RepoLThemeRootsOut(a),
     }
 }
 

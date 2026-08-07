@@ -18,7 +18,12 @@
 //!
 //! The data channel itself is WebTransport (see [`crate::server`]).
 
-use std::{collections::HashMap, io, path::PathBuf, rc::Rc};
+use std::{
+    collections::HashMap,
+    io,
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 
 use compio::{
     buf::BufResult,
@@ -30,13 +35,20 @@ use compio::{
 use log::{info, warn};
 
 use crate::assets::{load_assets, looks_like_asset, mime_for};
+use crate::repo::{self, RepoResp};
 use crate::tls::https_server_config;
+use crate::wikidot_page::RepoMeta;
 
 /// Bind `addr` with `SO_REUSEPORT`, wrap each connection in TLS, and serve the
 /// HTTP/1.1 page. (WebTransport is separate — see [`crate::server`].)
 ///
 /// Runs forever; only returns on a fatal listener error.
-pub(crate) async fn serve(addr: &str, assets_dir: PathBuf, inject_wt_hash: bool) -> io::Result<()> {
+pub(crate) async fn serve(
+    addr: &str,
+    assets_dir: PathBuf,
+    repo_meta: RepoMeta,
+    inject_wt_hash: bool,
+) -> io::Result<()> {
     // Hash-pinning mode injects the WT cert hash into the cached page once
     // here; pooling mode passes `None` (no injection).
     let wt_hash = if inject_wt_hash {
@@ -45,6 +57,7 @@ pub(crate) async fn serve(addr: &str, assets_dir: PathBuf, inject_wt_hash: bool)
         None
     };
     let assets = Rc::new(load_assets(&assets_dir, wt_hash));
+    let repo_root = repo_meta.path();
     let acceptor = TlsAcceptor::from(https_server_config()?);
     let listener = bind_reuseport(addr).await?;
     let local = listener.local_addr()?;
@@ -77,7 +90,8 @@ pub(crate) async fn serve(addr: &str, assets_dir: PathBuf, inject_wt_hash: bool)
                             return;
                         }
                     };
-                    if let Err(e) = handle_conn(&mut stream, &assets, alt_svc.as_deref()).await
+                    if let Err(e) =
+                        handle_conn(&mut stream, &assets, repo_root, alt_svc.as_deref()).await
                         && !is_disconnect(&e)
                     {
                         warn!("conn {peer}: {e}");
@@ -114,6 +128,7 @@ async fn bind_reuseport(addr: &str) -> io::Result<TcpListener> {
 async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     assets: &HashMap<String, Vec<u8>>,
+    repo_root: &Path,
     alt_svc: Option<&str>,
 ) -> io::Result<()> {
     let head = read_request_head(stream).await?;
@@ -127,19 +142,29 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(());
     }
 
-    // Strip the query string before asset lookup: `GET /?x=1` → `/`.
+    // Strip the query string for the asset-map lookup (`GET /?x=1` → `/`); the
+    // repo resolver keeps it (mirrored paths live on disk without the query).
+    let raw_path = path;
     let path = path.split('?').next().unwrap_or(path);
     let key: &str = if path == "/" { "/index.html" } else { path };
     let res = match assets.get(key) {
         Some(bytes) => write_http(stream, 200, mime_for(key), bytes, alt_svc).await,
-        None if !looks_like_asset(key) => {
-            let idx = assets
-                .get("/index.html")
-                .map(Vec::as_slice)
-                .unwrap_or(crate::assets::PLACEHOLDER_INDEX.as_bytes());
-            write_http(stream, 200, "text/html; charset=utf-8", idx, alt_svc).await
-        }
-        None => write_http(stream, 404, "text/plain", b"not found\n", alt_svc).await,
+        None => match repo::serve(raw_path, repo_root).await {
+            Some(RepoResp::Ok { mime, body }) => {
+                write_http(stream, 200, mime, &body, alt_svc).await
+            }
+            Some(RepoResp::Redirect { location }) => {
+                write_redirect(stream, &location, alt_svc).await
+            }
+            None if !looks_like_asset(key) => {
+                let idx = assets
+                    .get("/index.html")
+                    .map(Vec::as_slice)
+                    .unwrap_or(crate::assets::PLACEHOLDER_INDEX.as_bytes());
+                write_http(stream, 200, "text/html; charset=utf-8", idx, alt_svc).await
+            }
+            None => write_http(stream, 404, "text/plain", b"not found\n", alt_svc).await,
+        },
     };
     let _ = stream.shutdown().await; // send close_notify for a clean TLS close
     res
@@ -175,20 +200,45 @@ async fn write_http<S: AsyncWrite + Unpin>(
     body: &[u8],
     alt_svc: Option<&str>,
 ) -> io::Result<()> {
+    write_response(stream, status, mime, None, body, alt_svc).await
+}
+
+/// `302 Found` to `location`, used when a mirrored asset is missing so the
+/// browser falls back onto the original host.
+async fn write_redirect<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    location: &str,
+    alt_svc: Option<&str>,
+) -> io::Result<()> {
+    write_response(stream, 302, "text/plain", Some(location), b"", alt_svc).await
+}
+
+async fn write_response<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    status: u16,
+    mime: &str,
+    location: Option<&str>,
+    body: &[u8],
+    alt_svc: Option<&str>,
+) -> io::Result<()> {
     let status_text = match status {
         200 => "OK",
+        301 => "Moved Permanently",
+        302 => "Found",
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
         _ => "OK",
     };
     let mut head = format!(
-        "HTTP/1.1 {status} {status_text}\r\n\
-         Content-Type: {mime}\r\n\
-         Content-Length: {len}\r\n\
-         Connection: close\r\n",
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {mime}\r\nContent-Length: {len}\r\nConnection: close\r\n",
         len = body.len(),
     );
+    if let Some(loc) = location {
+        head.push_str("Location: ");
+        head.push_str(loc);
+        head.push_str("\r\n");
+    }
     if let Some(alt) = alt_svc {
         head.push_str("Alt-Svc: ");
         head.push_str(alt);

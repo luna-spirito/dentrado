@@ -7,8 +7,10 @@
 //! tree and depend on no platform-specific API, so the same source compiles
 //! under either feature.
 
+mod css;
 mod render;
 
+pub use css::{asset_url, rewrite};
 pub use render::render_block;
 
 #[cfg(feature = "ssr")]

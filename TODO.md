@@ -67,3 +67,4 @@ bridge.rs:
 * Swap Event: it has internal Rc, and I don't like that >_<
 * Do we need LocMsgTypeId? It's probably obsolete by that point, overridden by the R::Group. LocGroupId merges both for quire some time already.
 * CRITICAL: DEAL WITH LOCALIZABLE IN SERVER<->CLIENT INTERACTION!
+* Remove `output` caching from Gears?, add foreign_ptr for shared memory?, assets-as-gears?
