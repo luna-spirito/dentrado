@@ -11,6 +11,7 @@ console_error_panic_hook = "0.1"
 js-sys = "0.3"
 kolorinko-rt = { path = "../kolorinko-rt" }
 kolorinko-wikitext = { path = "../kolorinko-wikitext" }
+kolorinko-render = { path = "../kolorinko-render", default-features = false, features = ["csr"] }
 leptos = { version = "0.8", features = ["csr"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

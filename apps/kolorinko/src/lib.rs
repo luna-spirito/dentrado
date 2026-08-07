@@ -1,3 +1,4 @@
+use clap::Parser;
 use dentrado::{
     core::{
         core_ctx::Core,
@@ -19,6 +20,7 @@ use std::{
 
 use crate::runtime::KolorinkoRT;
 mod assets;
+mod render_cli;
 mod runtime;
 mod server;
 mod tls;
@@ -61,15 +63,41 @@ struct ServerCfg {
     key_file: Option<String>,
 }
 
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    commands: Option<Command>,
+    config_path: PathBuf,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    Render {
+        #[arg(long)]
+        inject: bool,
+        page: String,
+    },
+}
+
 pub fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    let config_path = std::env::args()
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("usage: kolorinko <config.toml>"))?;
-    let config: Config = toml::from_str(&std::fs::read_to_string(&config_path)?)
-        .map_err(|e| anyhow::anyhow!("failed to parse {config_path}: {e}"))?;
+    let cli = Cli::parse();
+    match cli.commands {
+        None => run_server(load_config(&cli.config_path)?),
+        Some(Command::Render { inject, page }) => {
+            render_cli::run_cli(cli.config_path, page, inject)
+        }
+    }
+}
 
+fn load_config(config_path: &Path) -> anyhow::Result<Config> {
+    toml::from_str(&std::fs::read_to_string(config_path)?)
+        .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", config_path.display()))
+}
+
+/// `kolorinko <config.toml>` — run the H3 + WebTransport server.
+fn run_server(config: Config) -> anyhow::Result<()> {
     let cores = NonZero::new(
         std::env::var("NUM_CORES")
             .ok()
@@ -82,20 +110,8 @@ pub fn main() -> anyhow::Result<()> {
     )
     .unwrap();
 
-    let db_config = DbConfig::<KolorinkoRT, InMemoryStorage<KolorinkoRT>> {
-        num_cores: cores,
-        node_id: NodeId(0),
-        module: std::sync::Arc::new(()),
-        peers: HashMap::new(),
-        doorbells: iter::repeat_with(Doorbell::new)
-            .take(cores.get() as usize)
-            .collect(),
-        make_storage: std::sync::Arc::new(|| InMemoryStorage::<KolorinkoRT>::default()),
-    };
-
     let repo_meta = make_repo_meta(&config.repo);
     let bind = config.server.bind.clone();
-    let web_dist = PathBuf::from(&config.server.web_dist);
     let inject_wt_hash = config.server.inject_wt_hash;
     tls::set_cert_paths(
         config.server.cert_file.map(PathBuf::from),
@@ -115,7 +131,7 @@ pub fn main() -> anyhow::Result<()> {
 
     let worker = move |core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>| {
         let bind = bind.clone();
-        let dist = web_dist.clone();
+        let dist = PathBuf::from(&config.server.web_dist);
         let meta = repo_meta.clone();
         let claim = bind_claim.clone();
         async move {
@@ -152,10 +168,25 @@ pub fn main() -> anyhow::Result<()> {
 
     // Keep the `Db` alive for the life of the process: its `Drop` impl sends
     // `Shutdown` to every core and joins the worker threads.
-    let _db = Db::start_with_worker(db_config, worker)?;
+    let _db = Db::start_with_worker(db_config(cores), worker)?;
 
     loop {
         std::thread::park();
+    }
+}
+
+/// Build a single-node [`DbConfig`] for `cores` cores. Shared by the server
+/// ([`run_server`]) and the one-shot render CLI ([`render_cli`]).
+fn db_config(cores: NonZero<u32>) -> DbConfig<KolorinkoRT, InMemoryStorage<KolorinkoRT>> {
+    DbConfig {
+        num_cores: cores,
+        node_id: NodeId(0),
+        module: std::sync::Arc::new(()),
+        peers: HashMap::new(),
+        doorbells: iter::repeat_with(Doorbell::new)
+            .take(cores.get() as usize)
+            .collect(),
+        make_storage: std::sync::Arc::new(InMemoryStorage::<KolorinkoRT>::default),
     }
 }
 

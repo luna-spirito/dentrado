@@ -4,6 +4,7 @@ members = [
   "dentrado-macros",
   "dentrado-types",
   "apps/kolorinko",
+  "apps/kolorinko-render",
   "apps/kolorinko-rt",
   "apps/kolorinko-wikitext",
 ]

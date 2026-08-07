@@ -10,7 +10,10 @@ feature-depth = 1
 
 [advisories]
 yanked = "deny"
-ignore = []
+ignore = [
+    "RUSTSEC-2024-0436", # paste
+    "RUSTSEC-2026-0173" # proc-macro-error2
+]
 
 [licenses]
 allow = [
@@ -21,6 +24,7 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSL-1.0",
     "ISC",
     "Zlib",
     "CC0-1.0",

@@ -10,10 +10,10 @@
 //! and, for the page, its `slug`) changes. Navigation is client-side
 //! (pushState) so the session and subscriptions stay live across page changes.
 
-mod render;
 mod router;
 mod wt;
 
+use kolorinko_render::render_block;
 use kolorinko_rt::wire;
 use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
@@ -95,7 +95,7 @@ fn layout(client: Rc<WtClient>) -> AnyView {
                         <div id="page-content">{move || match page.get() {
                             Some(a) => {
                                 let s = site.get();
-                                let blocks = render::render_block(
+                                let blocks = render_block(
                                     &s.as_ref().to_string_lossy(),
                                     &a.content,
                                 );
@@ -118,7 +118,7 @@ fn view_nav(site: kolorinko_rt::SafePathComponent, nav: Option<ArticleView>) -> 
     match nav {
         Some(a) => {
             let s = site.as_ref().to_string_lossy();
-            let blocks = render::render_block(&s, &a.content);
+            let blocks = render_block(&s, &a.content);
             view! { <>{blocks}</> }.into_any()
         }
         None => {

@@ -32,6 +32,7 @@ h3-webtransport = "0.1"
 http = "1"
 im = "15.1.0"
 kolorinko-rt = { path = "../kolorinko-rt" }
+kolorinko-render = { path = "../kolorinko-render", default-features = false, features = ["ssr"] }
 kolorinko-wikitext = { path = "../kolorinko-wikitext" }
 # `ring` (also pulled by compio/quic) gives the SHA-256 for the WebTransport
 # cert hash; `time` sets the short validity browsers require.
@@ -44,6 +45,8 @@ rcgen = "0.14"
 rustls-pki-types = "1.15"
 serde = "1.0.228"
 toml = "0.8"
+clap = { version = "4.6.6", features = ["derive"] }
+clap_derive = { version = "4.6.4" }
 
 [[bin]]
 name = "kolorinko"

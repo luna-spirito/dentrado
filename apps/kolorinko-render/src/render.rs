@@ -8,7 +8,7 @@
 
 use kolorinko_wikitext::{
     Align, AlignSide, BlockCell, BlockTable, ContainerKind, Content, LinkTarget, Node, TableCell,
-    TextStyle, TextObj,
+    TextObj, TextStyle,
 };
 use leptos::prelude::*;
 
@@ -18,7 +18,7 @@ pub(crate) fn render_inline(site: &str, content: &Content) -> Vec<AnyView> {
 
 /// Render `#page-content`: top-level inline runs are grouped into `<p>`,
 /// block nodes render standalone — exactly as Wikidot's renderer does.
-pub(crate) fn render_block(site: &str, content: &Content) -> Vec<AnyView> {
+pub fn render_block(site: &str, content: &Content) -> Vec<AnyView> {
     let mut out: Vec<AnyView> = Vec::with_capacity(content.len());
     let mut para: Vec<AnyView> = Vec::new();
     for node in content {
@@ -78,10 +78,12 @@ fn render_node(site: &str, node: &Node) -> AnyView {
         Node::Heading { level, content } => render_heading(site, *level, content),
         Node::Table(rows) => render_table(site, rows),
         Node::BlockTable(table) => render_grid_table(site, table),
-        Node::BlockCell(cell) => {
-            view! { <>{render_inline(site, &cell.content)}</> }.into_any()
-        }
-        Node::Image { align, source, params } => render_image(align, source, params),
+        Node::BlockCell(cell) => view! { <>{render_inline(site, &cell.content)}</> }.into_any(),
+        Node::Image {
+            align,
+            source,
+            params,
+        } => render_image(align, source, params),
         Node::Link { target, text } => render_link(site, target, text),
         Node::SupSubscript { sup, sub } => view! {
             <>
@@ -98,7 +100,9 @@ fn render_node(site: &str, node: &Node) -> AnyView {
         .into_any(),
         Node::Tabview(tabs) => render_tabview(site, tabs),
         Node::ListPages(lp) => render_block(site, &lp.repeat).into_any(),
-        Node::Include(_) => view! { <span class="include-placeholder">"[include]"</span> }.into_any(),
+        Node::Include(_) => {
+            view! { <span class="include-placeholder">"[include]"</span> }.into_any()
+        }
         Node::Date { timestamp, .. } => {
             view! { <span class="odate">{format!("#{timestamp}")}</span> }.into_any()
         }
@@ -133,10 +137,12 @@ fn render_text_obj(t: &TextObj) -> AnyView {
         TextObj::IncludeVar { name, default } => {
             let shown = default
                 .as_ref()
-                .and_then(|c| c.first().and_then(|n| match n {
-                    Node::Text(TextObj::Plain(s)) => Some(s.clone()),
-                    _ => None,
-                }))
+                .and_then(|c| {
+                    c.first().and_then(|n| match n {
+                        Node::Text(TextObj::Plain(s)) => Some(s.clone()),
+                        _ => None,
+                    })
+                })
                 .unwrap_or_else(|| format!("{{${name}}}"));
             view! { <span class="includevar">{shown}</span> }.into_any()
         }
@@ -190,7 +196,9 @@ fn render_container(site: &str, kind: &ContainerKind, content: &Content) -> AnyV
             }
             .into_any()
         }
-        ContainerKind::Quote => view! { <blockquote>{render_block(site, content)}</blockquote> }.into_any(),
+        ContainerKind::Quote => {
+            view! { <blockquote>{render_block(site, content)}</blockquote> }.into_any()
+        }
         // Tag gating is a server concern; render the body unconditionally.
         ContainerKind::IfTags { .. } => view! { <>{render_block(site, content)}</> }.into_any(),
     }
@@ -360,9 +368,17 @@ fn render_tabview(site: &str, tabs: &[kolorinko_wikitext::Tab]) -> AnyView {
     .into_any()
 }
 
-fn params_to_class_style(params: &std::collections::HashMap<String, Vec<TextObj>>) -> (String, String) {
-    let class = params.get("class").map(|v| text_objs_to_string(v)).unwrap_or_default();
-    let mut style = params.get("style").map(|v| text_objs_to_string(v)).unwrap_or_default();
+fn params_to_class_style(
+    params: &std::collections::HashMap<String, Vec<TextObj>>,
+) -> (String, String) {
+    let class = params
+        .get("class")
+        .map(|v| text_objs_to_string(v))
+        .unwrap_or_default();
+    let mut style = params
+        .get("style")
+        .map(|v| text_objs_to_string(v))
+        .unwrap_or_default();
     for (k, v) in params {
         if matches!(k.as_str(), "class" | "style" | "id") {
             continue;
@@ -383,7 +399,12 @@ pub(crate) fn text_objs_to_string(objs: &[TextObj]) -> String {
         match o {
             TextObj::Plain(s) => out.push_str(s),
             TextObj::ModuleVar { name, default } => {
-                out.push_str(default.clone().unwrap_or_else(|| format!("%%{name}%%")).as_str());
+                out.push_str(
+                    default
+                        .clone()
+                        .unwrap_or_else(|| format!("%%{name}%%"))
+                        .as_str(),
+                );
             }
             TextObj::IncludeVar { name, default } => {
                 if let Some(d) = default
