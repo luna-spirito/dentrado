@@ -7,13 +7,29 @@
 //! instead of Wikidot's per-site subdomains.
 
 use kolorinko_wikitext::{
-    Align, AlignSide, BlockCell, BlockTable, ContainerKind, Content, LinkTarget, Node, TableCell,
-    TextObj, TextStyle,
+    Align, AlignSide, BlockCell, BlockTable, ContainerKind, Content, LinkTarget, List, Node,
+    TableCell, TextObj, TextStyle,
 };
 use leptos::prelude::*;
 
-pub(crate) fn render_inline(site: &str, content: &Content) -> Vec<AnyView> {
+pub(crate) fn render_inline(site: &str, content: &[Node]) -> Vec<AnyView> {
     content.iter().map(|n| render_node(site, n)).collect()
+}
+
+/// Slice off leading/trailing nodes that are pure whitespace text, so inline
+/// containers (`[[div_ …]]`, `[[span …]]`, grid cells) don't emit spurious
+/// `<br>` from the newlines around their real content.
+fn trim_ws(content: &Content) -> &[Node] {
+    let is_ws = |n: &Node| matches!(n, Node::Text(TextObj::Plain(s)) if s.trim().is_empty());
+    let mut start = 0;
+    let mut end = content.len();
+    while start < end && is_ws(&content[start]) {
+        start += 1;
+    }
+    while end > start && is_ws(&content[end - 1]) {
+        end -= 1;
+    }
+    &content[start..end]
 }
 
 /// Render `#page-content`: top-level inline runs are grouped into `<p>`,
@@ -124,6 +140,7 @@ fn is_block(node: &Node) -> bool {
             | Node::Include(_)
             | Node::Raw(_)
             | Node::Code(_)
+            | Node::List(_)
     )
 }
 
@@ -171,6 +188,7 @@ fn render_node(site: &str, node: &Node) -> AnyView {
             <div class="code"><pre><code>{s.clone()}</code></pre></div>
         }
         .into_any(),
+        Node::List(list) => render_list(site, list),
     }
 }
 
@@ -233,9 +251,17 @@ fn render_container(site: &str, kind: &ContainerKind, content: &Content) -> AnyV
             <span style="text-decoration: line-through">{render_inline(site, content)}</span>
         }
         .into_any(),
-        ContainerKind::Div { inline, params } => {
+        ContainerKind::Div {
+            inline,
+            block,
+            params,
+        } => {
             let (class, style) = params_to_class_style(params);
-            let inner = render_block(site, content);
+            let inner = if *block {
+                render_block(site, content)
+            } else {
+                render_inline(site, trim_ws(content))
+            };
             if *inline {
                 view! { <span class=class style=style>{inner}</span> }.into_any()
             } else {
@@ -281,6 +307,30 @@ fn render_heading(site: &str, level: u32, content: &Content) -> AnyView {
         4 => view! { <h4>{inner}</h4> }.into_any(),
         5 => view! { <h5>{inner}</h5> }.into_any(),
         _ => view! { <h6>{inner}</h6> }.into_any(),
+    }
+}
+
+fn render_list(site: &str, list: &List) -> AnyView {
+    let items: Vec<AnyView> = list
+        .items
+        .iter()
+        .map(|item| {
+            let inner = render_inline(site, &item.content);
+            let sub = item
+                .sublist
+                .as_ref()
+                .map(|l| render_list(site, l))
+                .unwrap_or_else(|| {
+                    let _: () = view! { <></> };
+                    ().into_any()
+                });
+            view! { <li>{inner}{sub}</li> }.into_any()
+        })
+        .collect();
+    if list.ordered {
+        view! { <ol>{items}</ol> }.into_any()
+    } else {
+        view! { <ul>{items}</ul> }.into_any()
     }
 }
 
@@ -357,7 +407,7 @@ fn collect_grid_cells(content: &Content) -> Vec<&BlockCell> {
 
 fn render_grid_cell(site: &str, cell: &BlockCell) -> AnyView {
     let (class, style) = params_to_class_style(&cell.params);
-    let inner = render_inline(site, &cell.content);
+    let inner = render_inline(site, trim_ws(&cell.content));
     if cell.header {
         view! { <th class=class style=style>{inner}</th> }.into_any()
     } else {

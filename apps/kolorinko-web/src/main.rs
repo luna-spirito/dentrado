@@ -10,6 +10,7 @@
 //! and, for the page, its `slug`) changes. Navigation is client-side
 //! (pushState) so the session and subscriptions stay live across page changes.
 
+mod menu;
 mod router;
 mod wt;
 
@@ -84,7 +85,10 @@ fn layout(client: Rc<WtClient>) -> AnyView {
             <div id="container">
                 <div id="header">
                     <h1><a href="/">{move || site.get().as_ref().to_string_lossy().to_string()}</a></h1>
-                    <div id="top-bar">{move || view_nav(site.get(), nav_top.get())}</div>
+                    <div id="top-bar"
+                        on:mouseover=menu::on_over
+                        on:mouseout=menu::on_out
+                    >{move || view_nav(site.get(), nav_top.get())}</div>
                 </div>
                 <div id="content-wrap">
                     <div id="side-bar">{move || view_nav(site.get(), nav_side.get())}</div>
@@ -122,7 +126,7 @@ fn view_nav(site: kolorinko_rt::SafePathComponent, nav: Option<ArticleView>) -> 
             view! { <>{blocks}</> }.into_any()
         }
         None => {
-            let _: () = view! {};
+            let _: () = view! { <></> };
             ().into_any()
         },
     }

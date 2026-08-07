@@ -50,7 +50,7 @@ use im::HashMap as ImHashMap;
 use kolorinko_rt::SafePathComponent;
 use kolorinko_wikitext::{
     ArticleLatest, ArticleMeta, ArticleView, BlockCell, BlockRow, BlockTable, ContainerKind,
-    Content, Include, ListPages, Node, PageRef, RevMeta, Tab, TableCell, TextObj,
+    Content, Include, List, ListItem, ListPages, Node, PageRef, RevMeta, Tab, TableCell, TextObj,
 };
 use log::error;
 use std::{
@@ -987,6 +987,9 @@ fn collect_include_targets(
                 collect_include_targets(&lp.repeat, current_site, visited, out);
                 collect_include_targets(&lp.append, current_site, visited, out);
             }
+            Node::List(list) => for_each_content_in_list(list, &mut |c| {
+                collect_include_targets(c, current_site, visited, out)
+            }),
             _ => {}
         }
     }
@@ -1076,6 +1079,9 @@ fn substitute_includes(
                 repeat: substitute_includes(lp.repeat, current_site, fetched),
                 append: substitute_includes(lp.append, current_site, fetched),
             })),
+            Node::List(list) => out.push(Node::List(map_list(list, &|c| {
+                substitute_includes(c, current_site, fetched)
+            }))),
             leaf => out.push(leaf),
         }
     }
@@ -1180,6 +1186,7 @@ fn subst_node(node: Node, vars: &HashMap<String, Content>) -> Content {
                 })
                 .collect(),
         )],
+        Node::List(list) => vec![Node::List(map_list(list, &|c| apply_include_vars(c, vars)))],
         Node::Date { .. }
         | Node::HorizontalRule
         | Node::Raw(_)
@@ -1191,10 +1198,42 @@ fn subst_node(node: Node, vars: &HashMap<String, Content>) -> Content {
     }
 }
 
+/// Walk a [`List`], producing a new one whose every item body (and nested
+/// sublist body) is transformed by `f`.
+fn map_list<F: Fn(Content) -> Content>(list: List, f: &F) -> List {
+    List {
+        ordered: list.ordered,
+        items: list
+            .items
+            .into_iter()
+            .map(|item| ListItem {
+                content: f(item.content),
+                sublist: item.sublist.map(|b| Box::new(map_list(*b, f))),
+            })
+            .collect(),
+    }
+}
+
+/// Borrow-walking twin of [`map_list`]: visit every item body in `list` (and
+/// nested sublists) with `f`.
+fn for_each_content_in_list<F: FnMut(&Content)>(list: &List, f: &mut F) {
+    for item in &list.items {
+        f(&item.content);
+        if let Some(sub) = &item.sublist {
+            for_each_content_in_list(sub, f);
+        }
+    }
+}
+
 fn subst_kind(kind: ContainerKind, vars: &HashMap<String, Content>) -> ContainerKind {
     match kind {
-        ContainerKind::Div { inline, params } => ContainerKind::Div {
+        ContainerKind::Div {
             inline,
+            block,
+            params,
+        } => ContainerKind::Div {
+            inline,
+            block,
             params: subst_params(params, vars),
         },
         other => other,
@@ -1491,6 +1530,7 @@ mod tests {
         let div = Node::Container {
             kind: ContainerKind::Div {
                 inline: false,
+                block: true,
                 params: HashMap::from([(
                     "style".to_string(),
                     vec![

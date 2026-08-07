@@ -36,7 +36,7 @@ use std::collections::HashMap;
 
 use crate::wikidot_parser::types::{
     Align, AlignSide, BlockCell, BlockRow, BlockTable, ContainerKind, Content, Include, LinkTarget,
-    ListPages, ListPagesParams, Node, PageRef, TableCell, TextObj, TextStyle,
+    List, ListItem, ListPages, ListPagesParams, Node, PageRef, TableCell, TextObj, TextStyle,
 };
 
 pub mod types;
@@ -393,6 +393,8 @@ fn build_element<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
             bare_http_link(),
             // Line-start-only block constructs.
             line_syntax(element.clone()),
+            // Single-bracket `[url text]` link (must precede the `[[…]]` arm).
+            single_bracket_link(),
             // Bracketed `[[…]]` constructs (and `[[[…]]]` links).
             just('[').ignore_then(just('[').ignore_then(bracket_syntax(element.clone()))),
             // Inline markup: `//`, `**`, `__`, `--`, `^^`, `,,`, `##`, vars.
@@ -442,6 +444,70 @@ fn bare_http_link<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
         })
 }
 
+/// `[url text]` / `[url]` single-bracket link (e.g. `[/ Main]`,
+/// `[http://x click]`). Rejected when preceded by `[` (so the inner bracket of
+/// a `[[\u{2026}]]` construct like `[[toc]]` is not swallowed) and when the `[`
+/// is followed by `[`, `!` (a comment) or `]`.
+fn single_bracket_link<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
+    custom(|inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let full = inp.full_slice();
+        let off = *inp.cursor().inner();
+        let prev = off.checked_sub(1).and_then(|i| full.as_bytes().get(i));
+        let next = full.as_bytes().get(off).copied();
+        let after = full.as_bytes().get(off + 1).copied();
+        if prev == Some(&b'[')
+            || next != Some(b'[')
+            || matches!(
+                after,
+                Some(b'[') | Some(b'!') | Some(b']') | Some(b'\n') | None
+            )
+        {
+            return Err(perr(inp, "not a single-bracket link"));
+        }
+        let _ = inp.next(); // consume '['
+        let rest = &full[*inp.cursor().inner()..];
+        let bytes = rest.as_bytes();
+        let mut url_end = 0;
+        while url_end < bytes.len() && !matches!(bytes[url_end], b' ' | b'\n' | b']') {
+            url_end += 1;
+        }
+        let raw = rest[..url_end].to_string();
+        for _ in 0..url_end {
+            let _ = inp.next();
+        }
+        let text = match inp.peek() {
+            Some(']') => {
+                let _ = inp.next();
+                Vec::new()
+            }
+            Some(' ') => {
+                let _ = inp.next();
+                let rest2 = &full[*inp.cursor().inner()..];
+                let bytes2 = rest2.as_bytes();
+                let mut t_end = 0;
+                while t_end < bytes2.len() && bytes2[t_end] != b']' {
+                    t_end += 1;
+                }
+                let t = rest2[..t_end].trim().to_string();
+                for _ in 0..t_end {
+                    let _ = inp.next();
+                }
+                if matches!(inp.peek(), Some(']')) {
+                    let _ = inp.next();
+                }
+                vec![Node::Text(TextObj::Plain(t))]
+            }
+            _ => Vec::new(),
+        };
+        let target = parse_link_target(&raw);
+        let text = if text.is_empty() {
+            vec![Node::Text(TextObj::Plain(raw))]
+        } else {
+            text
+        };
+        Ok(Node::Link { target, text })
+    })
+}
 // =========================================================================
 // Line-start block constructs
 // =========================================================================
@@ -455,7 +521,8 @@ fn line_syntax<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
         hr(),
         table_block(element.clone()),
         blockquote(element.clone()),
-        centered_line(element),
+        centered_line(element.clone()),
+        list_block(element),
     )))
 }
 
@@ -618,10 +685,124 @@ fn centered_line<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
             content,
         })
 }
+/// `* item` / `# item` bullet lists, nestable by leading-space indentation.
+/// Consecutive lines (one or more) form the list; a line without a marker
+/// (or non-increasing indentation) ends it. Each item's body is parsed as
+/// inline markup; deeper-indented lines become a [`ListItem::sublist`].
+fn list_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+    element: P,
+) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
+    custom(move |inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let element = element.clone();
+        let mut lines: Vec<(usize, bool, Content)> = Vec::new();
+        loop {
+            let full = inp.full_slice();
+            let off = *inp.cursor().inner();
+            let at_ls = off == 0 || full.as_bytes().get(off - 1) == Some(&b'\n');
+            if !at_ls {
+                break;
+            }
+            let rest = &full[off..];
+            // Count leading indentation: a regular space or a non-breaking
+            // space (U+00A0) — Wikidot authors indent sub-items with NBSP.
+            let mut chars = rest.chars();
+            let mut indent = 0;
+            let mut peek = chars.next();
+            while matches!(peek, Some(' ') | Some('\u{00A0}')) {
+                indent += 1;
+                peek = chars.next();
+            }
+            let ordered = match peek {
+                Some('*') => false,
+                Some('#') => true,
+                _ => break,
+            };
+            // `##color##` and `**bold**` are inline markup, not lists: a marker
+            // immediately followed by the same character is not a list item.
+            if chars.next() == peek {
+                break;
+            }
+            for _ in 0..(indent + 1) {
+                let _ = inp.next();
+            }
+            while matches!(inp.peek(), Some(' ') | Some('\u{00A0}')) {
+                let _ = inp.next();
+            }
+            let content = inp
+                .parse(content_before(element.clone(), line_end()))
+                .unwrap_or_default();
+            let _ = inp.parse(line_end());
+            lines.push((indent, ordered, content));
+        }
+        if lines.is_empty() {
+            return Err(perr(inp, "expected list"));
+        }
+        Ok(Node::List(build_list(&lines)))
+    })
+}
+
+/// Fold flat indented list lines into a nested [`List`]. Lines at the minimum
+/// indent are top-level items; each is followed by its deeper-indented run
+/// (which becomes the item's `sublist`).
+fn build_list(lines: &[(usize, bool, Content)]) -> List {
+    let root_indent = lines[0].0;
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let (_, _, content) = &lines[i];
+        let mut child: Vec<(usize, bool, Content)> = Vec::new();
+        let mut j = i + 1;
+        while j < lines.len() && lines[j].0 > root_indent {
+            child.push((lines[j].0, lines[j].1, lines[j].2.clone()));
+            j += 1;
+        }
+        let sublist = if child.is_empty() {
+            None
+        } else {
+            Some(Box::new(build_list(&child)))
+        };
+        items.push(ListItem {
+            content: content.clone(),
+            sublist,
+        });
+        i = j;
+    }
+    List {
+        ordered: lines[0].1,
+        items,
+    }
+}
 
 // =========================================================================
 // Bracketed `[[…]]` syntax
 // =========================================================================
+
+/// `[[a href="url" …]] body [[/a]]` — an explicit anchor. The `href` attribute
+/// is used verbatim (no site-prefixing); the body is inline wikitext.
+fn anchor_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+    element: P,
+) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
+    let close = tag_close("a").to(ContentExitReason::Eof);
+    kw_ci("a".to_string())
+        .ignore_then(params_block())
+        .then_ignore(spaces())
+        .then_ignore(just("]]"))
+        .then(content_until(element, close))
+        .map(|(params, (content, _))| {
+            let href = params
+                .get("href")
+                .and_then(|v| v.first())
+                .and_then(|t| match t {
+                    TextObj::Plain(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "#".to_string());
+            Node::Link {
+                target: LinkTarget::Url(href),
+                text: content,
+            }
+        })
+}
 
 /// Dispatch over everything that can follow `[[`.
 fn bracket_syntax<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
@@ -631,6 +812,7 @@ fn bracket_syntax<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
         // `[[[target|text]]]` / `[[[target]]]`. The third `[` is consumed here.
         just('[').ignore_then(link(element.clone())),
         div_span_block(element.clone()),
+        anchor_block(element.clone()),
         grid_table_block(element.clone()),
         grid_cell_block(element.clone()),
         align_block(element.clone()),
@@ -666,14 +848,15 @@ fn link<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
 fn div_span_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
     element: P,
 ) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
-    let div = container_open("div")
+    let div = div_open()
         .then(content_until(
             element.clone(),
             closing_tag(ClosedTag::Div).to(ContentExitReason::EndOfTag(ClosedTag::Div)),
         ))
-        .map(|(params, (content, _))| Node::Container {
+        .map(|((underscore, params), (content, _))| Node::Container {
             kind: ContainerKind::Div {
                 inline: false,
+                block: !underscore,
                 params,
             },
             content,
@@ -686,11 +869,23 @@ fn div_span_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
         .map(|(params, (content, _))| Node::Container {
             kind: ContainerKind::Div {
                 inline: true,
+                block: false,
                 params,
             },
             content,
         });
     div.or(span)
+}
+
+/// `[[div _? params ]]` open tag, returning whether the `div_` (no-paragraph)
+/// underscore was present and the attribute map.
+fn div_open<'a>()
+-> impl Parser<'a, In<'a>, (bool, HashMap<String, Vec<TextObj>>), E<'a>> + Clone + 'a {
+    kw_ci("div".to_string())
+        .ignore_then(just('_').or_not().map(|opt| opt.is_some()))
+        .then(params_block())
+        .then_ignore(spaces())
+        .then_ignore(just("]]"))
 }
 
 /// `[[table …]] … [[row …]] … [[/row]] … [[/table]]` grid table. The leading
@@ -870,6 +1065,7 @@ fn collapsible_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
         .map(|(content, _)| Node::Container {
             kind: ContainerKind::Div {
                 inline: false,
+                block: true,
                 params: [(
                     "class".to_string(),
                     vec![TextObj::Plain("collapsible-block".to_string())],
@@ -2142,10 +2338,16 @@ mod tests {
         let Node::Container { kind, content } = &c[0] else {
             panic!("expected container, got {c:#?}");
         };
-        let ContainerKind::Div { inline, params } = kind else {
+        let ContainerKind::Div {
+            inline,
+            block,
+            params,
+        } = kind
+        else {
             panic!("expected div, got {kind:#?}");
         };
         assert!(!inline);
+        assert!(block);
         assert_eq!(
             params
                 .get("class")
@@ -2164,6 +2366,38 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn nested_bullet_list_nbsp_indent() {
+        // Sub-items indented with a non-breaking space (U+00A0), as in
+        // rpcauthority's nav:top. `##color##` must not be mistaken for a list.
+        let c = parse("* parent\n\u{00A0}* child1\n\u{00A0}* child2\n* sibling\n##ff0000|red##");
+        let txt = |content: &Content| -> String {
+            content
+                .iter()
+                .filter_map(|n| match n {
+                    Node::Text(TextObj::Plain(s)) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let list = c
+            .iter()
+            .filter_map(|n| match n {
+                Node::List(l) => Some(l),
+                _ => None,
+            })
+            .next()
+            .expect("a list");
+        assert!(!list.ordered);
+        assert_eq!(list.items.len(), 2); // parent, sibling
+        let parent = &list.items[0];
+        assert_eq!(txt(&parent.content), "parent");
+        let sub = parent.sublist.as_ref().expect("sublist");
+        assert_eq!(sub.items.len(), 2);
+        assert_eq!(txt(&sub.items[0].content), "child1");
+        assert_eq!(txt(&list.items[1].content), "sibling");
     }
 
     #[test]

@@ -71,12 +71,14 @@ pub enum ContainerKind {
     /// PureScript `KunStil`.
     Style(TextStyle),
 
-    /// `[[div …]]` (`inline == false`, block) or `[[span …]]` (`inline == true`,
-    /// inline) with arbitrary `key="value"` attributes. Attribute values may
-    /// contain variable references, hence `Vec<TextObj>`. PureScript
-    /// `Div { lin }`.
+    /// `[[div …]]`, `[[div_ …]]` or `[[span …]]` with arbitrary `key="value"`
+    /// attributes. `inline` selects the tag (`<span>` when true, `<div>` when
+    /// false). `block` selects whether the body is auto-paragraphed: `[[div]]`
+    /// paragraphs (`true`); `[[div_]]` and `[[span]]` render inline (`false`).
+    /// Attribute values may contain variable references, hence `Vec<TextObj>`.
     Div {
         inline: bool,
+        block: bool,
         params: HashMap<String, Vec<TextObj>>,
     },
 
@@ -231,6 +233,27 @@ pub enum Node {
     /// `[[code]] … [[/code]]` — verbatim preformatted source (not parsed as
     /// wikitext). Rendered as Wikidot's `<div class="code"><pre><code>…` block.
     Code(String),
+
+    /// `* item` / `# item` bullet list, nestable by indentation. PureScript
+    /// `Listo`.
+    List(List),
+}
+
+/// A bullet (`*`, `<ul>`) or numbered (`#`, `<ol>`) list. Items are
+/// homogeneous in marker within one list; nesting is expressed via
+/// [`ListItem::sublist`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct List {
+    pub ordered: bool,
+    pub items: Vec<ListItem>,
+}
+
+/// One entry of a [`List`]. The item's own text lives in `content`; deeper
+/// items (more indented in the source) form `sublist`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListItem {
+    pub content: Content,
+    pub sublist: Option<Box<List>>,
 }
 
 /// One cell of a [`Node::Table`]. Corresponds to PureScript `TabelEl`.
