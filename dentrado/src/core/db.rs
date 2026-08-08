@@ -406,12 +406,14 @@ async fn core_event_loop<R: IsRuntime, S: Storage<R>>(
             }
         }
 
-        // 2. Drain inter-core SPSC channels
-        for rx in &intercore_rxs {
+        // 2. Drain inter-core SPSC channels. The channel index *is* the sender's
+        //    core id, so the handlers learn the sender from it (no `from_core`
+        //    field needed on shared messages).
+        for (from_core, rx) in intercore_rxs.iter().enumerate() {
             loop {
                 match rx.try_recv() {
                     Ok(msg) => {
-                        state.handle_intercore_msg(msg).await;
+                        state.handle_intercore_msg(msg, from_core as u32).await;
                         did_work = true;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,

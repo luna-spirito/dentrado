@@ -60,18 +60,10 @@ fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
             let page_sub = page_q.subscribe(&core).await;
             let nav_top_sub = nav_top_q.subscribe(&core).await;
             let nav_side_sub = nav_side_q.subscribe(&core).await;
-            let res = (|| -> anyhow::Result<(ArticleView, ArticleView, ArticleView)> {
-                let ship = |out: dentrado::core::gear::GearResult<KolorinkoRT>| {
-                    out.into_ship().ok_or_else(|| {
-                        anyhow::anyhow!("article_latest produced a local (non-shippable) output")
-                    })
-                };
-                let page = (page_q.getter)(ship(page_sub.current())?);
-                let nav_top = (nav_top_q.getter)(ship(nav_top_sub.current())?);
-                let nav_side = (nav_side_q.getter)(ship(nav_side_sub.current())?);
-                Ok((page, nav_top, nav_side))
-            })();
-            let _ = tx.send(res);
+            let page = (page_q.getter)(page_sub.current());
+            let nav_top = (nav_top_q.getter)(nav_top_sub.current());
+            let nav_side = (nav_side_q.getter)(nav_side_sub.current());
+            let _ = tx.send(Ok((page, nav_top, nav_side)));
         }
     };
 

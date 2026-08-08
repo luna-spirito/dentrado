@@ -3,7 +3,7 @@ use std::{fmt::Debug, num::NonZero};
 use dentrado::{
     core::{
         core_ctx::GearCtx,
-        gear::{GearInput, GearMeta, GearResult, IsRuntime},
+        gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime},
         storage::{CacheSer, InMemoryStorage, PageId, Storage},
     },
     types::*,
@@ -212,6 +212,7 @@ pub struct Wiki2Runtime;
 impl IsRuntime for Wiki2Runtime {
     type GearId = Wiki2Gear;
     type GearOut = Wiki2GearOut;
+    type GearOutShared = ();
     type GearOutLocal = ();
     type Module = ();
     type Group = Wiki2Group;
@@ -253,11 +254,13 @@ impl IsRuntime for Wiki2Runtime {
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
         cache: &mut Self::GearCache<S::Watermark>,
-    ) -> GearResult<Self> {
+    ) -> GearProduce<Self> {
         let GearInput::Events(group) = input else {
             return match cache {
-                Wiki2Cache::Invited(c) => GearResult::Ship(Wiki2GearOut::Invited(c.sg.as_writes())),
-                Wiki2Cache::DocContent(c) => GearResult::Ship(Wiki2GearOut::DocContent {
+                Wiki2Cache::Invited(c) => {
+                    GearProduce::Ship(Wiki2GearOut::Invited(c.sg.as_writes()))
+                }
+                Wiki2Cache::DocContent(c) => GearProduce::Ship(Wiki2GearOut::DocContent {
                     anchors: c.anchors.clone(),
                     text: c.sg.as_writes(),
                 }),
@@ -340,7 +343,7 @@ impl IsRuntime for Wiki2Runtime {
 
                 c.watermark = watermark;
 
-                GearResult::Ship(Wiki2GearOut::Invited(c.sg.as_writes()))
+                GearProduce::Ship(Wiki2GearOut::Invited(c.sg.as_writes()))
             }
             (Wiki2Gear::DocContent { .. }, Wiki2Cache::DocContent(c)) => {
                 let diff = ctx.storage().diff_group(group, c.watermark.clone()).await;
@@ -459,7 +462,7 @@ impl IsRuntime for Wiki2Runtime {
 
                 c.watermark = watermark;
 
-                GearResult::Ship(Wiki2GearOut::DocContent {
+                GearProduce::Ship(Wiki2GearOut::DocContent {
                     anchors: c.anchors.clone(),
                     text: c.sg.as_writes(),
                 })

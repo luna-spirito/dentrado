@@ -4,7 +4,7 @@ use std::{
     fmt::Debug,
     num::NonZero,
     ops::Deref,
-    rc::Rc,
+    rc::{Rc, Weak},
     sync::{Arc, mpsc},
     time::Duration,
 };
@@ -17,7 +17,8 @@ use crate::{
     core::{
         db,
         doorbell::DoorbellHandle,
-        gear::{GearInput, GearMeta, GearResult, IsRuntime},
+        gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime},
+        shared::{RemoteShared, Shared, SharedArena, SharedBus, SharedData, SharedKey},
         storage::{GroupStore, Storage},
     },
     types::{GlobalCoreId, GlobalHash, LocGroupId, NodeId},
@@ -106,6 +107,26 @@ pub(crate) enum InterCoreMsg<R: IsRuntime> {
         gear: R::GearId,
         output: R::GearOut,
         wire_ctx: Arc<WireLocCtx<R>>,
+    },
+    /// Cross-core push of a **shared** gear's output: a raw pointer to the
+    /// owner core's immutable payload (`SharedData`), already cross-core
+    /// retained there (the owner bumped the arena `xcount` for this push), plus
+    /// the opaque [`SharedKey`] the receiver echoes back on unref. The receiver
+    /// knows the sender — and thus the allocation's owner — from the channel the
+    /// message arrived on, so no `from_core` is carried. The receiver wraps
+    /// `data`/`key` in a foreign [`Shared`] handle whose `owner` is that sender.
+    SubscriptionUpdateShared {
+        gear: R::GearId,
+        data: RemoteShared<SharedData<R>>,
+        key: SharedKey,
+        wire_ctx: Arc<WireLocCtx<R>>,
+    },
+    /// A foreign core dropped the **last** of its local handles to one of this
+    /// core's allocations: release that core's cross-core claim (`xcount -= 1`,
+    /// freeing on zero). No retain counterpart exists: a foreign core can only
+    /// drop a claim it already holds.
+    SharedUnref {
+        key: SharedKey,
     },
     StopSubscription {
         /// The session id from the matching [`InterCoreMsg::StartSubscription`].
@@ -276,6 +297,11 @@ pub struct Core<R: IsRuntime, S: Storage<R>> {
     /// localization, the event log, and the gear cache (keyed by `R::GearId`).
     storage: S,
     inner: RefCell<CoreLocCtx<R>>,
+    /// Owner-local generational arena of cross-core refcounts for [`Shared`]
+    /// outputs (`xcount`), kept separate from the immutable payload so refcount
+    /// churn never bounces the payload's cache line. Mutated only on this core's
+    /// thread.
+    shared_arena: RefCell<SharedArena<R>>,
 }
 
 impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
@@ -304,6 +330,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
             doorbells,
             inter_node_peers,
             storage,
+            shared_arena: RefCell::new(SharedArena::new()),
             inner: RefCell::new(CoreLocCtx {
                 gears: SlotMap::with_key(),
                 gear_index: HashMap::new(),
@@ -521,10 +548,13 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 gear: gear_id.clone(),
                 deps: RefCell::new(HashSet::new()),
             };
-            let output = R::run_step(&mut ctx, input, &mut cache).await;
+            let produce = R::run_step(&mut ctx, input, &mut cache).await;
 
-            // Persist the cache, then write output + reconcile dep edges.
+            // Persist the cache, then install the fresh output (a `Shared`
+            // produce is boxed + refcounted here; `Ship`/`Local` pass through)
+            // and reconcile dep edges.
             self.storage.put_cache(gear_id.clone(), cache).await;
+            let output = self.install_produce(produce);
 
             let (removed_deps, dependents, remote_subs, do_rerun) = {
                 let mut inner = self.inner.borrow_mut();
@@ -590,6 +620,11 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 GearResult::Ship(o) => {
                     for target in &remote_subs {
                         self.push_remote_update(&gear_id, o, *target).await;
+                    }
+                }
+                GearResult::Shared(s) => {
+                    for target in &remote_subs {
+                        self.push_remote_update_shared(&gear_id, s, *target).await;
                     }
                 }
                 GearResult::Local(_) => {
@@ -900,6 +935,73 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
         self.doorbells[target as usize].ring();
     }
 
+    /// Install a fresh [`GearProduce`] into its stored [`GearResult`]: a
+    /// `Shared` produce is boxed into an immutable [`SharedData`] payload and
+    /// registered in this core's [`SharedArena`] (`xcount = 1`, this handle),
+    /// then wrapped in an owner-local [`Shared`]; `Ship`/`Local` pass through
+    /// unchanged.
+    fn install_produce(self: &Rc<Self>, produce: GearProduce<R>) -> GearResult<R> {
+        match produce {
+            GearProduce::Ship(o) => GearResult::Ship(o),
+            GearProduce::Local(o) => GearResult::Local(o),
+            GearProduce::Shared(v) => {
+                let data = SharedData::new(v);
+                let key = self.shared_arena.borrow_mut().insert(data);
+                GearResult::Shared(Shared::new_owner(
+                    data,
+                    key,
+                    self.shared_bus(),
+                    self.core_id,
+                ))
+            }
+        }
+    }
+
+    /// The owner side of shipping a shared output to a subscriber: bump the
+    /// cross-core refcount (arena `xcount += 1`, direct — we are the owner)
+    /// *before* sending (one more core will hold a claim), then push both the
+    /// immutable payload pointer and the unref key as a
+    /// `SubscriptionUpdateShared`.
+    async fn push_remote_update_shared(
+        self: &Rc<Self>,
+        gear: &R::GearId,
+        shared: &Shared<R>,
+        target: u32,
+    ) {
+        let data = shared.data();
+        let key = shared.key();
+        self.shared_arena.borrow_mut().inc(key);
+        let (gear_wire, wire_ctx) = self.build_gear_wire(gear).await;
+        let _ = self.intercore_tx[target as usize].send(InterCoreMsg::SubscriptionUpdateShared {
+            gear: gear_wire,
+            data: RemoteShared::from_ptr(data),
+            key,
+            wire_ctx,
+        });
+        self.doorbells[target as usize].ring();
+    }
+
+    /// Wrap a freshly-received foreign payload as a [`Shared`] handle on this
+    /// core. The owner already retained it for this push; this handle's `Drop`
+    /// sends the balancing `SharedUnref`.
+    fn shared_from_remote(
+        self: &Rc<Self>,
+        data: RemoteShared<SharedData<R>>,
+        key: SharedKey,
+        owner: u32,
+    ) -> Shared<R> {
+        Shared::new_foreign(data.as_ptr(), key, self.shared_bus(), owner)
+    }
+
+    /// `Weak<dyn SharedBus>` view of this core — how a [`Shared`] handle minted
+    /// here routes an unref to its owner. `Weak` (not `Rc`) breaks the
+    /// `Core → ActiveGear → Shared → Core` cycle, and `std::rc::Weak::upgrade`
+    /// is non-atomic.
+    fn shared_bus(self: &Rc<Self>) -> Weak<dyn SharedBus> {
+        let bus: Rc<dyn SharedBus> = self.clone();
+        Rc::downgrade(&bus)
+    }
+
     /// Rebalance a gear by its arena key. Any `StopSubscription` messages
     /// produced by cascade evictions are emitted directly by `CoreLocCtx` via
     /// the borrowed [`StopCtx`] (channels/doorbells/core id) — no `Vec` of
@@ -1043,7 +1145,11 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
         }
     }
 
-    pub(crate) async fn handle_intercore_msg(self: &Rc<Self>, msg: InterCoreMsg<R>) {
+    pub(crate) async fn handle_intercore_msg(
+        self: &Rc<Self>,
+        msg: InterCoreMsg<R>,
+        from_core: u32,
+    ) {
         match msg {
             InterCoreMsg::Op(op) => self.handle_client_op(op).await,
             InterCoreMsg::StartSubscription {
@@ -1077,11 +1183,15 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                     let output = this.wait_for_output_unpinned(key).await.expect(
                         "StartSubscription: gear evicted while a remote subscriber was attached",
                     );
-                    // A remote subscription can only be satisfied by a shippable
-                    // output; a `Local` gear reached this way is a routing bug.
+                    // A remote subscription is satisfied by a shippable or a
+                    // shared output; a `Local` gear reached this way is a
+                    // routing bug.
                     match &output {
                         GearResult::Ship(o) => {
                             this.push_remote_update(&gear, o, from_core).await;
+                        }
+                        GearResult::Shared(s) => {
+                            this.push_remote_update_shared(&gear, s, from_core).await;
                         }
                         GearResult::Local(_) => {
                             debug_assert!(
@@ -1124,6 +1234,45 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 };
                 for dep in dependents {
                     self.kick_loc_gear(dep);
+                }
+            }
+            InterCoreMsg::SubscriptionUpdateShared {
+                gear,
+                data,
+                key,
+                wire_ctx,
+            } => {
+                let gear = {
+                    let mut merger = WireLocCtxMerger::new(&wire_ctx, &self.storage);
+                    merger
+                        .remap(gear)
+                        .await
+                        .expect("SubscriptionUpdateShared: failed to localize gear")
+                };
+                let shared = self.shared_from_remote(data, key, from_core);
+                let dependents = {
+                    let mut inner = self.inner.borrow_mut();
+                    let Some(key) = inner.gear_index.get(&gear).copied() else {
+                        return;
+                    };
+                    let Some(ag) = inner.gears.get_mut(key) else {
+                        return;
+                    };
+                    ag.output = Some(GearResult::Shared(shared));
+                    ag.changed.notify_all();
+                    ag.local_dependents.iter().copied().collect::<Vec<_>>()
+                };
+                for dep in dependents {
+                    self.kick_loc_gear(dep);
+                }
+            }
+            InterCoreMsg::SharedUnref { key } => {
+                // Owner thread: release one cross-core claim, reclaim payload on
+                // zero (after the arena borrow is released, so the payload's own
+                // `Drop` can never reenter the arena).
+                let data = self.shared_arena.borrow_mut().dec(key);
+                if let Some(data) = data {
+                    SharedData::<R>::reclaim(data);
                 }
             }
             InterCoreMsg::StopSubscription { session, from_core } => {
@@ -1506,6 +1655,25 @@ struct StopCtx<'a, R: IsRuntime> {
     intercore_tx: &'a [mpsc::Sender<InterCoreMsg<R>>],
     doorbells: &'a [DoorbellHandle],
     core_id: u32,
+}
+
+/// How a [`Shared`] handle on this core, on dropping its core's *last* local
+/// reference, releases that core's cross-core claim: an **owner** handle hits
+/// the arena directly; a **foreign** handle forwards a `SharedUnref` over the
+/// inter-core channel (FIFO per core-pair ⇒ unrefs from one core land in order,
+/// so the owner's `xcount` never goes negative).
+impl<R: IsRuntime, S: Storage<R>> SharedBus for Core<R, S> {
+    fn shared_local_unref(&self, key: SharedKey) {
+        let data = self.shared_arena.borrow_mut().dec(key);
+        if let Some(data) = data {
+            SharedData::<R>::reclaim(data);
+        }
+    }
+
+    fn shared_unref(&self, owner: u32, key: SharedKey) {
+        let _ = self.intercore_tx[owner as usize].send(InterCoreMsg::SharedUnref { key });
+        self.doorbells[owner as usize].ring();
+    }
 }
 
 impl<R: IsRuntime> CoreLocCtx<R> {

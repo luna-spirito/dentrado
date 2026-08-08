@@ -1,8 +1,9 @@
-use std::{fmt::Debug, hash::Hash, num::NonZero};
+use std::{fmt::Debug, hash::Hash, num::NonZero, ops::Deref, rc::Rc};
 
 use crate::{
     core::{
         core_ctx::{Core, GearCtx, Subscription},
+        shared::Shared,
         storage::Storage,
     },
     types::{GlobalHash, LocGroupId, LocMsgTypeId, Localizable},
@@ -75,25 +76,43 @@ pub enum GearInput<R: IsRuntime> {
     Follow { out: GearResult<R> },
 }
 
-/// The result of running a gear, tagging whether the output is **shippable**
-/// across cores ([`Ship`](GearResult::Ship) — `R::GearOut`, which is
-/// `Send + Localizable`) or **pinned to its owning core**
-/// ([`Local`](GearResult::Local) — `R::GearOutLocal`, which is *not* required
-/// to be `Send` or [`Localizable`]).
-///
-/// This is what [`IsRuntime::run_step`] returns and what flows through every
-/// on-core path (`ActiveGear::output`, `secondary_get`, [`GearInput::Follow`],
-/// the worker read APIs). The cross-core/wire boundary carries only `R::GearOut`
-/// — extracted via [`GearResult::into_ship`] — so a `Local` output physically
-/// cannot enter a `Send`-typed channel (`InterCoreMsg`, the `RunGear` reply).
-///
-/// `Clone`/`Debug` are implemented manually (not derived) so they don't add a
-/// spurious `R: Clone`/`R: Debug` bound beyond what [`IsRuntime`] already
-/// requires; only the associated output types need it.
-pub enum GearResult<R: IsRuntime> {
-    /// A shippable output — crosses cores, is `Send + Localizable`.
+/// The fresh output of one `run_step` — what the gear *produces*. Distinct
+/// from [`GearResult`] (the *stored* form) only in the `Shared` arm: a gear
+/// produces an owned `R::GearOutShared`, which the core then heap-allocates and
+/// refcounts into a [`Shared`] handle. `Ship`/`Local` are their own stored form.
+/// Never cloned: produced once per run and immediately installed.
+pub enum GearProduce<R: IsRuntime> {
     Ship(R::GearOut),
-    /// A core-local output — never serialized, never sent across a thread.
+    Shared(R::GearOutShared),
+    Local(R::GearOutLocal),
+}
+
+impl<R: IsRuntime> Debug for GearProduce<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ship(o) => f.debug_tuple("Ship").field(o).finish(),
+            Self::Shared(o) => f.debug_tuple("Shared").field(o).finish(),
+            Self::Local(o) => f.debug_tuple("Local").field(o).finish(),
+        }
+    }
+}
+
+/// The **stored** form of a gear output — what lives in `ActiveGear::output`,
+/// flows through [`GearInput::Follow`], and is handed out by `secondary_get` /
+/// the worker read APIs.
+///
+/// Three families, distinguished by how the value is shared:
+/// - [`Ship`](GearResult::Ship) — cheaply-cloned, `Send + Localizable`. Crosses
+///   cores by value (one clone per subscriber core).
+/// - [`Shared`](GearResult::Shared) — opaque `Sync` monolith, read by reference.
+///   Crosses cores by raw pointer to the *same* allocation ([`RemoteShared`]).
+/// - [`Local`](GearResult::Local) — pinned to its owning core, `!Send`.
+///
+/// `Clone`/`Debug` are manual (not derived) so they add no `R: Clone`/`R: Debug`
+/// bound beyond what [`IsRuntime`] requires.
+pub enum GearResult<R: IsRuntime> {
+    Ship(R::GearOut),
+    Shared(Shared<R>),
     Local(R::GearOutLocal),
 }
 
@@ -101,6 +120,7 @@ impl<R: IsRuntime> Clone for GearResult<R> {
     fn clone(&self) -> Self {
         match self {
             Self::Ship(o) => Self::Ship(o.clone()),
+            Self::Shared(s) => Self::Shared(s.clone()),
             Self::Local(o) => Self::Local(o.clone()),
         }
     }
@@ -110,6 +130,7 @@ impl<R: IsRuntime> Debug for GearResult<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Ship(o) => f.debug_tuple("Ship").field(o).finish(),
+            Self::Shared(s) => f.debug_tuple("Shared").field(s).finish(),
             Self::Local(o) => f.debug_tuple("Local").field(o).finish(),
         }
     }
@@ -117,25 +138,27 @@ impl<R: IsRuntime> Debug for GearResult<R> {
 
 impl<R: IsRuntime> GearResult<R> {
     /// The shippable payload, if this is a [`Ship`](GearResult::Ship) result.
-    /// Used at the cross-core boundary to extract the value that actually goes
-    /// on the wire / through the `RunGear` reply channel.
     pub fn into_ship(self) -> Option<R::GearOut> {
         match self {
             Self::Ship(o) => Some(o),
-            Self::Local(_) => None,
+            Self::Local(_) | Self::Shared(_) => None,
         }
     }
 
-    /// The shippable payload, panicking if this is a `Local` result. For tests
-    /// and call sites that statically know the gear is shippable.
-    ///
-    /// # Panics
-    ///
-    /// If this is a [`Local`](GearResult::Local) result.
+    /// The shared handle, if this is a [`Shared`](GearResult::Shared) result.
+    pub fn into_shared(self) -> Option<Shared<R>> {
+        match self {
+            Self::Shared(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The shippable payload, panicking otherwise. For call sites that
+    /// statically know the gear is shippable.
     pub fn expect_ship(self) -> R::GearOut {
         match self {
             Self::Ship(o) => o,
-            Self::Local(_) => panic!("expected a shippable GearResult, got Local"),
+            _ => panic!("expected a shippable GearResult"),
         }
     }
 }
@@ -144,6 +167,16 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
     type GearId: Debug + Hash + Eq + Clone + Send + 'static + Localizable;
 
     type GearOut: Debug + Clone + Send + 'static + Localizable;
+
+    /// An opaque, `Sync` output shared **by reference** across consumers and
+    /// cores (the `Shared` family). The runtime treats it as a monolith: it
+    /// never inspects or clones the value, only heap-allocates it once and
+    /// hands out refcounted [`Shared`] handles (raw pointer across cores).
+    /// Need not be `Clone` (the core never copies it) nor `Localizable` (it
+    /// crosses cores by pointer, not by serialized value). `Sync` is required
+    /// so a foreign core may read the shared allocation.
+    type GearOutShared: Debug + Sync + 'static; // TODO: CRITICAL: We need a new marker constraint here to describe the situation
+    // "this value doesn't need localization"
 
     /// Output of a gear that is **pinned to its owning core**: it never crosses
     /// a thread or core boundary, so (unlike [`GearOut`](IsRuntime::GearOut))
@@ -188,18 +221,20 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
         cache: &mut Self::GearCache<S::Watermark>,
-    ) -> GearResult<Self>;
+    ) -> GearProduce<Self>;
 }
 
 /// A deferred, composable read against a gear's output — the typed layer over
-/// the raw `GearCtx::secondary_get` (which returns an untyped `GearOut`).
+/// the raw [`GearCtx::secondary_get`] (which returns an untyped [`GearResult`]).
 ///
 /// `id` names the gear (with its id fields); `getter` extracts `Out` out of the
-/// matching shippable `GearOut` variant. The `#[gears]` macro pairs them per
-/// variant, so by construction `getter` is always fed the variant it matches —
-/// the `unreachable!` arm in it is a defensive invariant, not an expected path.
-/// Local (`#[gear(local)]`) outputs are deliberately outside this layer: they
-/// have no builder and are read only through `follow` gears.
+/// stored [`GearResult`]. The `#[gears]` macro pairs them per gear, so by
+/// construction `getter` is always fed the family it matches — the
+/// `unreachable!` arm in it is a defensive invariant, not an expected path.
+/// For a shippable gear `Out` is an owned value (peeled out of the `Ship` arm);
+/// for a `#[gear(shared)]` gear `Out` is [`SharedView<R, T>`] (built from the
+/// `Shared` arm). Local (`#[gear(local)]`) outputs are deliberately outside
+/// this layer: they have no builder and are read only through `follow` gears.
 ///
 /// Built by the `#[gears]` macro as one fn per gear, e.g.
 /// `pub fn repo(repo_meta: RepoMeta) -> GearQuery<R, Arc<RepoData>>`; methods
@@ -207,12 +242,13 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
 pub struct GearQuery<R: IsRuntime, Out> {
     /// Queried gear.
     pub id: R::GearId,
-    /// Getter that extracts `Out` out of the gear's **shippable** output.
-    /// `GearQuery` is the typed `secondary_get` layer, and that layer only
-    /// ever sees `R::GearOut` — a `Local` output is pinned to its core and is
-    /// reachable only through the `follow` mechanism. Must be used with the
-    /// response provided by `id`, else panics.
-    pub getter: fn(R::GearOut) -> Out,
+    /// Extracts `Out` out of the gear's **stored** result ([`GearResult`]).
+    /// For a shippable gear `Out` is owned, peeled from the `Ship` arm; for a
+    /// shared gear `Out` is [`SharedView<R, T>`], built from the `Shared` arm.
+    /// A `Local` result is never fed here — a `Local` output is pinned to its
+    /// core and reachable only through `follow`; the getter's defensive arm
+    /// panics if one somehow arrives.
+    pub getter: fn(GearResult<R>) -> Out,
 }
 
 // Manual (not derived) so we don't add `Out: Clone` / `R: Clone` bounds: the
@@ -229,30 +265,62 @@ impl<R: IsRuntime, Out> Clone for GearQuery<R, Out> {
 
 impl<R: IsRuntime, Out> GearQuery<R, Out> {
     /// Declare a dependency on this gear's output and pull its current value
-    /// (awaiting it if not yet computed) — the raw `GearCtx::secondary_get`
-    /// followed by the per-variant extraction. Only shippable outputs can be
-    /// reached this way: a `Local` result is a routing bug (it should have been
-    /// read through a `follow` gear on its own core).
-    pub async fn secondary_get<S: Storage<R>>(&self, ctx: &GearCtx<R, S>) -> Out
-    where
-        Out: Send,
-    {
+    /// (awaiting it if not yet computed) — the raw [`GearCtx::secondary_get`]
+    /// followed by the getter's per-family extraction. A `Local` result never
+    /// reaches here: it is a routing bug (a `Local` output should be read
+    /// through a `follow` gear on its own core), so the getter's defensive arm
+    /// panics.
+    pub async fn secondary_get<S: Storage<R>>(&self, ctx: &GearCtx<R, S>) -> Out {
         let out = ctx.secondary_get(self.id.clone()).await;
-        (self.getter)(
-            out.into_ship()
-                .expect("secondary_get: local gear output reached through the typed query layer"),
-        )
+        (self.getter)(out)
     }
 
     /// Subscribe to this gear's output (worker-facing push mode). The id is
     /// owned internally, so the caller never names the concrete `R::GearId`
     /// type. The returned [`Subscription`] yields raw [`GearResult`]s; the
     /// per-variant extraction is up to the caller (e.g. via [`GearOut`]).
-    pub async fn subscribe<S: Storage<R>>(
-        &self,
-        core: &std::rc::Rc<Core<R, S>>,
-    ) -> Subscription<R, S> {
+    pub async fn subscribe<S: Storage<R>>(&self, core: &Rc<Core<R, S>>) -> Subscription<R, S> {
         core.subscribe_gear(self.id.clone()).await
+    }
+}
+
+/// The borrow-returning `Out` of a shared [`GearQuery`]: an owned refcounted
+/// handle ([`Shared<R>`]) that [`Deref`]s to a projected `&Out` of the shared
+/// value. Built by the getter of `GearQuery<R, SharedView<R, T>>`.
+///
+/// [`GearQuery::secondary_get`] cannot return a borrow tied to the core's
+/// internals, so it returns this owned handle instead — the borrow stays valid
+/// for as long as the caller holds the `SharedView`, and dropping it releases
+/// the refcount (a cheap local decrement). `Clone` is likewise a local
+/// refcount bump (never an inter-core message); `Deref` projects inside
+/// `R::GearOutShared` via the stored fn.
+pub struct SharedView<R: IsRuntime, Out> {
+    /// The refcounted handle backing the borrow.
+    pub inner: Shared<R>,
+    /// Per-variant projection `&GearOutShared → &Out`; borrows from the shared
+    /// allocation, valid for any lifetime the caller requests.
+    pub project: for<'a> fn(&'a R::GearOutShared) -> &'a Out,
+}
+
+impl<R: IsRuntime, Out> Clone for SharedView<R, Out> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            project: self.project,
+        }
+    }
+}
+
+impl<R: IsRuntime, Out> Deref for SharedView<R, Out> {
+    type Target = Out;
+    fn deref(&self) -> &Out {
+        (self.project)(&*self.inner)
+    }
+}
+
+impl<R: IsRuntime, Out: Debug> Debug for SharedView<R, Out> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(&**self, f)
     }
 }
 
@@ -261,6 +329,7 @@ pub(crate) struct EmptyRuntime;
 impl IsRuntime for EmptyRuntime {
     type GearId = ();
     type GearOut = ();
+    type GearOutShared = ();
     type GearOutLocal = ();
     type Module = ();
     type Group = ();
@@ -287,7 +356,7 @@ impl IsRuntime for EmptyRuntime {
         _ctx: &mut crate::core::core_ctx::GearCtx<Self, S>,
         _input: GearInput<Self>,
         _cache: &mut Self::GearCache<S::Watermark>,
-    ) -> GearResult<Self> {
-        GearResult::Ship(())
+    ) -> GearProduce<Self> {
+        GearProduce::Ship(())
     }
 }

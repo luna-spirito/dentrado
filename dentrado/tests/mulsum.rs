@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use dentrado::{
     core::{
         core_ctx::{Core, GearCtx},
-        gear::{GearInput, GearMeta, GearResult, IsRuntime},
+        gear::{GearInput, GearMeta, GearProduce, IsRuntime},
         storage::{CacheSer, InMemoryStorage, PageId, Storage},
     },
     types::*,
@@ -56,6 +56,7 @@ pub struct MulSumRuntime;
 impl IsRuntime for MulSumRuntime {
     type GearId = MulSumGear;
     type GearOut = i64;
+    type GearOutShared = ();
     type GearOutLocal = ();
     type Module = ();
     type Group = i64;
@@ -88,9 +89,9 @@ impl IsRuntime for MulSumRuntime {
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
         cache: &mut Self::GearCache<S::Watermark>,
-    ) -> GearResult<Self> {
+    ) -> GearProduce<Self> {
         let GearInput::Events(group) = input else {
-            return GearResult::Ship(cache.agg);
+            return GearProduce::Ship(cache.agg);
         };
         let core = ctx.core();
         let diff = ctx
@@ -108,7 +109,7 @@ impl IsRuntime for MulSumRuntime {
             cache.agg -= body.a * body.b;
         }
         cache.watermark = diff.watermark;
-        GearResult::Ship(cache.agg)
+        GearProduce::Ship(cache.agg)
     }
 }
 

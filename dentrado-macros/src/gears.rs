@@ -95,6 +95,9 @@ enum GearArg {
         target: TokenStream2,
     },
     Local,
+    /// `#[gear(shared)]` — the output is an opaque `Sync` monolith shared by
+    /// reference across consumers/cores (the `Shared` family → `GearOutShared`).
+    Shared,
     /// `wire_skip(a, b, …)` — id fields excluded from the wire schema (server
     /// config the client never supplies, e.g. `repo_meta`). Ignored by the
     /// runtime expansion; the schema expansion drops these fields.
@@ -141,6 +144,7 @@ impl Parse for GearArg {
                 Ok(GearArg::Follow { target })
             }
             "local" => Ok(GearArg::Local),
+            "shared" => Ok(GearArg::Shared),
             "wire_skip" => {
                 let inner;
                 syn::parenthesized!(inner in input);
@@ -201,6 +205,12 @@ struct GearSpec {
     /// `GearOutLocal` (never `Send`/`Localizable`) and is reachable only
     /// through the `follow` mechanism. No `GearQuery` builder is emitted.
     is_local: bool,
+    /// `#[gear(shared)]`: the output is an opaque `Sync` monolith shared by
+    /// reference (the `Shared` family). Goes to `GearOutShared`; reachable via
+    /// a `GearQuery<R, SharedView<R, T>>` builder (one `GearQuery` for both
+    /// families — `Out` distinguishes them). Exactly one of `is_local`/
+    /// `is_shared` may be set.
+    is_shared: bool,
     params: Vec<ParamRole>,
     out_ty: Type,
     kind: KindSpec,
@@ -306,6 +316,7 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
     let mut name: Option<Ident> = None;
     let mut kind: Option<KindSpec> = None;
     let mut is_local = false;
+    let mut is_shared = false;
     let mut wire_skip = std::collections::HashSet::new();
     for arg in args {
         match arg {
@@ -313,6 +324,7 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
             GearArg::Event => kind = Some(KindSpec::Event),
             GearArg::Follow { target } => kind = Some(KindSpec::Follow { target }),
             GearArg::Local => is_local = true,
+            GearArg::Shared => is_shared = true,
             GearArg::WireSkip(v) => {
                 wire_skip = v.into_iter().map(|i| i.to_string()).collect();
             }
@@ -322,6 +334,12 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
     let name = name.ok_or_else(|| {
         syn::Error::new_spanned(gear_attr, "`#[gear(...)]` must set `name = <Variant>`")
     })?;
+    if is_local && is_shared {
+        return Err(syn::Error::new_spanned(
+            gear_attr,
+            "a gear cannot be both `local` and `shared`",
+        ));
+    }
     let kind = kind.ok_or_else(|| {
         syn::Error::new_spanned(
             gear_attr,
@@ -408,6 +426,7 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
         vis: fn_item.vis.clone(),
         is_async,
         is_local,
+        is_shared,
         params,
         out_ty,
         kind,
@@ -666,18 +685,32 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         }
     });
 
-    let out_variants = specs.iter().filter(|g| !g.is_local).map(|g| {
-        let v = format_ident!("{}Out", g.name);
-        let t = &g.out_ty;
-        quote! { #[localizable(skip)] #v(#t) }
-    });
+    let out_variants = specs
+        .iter()
+        .filter(|g| !g.is_local && !g.is_shared)
+        .map(|g| {
+            let v = format_ident!("{}Out", g.name);
+            let t = &g.out_ty;
+            quote! { #[localizable(skip)] #v(#t) }
+        });
 
+    // `GearOutShared` variants: exactly the `#[gear(shared)]` gears. Like
+    // `GearOutLocal` this enum is neither `Send`/`Clone` (the core never copies
+    // a shared value — it refcounts the allocation) nor `Localizable` (it
+    // crosses cores by raw pointer, not by serialized value). `Sync` is the one
+    // extra requirement, so a foreign core may read the shared allocation.
     // `GearOutLocal` variants: exactly the `#[gear(local)]` gears. This enum is
     // deliberately NOT `Localizable`/`Send` — that's the whole point of the
     // local-output family. `GearOut` (shippable) only ever carries the non-local
     // gears' variants, so a local gear has no `GearOut` variant and no
     // `GearQuery` builder: the typed `secondary_get` layer cannot reach it.
     let out_local_variants = specs.iter().filter(|g| g.is_local).map(|g| {
+        let v = format_ident!("{}Out", g.name);
+        let t = &g.out_ty;
+        quote! { #v(#t) }
+    });
+
+    let out_shared_variants = specs.iter().filter(|g| g.is_shared).map(|g| {
         let v = format_ident!("{}Out", g.name);
         let t = &g.out_ty;
         quote! { #v(#t) }
@@ -851,9 +884,11 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         };
 
         let result = if g.is_local {
-            quote! { ::dentrado::core::gear::GearResult::Local(GearOutLocal::#out_v(#run_call)) }
+            quote! { ::dentrado::core::gear::GearProduce::Local(GearOutLocal::#out_v(#run_call)) }
+        } else if g.is_shared {
+            quote! { ::dentrado::core::gear::GearProduce::Shared(GearOutShared::#out_v(#run_call)) }
         } else {
-            quote! { ::dentrado::core::gear::GearResult::Ship(GearOut::#out_v(#run_call)) }
+            quote! { ::dentrado::core::gear::GearProduce::Ship(GearOut::#out_v(#run_call)) }
         };
 
         quote! {
@@ -865,14 +900,14 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         }
     });
 
-    // One `GearQuery` builder per **shippable** gear: `#vis fn <fn_name>(<id
-    // fields>) -> GearQuery<R, Out>`. The async gear impl is renamed
-    // `<fn_name>_step` (see the rename pass above), so the builder takes the
-    // gear's own name. Local gears get no builder — `GearQuery::secondary_get`
-    // is the shippable-only typed layer, so a local output has no query handle
-    // by construction (it is read through `follow` gears instead). The
-    // per-variant extraction lives in a nested fn so the module surface is
-    // exactly one builder per gear.
+    // One `GearQuery` builder per non-local gear: `#vis fn <fn_name>(<id
+    // fields>) -> GearQuery<R, Out>`. Shippable gears use `Out = T` (owned);
+    // `#[gear(shared)]` gears use `Out = SharedView<R, T>` (borrow-returning).
+    // The async gear impl is renamed `<fn_name>_step` (see the rename pass
+    // above), so the builder takes the gear's own name. Local gears get no
+    // builder — a local output has no query handle by construction (it is read
+    // through `follow` gears instead). The per-family extraction lives in a
+    // nested fn so the module surface is exactly one builder per gear.
     let builders = specs.iter().filter(|g| !g.is_local).map(|g| {
         let builder = &g.fn_name;
         let vis = &g.vis;
@@ -888,22 +923,68 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             quote! { GearId::#id_variant { #( #param_names ),* } }
         };
         let getter = format_ident!("__dentrado_get_{}", g.fn_name);
-        let msg = format!("{} gear produces GearOut::{}", g.name, out_v);
-        quote! {
-            #vis fn #builder(#( #param_decls ),*)
-                -> ::dentrado::core::gear::GearQuery<#runtime, #out_t>
-            {
-                fn #getter(
-                    out: <#runtime as ::dentrado::core::gear::IsRuntime>::GearOut,
-                ) -> #out_t {
-                    match out {
-                        GearOut::#out_v(__o) => __o,
-                        _ => ::core::unreachable!(#msg),
+
+        if g.is_shared {
+            // `#[gear(shared)]`: the builder returns
+            // `GearQuery<R, SharedView<R, Out>>`. The getter extracts the
+            // `Shared` handle from `GearResult::Shared` and wraps it — plus a
+            // per-variant projection fn — in a `SharedView` that derefs to
+            // `&Out`, the borrow-returning analogue of the shippable getter's
+            // owned `Out`.
+            let project = format_ident!("__dentrado_project_{}", g.fn_name);
+            let msg = format!("{} gear produces GearOutShared::{}", g.name, out_v);
+            quote! {
+                #vis fn #builder(#( #param_decls ),*)
+                    -> ::dentrado::core::gear::GearQuery<
+                        #runtime,
+                        ::dentrado::core::gear::SharedView<#runtime, #out_t>,
+                    >
+                {
+                    fn #project(
+                        shared: &<#runtime as ::dentrado::core::gear::IsRuntime>::GearOutShared,
+                    ) -> &#out_t {
+                        match shared {
+                            GearOutShared::#out_v(__o) => __o,
+                            _ => ::core::unreachable!(#msg),
+                        }
+                    }
+                    fn #getter(
+                        res: ::dentrado::core::gear::GearResult<#runtime>,
+                    ) -> ::dentrado::core::gear::SharedView<#runtime, #out_t> {
+                        match res {
+                            ::dentrado::core::gear::GearResult::Shared(__s) => {
+                                ::dentrado::core::gear::SharedView {
+                                    inner: __s,
+                                    project: #project,
+                                }
+                            }
+                            _ => ::core::unreachable!(#msg),
+                        }
+                    }
+                    ::dentrado::core::gear::GearQuery {
+                        id: #id_construct,
+                        getter: #getter,
                     }
                 }
-                ::dentrado::core::gear::GearQuery {
-                    id: #id_construct,
-                    getter: #getter,
+            }
+        } else {
+            let msg = format!("{} gear produces GearOut::{}", g.name, out_v);
+            quote! {
+                #vis fn #builder(#( #param_decls ),*)
+                    -> ::dentrado::core::gear::GearQuery<#runtime, #out_t>
+                {
+                    fn #getter(
+                        res: ::dentrado::core::gear::GearResult<#runtime>,
+                    ) -> #out_t {
+                        match res {
+                            ::dentrado::core::gear::GearResult::Ship(GearOut::#out_v(__o)) => __o,
+                            _ => ::core::unreachable!(#msg),
+                        }
+                    }
+                    ::dentrado::core::gear::GearQuery {
+                        id: #id_construct,
+                        getter: #getter,
+                    }
                 }
             }
         }
@@ -934,6 +1015,14 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         #[derive(Debug, Clone)]
         pub(crate) enum GearOutLocal {
             #( #out_local_variants, )*
+        }
+
+        // Shared outputs: exactly the `#[gear(shared)]` gears. `Debug` only — no
+        // `Clone` (the core refcounts, never copies) and no `Localizable`
+        // (crosses cores by pointer). `Sync` is asserted by the assoc-type bound.
+        #[derive(Debug)]
+        pub(crate) enum GearOutShared {
+            #( #out_shared_variants, )*
         }
 
         #[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado_types::Localizable)]
@@ -969,6 +1058,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         impl ::dentrado::core::gear::IsRuntime for #runtime {
             type GearId = GearId;
             type GearOut = GearOut;
+            type GearOutShared = GearOutShared;
             type GearOutLocal = GearOutLocal;
             type Module = ();
             type Group = Group;
@@ -997,7 +1087,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
                 ctx: &mut ::dentrado::core::core_ctx::GearCtx<Self, S>,
                 input: ::dentrado::core::gear::GearInput<Self>,
                 cache: &mut Self::GearCache<S::Watermark>,
-            ) -> ::dentrado::core::gear::GearResult<Self> {
+            ) -> ::dentrado::core::gear::GearProduce<Self> {
                 match (ctx.gear().clone(), cache) {
                     #( #run_arms )*
                     _ => ::core::unreachable!("gear id and cache variants always agree"),
@@ -1051,7 +1141,12 @@ fn expand_schema(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStr
     })?;
     let (file_items, track) = load_gear_file(rel)?;
     let specs = collect_specs(&file_items)?;
-    let shippable: Vec<&GearSpec> = specs.iter().filter(|g| !g.is_local).collect();
+    // Shared gears cross cores by raw pointer, never by serialized value, so
+    // they have no client/wire schema entry.
+    let shippable: Vec<&GearSpec> = specs
+        .iter()
+        .filter(|g| !g.is_local && !g.is_shared)
+        .collect();
 
     let id_variants = shippable.iter().map(|g| {
         let v = &g.name;
