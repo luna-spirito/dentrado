@@ -7,13 +7,20 @@
 //!   loop that round-trips the dentrado gear protocol (NDJSON over one bidi
 //!   stream), with server push from per-page subscriptions.
 //!
-//! # Why QUIC binds on one core only
-//! compio-quic's `bind` does not set `SO_REUSEPORT`, so only one core can bind
-//! the UDP socket (unlike the old TCP server, which reused the port across
-//! cores via kernel hashing). That's fine here: QUIC multiplexes many
-//! connections/streams over one socket, and gear work for an incoming session
-//! is routed to the owning core by [`Core::db_run_gear`]'s inter-core routing.
-//! The other cores stay warm via `Db`'s per-core `core_event_loop`.
+//! # Every core binds the same QUIC port (SO_REUSEPORT)
+//! compio-quic's `Endpoint::server`/`ServerBuilder::bind` call `UdpSocket::bind`
+//! directly, which never sets `SO_REUSEPORT`. [`build_endpoint`] instead builds
+//! the UDP socket via `socket2` and sets `SO_REUSEPORT` before binding, so every
+//! core owns a listener on the same port. The kernel spreads incoming QUIC
+//! datagrams across cores by client 4-tuple, so each connection lives entirely
+//! on the core whose socket received its Initial — mirroring how the TCP
+//! bootstrap already reuses the port. Gear work for a session still routes to
+//! the owning core by [`Core::db_run_gear`]'s inter-core routing.
+//!
+//! The cost is connection migration: a client that changes its source address
+//! (NAT rebinding, Wi-Fi → cellular) is re-hashed to a different core, where
+//! its connection state doesn't exist, so the connection drops.
+//! eBPF CID steering desired in long term.
 //!
 //! # TLS — two modes, switched by `--inject-wt-hash`
 //! - **Pooling mode** (flag unset, the default): the QUIC endpoint presents the
@@ -82,7 +89,7 @@ pub(crate) async fn serve(
     };
     let assets = Rc::new(load_assets(&assets_dir, wt_hash));
 
-    let endpoint = build_endpoint(bind, inject_wt_hash).await?;
+    let endpoint = build_endpoint(bind, inject_wt_hash)?;
     info!(
         "kolorinko H3 server listening on {bind} ({})",
         if inject_wt_hash {
@@ -119,17 +126,48 @@ pub(crate) async fn serve(
 /// - pooling mode → the CA-trusted (mkcert) cert, so the HTTP/3 upgrade
 ///   advertised by [`crate::web`] validates and WebTransport can pool with the
 ///   fetch connection pool.
-async fn build_endpoint(bind: &str, inject_wt_hash: bool) -> io::Result<compio_quic::Endpoint> {
+fn build_endpoint(bind: &str, inject_wt_hash: bool) -> io::Result<compio_quic::Endpoint> {
     let (certs, key) = if inject_wt_hash {
         crate::tls::wt_cert()
     } else {
         crate::tls::load_cert_key()?
     };
-    compio_quic::ServerBuilder::new_with_single_cert(certs, key)
+    let server_config = compio_quic::ServerBuilder::new_with_single_cert(certs, key)
         .map_err(|e| io::Error::other(format!("server cert: {e}")))?
         .with_alpn_protocols(&["h3"])
-        .bind(bind)
-        .await
+        .build();
+    // Build the UDP socket ourselves so we can set SO_REUSEPORT (compio-quic's
+    // `bind` doesn't). With it every core binds the same port; the kernel hashes
+    // incoming QUIC datagrams by 4-tuple to one core, so each connection lives
+    // entirely on the endpoint that received its Initial.
+    let socket = reuseport_udp_socket(bind)?;
+    compio_quic::Endpoint::new(
+        socket,
+        compio_quic::EndpointConfig::default(),
+        Some(server_config),
+        None,
+    )
+}
+
+/// Create a UDP socket bound to `bind` with `SO_REUSEADDR` + `SO_REUSEPORT`, so
+/// every core can share the QUIC listener port and the kernel spreads incoming
+/// datagrams across them by client 4-tuple. Built via `socket2` (the only way
+/// to set `SO_REUSEPORT` before `bind`), then handed to compio through the safe
+/// `UdpSocket::from_std`, which attaches it to the current thread's runtime.
+/// There is no connection-migration support: a client that changes its source
+/// address is re-hashed to another core where its state is absent — fine for
+/// localhost/LAN, where no NAT sits between client and server.
+fn reuseport_udp_socket(bind: &str) -> io::Result<compio::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let addr: std::net::SocketAddr = bind
+        .parse()
+        .map_err(|e| io::Error::other(format!("bind addr: {e}")))?;
+    let sock = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    // SO_REUSEPORT must be set before `bind` to join the per-port socket group.
+    sock.set_reuse_address(true)?;
+    sock.set_reuse_port(true)?;
+    sock.bind(&addr.into())?;
+    compio::net::UdpSocket::from_std(sock.into())
 }
 
 /// Handle one QUIC connection: serve HTTP/3 requests (static assets) and, if a
@@ -466,4 +504,19 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, msg: &ServerMsg) -> io::R
     w.write_all(b"\n").await?;
     w.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn reuseport_shared_bind() {
+        // The invariant the whole multi-core QUIC design rests on: two sockets
+        // bind the same port. Catches a silent regression if set_reuse_port
+        // were reordered after bind (it would no-op, second bind → EADDRINUSE).
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let a = super::reuseport_udp_socket("127.0.0.1:0").unwrap();
+            let port = a.local_addr().unwrap().port();
+            let _b = super::reuseport_udp_socket(&format!("127.0.0.1:{port}")).unwrap();
+        });
+    }
 }

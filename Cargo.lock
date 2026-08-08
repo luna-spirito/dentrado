@@ -1902,6 +1902,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "socket2",
  "time",
  "toml 0.8.23",
 ]

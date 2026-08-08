@@ -23,6 +23,9 @@ compio = { version = "0.19.1", features = [
 # HTTP/3 over QUIC for compio. `compio/h3` (above) pulls compio-quic with its
 # `h3` feature; the direct dep gives us `compio_quic::{ServerBuilder, Connection, ...}`.
 compio-quic = "0.8"
+# `socket2` builds the QUIC UDP socket with SO_REUSEPORT (compio-quic's own
+# `bind` doesn't set it), so every core can listen on the same port.
+socket2 = "0.6"
 dentrado = { path = "../../dentrado" }
 dentrado-types = { path = "../../dentrado-types" }
 env_logger = "0.11.10"
@@ -32,7 +35,9 @@ h3-webtransport = "0.1"
 http = "1"
 im = "15.1.0"
 kolorinko-rt = { path = "../kolorinko-rt" }
-kolorinko-render = { path = "../kolorinko-render", default-features = false, features = ["ssr"] }
+kolorinko-render = { path = "../kolorinko-render", default-features = false, features = [
+  "ssr",
+] }
 kolorinko-wikitext = { path = "../kolorinko-wikitext" }
 # `ring` (also pulled by compio/quic) gives the SHA-256 for the WebTransport
 # cert hash; `time` sets the short validity browsers require.

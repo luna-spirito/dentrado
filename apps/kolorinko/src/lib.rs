@@ -124,43 +124,23 @@ fn run_server(config: Config) -> anyhow::Result<()> {
         info!("no inject_wt_hash: WebTransport will use allowPooling + Alt-Svc upgrade");
     }
 
-    // compio-quic can't SO_REUSEPORT across cores, so the QUIC/UDP listener is
-    // bound by one core; gear work still routes to all cores via
-    // `db_run_gear`. The TCP bootstrap, by contrast, is bound by every core
-    // with SO_REUSEPORT (kernel-hashed per connection).
-    let bind_claim = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
     let worker = move |core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>| {
         let bind = bind.clone();
         let dist = PathBuf::from(&config.server.web_dist);
         let meta = repo_meta.clone();
-        let claim = bind_claim.clone();
         async move {
-            // One core also drives the QUIC/H3+WT accept loop (UDP) as a
-            // background task before joining the others on the TCP bootstrap.
-            if claim
-                .compare_exchange(
-                    false,
-                    true,
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                )
-                .is_ok()
-            {
-                let core_h3 = core.clone();
-                let dist_h3 = dist.clone();
-                let meta_h3 = meta.clone();
-                let bind_h3 = bind.clone();
-                compio::runtime::spawn(async move {
-                    if let Err(e) =
-                        server::serve(core_h3, &bind_h3, dist_h3, meta_h3, inject_wt_hash).await
-                    {
-                        error!("h3 server exited: {e}");
-                    }
-                })
-                .detach();
-            }
-            // Every core serves the HTTPS bootstrap over TCP.
+            let core_h3 = core.clone();
+            let dist_h3 = dist.clone();
+            let meta_h3 = meta.clone();
+            let bind_h3 = bind.clone();
+            compio::runtime::spawn(async move {
+                if let Err(e) =
+                    server::serve(core_h3, &bind_h3, dist_h3, meta_h3, inject_wt_hash).await
+                {
+                    error!("h3 server exited: {e}");
+                }
+            })
+            .detach();
             if let Err(e) = web::serve(&bind, dist, meta, inject_wt_hash).await {
                 error!("https bootstrap exited: {e}");
             }
