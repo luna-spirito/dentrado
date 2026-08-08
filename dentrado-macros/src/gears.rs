@@ -223,6 +223,11 @@ struct GearSpec {
     /// `GearResult::Local(GearOutLocal::<Variant>(…))` instead of
     /// `GearResult::Ship(GearOut::<Variant>(…))`.
     follow_out_local: bool,
+    /// Follow gears only: whether the followed gear is `#[gear(shared)]`. When
+    /// true, the followed output arrives as `GearResult::Shared(Shared<R>)` and
+    /// the follow param is a `&out_ty` borrow — the `Shared` handle is kept
+    /// alive for the gear body's duration to back the borrow.
+    follow_out_shared: bool,
     /// Id-field names excluded from the wire schema (`#[gear(wire_skip(…))]`).
     /// The runtime expansion keeps them as real id fields; the schema expansion
     /// drops them.
@@ -432,6 +437,7 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
         kind,
         follow_out_variant: None,
         follow_out_local: false,
+        follow_out_shared: false,
         wire_skip,
     })
 }
@@ -546,12 +552,17 @@ fn collect_specs(items: &[Item]) -> syn::Result<Vec<GearSpec>> {
     // variant; exactly one of its by-value params must then match the target's
     // output type and is reclassified as the followed-output binding. Also
     // rejects direct self-follow (which would infinitely recurse in `meta`).
-    let target_info: std::collections::HashMap<String, (Type, Ident, bool)> = specs
+    let target_info: std::collections::HashMap<String, (Type, Ident, bool, bool)> = specs
         .iter()
         .map(|g| {
             (
                 g.name.to_string(),
-                (g.out_ty.clone(), format_ident!("{}Out", g.name), g.is_local),
+                (
+                    g.out_ty.clone(),
+                    format_ident!("{}Out", g.name),
+                    g.is_local,
+                    g.is_shared,
+                ),
             )
         })
         .collect();
@@ -566,7 +577,7 @@ fn collect_specs(items: &[Item]) -> syn::Result<Vec<GearSpec>> {
                 "a gear cannot follow itself",
             ));
         }
-        let (out_ty, out_variant, target_local) =
+        let (out_ty, out_variant, target_local, target_shared) =
             target_info.get(&variant.to_string()).ok_or_else(|| {
                 syn::Error::new_spanned(
                     &variant,
@@ -577,20 +588,40 @@ fn collect_specs(items: &[Item]) -> syn::Result<Vec<GearSpec>> {
         // nor `proc_macro2::TokenStream` has `PartialEq` without extra feature
         // flags, but two identical type spellings stringify identically.
         let out_ty_q = quote!(#out_ty).to_string();
+        // A by-value param matching the target output type (a non-shared
+        // follow), or — when the target is `#[gear(shared)]` — a `&out_ty` param
+        // borrowing the shared allocation instead of owning it.
         let matches: Vec<usize> = g
             .params
             .iter()
             .enumerate()
-            .filter_map(|(i, p)| match p {
-                ParamRole::IdField { ty, .. } if quote!(#ty).to_string() == out_ty_q => Some(i),
-                _ => None,
+            .filter_map(|(i, p)| {
+                let ParamRole::IdField { ty, .. } = p else {
+                    return None;
+                };
+                if quote!(#ty).to_string() == out_ty_q {
+                    return Some(i);
+                }
+                if *target_shared && let Type::Reference(r) = ty {
+                    // `r.elem` is `Box<Type>`; quoting the borrow emits the inner type.
+                    let elem = &r.elem;
+                    if quote!(#elem).to_string() == out_ty_q {
+                        return Some(i);
+                    }
+                }
+                None
             })
             .collect();
         let idx = match matches.as_slice() {
             [] => {
                 return Err(syn::Error::new_spanned(
                     &g.fn_name,
-                    "follow gear must take a param of the target gear's output type",
+                    if *target_shared {
+                        "a gear following a `#[gear(shared)]` target must take a `&` param \
+                         of the target's output type"
+                    } else {
+                        "follow gear must take a param of the target gear's output type"
+                    },
                 ));
             }
             [single] => *single,
@@ -602,12 +633,14 @@ fn collect_specs(items: &[Item]) -> syn::Result<Vec<GearSpec>> {
                 ));
             }
         };
-        let ParamRole::IdField { name, .. } = &g.params[idx] else {
+        let ParamRole::IdField { name, ty } = &g.params[idx] else {
             unreachable!("matched an IdField above");
         };
+        let follow_shared = matches!(ty, Type::Reference(_));
         g.params[idx] = ParamRole::FollowOut { name: name.clone() };
         g.follow_out_variant = Some(out_variant.clone());
         g.follow_out_local = *target_local;
+        g.follow_out_shared = follow_shared;
     }
 
     Ok(specs)
@@ -849,9 +882,12 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         });
 
         // For follow gears, pull the followed gear's output out of `input` and
-        // destructure it to the typed inner value, binding it to the param the
-        // Follow-resolution pass reclassified. The followed value lives in
-        // `GearResult::Local` iff the *target* is `#[gear(local)]`.
+        // bind it to the param the Follow-resolution pass reclassified. The
+        // binding shape depends on the target's family:
+        //   - `Ship`/`Local`: an owned value, peeled out of `GearResult`.
+        //   - `Shared`: a `&T` borrow. The `Shared` handle that backs the borrow
+        //     is moved out of `input` and kept alive for the gear body's
+        //     duration (its `Drop` releases the refcount when the arm ends).
         let follow_bind = if let (KindSpec::Follow { .. }, Some(out_v)) =
             (&g.kind, &g.follow_out_variant)
         {
@@ -863,21 +899,42 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
                     _ => None,
                 })
                 .expect("resolved above");
-            let followed_out = if g.follow_out_local {
-                quote! { ::dentrado::core::gear::GearResult::Local(GearOutLocal::#out_v(__followed)) }
-            } else {
-                quote! { ::dentrado::core::gear::GearResult::Ship(GearOut::#out_v(__followed)) }
-            };
-            quote! {
-                let #name = match input {
-                    ::dentrado::core::gear::GearInput::Follow { out } => match out {
-                        #followed_out => __followed,
+            if g.follow_out_shared {
+                let handle = format_ident!("__dentrado_followed_shared");
+                quote! {
+                    let #handle = match input {
+                        ::dentrado::core::gear::GearInput::Follow { out } => match out {
+                            ::dentrado::core::gear::GearResult::Shared(__s) => __s,
+                            _ => ::core::unreachable!(
+                                "follow target produced an unexpected output"
+                            ),
+                        },
+                        _ => ::core::unreachable!("follow gear received a non-Follow input"),
+                    };
+                    let #name = match &*#handle {
+                        GearOutShared::#out_v(__o) => __o,
                         _ => ::core::unreachable!(
                             "follow target produced an unexpected output"
                         ),
-                    },
-                    _ => ::core::unreachable!("follow gear received a non-Follow input"),
+                    };
+                }
+            } else {
+                let followed_out = if g.follow_out_local {
+                    quote! { ::dentrado::core::gear::GearResult::Local(GearOutLocal::#out_v(__followed)) }
+                } else {
+                    quote! { ::dentrado::core::gear::GearResult::Ship(GearOut::#out_v(__followed)) }
                 };
+                quote! {
+                    let #name = match input {
+                        ::dentrado::core::gear::GearInput::Follow { out } => match out {
+                            #followed_out => __followed,
+                            _ => ::core::unreachable!(
+                                "follow target produced an unexpected output"
+                            ),
+                        },
+                        _ => ::core::unreachable!("follow gear received a non-Follow input"),
+                    };
+                }
             }
         } else {
             quote! {}
@@ -1141,12 +1198,12 @@ fn expand_schema(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStr
     })?;
     let (file_items, track) = load_gear_file(rel)?;
     let specs = collect_specs(&file_items)?;
-    // Shared gears cross cores by raw pointer, never by serialized value, so
-    // they have no client/wire schema entry.
-    let shippable: Vec<&GearSpec> = specs
-        .iter()
-        .filter(|g| !g.is_local && !g.is_shared)
-        .collect();
+    // Every non-local gear — shippable or shared — is wire-exposed: shared
+    // gears are shared *across cores* by reference, but to the client they
+    // serialize the same way (the server derefs the `Shared` handle and sends
+    // the value). Only `#[gear(local)]` gears (core-pinned, no output variant)
+    // are absent from the wire schema.
+    let shippable: Vec<&GearSpec> = specs.iter().filter(|g| !g.is_local).collect();
 
     let id_variants = shippable.iter().map(|g| {
         let v = &g.name;

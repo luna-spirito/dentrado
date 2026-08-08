@@ -889,7 +889,7 @@ pub(crate) async fn article_latest_parsed<S: Storage<KolorinkoRT>>(
         content: parse(&latest.body),
     };
     *cache = ParsedCache {
-        body: Some(latest.body),
+        body: Some(latest.body.clone()),
         view: Some(view.clone()),
     };
     view
@@ -915,7 +915,7 @@ pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
     meta: &RepoMeta,
     site: SafePathComponent,
     slug: Slug,
-    parsed: ArticleView,
+    parsed: &ArticleView,
     ctx: &mut GearCtx<KolorinkoRT, S>,
     _cache: &mut LatestCache,
 ) -> ArticleView {
@@ -923,7 +923,7 @@ pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
         meta: page_meta,
         revisions,
         content,
-    } = parsed;
+    } = parsed.clone();
     let mut visited = HashSet::new();
     visited.insert((site.clone(), slug.0.clone(), slug.1.clone()));
     let content = resolve(content, &site, meta, &mut visited, ctx).await;
@@ -965,7 +965,7 @@ async fn resolve<S: Storage<KolorinkoRT>>(
             )
             .secondary_get(ctx)
             .await;
-            fetched.insert(key, parsed.content);
+            fetched.insert(key, parsed.content.clone());
         }
         content = substitute_includes(content, site, &fetched);
     }

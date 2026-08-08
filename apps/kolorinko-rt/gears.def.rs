@@ -32,6 +32,7 @@ pub(crate) async fn repo(
 
 #[dentrado::gear(
     follow(target = GearId::Repo(_repo_meta)),
+    shared,
     name = RepoLArticleLatest,
     wire_skip(_repo_meta),
 )]
@@ -61,6 +62,7 @@ pub(crate) async fn repo_l_theme_roots(
 
 #[dentrado::gear(
     event,
+    shared,
     name = ArticleLatestParsed,
     wire_skip(repo_meta),
 )]
@@ -76,6 +78,7 @@ pub(crate) async fn article_latest_parsed<S: Storage<KolorinkoRT>>(
 
 #[dentrado::gear(
     follow(target = GearId::ArticleLatestParsed { repo_meta, site, slug }),
+    shared,
     name = ArticleLatest,
     wire_skip(repo_meta),
 )]
@@ -83,7 +86,7 @@ pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
     repo_meta: RepoMeta,
     site: SafePathComponent,
     slug: (Option<SafePathComponent>, SafePathComponent),
-    parsed: ArticleView,
+    parsed: &ArticleView,
     ctx: &mut GearCtx<KolorinkoRT, S>,
     cache: &mut LatestCache,
 ) -> ArticleView {

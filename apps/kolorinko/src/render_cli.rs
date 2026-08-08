@@ -63,7 +63,13 @@ fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
             let page = (page_q.getter)(page_sub.current());
             let nav_top = (nav_top_q.getter)(nav_top_sub.current());
             let nav_side = (nav_side_q.getter)(nav_side_sub.current());
-            let _ = tx.send(Ok((page, nav_top, nav_side)));
+            // The getters return `SharedView<…>` (a `!Send` refcount handle);
+            // clone the payload out so owned `ArticleView`s cross the channel.
+            let _ = tx.send(Ok((
+                (*page).clone(),
+                (*nav_top).clone(),
+                (*nav_side).clone(),
+            )));
         }
     };
 

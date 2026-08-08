@@ -44,6 +44,7 @@ use log::{error, info, warn};
 
 use dentrado::core::{
     core_ctx::{Core, Subscription},
+    gear::GearResult,
     storage::InMemoryStorage,
 };
 use kolorinko_rt::wire::{self, ClientMsg, ServerMsg};
@@ -52,8 +53,8 @@ use crate::{
     assets::{load_assets, looks_like_asset, mime_for},
     repo,
     runtime::{
-        GearOut, KolorinkoRT, article_latest, article_latest_parsed, repo_l_article_latest,
-        repo_l_theme_roots,
+        GearOut, GearOutShared, KolorinkoRT, article_latest, article_latest_parsed,
+        repo_l_article_latest, repo_l_theme_roots,
     },
     wikidot_page::RepoMeta,
 };
@@ -384,12 +385,25 @@ async fn subscribe_wire(
     }
 }
 
-fn to_wire_out(out: GearOut) -> wire::GearOut {
-    match out {
-        GearOut::ArticleLatestOut(a) => wire::GearOut::ArticleLatestOut(a),
-        GearOut::ArticleLatestParsedOut(a) => wire::GearOut::ArticleLatestParsedOut(a),
-        GearOut::RepoLArticleLatestOut(a) => wire::GearOut::RepoLArticleLatestOut(a),
-        GearOut::RepoLThemeRootsOut(a) => wire::GearOut::RepoLThemeRootsOut(a),
+// TOO: Annihilate.
+fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
+    match res {
+        // Shippable gears carry their payload directly.
+        GearResult::Ship(GearOut::RepoLThemeRootsOut(a)) => {
+            Some(wire::GearOut::RepoLThemeRootsOut(a))
+        }
+        // Shared gears are shared *across cores* by reference; to the client
+        // they serialize the same way, so clone the payload out of the handle.
+        GearResult::Shared(s) => match &*s {
+            GearOutShared::ArticleLatestOut(a) => Some(wire::GearOut::ArticleLatestOut(a.clone())),
+            GearOutShared::ArticleLatestParsedOut(a) => {
+                Some(wire::GearOut::ArticleLatestParsedOut(a.clone()))
+            }
+            GearOutShared::RepoLArticleLatestOut(a) => {
+                Some(wire::GearOut::RepoLArticleLatestOut(a.clone()))
+            }
+        },
+        GearResult::Local(_) => None,
     }
 }
 
@@ -403,17 +417,11 @@ async fn push(
     tx: mpsc::UnboundedSender<ServerMsg>,
 ) {
     let s = subscribe_wire(id, repo_meta, core).await;
-    if let Some(out) = s.current().into_ship() {
-        let _ = tx.unbounded_send(ServerMsg::Update {
-            sub,
-            out: to_wire_out(out),
-        });
+    if let Some(out) = to_wire_out(s.current()) {
+        let _ = tx.unbounded_send(ServerMsg::Update { sub, out });
     }
-    while let Some(out) = s.next().await.into_ship() {
-        let _ = tx.unbounded_send(ServerMsg::Update {
-            sub,
-            out: to_wire_out(out),
-        });
+    while let Some(out) = to_wire_out(s.next().await) {
+        let _ = tx.unbounded_send(ServerMsg::Update { sub, out });
     }
     let _ = tx.unbounded_send(ServerMsg::Dropped { sub });
 }

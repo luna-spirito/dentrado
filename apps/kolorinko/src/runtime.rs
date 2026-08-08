@@ -29,5 +29,6 @@ mod gears {
 // `GearQuery` builders. `GearOut` and the builders are re-exported for the
 // server's subscription/dispatch code.
 pub(crate) use gears::{
-    GearOut, article_latest, article_latest_parsed, repo_l_article_latest, repo_l_theme_roots,
+    GearOut, GearOutShared, article_latest, article_latest_parsed, repo_l_article_latest,
+    repo_l_theme_roots,
 };
