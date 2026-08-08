@@ -44,10 +44,12 @@
 //!   the transitive include cone re-runs this gear.
 
 use crate::wikidot_parser::parse;
+use compio::fs;
 use dentrado::core::{core_ctx::GearCtx, storage::Storage};
 use git2::{ObjectType, Oid, Repository, Tree, TreeWalkMode};
 use im::HashMap as ImHashMap;
-use kolorinko_rt::SafePathComponent;
+use kolorinko_render::rewrite;
+use kolorinko_rt::{AssetKind, RepoAssetOut, RepoAssetPath, SafePathComponent};
 use kolorinko_wikitext::{
     ArticleLatest, ArticleMeta, ArticleView, BlockCell, BlockRow, BlockTable, ContainerKind,
     Content, Include, List, ListItem, ListPages, Node, PageRef, RevMeta, Tab, TableCell, TextObj,
@@ -849,6 +851,58 @@ pub(crate) fn repo_l_theme_roots(data: &RepoData, site: &SafePathComponent) -> V
         .get(site)
         .map(|w| w.theme_roots.clone())
         .unwrap_or_default()
+}
+
+// =========================================================================
+// `repo_asset` gear — mirrored site assets (theme/files)
+// =========================================================================
+
+/// No carry-over state: the gear reads the repo working tree fresh each run,
+/// and its output is cached by the runtime (shared across cores until evicted
+/// under interest pressure). A `()`-equivalent unit so the macro never emits
+/// the invalid `()::default()` (types that don't start with an identifier need
+/// `<()>` in qualified paths).
+#[derive(Default, Clone, Debug)]
+pub(crate) struct RepoAssetCache;
+
+/// Read one mirrored site asset (`<site>/<kind>/<host>/<path…>`) out of the repo
+/// working tree, rewriting CSS refs to local `/repo/…` URLs and zstd-compressing
+/// the result when that shrinks it. A missing file yields a redirect back onto
+/// the original host (`https://{host}/{path…}`). The [`RepoAssetPath`] is the
+/// validated `<host>/<path…>` tail, so it doubles as the redirect target.
+///
+/// `shared` so the cached bytes are shared across cores by reference (one
+/// allocation, refcounted) rather than cloned per subscriber core.
+pub(crate) async fn repo_asset(
+    meta: &RepoMeta,
+    site: &SafePathComponent,
+    kind: AssetKind,
+    path: &RepoAssetPath,
+) -> RepoAssetOut {
+    let file = meta
+        .path()
+        .join(site.as_ref())
+        .join(kind.as_str())
+        .join(path.as_ref());
+    match fs::read(&file).await {
+        Ok(bytes) => {
+            let mime = crate::assets::mime_for(path.as_str());
+            let body = if mime == "text/css" {
+                let base = format!("https://{}", path.as_str());
+                let site_str = site.as_ref().to_string_lossy();
+                let text = String::from_utf8_lossy(&bytes);
+                crate::assets::compress(
+                    rewrite(&text, Some(&base), &site_str, kind.as_str()).into_bytes(),
+                )
+            } else {
+                crate::assets::compress(bytes)
+            };
+            RepoAssetOut::Ok(body)
+        }
+        Err(_) => RepoAssetOut::Redirect {
+            location: format!("https://{}", path.as_str()),
+        },
+    }
 }
 
 // =========================================================================

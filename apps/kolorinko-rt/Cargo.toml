@@ -10,3 +10,4 @@ dentrado-types = { path = "../../dentrado-types" }
 dentrado-macros = { path = "../../dentrado-macros" }
 kolorinko-wikitext = { path = "../kolorinko-wikitext" }
 serde = { version = "1", features = ["derive"] }
+bytes = { version = "1", features = ["serde"] }

@@ -55,6 +55,127 @@ impl AsRef<Path> for SafePathComponent {
     }
 }
 
+/// Which mirrored subtree a [`RepoAsset`] gear reads from: `<site>/theme/…`
+/// (stylesheets, rewritten to local refs) or `<site>/files/…` (attachments).
+///
+/// [`RepoAsset`]: kolorinko_rt gear
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    dentrado_types::Localizable,
+)]
+pub enum AssetKind {
+    Theme,
+    Files,
+}
+
+impl AssetKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Theme => "theme",
+            Self::Files => "files",
+        }
+    }
+
+    /// Parse the `kind` segment of a `/repo/<site>/<kind>/…` URL, or `None`
+    /// for anything outside the `theme`/`files` namespaces.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "theme" => Some(Self::Theme),
+            "files" => Some(Self::Files),
+            _ => None,
+        }
+    }
+}
+
+/// A validated relative path under `<site>/<kind>/`: no `..`, no empty/`.`
+/// segments, not absolute. Carries the `<host>/<path…>` tail of a
+/// `/repo/<site>/<kind>/<host>/<path…>` request, so it doubles as the origin
+/// URL the missing-asset redirect falls back onto (`https://{this}`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado_types::Localizable)]
+pub struct RepoAssetPath(String);
+
+impl RepoAssetPath {
+    /// Validate `input` is a non-empty relative path of normal segments.
+    #[must_use]
+    pub fn new(input: String) -> Option<Self> {
+        if input.is_empty()
+            || input
+                .split('/')
+                .any(|s| s.is_empty() || s == "." || s == "..")
+        {
+            return None;
+        }
+        // Reject absolute paths (`/x`) and any non-`Normal` component
+        // (RootDir, CurDir, ParentDir, Prefix). Multi-segment relative paths
+        // of normals are valid (`host/path/to/file.css`).
+        if !Path::new(&input)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+        {
+            return None;
+        }
+        Some(Self(input))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for RepoAssetPath {
+    fn as_ref(&self) -> &Path {
+        self.0.as_ref()
+    }
+}
+
+// Validate on deserialize (not just `new`): a wire `GearId::RepoAsset` arriving
+// from a client must not carry a traversal path, since the gear joins it into
+// the repo tree. Mirrors `SafePathComponent`'s defensive deserialize.
+impl<'de> serde::Deserialize<'de> for RepoAssetPath {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Self::new(String::deserialize(d)?)
+            .ok_or_else(|| serde::de::Error::custom("invalid repo asset path"))
+    }
+}
+
+impl serde::Serialize for RepoAssetPath {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+/// The body of a served asset: stored zstd-compressed when compression helped,
+/// otherwise raw. Shared by static assets (loaded once at startup) and the
+/// [`RepoAsset`] gear's output. Carried behind a [`bytes::Bytes`] so serving is
+/// a refcount bump, never a memcpy.
+///
+/// [`RepoAsset`]: kolorinko_rt gear
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum Body {
+    Raw(bytes::Bytes),
+    Zstd(bytes::Bytes),
+}
+
+/// Output of the [`RepoAsset`] gear: the asset's bytes (compressed when that
+/// helped) or a redirect back onto the original host when the file is missing.
+///
+/// [`RepoAsset`]: kolorinko_rt gear
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum RepoAssetOut {
+    Ok(Body),
+    Redirect { location: String },
+}
+
 /// The wire schema + protocol envelope, generated from [`gears.def`](../gears.def.rs).
 ///
 /// `GearId` / `GearOut` / `GearQuery` (and one builder per shippable gear) are
@@ -66,7 +187,7 @@ impl AsRef<Path> for SafePathComponent {
 /// — the server never assigns ids.
 #[dentrado_macros::gears_schema(file = "gears.def.rs")]
 pub mod wire {
-    use crate::SafePathComponent;
+    use crate::{AssetKind, RepoAssetOut, RepoAssetPath, SafePathComponent};
     use kolorinko_wikitext::{ArticleLatest, ArticleView};
 
     /// Client → server: start or stop a subscription. `sub` is the client's

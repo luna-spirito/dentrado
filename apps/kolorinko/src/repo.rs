@@ -1,87 +1,126 @@
 //! Serve mirrored site assets (`theme/` and `files/` trees) out of the export
-//! repository over the existing static-serving loops.
+//! repository via the [`RepoAsset`] gear.
 //!
 //! The repo trees are keyed by the origin URL: `<site>/theme/<host>/<path>` and
 //! `<site>/files/<host>/<path>` (content stored as symlinks into the `_files`
 //! blob store, which `compio::fs` follows transparently). A request
-//! `/repo/<site>/<kind>/<host>/<path>` maps straight onto that layout, so no
-//! URL decode is applied (percent-encoding is preserved exactly as in the URL,
-//! e.g. `nav%3Aside`). Stylesheets additionally run through
-//! [`crate::css::rewrite`] so their `@import`/`url()` references become local
-//! too. Missing files fall back to a redirect back onto the original host.
+//! `/repo/<site>/<kind>/<host>/<path>` maps straight onto that layout. The
+//! [`RepoAsset`] gear reads + (for CSS) rewrites + zstd-compresses the file and
+//! caches the bytes shared across cores; a missing file falls back to a
+//! redirect back onto the original host.
+//!
+//! [`RepoAsset`]: kolorinko_rt gear
 
-use std::path::Path;
+use std::rc::Rc;
 
-use compio::fs;
-use kolorinko_render::rewrite;
-use kolorinko_rt::SafePathComponent;
+use dentrado::core::{core_ctx::Core, gear::GearResult, storage::InMemoryStorage};
+use kolorinko_rt::{AssetKind, Body, RepoAssetOut, RepoAssetPath, SafePathComponent};
 
 use crate::assets::mime_for;
+use crate::runtime::{GearOutShared, KolorinkoRT, repo_asset};
+use crate::wikidot_page::RepoMeta;
 
 const PREFIX: &str = "/repo/";
 
 /// Result of a repo-asset request.
 pub(crate) enum RepoResp {
-    Ok { mime: &'static str, body: Vec<u8> },
+    Ok { mime: &'static str, body: Body },
     Redirect { location: String },
 }
 
-/// Resolve one repo-asset request, or `None` for anything outside the
-/// `/repo/` namespace. `path` is the raw request path (with query, if any).
-pub(crate) async fn serve(path: &str, repo_root: &Path) -> Option<RepoResp> {
-    let rest = path.strip_prefix(PREFIX)?;
+/// The validated pieces of a `/repo/<site>/<kind>/<host>/<path…>` request, or
+/// `None` for anything outside the `/repo/` namespace or with an unsafe path.
+/// Pure (no disk, no core) so the SPA-fallback and traversal guards are testable
+/// without a runtime.
+pub(crate) struct ParsedRepoReq {
+    site: SafePathComponent,
+    kind: AssetKind,
+    path: RepoAssetPath,
+    query: String,
+}
+
+pub(crate) fn parse_repo_request(full: &str) -> Option<ParsedRepoReq> {
+    let rest = full.strip_prefix(PREFIX)?;
     let mut segs = rest.split('/');
     let site = segs.next()?;
-    let kind = segs.next()?;
-    if kind != "theme" && kind != "files" {
-        return None;
-    }
-    if SafePathComponent::new(site.to_string()).is_none() {
-        return None;
-    }
+    let kind = AssetKind::parse(segs.next()?)?;
+    let site = SafePathComponent::new(site.to_string())?;
     let url_path = segs.collect::<Vec<_>>().join("/");
-    let (disk_rel, _query) = url_path.split_once('?').unwrap_or((&url_path, ""));
-    // Guard the on-disk path: no traversal (`..`), no absolute/empty segments.
-    if disk_rel.is_empty()
-        || disk_rel
-            .split('/')
-            .any(|s| s.is_empty() || s == "." || s == "..")
-    {
+    let (disk_rel, query) = url_path.split_once('?').unwrap_or((&url_path, ""));
+    let path = RepoAssetPath::new(disk_rel.to_string())?;
+    Some(ParsedRepoReq {
+        site,
+        kind,
+        path,
+        query: query.to_string(),
+    })
+}
+
+/// Resolve one repo-asset request via the [`RepoAsset`] gear, or `None` for
+/// anything outside the `/repo/` namespace. `full` is the raw request path
+/// (with query, if any).
+///
+/// [`RepoAsset`]: kolorinko_rt gear
+pub(crate) async fn serve(
+    full: &str,
+    repo_meta: RepoMeta,
+    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+) -> Option<RepoResp> {
+    let ParsedRepoReq {
+        site,
+        kind,
+        path,
+        query,
+    } = parse_repo_request(full)?;
+    let disk_rel = path.as_str().to_owned();
+    let q = repo_asset(repo_meta, site, kind, path);
+    let res = core.read_gear(q.id).await;
+    let GearResult::Shared(s) = res else {
         return None;
-    }
-    let file = repo_root.join(site).join(kind).join(disk_rel);
-    match fs::read(&file).await {
-        Ok(bytes) => {
-            let mime = mime_for(disk_rel);
-            let body = if mime == "text/css" {
-                let base = format!("https://{disk_rel}");
-                // `to_string_lossy`: binary `.css` blobs are replaced char-for-char.
-                let text = String::from_utf8_lossy(&bytes);
-                rewrite(&text, Some(&base), site, kind).into_bytes()
-            } else {
-                bytes
-            };
-            Some(RepoResp::Ok { mime, body })
-        }
-        Err(_) => Some(RepoResp::Redirect {
-            location: format!("https://{url_path}"),
+    };
+    match &*s {
+        GearOutShared::RepoAssetOut(RepoAssetOut::Ok(body)) => Some(RepoResp::Ok {
+            mime: mime_for(&disk_rel),
+            body: body.clone(),
         }),
+        GearOutShared::RepoAssetOut(RepoAssetOut::Redirect { location }) => {
+            // Reattach the request's query (a cache-buster on the original host)
+            // since the gear only sees the validated, query-stripped path.
+            let location = if query.is_empty() {
+                location.clone()
+            } else {
+                format!("{location}?{query}")
+            };
+            Some(RepoResp::Redirect { location })
+        }
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::serve;
-    use std::path::Path;
-
+    use super::parse_repo_request;
+    use crate::wikidot_page::{RepoMeta, repo_asset};
     use compio::runtime::Runtime;
+    use kolorinko_rt::{AssetKind, RepoAssetPath, SafePathComponent};
+    use std::path::Path;
 
     fn repo_root() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kolorinko/repo")
     }
 
-    fn resolve(path: &str, root: &Path) -> Option<super::RepoResp> {
-        Runtime::new().unwrap().block_on(serve(path, root))
+    fn meta(root: &Path) -> RepoMeta {
+        let root: &'static Path = Box::leak(root.to_path_buf().into_boxed_path());
+        RepoMeta::new("unused", root, 900)
+    }
+
+    #[test]
+    fn traversal_is_rejected() {
+        assert!(parse_repo_request("/repo/rpcauthority/theme/../etc/passwd").is_none());
+        assert!(parse_repo_request("/repo/rpcauthority//theme/x").is_none());
+        assert!(parse_repo_request("/repo/rpcauthority/files/../secret").is_none());
+        assert!(parse_repo_request("/repo/rpcauthority/bogus/x").is_none()); // bad kind
+        assert!(parse_repo_request("/notrepo/x").is_none()); // outside namespace
     }
 
     #[test]
@@ -90,19 +129,18 @@ mod tests {
         if !root.exists() {
             return;
         }
-        let Some(super::RepoResp::Redirect { location }) =
-            resolve("/repo/rpcauthority/files/not/mirrored.png", &root)
-        else {
-            panic!("expected redirect");
+        let site = SafePathComponent::new("rpcauthority".into()).unwrap();
+        let path = RepoAssetPath::new("not/mirrored.png".into()).unwrap();
+        let out = Runtime::new().unwrap().block_on(repo_asset(
+            &meta(&root),
+            &site,
+            AssetKind::Files,
+            &path,
+        ));
+        let kolorinko_rt::RepoAssetOut::Redirect { location } = out else {
+            panic!("expected redirect, got {out:?}");
         };
         assert_eq!(location, "https://not/mirrored.png");
-    }
-
-    #[test]
-    fn traversal_is_rejected() {
-        let root = repo_root();
-        assert!(resolve("/repo/rpcauthority/theme/../etc/passwd", &root).is_none());
-        assert!(resolve("/repo/rpcauthority//theme/x", &root).is_none());
     }
 
     #[test]
@@ -112,14 +150,25 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let Some(super::RepoResp::Ok { mime, body }) = resolve(
-            "/repo/rpcauthority/theme/cdn.jsdelivr.net/gh/DoubleDenial/rpc-black-supremacy@refs/heads/main/style.css",
-            &root,
-        ) else {
-            panic!("expected served theme css");
+        let site = SafePathComponent::new("rpcauthority".into()).unwrap();
+        let asset_path = RepoAssetPath::new(
+            "cdn.jsdelivr.net/gh/DoubleDenial/rpc-black-supremacy@refs/heads/main/style.css".into(),
+        )
+        .unwrap();
+        let out = Runtime::new().unwrap().block_on(repo_asset(
+            &meta(&root),
+            &site,
+            AssetKind::Theme,
+            &asset_path,
+        ));
+        let kolorinko_rt::RepoAssetOut::Ok(body) = out else {
+            panic!("expected ok, got {out:?}");
         };
-        assert_eq!(mime, "text/css");
-        let css = String::from_utf8(body).unwrap();
+        let bytes = match body {
+            kolorinko_rt::Body::Raw(b) => b.to_vec(),
+            kolorinko_rt::Body::Zstd(b) => zstd::decode_all(&b[..]).unwrap(),
+        };
+        let css = String::from_utf8(bytes).unwrap();
         assert!(
             !css.contains("@import url('https://"),
             "refs must be localized"

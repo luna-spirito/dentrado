@@ -15,6 +15,7 @@ use std::{
     num::NonZero,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
     thread::available_parallelism,
 };
 
@@ -28,7 +29,6 @@ mod tls;
 mod web;
 mod wikidot_page;
 pub mod wikidot_parser;
-
 /// Process configuration, loaded once from a `.toml` file whose path is passed
 /// as the sole CLI argument. Every setting that used to live in env vars or
 /// `const`s (repo source/interval, bind address, frontend dist, WebTransport
@@ -124,24 +124,39 @@ fn run_server(config: Config) -> anyhow::Result<()> {
         info!("no inject_wt_hash: WebTransport will use allowPooling + Alt-Svc upgrade");
     }
 
+    // Load the frontend once for the whole process (blocking `std::fs`: a
+    // one-time read of a few small files), then share the single map across
+    // every core as one `Arc`. Each core holds a refcount bump, never its own
+    // copy of the bytes. The WT cert hash (hash-pinning mode) is injected into
+    // `/index.html` here, before compression, so it ships in the cached bytes.
+    let wt_hash = if inject_wt_hash {
+        Some(tls::wt_cert_hash())
+    } else {
+        None
+    };
+    let assets = Arc::new(assets::load_assets(
+        &PathBuf::from(&config.server.web_dist),
+        wt_hash,
+    ));
+
     let worker = move |core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>| {
         let bind = bind.clone();
-        let dist = PathBuf::from(&config.server.web_dist);
         let meta = repo_meta.clone();
+        let assets = assets.clone();
         async move {
             let core_h3 = core.clone();
-            let dist_h3 = dist.clone();
             let meta_h3 = meta.clone();
             let bind_h3 = bind.clone();
+            let assets_h3 = assets.clone();
             compio::runtime::spawn(async move {
                 if let Err(e) =
-                    server::serve(core_h3, &bind_h3, dist_h3, meta_h3, inject_wt_hash).await
+                    server::serve(core_h3, &bind_h3, assets_h3, meta_h3, inject_wt_hash).await
                 {
                     error!("h3 server exited: {e}");
                 }
             })
             .detach();
-            if let Err(e) = web::serve(&bind, dist, meta, inject_wt_hash).await {
+            if let Err(e) = web::serve(&bind, assets, meta, core, inject_wt_hash).await {
                 error!("https bootstrap exited: {e}");
             }
         }

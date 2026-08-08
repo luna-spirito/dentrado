@@ -16,14 +16,14 @@
 //! try, fail, and mark the origin's QUIC broken (which would also break
 //! WebTransport). The page stays on TCP in that mode; WebTransport owns QUIC.
 //!
-//! The data channel itself is WebTransport (see [`crate::server`]).
+//! Static assets and mirrored `/repo/` assets are served as zstd when the
+//! client advertises `Accept-Encoding: zstd` (the stored [`Body`] is already
+//! compressed; otherwise it's decompressed server-side). The `/repo/` path goes
+//! through the [`RepoAsset`] gear, so its bytes are cached shared across cores.
+//!
+//! [`RepoAsset`]: kolorinko_rt gear
 
-use std::{
-    collections::HashMap,
-    io,
-    path::{Path, PathBuf},
-    rc::Rc,
-};
+use std::{collections::HashMap, io, rc::Rc, sync::Arc};
 
 use compio::{
     buf::BufResult,
@@ -34,30 +34,31 @@ use compio::{
 };
 use log::{info, warn};
 
-use crate::assets::{load_assets, looks_like_asset, mime_for};
+use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
+use kolorinko_rt::Body;
+
+use crate::assets::{looks_like_asset, mime_for, serve_body};
 use crate::repo::{self, RepoResp};
+use crate::runtime::KolorinkoRT;
 use crate::tls::https_server_config;
 use crate::wikidot_page::RepoMeta;
 
 /// Bind `addr` with `SO_REUSEPORT`, wrap each connection in TLS, and serve the
 /// HTTP/1.1 page. (WebTransport is separate — see [`crate::server`].)
 ///
+/// `assets` is the single shared asset map (loaded once in [`crate::lib`]);
+/// `core` routes `/repo/` asset reads through the [`RepoAsset`] gear.
+///
+/// [`RepoAsset`]: kolorinko_rt gear
+///
 /// Runs forever; only returns on a fatal listener error.
 pub(crate) async fn serve(
     addr: &str,
-    assets_dir: PathBuf,
+    assets: Arc<HashMap<String, Body>>,
     repo_meta: RepoMeta,
+    core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     inject_wt_hash: bool,
 ) -> io::Result<()> {
-    // Hash-pinning mode injects the WT cert hash into the cached page once
-    // here; pooling mode passes `None` (no injection).
-    let wt_hash = if inject_wt_hash {
-        Some(crate::tls::wt_cert_hash())
-    } else {
-        None
-    };
-    let assets = Rc::new(load_assets(&assets_dir, wt_hash));
-    let repo_root = repo_meta.path();
     let acceptor = TlsAcceptor::from(https_server_config()?);
     let listener = bind_reuseport(addr).await?;
     let local = listener.local_addr()?;
@@ -82,6 +83,8 @@ pub(crate) async fn serve(
                 let assets = assets.clone();
                 let acceptor = acceptor.clone();
                 let alt_svc = alt_svc.clone();
+                let core = core.clone();
+                let repo_meta = repo_meta.clone();
                 runtime::spawn(async move {
                     let mut stream = match acceptor.accept(stream).await {
                         Ok(s) => s,
@@ -91,7 +94,8 @@ pub(crate) async fn serve(
                         }
                     };
                     if let Err(e) =
-                        handle_conn(&mut stream, &assets, repo_root, alt_svc.as_deref()).await
+                        handle_conn(&mut stream, &assets, &repo_meta, &core, alt_svc.as_deref())
+                            .await
                         && !is_disconnect(&e)
                     {
                         warn!("conn {peer}: {e}");
@@ -122,23 +126,34 @@ async fn bind_reuseport(addr: &str) -> io::Result<TcpListener> {
     sock.listen(128).await
 }
 
-/// Handle one TLS connection: serve a static asset. The WT cert hash (if in
-/// hash-pinning mode) was already injected into `/index.html` once at load time
-/// by [`crate::assets::load_assets`], so this just serves the cached bytes.
+/// Handle one TLS connection: serve a static asset or a `/repo/` asset. Both
+/// are stored as a [`Body`] (zstd-compressed when that helped) and served
+/// compressed to clients that accept zstd, decompressed otherwise. The WT cert
+/// hash (if in hash-pinning mode) was already injected into `/index.html` once
+/// at load time by [`crate::assets::load_assets`].
 async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
-    assets: &HashMap<String, Vec<u8>>,
-    repo_root: &Path,
+    assets: &Arc<HashMap<String, Body>>,
+    repo_meta: &RepoMeta,
+    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     alt_svc: Option<&str>,
 ) -> io::Result<()> {
     let head = read_request_head(stream).await?;
     let Some((method, path)) = parse_request_line(&head) else {
-        write_http(stream, 400, "text/plain", b"bad request\n", alt_svc).await?;
+        write_http(stream, 400, "text/plain", None, b"bad request\n", alt_svc).await?;
         return Ok(());
     };
 
     if method != "GET" && method != "HEAD" {
-        write_http(stream, 405, "text/plain", b"method not allowed\n", alt_svc).await?;
+        write_http(
+            stream,
+            405,
+            "text/plain",
+            None,
+            b"method not allowed\n",
+            alt_svc,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -147,27 +162,51 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
     let raw_path = path;
     let path = path.split('?').next().unwrap_or(path);
     let key: &str = if path == "/" { "/index.html" } else { path };
+    let accept_zstd = accepts_zstd(&head);
     let res = match assets.get(key) {
-        Some(bytes) => write_http(stream, 200, mime_for(key), bytes, alt_svc).await,
-        None => match repo::serve(raw_path, repo_root).await {
+        Some(b) => {
+            let s = serve_body(b, accept_zstd);
+            write_http(stream, 200, mime_for(key), s.encoding, &s.bytes, alt_svc).await
+        }
+        None => match repo::serve(raw_path, repo_meta.clone(), core).await {
             Some(RepoResp::Ok { mime, body }) => {
-                write_http(stream, 200, mime, &body, alt_svc).await
+                let s = serve_body(&body, accept_zstd);
+                write_http(stream, 200, mime, s.encoding, &s.bytes, alt_svc).await
             }
             Some(RepoResp::Redirect { location }) => {
                 write_redirect(stream, &location, alt_svc).await
             }
             None if !looks_like_asset(key) => {
-                let idx = assets
-                    .get("/index.html")
-                    .map(Vec::as_slice)
-                    .unwrap_or(crate::assets::PLACEHOLDER_INDEX.as_bytes());
-                write_http(stream, 200, "text/html; charset=utf-8", idx, alt_svc).await
+                let s = serve_body(
+                    assets.get("/index.html").expect("index.html always loaded"),
+                    accept_zstd,
+                );
+                write_http(
+                    stream,
+                    200,
+                    "text/html; charset=utf-8",
+                    s.encoding,
+                    &s.bytes,
+                    alt_svc,
+                )
+                .await
             }
-            None => write_http(stream, 404, "text/plain", b"not found\n", alt_svc).await,
+            None => write_http(stream, 404, "text/plain", None, b"not found\n", alt_svc).await,
         },
     };
     let _ = stream.shutdown().await; // send close_notify for a clean TLS close
     res
+}
+
+/// Whether the request head advertises `zstd` in `Accept-Encoding` (header name
+/// is case-insensitive). Scans the raw head string instead of a parsed header
+/// map: the HTTP/1.1 bootstrap reads only the request line + head bytes.
+fn accepts_zstd(head: &str) -> bool {
+    head.lines().any(|l| {
+        let mut parts = l.splitn(2, ':');
+        matches!(parts.next().map(str::trim), Some(name) if name.eq_ignore_ascii_case("accept-encoding"))
+            && parts.next().is_some_and(|v| v.contains("zstd"))
+    })
 }
 
 /// Read bytes until the end of the HTTP request head (`\r\n\r\n`).
@@ -191,16 +230,18 @@ async fn read_request_head<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<S
     String::from_utf8(buf).map_err(|_| io::Error::other("non-utf8 request head"))
 }
 
-/// Write a complete HTTP/1.1 response (head + body) and flush. `alt_svc`, when
-/// present, is sent as an `Alt-Svc` header to advertise the HTTP/3 upgrade.
+/// Write a complete HTTP/1.1 response (head + body) and flush. `encoding`, when
+/// present, is sent as `Content-Encoding` (zstd for a compressed [`Body`]).
+/// `alt_svc`, when present, advertises the HTTP/3 upgrade.
 async fn write_http<S: AsyncWrite + Unpin>(
     stream: &mut S,
     status: u16,
     mime: &str,
+    encoding: Option<&str>,
     body: &[u8],
     alt_svc: Option<&str>,
 ) -> io::Result<()> {
-    write_response(stream, status, mime, None, body, alt_svc).await
+    write_response(stream, status, mime, encoding, None, body, alt_svc).await
 }
 
 /// `302 Found` to `location`, used when a mirrored asset is missing so the
@@ -210,13 +251,23 @@ async fn write_redirect<S: AsyncWrite + Unpin>(
     location: &str,
     alt_svc: Option<&str>,
 ) -> io::Result<()> {
-    write_response(stream, 302, "text/plain", Some(location), b"", alt_svc).await
+    write_response(
+        stream,
+        302,
+        "text/plain",
+        None,
+        Some(location),
+        b"",
+        alt_svc,
+    )
+    .await
 }
 
 async fn write_response<S: AsyncWrite + Unpin>(
     stream: &mut S,
     status: u16,
     mime: &str,
+    encoding: Option<&str>,
     location: Option<&str>,
     body: &[u8],
     alt_svc: Option<&str>,
@@ -234,6 +285,11 @@ async fn write_response<S: AsyncWrite + Unpin>(
         "HTTP/1.1 {status} {status_text}\r\nContent-Type: {mime}\r\nContent-Length: {len}\r\nConnection: close\r\n",
         len = body.len(),
     );
+    if let Some(enc) = encoding {
+        head.push_str("Content-Encoding: ");
+        head.push_str(enc);
+        head.push_str("\r\n");
+    }
     if let Some(loc) = location {
         head.push_str("Location: ");
         head.push_str(loc);

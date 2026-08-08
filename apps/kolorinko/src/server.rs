@@ -37,7 +37,7 @@
 //!
 //! [`Core::db_run_gear`]: dentrado::core::core_ctx::Core::db_run_gear
 
-use std::{collections::HashMap, io, path::PathBuf, rc::Rc};
+use std::{collections::HashMap, io, rc::Rc, sync::Arc};
 
 use bytes::Bytes;
 use compio::runtime;
@@ -54,13 +54,16 @@ use dentrado::core::{
     gear::GearResult,
     storage::InMemoryStorage,
 };
-use kolorinko_rt::wire::{self, ClientMsg, ServerMsg};
+use kolorinko_rt::{
+    Body,
+    wire::{self, ClientMsg, ServerMsg},
+};
 
 use crate::{
-    assets::{load_assets, looks_like_asset, mime_for},
+    assets::{Served, looks_like_asset, mime_for, serve_body},
     repo,
     runtime::{
-        GearOut, GearOutShared, KolorinkoRT, article_latest, article_latest_parsed,
+        GearOut, GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, repo_asset,
         repo_l_article_latest, repo_l_theme_roots,
     },
     wikidot_page::RepoMeta,
@@ -76,19 +79,10 @@ const MAX_WT_SESSIONS: u64 = 16;
 pub(crate) async fn serve(
     core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     bind: &str,
-    assets_dir: PathBuf,
+    assets: Arc<HashMap<String, Body>>,
     repo_meta: RepoMeta,
     inject_wt_hash: bool,
 ) -> io::Result<()> {
-    // In hash-pinning mode the WT cert hash is injected into the cached
-    // `index.html` once here; in pooling mode nothing is injected.
-    let wt_hash = if inject_wt_hash {
-        Some(crate::tls::wt_cert_hash())
-    } else {
-        None
-    };
-    let assets = Rc::new(load_assets(&assets_dir, wt_hash));
-
     let endpoint = build_endpoint(bind, inject_wt_hash)?;
     info!(
         "kolorinko H3 server listening on {bind} ({})",
@@ -175,7 +169,7 @@ fn reuseport_udp_socket(bind: &str) -> io::Result<compio::net::UdpSocket> {
 async fn handle_conn(
     incoming: compio_quic::Incoming,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
-    assets: &Rc<HashMap<String, Vec<u8>>>,
+    assets: &Arc<HashMap<String, Body>>,
     repo_meta: &RepoMeta,
 ) -> io::Result<()> {
     let conn = incoming
@@ -237,7 +231,8 @@ async fn handle_conn(
         // HTTP/3 request — serve a static asset on this stream; the connection
         // stays open for further multiplexed requests.
         let assets = assets.clone();
-        let repo_root = repo_meta.path();
+        let core = core.clone();
+        let repo_meta = repo_meta.clone();
         runtime::spawn(async move {
             let mut stream = stream;
             let path = req.uri().path().to_string();
@@ -247,29 +242,54 @@ async fn handle_conn(
                 .map(|p| p.as_str().to_string())
                 .unwrap_or_else(|| path.clone());
             let key: &str = if path == "/" { "/index.html" } else { &path };
-            let (status, mime, body, location): (u16, &'static str, Bytes, Option<String>) =
+            let accept_zstd = req
+                .headers()
+                .get(http::header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("zstd"));
+            let (status, mime, served, location): (u16, &'static str, Served, Option<String>) =
                 match assets.get(key) {
-                    Some(b) => (200, mime_for(key), Bytes::from(b.clone()), None),
-                    None => match repo::serve(&full, repo_root).await {
+                    Some(b) => (200, mime_for(key), serve_body(b, accept_zstd), None),
+                    None => match repo::serve(&full, repo_meta, &core).await {
                         Some(repo::RepoResp::Ok { mime, body }) => {
-                            (200, mime, Bytes::from(body), None)
+                            (200, mime, serve_body(&body, accept_zstd), None)
                         }
-                        Some(repo::RepoResp::Redirect { location }) => {
-                            (302, "text/plain", Bytes::new(), Some(location))
-                        }
+                        Some(repo::RepoResp::Redirect { location }) => (
+                            302,
+                            "text/plain",
+                            Served {
+                                bytes: Bytes::new(),
+                                encoding: None,
+                            },
+                            Some(location),
+                        ),
                         None if !looks_like_asset(key) => (
                             200,
                             "text/html; charset=utf-8",
-                            Bytes::from(assets.get("/index.html").cloned().unwrap_or_default()),
+                            serve_body(
+                                assets.get("/index.html").expect("index.html always loaded"),
+                                accept_zstd,
+                            ),
                             None,
                         ),
-                        None => (404, "text/plain", Bytes::from_static(b"not found\n"), None),
+                        None => (
+                            404,
+                            "text/plain",
+                            Served {
+                                bytes: Bytes::from_static(b"not found\n"),
+                                encoding: None,
+                            },
+                            None,
+                        ),
                     },
                 };
             let mut b = http::Response::builder()
                 .status(status)
                 .header("content-type", mime)
-                .header("content-length", body.len().to_string());
+                .header("content-length", served.bytes.len().to_string());
+            if let Some(enc) = served.encoding {
+                b = b.header("content-encoding", enc);
+            }
             if let Some(loc) = location {
                 b = b.header("location", loc);
             }
@@ -278,7 +298,7 @@ async fn handle_conn(
                 warn!("h3 send_response: {e}");
                 return;
             }
-            if let Err(e) = stream.send_data(body).await {
+            if let Err(e) = stream.send_data(served.bytes).await {
                 warn!("h3 send_data: {e}");
                 return;
             }
@@ -420,6 +440,11 @@ async fn subscribe_wire(
         wire::GearId::RepoLThemeRoots(site) => {
             repo_l_theme_roots(repo_meta, site).subscribe(core).await
         }
+        wire::GearId::RepoAsset { site, kind, path } => {
+            repo_asset(repo_meta, site, kind, path)
+                .subscribe(core)
+                .await
+        }
     }
 }
 
@@ -440,6 +465,7 @@ fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
             GearOutShared::RepoLArticleLatestOut(a) => {
                 Some(wire::GearOut::RepoLArticleLatestOut(a.clone()))
             }
+            GearOutShared::RepoAssetOut(a) => Some(wire::GearOut::RepoAssetOut(a.clone())),
         },
         GearResult::Local(_) => None,
     }
