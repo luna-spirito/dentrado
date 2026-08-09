@@ -15,7 +15,10 @@ pub(crate) fn build_element<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clon
             // Single-bracket `[url text]` link (must precede the `[[…]]` arm).
             single_bracket_link(),
             // Bracketed `[[…]]` constructs (and `[[[…]]]` links).
-            just('[').ignore_then(just('[').ignore_then(bracket_syntax(element.clone()))),
+            just('[').ignore_then(choice((
+                comment().ignore_then(element.clone()),
+                just('[').ignore_then(bracket_syntax(element.clone())),
+            ))),
             // Inline markup: `//`, `**`, `__`, `--`, `^^`, `,,`, `##`, vars.
             inline_syntax(element.clone()),
             // Fallback: a single arbitrary character (graceful degradation).

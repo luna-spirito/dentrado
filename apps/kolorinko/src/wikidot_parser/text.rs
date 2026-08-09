@@ -19,6 +19,14 @@ pub(crate) fn raw_escape<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone +
         .then_ignore(just("@@").or_not())
 }
 
+/// `!-- ... --]`
+pub(crate) fn comment<'a>() -> impl Parser<'a, In<'a>, (), E<'a>> + Clone + 'a {
+    just("!--")
+        .ignore_then(read_until_lines(&["--]"]))
+        .ignore_then(just("--]"))
+        .to(())
+}
+
 /// Bare `http://` / `https://` URL that becomes a link whose text is the URL.
 pub(crate) fn bare_http_link<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
     just("http")

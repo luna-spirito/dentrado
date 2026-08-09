@@ -233,7 +233,7 @@ impl OdbInner {
 /// nested-map [`Key`]. Kept across ticks so a moved tip can patch only the
 /// pages the git diff touched, locating the old key to remove when a page's
 /// slug changed or it was deleted.
-type Index = HashMap<PathBuf, Key>;
+type Index = HashMap<PathBuf, Key>; // TODO
 
 /// Per-instance cache for [`repo`]: the shared [`Odb`] (opened `Repository` +
 /// blob cache, kept across ticks), the last commit tip, the last-built dataset,
@@ -265,6 +265,7 @@ impl fmt::Debug for RepoCache {
 /// garbage-collected the old tip). A same-tip or non-tick run returns the
 /// previously built dataset unchanged.
 pub(crate) fn repo(meta: &RepoMeta, tick: bool, cache: &mut RepoCache) -> Rc<RepoData> {
+    // TODO: Post to background thread?
     let mut inner = cache.0.borrow_mut();
     if inner.odb.is_none() {
         inner.odb = open_or_clone(meta.url, meta.path).map(|r| Rc::new(OdbInner::new(r)));
