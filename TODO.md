@@ -69,3 +69,4 @@ bridge.rs:
 * CRITICAL: DEAL WITH LOCALIZABLE IN SERVER<->CLIENT INTERACTION!
 * Remove `output` caching from Gears?, add foreign_ptr for shared memory?, assets-as-gears?
 * CRITICAL: fix distribution in dentrado-macro, phantom group by GearId when missing?
+* TODO: FATAL: TOCTOU race in `force_active`

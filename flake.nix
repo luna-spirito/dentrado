@@ -108,6 +108,7 @@
               # system OpenSSL, which it finds via pkg-config.
               pkgs.openssl
               pkgs.pkg-config
+              pkgs.heaptrack
             ];
           };
         };

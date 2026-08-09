@@ -2,17 +2,19 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
+    future::poll_fn,
     num::NonZero,
     ops::Deref,
     rc::{Rc, Weak},
     sync::{Arc, mpsc},
+    task::Poll,
     time::Duration,
 };
 
 use compio::runtime::JoinHandle;
 use slotmap::{SlotMap, new_key_type};
-use synchrony::unsync::event::Event;
 
+pub use crate::core::subscription::Subscription;
 use crate::{
     core::{
         db,
@@ -20,6 +22,7 @@ use crate::{
         gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime},
         shared::{RemoteShared, Shared, SharedArena, SharedBus, SharedData, SharedKey},
         storage::{GroupStore, Storage},
+        subscription::Epoch,
     },
     types::{GlobalCoreId, GlobalHash, LocGroupId, NodeId},
     wire::{
@@ -258,11 +261,10 @@ pub(crate) struct ActiveGear<R: IsRuntime> {
     pub(crate) remote_subscribers: HashSet<u32>,
     /// Count of direct (worker-side) subscribers. Eager demote trigger.
     pub(crate) direct_subscriber_count: usize,
-    /// Fan-out for output updates to direct subscribers / `secondary_get`
-    /// awaiters. Persistent: created on first activate, notified on every
-    /// completed run (local) or `SubscriptionUpdate` (remote).
-    /// TODO: Replace with other mechanism?
-    pub(crate) changed: Event,
+    /// Change signal for output updates to direct subscribers / `secondary_get`
+    /// awaiters. Bumped on every completed run (local) or `SubscriptionUpdate`
+    /// (remote); waiters park on its epoch via [`Core::wait_change`].
+    pub(crate) changed: Epoch,
 }
 
 impl<R: IsRuntime> ActiveGear<R> {
@@ -354,7 +356,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
     }
 
     #[must_use]
-    pub(crate) fn core_id(&self) -> u32 {
+    pub fn core_id(&self) -> u32 {
         self.core_id
     }
 
@@ -405,6 +407,11 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
         };
         match status {
             ActiveGearStatus::Eepy => {
+                log::trace!(
+                    target: "dentrado::gear",
+                    "kick core{} {:?} Eepy→Running",
+                    self_rc.core_id, ag.id
+                );
                 let handle = compio::runtime::spawn(Self::run_loc_gear_task(self_rc.clone(), key));
                 *status = ActiveGearStatus::Running {
                     handle,
@@ -412,6 +419,11 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 }
             }
             ActiveGearStatus::Running { rerun, .. } => {
+                log::trace!(
+                    target: "dentrado::gear",
+                    "kick core{} {:?} Running→rerun",
+                    self_rc.core_id, ag.id
+                );
                 *rerun = true;
             }
         }
@@ -536,6 +548,12 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 (gear_id, input)
             };
 
+            log::trace!(
+                target: "dentrado::gear",
+                "run_iter core{} {:?}",
+                self.core_id, gear_id
+            );
+
             // Load this gear's working state from storage (cold start ⇒ fresh).
             let mut cache = self
                 .storage
@@ -596,7 +614,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 };
                 let dependents: Vec<GearKey> = ag.local_dependents.iter().copied().collect();
                 let remote_subs: Vec<u32> = ag.remote_subscribers.iter().copied().collect();
-                ag.changed.notify_all();
+                ag.changed.bump();
                 (removed_deps, dependents, remote_subs, do_rerun)
             };
 
@@ -667,6 +685,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
     ///
     /// WARNING: Forces active even if there are no subscribers.
     async fn force_active(self: &Rc<Self>, gear: &R::GearId) -> GearKey {
+        // TODO: FATAL: TOCTOU RACE.
         // Existing gear: promote it out of limbo if needed. Nothing to kick or
         // re-subscribe — it already has an output or a run/subscription in flight.
         {
@@ -753,9 +772,14 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 local_dependents: HashSet::new(),
                 remote_subscribers: HashSet::new(),
                 direct_subscriber_count: 0,
-                changed: Event::new(),
+                changed: Epoch::new(),
             });
             inner.gear_index.insert(gear.clone(), key);
+            log::debug!(
+                target: "dentrado::gear",
+                "create core{} {:?} key={:?} live_gears={}",
+                self.core_id, gear, key, inner.gears.len()
+            );
             match registration {
                 Reg::Event(loc_group) => {
                     inner
@@ -811,7 +835,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
     /// `secondary_get_impl` / `StartSubscription` / `subscribe_gear*`.
     async fn wait_for_output_unpinned(self: &Rc<Self>, key: GearKey) -> Option<GearResult<R>> {
         loop {
-            let listener = {
+            let seen = {
                 let inner = self.inner.borrow();
                 let Some(ag) = inner.gears.get(key) else {
                     return None;
@@ -819,9 +843,11 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 if let Some(out) = ag.output.clone() {
                     return Some(out);
                 }
-                ag.changed.listen()
+                ag.changed.current()
             };
-            listener.await;
+            if !self.wait_change(key, seen).await {
+                return None;
+            }
         }
     }
 
@@ -861,9 +887,40 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
             .expect("secondary_get_impl: dependency evicted while awaiting its output")
     }
 
-    fn current_output_key(&self, key: GearKey) -> Option<GearResult<R>> {
+    pub(crate) fn current_output_key(&self, key: GearKey) -> Option<GearResult<R>> {
         let inner = self.inner.borrow();
         inner.gears.get(key).and_then(|ag| ag.output.clone())
+    }
+
+    /// Current change-epoch of the gear at `key`, or `None` if it has been
+    /// evicted.
+    pub(crate) fn change_epoch(&self, key: GearKey) -> Option<u64> {
+        self.inner
+            .borrow()
+            .gears
+            .get(key)
+            .map(|ag| ag.changed.current())
+    }
+
+    /// Park until the gear's change-epoch advances past `seen`, or the gear is
+    /// evicted. `seen` must be captured *before* the caller last observed the
+    /// gear's state, so a change landing between capture and park is not lost.
+    /// Returns `false` if the gear was evicted while waiting.
+    pub(crate) async fn wait_change(self: &Rc<Self>, key: GearKey, seen: u64) -> bool {
+        let core = Rc::clone(self);
+        poll_fn(move |cx| {
+            let mut inner = core.inner.borrow_mut();
+            let Some(ag) = inner.gears.get_mut(key) else {
+                return Poll::Ready(false);
+            };
+            if ag.changed.current() == seen {
+                ag.changed.park(cx);
+                Poll::Pending
+            } else {
+                Poll::Ready(true)
+            }
+        })
+        .await
     }
 
     fn is_locally_running_key(&self, key: GearKey) -> bool {
@@ -882,11 +939,29 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
     /// — that way a cancelled wait still drops the `Subscription` and decrements.
     fn inc_direct_subscriber(&self, key: GearKey) {
         let mut inner = self.inner.borrow_mut();
-        inner
+        let ag = inner
             .gears
             .get_mut(key)
-            .expect("inc_direct_subscriber: gear evicted immediately after force_active")
-            .direct_subscriber_count += 1;
+            .expect("inc_direct_subscriber: gear evicted immediately after force_active");
+        ag.direct_subscriber_count += 1;
+        log::debug!(
+            target: "dentrado::gear",
+            "subscribe core{} {:?} direct_subscriber_count={} local_dependents={} remote_subscribers={}",
+            self.core_id, ag.id, ag.direct_subscriber_count,
+            ag.local_dependents.len(), ag.remote_subscribers.len()
+        );
+    }
+
+    /// Decrement the direct-subscriber count for `key`; returns `true` if the
+    /// gear consequently lost all interest (the caller should then rebalance).
+    /// Matching increment: [`Core::inc_direct_subscriber`].
+    pub(crate) fn release_direct_subscriber(&self, key: GearKey) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let Some(ag) = inner.gears.get_mut(key) else {
+            return false;
+        };
+        ag.direct_subscriber_count = ag.direct_subscriber_count.saturating_sub(1);
+        !ag.has_interest()
     }
 
     // --- cross-core subscription wiring ---
@@ -1006,7 +1081,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
     /// produced by cascade evictions are emitted directly by `CoreLocCtx` via
     /// the borrowed [`StopCtx`] (channels/doorbells/core id) — no `Vec` of
     /// pending stops is round-tripped through `Core`.
-    fn rebalance_key(self: &Rc<Self>, key: GearKey) {
+    pub(crate) fn rebalance_key(self: &Rc<Self>, key: GearKey) {
         let stop_ctx = StopCtx {
             intercore_tx: &self.intercore_tx,
             doorbells: &self.doorbells,
@@ -1229,7 +1304,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                         return;
                     };
                     ag.output = Some(GearResult::Ship(output));
-                    ag.changed.notify_all();
+                    ag.changed.bump();
                     ag.local_dependents.iter().copied().collect::<Vec<_>>()
                 };
                 for dep in dependents {
@@ -1259,7 +1334,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                         return;
                     };
                     ag.output = Some(GearResult::Shared(shared));
-                    ag.changed.notify_all();
+                    ag.changed.bump();
                     ag.local_dependents.iter().copied().collect::<Vec<_>>()
                 };
                 for dep in dependents {
@@ -1529,71 +1604,6 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
         let out = sub.current();
         drop(sub);
         out
-    }
-}
-
-/// RAII handle for a direct, worker-side subscription to a gear's output.
-///
-/// Dropping it decrements the gear's direct-subscriber count and rebalances
-/// the gear (demoting it to limbo, or evicting it under pressure). Naturally
-/// `!Sync` via `Rc<Core>`: it must live on the owning core's thread.
-#[must_use]
-pub struct Subscription<R: IsRuntime, S: Storage<R>> {
-    core: Rc<Core<R, S>>,
-    /// The arena key, stored directly (not the `R::GearId`) so `current`/
-    /// `next`/`Drop` skip the `gear_index` lookup. Safe because a live
-    /// `Subscription` holds `direct_subscriber_count >= 1`, so `has_interest`
-    /// is true and the gear cannot be evicted (its key cannot go stale) for as
-    /// long as this handle exists.
-    key: GearKey,
-}
-
-impl<R: IsRuntime, S: Storage<R>> Subscription<R, S> {
-    /// Read the gear's currently-cached output. The value is guaranteed to be
-    /// present (subscribe awaits the first computation).
-    #[must_use]
-    pub fn current(&self) -> GearResult<R> {
-        let inner = self.core.inner.borrow();
-        inner
-            .gears
-            .get(self.key)
-            .and_then(|ag| ag.output.clone())
-            .expect("Subscription::current: gear has no output")
-    }
-
-    /// Wait for the next output update (the gear's `changed` event fires after
-    /// each completed run / `SubscriptionUpdate`) and return the new value
-    pub async fn next(&self) -> GearResult<R> {
-        let listener = {
-            let inner = self.core.inner.borrow();
-            let Some(ag) = inner.gears.get(self.key) else {
-                unreachable!("ActiveGear dropped even though we're subscribed to it");
-            };
-            ag.changed.listen()
-        };
-        listener.await;
-        let inner = self.core.inner.borrow();
-        inner
-            .gears
-            .get(self.key)
-            .and_then(|ag| ag.output.clone())
-            .expect("No output found")
-    }
-}
-
-impl<R: IsRuntime, S: Storage<R>> Drop for Subscription<R, S> {
-    fn drop(&mut self) {
-        let lost_interest = {
-            let mut inner = self.core.inner.borrow_mut();
-            let Some(ag) = inner.gears.get_mut(self.key) else {
-                return;
-            };
-            ag.direct_subscriber_count = ag.direct_subscriber_count.saturating_sub(1);
-            !ag.has_interest()
-        };
-        if lost_interest {
-            self.core.rebalance_key(self.key);
-        }
     }
 }
 

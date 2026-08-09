@@ -1052,6 +1052,7 @@ dependencies = [
  "futures",
  "im",
  "libc",
+ "log",
  "proptest",
  "rkyv",
  "serde_json",
