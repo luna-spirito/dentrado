@@ -3,7 +3,10 @@
 use super::*;
 
 /// All inline (non-line-start) markup.
-pub(crate) fn inline_syntax<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn inline_syntax<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
 ) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
     choice((
@@ -23,7 +26,10 @@ pub(crate) fn inline_syntax<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>
 
 /// A `//…//`-style delimited span. The opener must not be immediately followed
 /// by a space; the body runs to the next delimiter or EOL.
-pub(crate) fn style<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn style<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
     delim: &'static str,
     st: TextStyle,
@@ -40,7 +46,10 @@ pub(crate) fn style<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
 }
 
 /// `^^sup^^`.
-pub(crate) fn superscript<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn superscript<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
 ) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
     let end_at = choice((just("^^").ignored(), just('\n').ignored(), end()));
@@ -54,7 +63,10 @@ pub(crate) fn superscript<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
 }
 
 /// `,,sub,,`.
-pub(crate) fn subscript<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn subscript<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
 ) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
     let end_at = choice((just(",,").ignored(), just('\n').ignored(), end()));
@@ -68,7 +80,10 @@ pub(crate) fn subscript<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
 }
 
 /// `##color|text##`.
-pub(crate) fn color_span<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn color_span<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
 ) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
     let end_at = choice((just("##").ignored(), just('\n').ignored(), end()));

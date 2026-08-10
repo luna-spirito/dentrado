@@ -3,7 +3,10 @@
 use super::*;
 
 /// All constructs that may only appear at the beginning of a line.
-pub(crate) fn line_syntax<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn line_syntax<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
 ) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
     at_line_start().ignore_then(choice((
@@ -17,7 +20,10 @@ pub(crate) fn line_syntax<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
 }
 
 /// `+` … `++++++` heading. Body is the rest of the line.
-pub(crate) fn heading<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn heading<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
 ) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
     just('+')
@@ -43,7 +49,10 @@ pub(crate) fn hr<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
 /// A `||…||…` table: one or more consecutive `||`-prefixed lines. Cells are
 /// separated by `||`; each cell may begin with `~` (header) and an alignment
 /// marker (`<` / `=` / `>`).
-pub(crate) fn table_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn table_block<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
 ) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
     custom(move |inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
@@ -130,7 +139,10 @@ pub(crate) fn table_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
 }
 
 /// One or more `>` blockquote lines merged into a single quote container.
-pub(crate) fn blockquote<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn blockquote<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
 ) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
     let line = just('>')
@@ -160,7 +172,10 @@ pub(crate) fn blockquote<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
 }
 
 /// `= text` — a single centered line.
-pub(crate) fn centered_line<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn centered_line<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
 ) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
     just('=')
@@ -179,7 +194,10 @@ pub(crate) fn centered_line<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>
 /// Consecutive lines (one or more) form the list; a line without a marker
 /// (or non-increasing indentation) ends it. Each item's body is parsed as
 /// inline markup; deeper-indented lines become a [`ListItem::sublist`].
-pub(crate) fn list_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn list_block<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
 ) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
     custom(move |inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {

@@ -6,13 +6,20 @@
 //!
 //! ## Architecture
 //!
-//! The central combinator is [`content_until`]: it parses a stream of [`Node`]s
-//! until a *terminator* is reached, then consumes the terminator and reports
-//! *why* parsing stopped (via [`ContentExitReason`]). Every container in the
-//! language (`[[div]]`, `[[size]]`, a table cell, a style span, …) parses its
-//! body with a terminator specialized to its closing construct, while the
-//! top-level page parse uses EOF as its terminator. [`content_before`] is the
-//! non-consuming variant for inline contexts (style spans, link text).
+//! The central combinator is [`content_loop`]: it parses a stream of [`Node`]s
+//! and stops — *without backtracking* — at the first of: end of input, any
+//! closing tag `[[/…]]`, or a comment close `--]` (only inside a comment). It
+//! reports *why* it stopped (via [`ContentExitReason`]) and leaves the closer
+//! in the stream for the responsible container to claim. Every container
+//! (`[[div]]`, `[[span]]`, `[[code]]`, `[!--`, …) parses its opener, runs
+//! `content_loop`, then either consumes its own closer (a match → build the
+//! node) or, on a mismatch/EOF, *flattens*: emits the verbatim opener as a
+//! [`Node::Raw`] followed by the body it already parsed, and leaves the foreign
+//! closer for its ancestor. This makes malformed input degrade gracefully and
+//! keeps parsing linear — a missing closer never re-parses the whole page.
+//!
+//! [`content_before`] is the non-consuming variant for inline/line contexts
+//! (style spans, headings, link text) that stop at a caller-supplied sigil.
 //!
 //! The element grammar is left-recursive through containers, so the element
 //! parser is tied into a knot with [`recursive`] inside [`build_element`].
@@ -59,11 +66,11 @@ pub(crate) use text::*;
 // Tags & exit reasons
 // =========================================================================
 
-/// The block-level opening tags that pair with a matching `[[/…]]` closer.
+/// Every opening tag that pairs with a matching `[[/…]]` closer.
 ///
-/// These are the only constructs whose body is parsed with a *dedicated*
-/// closing terminator; everything else either self-closes (`[[image …]]`) or is
-/// inline.
+/// [`content_loop`] recognizes *any* of these closers (so a container stops at
+/// a foreign closer too, flattens, and propagates the reason) and reports
+/// which one via [`ContentExitReason::ClosedTag`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ClosedTag {
     Div,
@@ -75,6 +82,16 @@ pub enum ClosedTag {
     Module,
     Tab,
     Tabview,
+    Table,
+    Row,
+    /// `[[cell …]]` / `[[hcell …]]` — both close with `[[/cell]]` or
+    /// `[[/hcell]]`, so the closer keyword maps to this single variant.
+    Cell,
+    Collapsible,
+    /// `[[a href=…]] … [[/a]]` explicit anchor.
+    Anchor,
+    /// `[[code]] … [[/code]]`.
+    Code,
     /// `[[<]]`, `[[=]]`, `[[>]]`, `[[==]]`, `[[f<]]`, `[[f>]]`. The closer
     /// mirrors the opener exactly (`[[/f<]]`, `[[/==]]`, …).
     Align {
@@ -95,6 +112,12 @@ impl ClosedTag {
             ClosedTag::Module => "module".into(),
             ClosedTag::Tab => "tab".into(),
             ClosedTag::Tabview => "tabview".into(),
+            ClosedTag::Table => "table".into(),
+            ClosedTag::Row => "row".into(),
+            ClosedTag::Cell => "cell".into(),
+            ClosedTag::Collapsible => "collapsible".into(),
+            ClosedTag::Anchor => "a".into(),
+            ClosedTag::Code => "code".into(),
             ClosedTag::Align { floating, side } => {
                 let f = if *floating { "f" } else { "" };
                 let s = match side {
@@ -109,13 +132,15 @@ impl ClosedTag {
     }
 }
 
-/// Why a [`content_until`] run stopped.
+/// Why a [`content_loop`] run stopped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContentExitReason {
     /// Reached end of input.
     Eof,
-    /// Recognized and consumed the matching closing tag.
-    EndOfTag(ClosedTag),
+    /// A closing tag `[[/…]]` was found and consumed. Carries which tag it was.
+    ClosedTag(ClosedTag),
+    /// A comment close `--]` was found and consumed (only reported inside a comment).
+    ClosedComment,
 }
 
 // =========================================================================
@@ -132,13 +157,31 @@ pub type E<'a> = extra::Err<Rich<'a, char>>;
 // Public entry points
 // =========================================================================
 
-/// Top-level content parser: parses a whole page until EOF.
+/// Top-level content parser: parses a whole page, absorbing any stray closing
+/// tags as raw text, until EOF.
 ///
-/// Matches the skeleton signature, but over `&str` rather than `&[u8]` (see the
-/// module docs).
+/// [`content_loop`] stops at the first closer it sees; at the top level no
+/// container is open, so any closer is stray and is folded back into a
+/// [`Node::Raw`] before parsing resumes. Returns the page content and (always
+/// [`ContentExitReason::Eof`] on success) the stop reason.
 pub fn content<'a>() -> impl Parser<'a, In<'a>, (Content, ContentExitReason), E<'a>> + Clone + 'a {
     let element = build_element();
-    content_until(element, end().to(ContentExitReason::Eof))
+    custom(move |inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let element = element.clone();
+        let mut nodes = Content::new();
+        loop {
+            let (sub, reason) = inp.parse(content_loop(element.clone(), false))?;
+            nodes.extend(sub);
+            match &reason {
+                ContentExitReason::Eof => return Ok((nodes, reason)),
+                // A stray closer was consumed by the loop; re-emit it verbatim.
+                ContentExitReason::ClosedComment => nodes.push(Node::Raw("--]".to_string())),
+                ContentExitReason::ClosedTag(tag) => {
+                    nodes.push(Node::Raw(format!("[[/{}]]", tag.opener_str())))
+                }
+            }
+        }
+    })
 }
 
 /// Parse a whole page, fusing adjacent text fragments with [`merge_text`].
@@ -588,5 +631,118 @@ mod tests {
             }
         }
         assert!(found, "no ModuleVar parsed");
+    }
+
+    /// A deeply nested *unclosed* `[[div]]` used to catastrophic-backtrack and
+    /// hang. It must now complete, flattening each broken opener to a raw node.
+    #[test]
+    fn nested_unclosed_div_completes() {
+        let src = "[[div]]\n".repeat(500) + "body";
+        let c = parse(&src);
+        // Every broken opener flattens to a `Node::Raw`; none are swallowed or
+        // collapsed into a single text blob.
+        let raws = c.iter().filter(|n| matches!(n, Node::Raw(_))).count();
+        assert_eq!(raws, 500, "expected 500 raw openers, got {c:#?}");
+        // The trailing body text survives and is not eaten by the bug.
+        assert!(
+            c.iter()
+                .any(|n| matches!(n, Node::Text(TextObj::Plain(s)) if s.contains("body")))
+        );
+    }
+
+    /// Nested *unclosed* comments (`[!--`) must not eat the rest of the page and
+    /// must complete (the old `read_until_lines` closer backtracked mildly
+    /// superlinearly; the content-loop route must stay bounded).
+    #[test]
+    fn nested_unclosed_comment_does_not_eat_page() {
+        let src = "[!--\n".repeat(50) + "after\n";
+        let c = parse(&src);
+        // `after` must remain as parseable text, not be discarded.
+        assert!(
+            c.iter()
+                .any(|n| matches!(n, Node::Text(TextObj::Plain(s)) if s.contains("after"))),
+            "page tail eaten: {c:#?}"
+        );
+        // Each broken `[!--` flattens to a raw opener.
+        let raws = c.iter().filter(|n| matches!(n, Node::Raw(_))).count();
+        assert_eq!(raws, 50, "expected 50 raw `[!--` openers, got {c:#?}");
+    }
+
+    /// A balanced comment around markup discards its contents entirely.
+    #[test]
+    fn balanced_comment_discards() {
+        let c = parse("before [!-- [[div]] hidden [[/div]] --] after");
+        // Nothing of the commented-out div should leak.
+        assert!(
+            c.iter().all(|n| !matches!(
+                n,
+                Node::Container {
+                    kind: ContainerKind::Div { .. },
+                    ..
+                }
+            )),
+            "commented div leaked: {c:#?}"
+        );
+        assert!(
+            c.iter()
+                .any(|n| matches!(n, Node::Text(TextObj::Plain(s)) if s.contains("before")))
+        );
+        assert!(
+            c.iter()
+                .any(|n| matches!(n, Node::Text(TextObj::Plain(s)) if s.contains("after")))
+        );
+    }
+
+    /// A foreign closer (`[[/span]]`) must be claimed by its matching open
+    /// container, with the intervening mismatched container (`[[div]]`)
+    /// flattened inside it — not left to leak as stray text.
+    #[test]
+    fn mismatched_closer_claimed_by_ancestor() {
+        let c = parse("[[span]] outer [[div]] inner [[/span]] tail");
+        // The span matches and wraps the broken div.
+        let span = c
+            .iter()
+            .find_map(|n| match n {
+                Node::Container {
+                    kind: ContainerKind::Div { inline: true, .. },
+                    content,
+                } => Some(content),
+                _ => None,
+            })
+            .expect("matched span container");
+        assert!(
+            span.iter()
+                .any(|n| matches!(n, Node::Raw(s) if s == "[[div]]")),
+            "div should flatten inside span: {span:#?}"
+        );
+        assert!(
+            span.iter()
+                .any(|n| matches!(n, Node::Text(TextObj::Plain(s)) if s.contains("inner")))
+        );
+        // The `[[/span]]` closer is consumed by the span, so `tail` is free text.
+        assert!(
+            c.iter()
+                .any(|n| matches!(n, Node::Text(TextObj::Plain(s)) if s.contains("tail")))
+        );
+        // No stray raw closer leaks.
+        assert!(
+            c.iter()
+                .all(|n| !matches!(n, Node::Raw(s) if s.contains("/span")))
+        );
+    }
+
+    /// A top-level stray closer (`[[/div]]` with no opener) is absorbed as raw
+    /// text and parsing resumes.
+    #[test]
+    fn stray_closer_absorbed_as_raw() {
+        let c = parse("text [[/div]] more");
+        assert!(
+            c.iter()
+                .any(|n| matches!(n, Node::Raw(s) if s.contains("/div")))
+        );
+        assert!(
+            c.iter()
+                .any(|n| matches!(n, Node::Text(TextObj::Plain(s)) if s.contains("more")))
+        );
     }
 }

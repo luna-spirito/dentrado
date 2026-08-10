@@ -427,7 +427,10 @@ fn render_container(site: &str, kind: &ContainerKind, content: &Content) -> AnyV
             // [`render_block`] when its runs split into paragraphs.
             let runs = paragraph_runs(content);
             if runs.is_empty() {
-                return view! { <></> }.into_any();
+                return {
+                    let _: () = view! { <></> };
+                    ().into_any()
+                };
             }
             if *inline {
                 let inner = render_inline(site, content);

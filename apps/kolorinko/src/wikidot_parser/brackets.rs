@@ -4,16 +4,21 @@ use super::*;
 
 /// `[[a href="url" …]] body [[/a]]` — an explicit anchor. The `href` attribute
 /// is used verbatim (no site-prefixing); the body is inline wikitext.
-pub(crate) fn anchor_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn anchor_block<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
-) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
-    let close = tag_close("a").to(ContentExitReason::Eof);
-    kw_ci("a".to_string())
-        .ignore_then(params_block())
-        .then_ignore(spaces())
-        .then_ignore(just("]]"))
-        .then(content_until(element, close))
-        .map(|(params, (content, _))| {
+) -> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a {
+    balanced(
+        element,
+        just("[[")
+            .ignore_then(kw_ci("a".to_string()))
+            .ignore_then(params_block())
+            .then_ignore(spaces())
+            .then_ignore(just("]]")),
+        ContentExitReason::ClosedTag(ClosedTag::Anchor),
+        |params, content| {
             let href = params
                 .get("href")
                 .and_then(|v| v.first())
@@ -26,16 +31,20 @@ pub(crate) fn anchor_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
                 target: LinkTarget::Url(href),
                 text: content,
             }
-        })
+        },
+    )
 }
 
 /// Dispatch over everything that can follow `[[`.
-pub(crate) fn bracket_syntax<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn bracket_syntax<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
-) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
+) -> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a {
     choice((
-        // `[[[target|text]]]` / `[[[target]]]`. The third `[` is consumed here.
-        just('[').ignore_then(link(element.clone())),
+        // `[[[target|text]]]` / `[[[target]]]`. Must precede the `[[KW]]` arms.
+        link(element.clone()),
         div_span_block(element.clone()),
         anchor_block(element.clone()),
         grid_table_block(element.clone()),
@@ -45,68 +54,75 @@ pub(crate) fn bracket_syntax<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a
         iftags_block(element.clone()),
         module_block(element.clone()),
         tabview_block(element.clone()),
-        include_block(),
-        image_block(),
-        code_block(),
-        collapsible_block(element.clone()),
+        one(image_block()),
+        one(include_block()),
+        code_block(element.clone()),
+        collapsible_block(element),
     ))
 }
 
-/// `[[[target|text]]]` / `[[[target]]]`. The caller has consumed `[[[`.
-pub(crate) fn link<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+/// `[[[target|text]]]` / `[[[target]]]`. The leading `[[[` is consumed here.
+pub(crate) fn link<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
-) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
+) -> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a {
     let target = read_until(&["|", "]]]"]).map(|s| s.trim().to_string());
     let text = just('|').ignore_then(content_before(element, just("]]]").ignored()));
 
-    target
-        .then(text.or_not())
-        .then_ignore(just("]]]"))
+    just("[[[")
+        .ignore_then(target.then(text.or_not()).then_ignore(just("]]]")))
         .map(|(raw, text)| {
             let target = parse_link_target(&raw);
             let text = text.unwrap_or_else(|| vec![Node::Text(TextObj::Plain(raw))]);
-            Node::Link { target, text }
+            (vec![Node::Link { target, text }], None)
         })
 }
 
 /// `[[div …]] … [[/div]]` / `[[span …]] … [[/span]]`.
-pub(crate) fn div_span_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn div_span_block<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
-) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
-    let div = div_open()
-        .then(content_until(
-            element.clone(),
-            closing_tag(ClosedTag::Div).to(ContentExitReason::EndOfTag(ClosedTag::Div)),
-        ))
-        .map(|((underscore, params), (content, _))| Node::Container {
+) -> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a {
+    let div = balanced(
+        element.clone(),
+        div_open(),
+        ContentExitReason::ClosedTag(ClosedTag::Div),
+        |(underscore, params), content| Node::Container {
             kind: ContainerKind::Div {
                 inline: false,
                 block: !underscore,
                 params,
             },
             content,
-        });
-    let span = container_open("span")
-        .then(content_until(
-            element,
-            closing_tag(ClosedTag::Span).to(ContentExitReason::EndOfTag(ClosedTag::Span)),
-        ))
-        .map(|(params, (content, _))| Node::Container {
+        },
+    );
+    let span = balanced(
+        element,
+        container_open("span"),
+        ContentExitReason::ClosedTag(ClosedTag::Span),
+        |params, content| Node::Container {
             kind: ContainerKind::Div {
                 inline: true,
                 block: false,
                 params,
             },
             content,
-        });
+        },
+    );
     div.or(span)
 }
 
-/// `[[div _? params ]]` open tag, returning whether the `div_` (no-paragraph)
-/// underscore was present and the attribute map.
+/// `[[div _? params ]]` open tag (including the leading `[[`), returning
+/// whether the `div_` (no-paragraph) underscore was present and the attribute
+/// map.
 pub(crate) fn div_open<'a>()
 -> impl Parser<'a, In<'a>, (bool, HashMap<String, Vec<TextObj>>), E<'a>> + Clone + 'a {
-    kw_ci("div".to_string())
+    just("[[")
+        .ignore_then(kw_ci("div".to_string()))
         .ignore_then(just('_').or_not().map(|opt| opt.is_some()))
         .then(params_block())
         .then_ignore(spaces())
@@ -114,87 +130,68 @@ pub(crate) fn div_open<'a>()
 }
 
 /// `[[table …]] … [[row …]] … [[/row]] … [[/table]]` grid table. The leading
-/// `[[` of `[[table]]` is consumed by [`bracket_syntax`]; each `[[row]]` opener
-/// consumes its own `[[`. A row's body is generic content in which
-/// `[[cell]]` / `[[hcell]]` appear as [`Node::BlockCell`] nodes — often wrapped
-/// in `[[iftags]]` conditionals — produced by [`grid_cell_block`].
-pub(crate) fn grid_table_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+/// `[[` of `[[table]]` is consumed here; each `[[row]]` opener consumes its own
+/// `[[`. A row's body is generic content in which `[[cell]]` / `[[hcell]]`
+/// appear as [`Node::BlockCell`] nodes — often wrapped in `[[iftags]]`
+/// conditionals — produced by [`grid_cell_block`].
+pub(crate) fn grid_table_block<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
-) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
-    let ws = choice((just(' ').ignored(), just('\n').ignored()))
-        .repeated()
-        .ignored();
-    let row = just("[[")
-        .ignore_then(spaces())
-        .ignore_then(kw_ci("row".into()))
-        .ignore_then(params_block())
-        .then_ignore(spaces())
-        .then_ignore(just("]]"))
-        .then(content_until(
-            element.clone(),
-            tag_close("row").to(ContentExitReason::Eof),
-        ))
+) -> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a {
+    let row = container_open("row")
+        .then(content_loop(element.clone(), false))
         .map(|(params, (content, _))| BlockRow { params, content });
-    container_open("table")
-        .then(
-            ws.clone()
-                .ignore_then(row.separated_by(ws.clone()).collect::<Vec<_>>())
-                .then_ignore(ws),
-        )
-        .then_ignore(tag_close("table"))
-        .map(|(params, rows)| Node::BlockTable(BlockTable { params, rows }))
+    container_balanced(
+        element,
+        container_open("table"),
+        ContentExitReason::ClosedTag(ClosedTag::Table),
+        row,
+        |r: BlockRow| r.content,
+        |params, rows| Node::BlockTable(BlockTable { params, rows }),
+    )
 }
 
 /// `[[cell …]] … [[/cell]]` (`<td>`) or `[[hcell …]] … [[/hcell]]` (`<th>`),
 /// closed by either `[[/cell]]` or `[[/hcell]]`. Registered in
 /// [`bracket_syntax`] (not just inside the table) so that cells are recognised
 /// when wrapped in `[[iftags]]` conditionals within a grid-table row.
-pub(crate) fn grid_cell_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn grid_cell_block<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
-) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
-    let cell_close = just("[[")
-        .ignore_then(spaces())
-        .ignore_then(just('/'))
-        .ignore_then(spaces())
-        .ignore_then(choice((kw_ci("cell".into()), kw_ci("hcell".into()))))
-        .ignore_then(spaces())
-        .ignore_then(just("]]"))
-        .to(ContentExitReason::Eof);
-    choice((
-        kw_ci("hcell".into()).to(true),
-        kw_ci("cell".into()).to(false),
-    ))
-    .then(params_block())
-    .then_ignore(spaces())
-    .then_ignore(just("]]"))
-    .then(content_until(element, cell_close))
-    .map(|((header, params), (content, _))| {
-        Node::BlockCell(BlockCell {
-            header,
-            params,
-            content,
-        })
-    })
+) -> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a {
+    let opener = just("[[")
+        .ignore_then(choice((
+            kw_ci("hcell".to_string()).to(true),
+            kw_ci("cell".to_string()).to(false),
+        )))
+        .then(params_block())
+        .then_ignore(spaces())
+        .then_ignore(just("]]"));
+    balanced(
+        element,
+        opener,
+        ContentExitReason::ClosedTag(ClosedTag::Cell),
+        |(header, params), content| {
+            Node::BlockCell(BlockCell {
+                header,
+                params,
+                content,
+            })
+        },
+    )
 }
 
-/// `[[/KW]]` closing tag, tolerant of inner whitespace.
-pub(crate) fn tag_close<'a>(kw: &'static str) -> impl Parser<'a, In<'a>, (), E<'a>> + Clone + 'a {
-    just("[[")
-        .ignore_then(spaces())
-        .ignore_then(just('/'))
-        .ignore_then(spaces())
-        .ignore_then(kw_ci(kw.to_string()))
-        .ignore_then(spaces())
-        .ignore_then(just("]]"))
-        .to(())
-}
-
-/// Parse `[[KW _? params ]]` for an inline/block container, returning the
-/// attribute map.
+/// Parse `[[KW _? params ]]` for an inline/block container (including the
+/// leading `[[`), returning the attribute map.
 pub(crate) fn container_open<'a>(
     kw: &'static str,
 ) -> impl Parser<'a, In<'a>, HashMap<String, Vec<TextObj>>, E<'a>> + Clone + 'a {
-    kw_ci(kw.to_string())
+    just("[[")
+        .ignore_then(kw_ci(kw.to_string()))
         .ignore_then(just('_').or_not().ignored())
         .ignore_then(params_block())
         .then_ignore(spaces())
@@ -204,9 +201,12 @@ pub(crate) fn container_open<'a>(
 /// `[[<]]` / `[[=]]` / `[[>]]` / `[[==]]` / `[[f<]]` / `[[f>]]` alignment
 /// blocks. The six forms are enumerated so the closer can be built from
 /// compile-time-known data.
-pub(crate) fn align_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn align_block<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
-) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
+) -> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a {
     choice((
         align_case(element.clone(), "f<", true, AlignSide::Left),
         align_case(element.clone(), "f>", true, AlignSide::Right),
@@ -217,77 +217,96 @@ pub(crate) fn align_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
     ))
 }
 
-pub(crate) fn align_case<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn align_case<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
     opener: &'static str,
     floating: bool,
     side: AlignSide,
-) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
+) -> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a {
     let tag = ClosedTag::Align { floating, side };
-    just(opener)
-        .ignore_then(just("]]"))
-        .ignore_then(content_until(
-            element,
-            closing_tag(tag.clone()).to(ContentExitReason::EndOfTag(tag)),
-        ))
-        .map(move |(content, _)| Node::Container {
+    balanced(
+        element,
+        just("[[")
+            .ignore_then(just(opener))
+            .ignore_then(just("]]"))
+            .to(()),
+        ContentExitReason::ClosedTag(tag),
+        move |(), content| Node::Container {
             kind: ContainerKind::Align(Align { floating, side }),
             content,
-        })
+        },
+    )
 }
 
 /// `[[size ARG]] … [[/size]]`.
-pub(crate) fn size_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn size_block<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
-) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
-    kw_ci("size".into())
-        .ignore_then(spaces1())
-        .ignore_then(read_until(&["]]"]).map(|s| s.trim().to_string()))
-        .then_ignore(just("]]"))
-        .then(content_until(
-            element,
-            closing_tag(ClosedTag::Size).to(ContentExitReason::EndOfTag(ClosedTag::Size)),
-        ))
-        .map(|(arg, (content, _))| Node::Container {
+) -> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a {
+    balanced(
+        element,
+        just("[[")
+            .ignore_then(kw_ci("size".to_string()))
+            .ignore_then(spaces1())
+            .ignore_then(read_until(&["]]"]).map(|s| s.trim().to_string()))
+            .then_ignore(just("]]")),
+        ContentExitReason::ClosedTag(ClosedTag::Size),
+        |arg, content| Node::Container {
             kind: ContainerKind::Size(arg),
             content,
-        })
+        },
+    )
 }
 
 /// `[[iftags +a -b c]] … [[/iftags]]`.
-pub(crate) fn iftags_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn iftags_block<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
-) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
-    kw_ci("iftags".into())
-        .ignore_then(spaces1())
-        .ignore_then(read_until(&["]]"]).map(|s| s.to_string()))
-        .then_ignore(just("]]"))
-        .then(content_until(
-            element,
-            closing_tag(ClosedTag::IfTags).to(ContentExitReason::EndOfTag(ClosedTag::IfTags)),
-        ))
-        .map(|(tags_raw, (content, _))| {
+) -> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a {
+    balanced(
+        element,
+        just("[[")
+            .ignore_then(kw_ci("iftags".to_string()))
+            .ignore_then(spaces1())
+            .ignore_then(read_until(&["]]"]).map(|s| s.to_string()))
+            .then_ignore(just("]]")),
+        ContentExitReason::ClosedTag(ClosedTag::IfTags),
+        |tags_raw, content| {
             let (has_all, has_none) = parse_tag_filter(&tags_raw);
             Node::Container {
                 kind: ContainerKind::IfTags { has_all, has_none },
                 content,
             }
-        })
+        },
+    )
 }
 
 /// `[[collapsible show="…" hide="…"]] … [[/collapsible]]`. The body is parsed
 /// wikitext, shown expanded (a static mirror has no JS); `show`/`hide` labels
 /// are discarded. Modelled as a `collapsible-block` div so user themes apply.
-pub(crate) fn collapsible_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn collapsible_block<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
-) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
-    let close = tag_close("collapsible").to(ContentExitReason::Eof);
-    kw_ci("collapsible".to_string())
-        .ignore_then(params_block())
-        .then_ignore(spaces())
-        .then_ignore(just("]]"))
-        .ignore_then(content_until(element, close))
-        .map(|(content, _)| Node::Container {
+) -> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a {
+    balanced(
+        element,
+        just("[[")
+            .ignore_then(kw_ci("collapsible".to_string()))
+            .ignore_then(params_block().ignored())
+            .then_ignore(spaces())
+            .then_ignore(just("]]"))
+            .to(()),
+        ContentExitReason::ClosedTag(ClosedTag::Collapsible),
+        |(), content| Node::Container {
             kind: ContainerKind::Div {
                 inline: false,
                 block: true,
@@ -298,50 +317,111 @@ pub(crate) fn collapsible_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone +
                 .into(),
             },
             content,
-        })
+        },
+    )
 }
 
-/// `[[code]] … [[/code]]` — verbatim source, taken raw (no wikitext parsing)
-/// up to the closer. Optional `type="lang"` and other params on the open tag
-/// are skipped.
-pub(crate) fn code_block<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
-    kw_ci("code".into())
-        .ignore_then(read_until(&["]]"]).ignored())
-        .then_ignore(just("]]"))
-        .ignore_then(read_until_lines(&["[[/code"]).map(|s| s.to_string()))
-        .then_ignore(choice((just("[[/code]]").ignored(), end())))
-        .map(|s| Node::Code(s.trim().to_string()))
-}
-
-/// `[[module NAME …]] … [[/module]]`. Dispatches `css` (raw stylesheet) and
-/// `ListPages` (template); other modules fall through to raw text.
-pub(crate) fn module_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+/// `[[code]] … [[/code]]` — the body is parsed through the content loop (so a
+/// missing closer degrades gracefully like any block), but on a match the
+/// *verbatim* body span is kept ([`Node::Code`]) and the parsed nodes are
+/// discarded: code is raw, not wikitext.
+pub(crate) fn code_block<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
-) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
-    let css = kw_ci("css".into())
-        .ignore_then(read_until(&["]]"]).ignored())
-        .then_ignore(just("]]"))
-        .ignore_then(read_until_lines(&["[[/module"]).map(|s| s.to_string()))
-        .then_ignore(choice((just("[[/module]]").ignored(), end())))
-        .map(Node::Stylesheet);
+) -> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a {
+    raw_balanced(
+        element,
+        just("[[")
+            .ignore_then(kw_ci("code".to_string()))
+            .ignore_then(read_until(&["]]"]).ignored())
+            .then_ignore(just("]]")),
+        ContentExitReason::ClosedTag(ClosedTag::Code),
+        false,
+        |body| vec![Node::Code(body.trim().to_string())],
+    )
+}
 
-    let listpages = kw_ci("listpages".into())
-        .ignore_then(read_until(&["]]"]).ignored())
-        .then_ignore(just("]]"))
-        .ignore_then(listpages_body(element));
-
-    // Any other single-tag module (`[[module Rate]]`, `[[module PageTree …]]`,
-    // …) with no `[[/module]]` closer: consume its name + params up to `]]`
-    // and emit a suppressed [`Node::Module`]. These are dynamic and have no
-    // static representation.
-    let inline = module_name()
-        .then_ignore(read_until(&["]]"]).ignored())
-        .then_ignore(just("]]").or_not())
-        .map(Node::Module);
-
-    kw_ci("module".into())
-        .ignore_then(spaces1())
-        .ignore_then(css.or(listpages).or(inline))
+/// `[[module NAME …]] … [[/module]]`. Dispatches `css` (raw stylesheet, kept
+/// verbatim like code) and `ListPages` (template body kept as parsed content);
+/// other modules fall through to a single-tag [`Node::Module`].
+pub(crate) fn module_block<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
+    element: P,
+) -> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a {
+    custom(move |inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let full = inp.full_slice();
+        let opener_start = *inp.cursor().inner();
+        // Peek `[[module <name>` to dispatch, then rewind so the css branch can
+        // hand its *complete* opener to [`raw_balanced`] (which needs the full
+        // opener span for the flatten path).
+        let peeked = inp.save();
+        inp.parse(
+            just("[[")
+                .ignore_then(kw_ci("module".to_string()))
+                .ignore_then(spaces1()),
+        )?;
+        let rest = &full[*inp.cursor().inner()..];
+        let lower = rest.to_ascii_lowercase();
+        let result = if lower.starts_with("css") {
+            inp.rewind(peeked);
+            inp.parse(raw_balanced(
+                element.clone(),
+                just("[[")
+                    .ignore_then(kw_ci("module".to_string()))
+                    .ignore_then(spaces1())
+                    .ignore_then(kw_ci("css".to_string()))
+                    .ignore_then(read_until(&["]]"]).ignored())
+                    .then_ignore(just("]]")),
+                ContentExitReason::ClosedTag(ClosedTag::Module),
+                false,
+                |body| vec![Node::Stylesheet(body.trim().to_string())],
+            ))?
+        } else if lower.starts_with("listpages") {
+            inp.parse(
+                kw_ci("listpages".to_string())
+                    .ignore_then(read_until(&["]]"]).ignored())
+                    .then_ignore(just("]]")),
+            )?;
+            let opener_end = *inp.cursor().inner();
+            let (repeat, reason) = inp.parse(content_loop(element.clone(), false))?;
+            if reason == ContentExitReason::ClosedTag(ClosedTag::Module) {
+                (
+                    vec![Node::ListPages(ListPages {
+                        params: ListPagesParams {
+                            category: None,
+                            tags: None,
+                            created_by: None,
+                            created_at: None,
+                            updated_at: None,
+                            order: None,
+                            offset: None,
+                            limit: None,
+                        },
+                        prepend: Vec::new(),
+                        repeat,
+                        append: Vec::new(),
+                    })],
+                    None,
+                )
+            } else {
+                let mut out = Vec::with_capacity(repeat.len() + 1);
+                out.push(Node::Raw(full[opener_start..opener_end].to_string()));
+                out.extend(repeat);
+                (out, Some(reason))
+            }
+        } else {
+            // Single-tag module (`[[module Rate]]`, …) with no closer.
+            let name = inp.parse(module_name())?;
+            let _ = inp.parse(read_until(&["]]"]).ignored());
+            let _ = inp.parse(just("]]").or_not());
+            (vec![Node::Module(name)], None)
+        };
+        Ok(result)
+    })
 }
 
 /// A single word (module name): letters/digits, case-insensitive-friendly.
@@ -353,81 +433,45 @@ pub(crate) fn module_name<'a>() -> impl Parser<'a, In<'a>, String, E<'a>> + Clon
         .collect::<String>()
 }
 
-/// Body of a `[[module ListPages …]]`: everything up to `[[/module]]`.
-///
-/// TODO: split into `prependLine` / per-page template / `appendLine` using the
-/// module parameters, and interpret the parameter string into
-/// [`ListPagesParams`] (category, tags, dates, ordering).
-pub(crate) fn listpages_body<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
-    element: P,
-) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
-    let term = closing_tag(ClosedTag::Module)
-        .to(ContentExitReason::EndOfTag(ClosedTag::Module))
-        .or(end().to(ContentExitReason::Eof));
-    content_until(element, term).map(|(repeat, _)| {
-        Node::ListPages(ListPages {
-            params: ListPagesParams {
-                category: None,
-                tags: None,
-                created_by: None,
-                created_at: None,
-                updated_at: None,
-                order: None,
-                offset: None,
-                limit: None,
-            },
-            prepend: Vec::new(),
-            repeat,
-            append: Vec::new(),
-        })
-    })
-}
-
 /// `[[tabview]] … [[tab Name]] … [[/tab]] … [[/tabview]]`.
-pub(crate) fn tabview_block<'a, P: Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a>(
+pub(crate) fn tabview_block<
+    'a,
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+>(
     element: P,
-) -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
-    let ws = choice((just(' ').ignored(), just('\n').ignored()))
-        .repeated()
-        .ignored();
-    let tab_close = just("[[")
-        .ignore_then(spaces())
-        .ignore_then(just('/'))
-        .ignore_then(spaces())
-        .ignore_then(kw_ci("tab".into()))
-        .ignore_then(spaces())
-        .ignore_then(just("]]"))
-        .to(ContentExitReason::EndOfTag(ClosedTag::Tab));
-
+) -> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a {
     let tab = just("[[")
         .ignore_then(spaces())
-        .ignore_then(kw_ci("tab".into()))
+        .ignore_then(kw_ci("tab".to_string()))
         .ignore_then(spaces())
         .ignore_then(content_before(element.clone(), just("]]").ignored()))
         .then_ignore(just("]]"))
-        .then(content_until(element, tab_close))
-        .map(|(name, (content, _))| types::Tab { name, content });
-
-    kw_ci("tabview".into())
-        .ignore_then(params_block())
-        .ignore_then(spaces())
-        .ignore_then(just("]]"))
-        .ignore_then(ws.clone())
-        .ignore_then(tab.separated_by(ws.clone()).collect::<Vec<_>>())
-        .then_ignore(ws)
-        .then_ignore(just("[["))
+        .then(content_loop(element.clone(), false))
+        .map(|(name, (content, _))| Tab { name, content });
+    let opener = just("[[")
+        .ignore_then(kw_ci("tabview".to_string()))
+        .ignore_then(params_block().ignored())
         .then_ignore(spaces())
-        .then_ignore(just('/'))
-        .then_ignore(spaces())
-        .then_ignore(kw_ci("tabview".into()))
-        .then_ignore(spaces())
-        .then_ignore(just("]]"))
-        .map(|tabs: Vec<types::Tab>| Node::Tabview(tabs))
+        .then_ignore(just("]]"));
+    container_balanced(
+        element,
+        opener,
+        ContentExitReason::ClosedTag(ClosedTag::Tabview),
+        tab,
+        |t: Tab| {
+            let mut c = Content::new();
+            c.extend(t.name);
+            c.extend(t.content);
+            c
+        },
+        |(), tabs| Node::Tabview(tabs),
+    )
 }
 
 /// `[[include source key="value" …]]`.
 pub(crate) fn include_block<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
-    kw_ci("include".into())
+    just("[[")
+        .ignore_then(kw_ci("include".to_string()))
         .ignore_then(spaces1())
         .ignore_then(read_include_body())
         .then_ignore(just("]]"))
@@ -712,8 +756,9 @@ pub(crate) fn image_block<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone 
         })),
         empty().to(None),
     ));
-    align
-        .then_ignore(kw_ci("image".into()))
+    just("[[")
+        .ignore_then(align)
+        .then_ignore(kw_ci("image".to_string()))
         .then_ignore(spaces1())
         .then(text_objs(&[" ", "]]"]))
         .then(params_block())

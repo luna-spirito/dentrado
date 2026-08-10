@@ -19,12 +19,27 @@ pub(crate) fn raw_escape<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone +
         .then_ignore(just("@@").or_not())
 }
 
-/// `!-- ... --]`
-pub(crate) fn comment<'a>() -> impl Parser<'a, In<'a>, (), E<'a>> + Clone + 'a {
-    just("!--")
-        .ignore_then(read_until_lines(&["--]"]))
-        .ignore_then(just("--]"))
-        .to(())
+/// `[!-- … --]` comment, routed through the content loop like any other block.
+///
+/// After the `[!--` opener, [`content_loop`] runs in comment mode (so it also
+/// stops at `--]`). If it lands on the comment close, the parsed body is
+/// discarded. If it stops on anything else (EOF, or a foreign `[[/…]]` closer
+/// that cut the comment short — the only way a comment “fails”), the opener is
+/// emitted verbatim as a [`Node::Raw`] followed by the body, exactly as a
+/// broken block: nothing swallows the rest of the page.
+pub(crate) fn comment<'a, P>(
+    element: P,
+) -> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a
+where
+    P: Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a,
+{
+    raw_balanced(
+        element,
+        just("[!--"),
+        ContentExitReason::ClosedComment,
+        true,
+        |_| Content::new(),
+    )
 }
 
 /// Bare `http://` / `https://` URL that becomes a link whose text is the URL.
@@ -66,16 +81,7 @@ pub(crate) fn single_bracket_link<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> 
             return Err(perr(inp, "not a single-bracket link"));
         }
         let _ = inp.next(); // consume '['
-        let rest = &full[*inp.cursor().inner()..];
-        let bytes = rest.as_bytes();
-        let mut url_end = 0;
-        while url_end < bytes.len() && !matches!(bytes[url_end], b' ' | b'\n' | b']') {
-            url_end += 1;
-        }
-        let raw = rest[..url_end].to_string();
-        for _ in 0..url_end {
-            let _ = inp.next();
-        }
+        let raw = inp.parse(read_until(&[" ", "]"]))?.to_string();
         let text = match inp.peek() {
             Some(']') => {
                 let _ = inp.next();

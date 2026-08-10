@@ -70,3 +70,4 @@ bridge.rs:
 * Remove `output` caching from Gears?, add foreign_ptr for shared memory?, assets-as-gears?
 * CRITICAL: fix distribution in dentrado-macro, phantom group by GearId when missing?
 * TODO: FATAL: TOCTOU race in `force_active`
+* TODO: Crash safety (e. g. stack overflow in task), security&limits in general...

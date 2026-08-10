@@ -2,27 +2,28 @@
 
 use super::*;
 
-/// The single-element parser, tied into a knot with [`recursive`] so containers
-/// can recurse.
-pub(crate) fn build_element<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
+/// The single-element parser (yielding a [`Content`] slice, since a malformed
+/// block *flattens* into more than one node), tied into a knot with
+/// [`recursive`] so containers can recurse.
+pub(crate) fn build_element<'a>()
+-> impl Parser<'a, In<'a>, (Content, Option<ContentExitReason>), E<'a>> + Clone + 'a {
     recursive(|element| {
         choice((
-            text_run(),
-            raw_escape(),
-            bare_http_link(),
+            one(text_run()),
+            one(raw_escape()),
+            one(bare_http_link()),
             // Line-start-only block constructs.
-            line_syntax(element.clone()),
+            one(line_syntax(element.clone())),
             // Single-bracket `[url text]` link (must precede the `[[…]]` arm).
-            single_bracket_link(),
+            one(single_bracket_link()),
+            // `[!-- … --]` comment, routed through the content loop.
+            comment(element.clone()),
             // Bracketed `[[…]]` constructs (and `[[[…]]]` links).
-            just('[').ignore_then(choice((
-                comment().ignore_then(element.clone()),
-                just('[').ignore_then(bracket_syntax(element.clone())),
-            ))),
+            bracket_syntax(element.clone()),
             // Inline markup: `//`, `**`, `__`, `--`, `^^`, `,,`, `##`, vars.
-            inline_syntax(element.clone()),
+            one(inline_syntax(element.clone())),
             // Fallback: a single arbitrary character (graceful degradation).
-            any::<In<'a>, E<'a>>().map(|c| Node::Text(TextObj::Plain(c.to_string()))),
+            any::<In<'a>, E<'a>>().map(|c| (vec![Node::Text(TextObj::Plain(c.to_string()))], None)),
         ))
     })
 }
