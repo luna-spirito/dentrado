@@ -14,7 +14,7 @@ mod menu;
 mod router;
 mod wt;
 
-use kolorinko_render::{asset_url, render_block};
+use kolorinko_render::{asset_url, render_block, wrap_topbar_lists};
 use kolorinko_rt::wire;
 use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
@@ -93,7 +93,7 @@ fn layout(client: Rc<WtClient>) -> AnyView {
         let Some(doc) = window.document() else { return };
         let Ok(Some(head)) = doc.query_selector("head") else { return };
         if let Some(old) = doc.get_element_by_id(THEME_LINK_ID) {
-            let _ = old.remove();
+            old.remove();
         }
         let Some(Some(root)) = theme_roots.get().map(|r| r.first().cloned()) else {
             return;
@@ -119,10 +119,10 @@ fn layout(client: Rc<WtClient>) -> AnyView {
                     <div id="top-bar"
                         on:mouseover=menu::on_over
                         on:mouseout=menu::on_out
-                    >{move || view_nav(site.get(), nav_top.get())}</div>
+                    >{move || view_nav(site.get(), nav_top.get(), true)}</div>
                 </div>
                 <div id="content-wrap">
-                    <div id="side-bar">{move || view_nav(site.get(), nav_side.get())}</div>
+                    <div id="side-bar">{move || view_nav(site.get(), nav_side.get(), false)}</div>
                     <div id="main-content">
                         <div id="page-title">
                             {move || page.get().map(|a| a.meta.title).unwrap_or_default()}
@@ -148,10 +148,20 @@ fn layout(client: Rc<WtClient>) -> AnyView {
 }
 
 /// Render a navigation page (`nav:top` / `nav:side`) — or nothing before it
-/// arrives. The same renderer as page bodies; nav pages are just pages.
-fn view_nav(site: kolorinko_rt::SafePathComponent, nav: Option<ArticleView>) -> AnyView {
+/// arrives. The same renderer as page bodies; nav pages are just pages. When
+/// `top_bar` is set the `nav:top` list transform is applied first, wrapping
+/// each top-level submenu item in the `<a href="javascript:;">` legacy themes
+/// target.
+fn view_nav(
+    site: kolorinko_rt::SafePathComponent,
+    nav: Option<ArticleView>,
+    top_bar: bool,
+) -> AnyView {
     match nav {
-        Some(a) => {
+        Some(mut a) => {
+            if top_bar {
+                wrap_topbar_lists(&mut a.content);
+            }
             let s = site.as_ref().to_string_lossy();
             let blocks = render_block(&s, &a.content);
             view! { <>{blocks}</> }.into_any()

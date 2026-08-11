@@ -11,7 +11,7 @@ mod css;
 mod render;
 
 pub use css::{asset_url, rewrite};
-pub use render::render_block;
+pub use render::{render_block, wrap_topbar_lists};
 
 #[cfg(feature = "ssr")]
 mod skeleton;

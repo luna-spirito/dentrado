@@ -507,6 +507,33 @@ fn render_list(site: &str, list: &List) -> AnyView {
     }
 }
 
+/// Wikidot's `nav:top` quirk: a top-level list item that opens a submenu has
+/// its content wrapped in `<a href="javascript:;">` — the inert "button"
+/// legacy themes target with `#top-bar li a`. Only the first level of each
+/// list is wrapped: we descend through containers (the nav page keeps its
+/// lists in `[[div class="top-bar"]]` / `mobile-top-bar`) but never into a
+/// sublist, so nested entries keep their real links. Apply to the `nav:top`
+/// content before [`render_block`].
+pub fn wrap_topbar_lists(content: &mut Content) {
+    for node in content {
+        match node {
+            Node::List(list) => {
+                for item in &mut list.items {
+                    if item.sublist.is_some() {
+                        let text = std::mem::take(&mut item.content);
+                        item.content = vec![Node::Link {
+                            target: LinkTarget::Url("javascript:;".to_string()),
+                            text,
+                        }];
+                    }
+                }
+            }
+            Node::Container { content, .. } => wrap_topbar_lists(content),
+            _ => {}
+        }
+    }
+}
+
 fn render_table(site: &str, rows: &[Vec<TableCell>]) -> AnyView {
     let rows_view: Vec<AnyView> = rows
         .iter()

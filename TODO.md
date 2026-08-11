@@ -71,3 +71,25 @@ bridge.rs:
 * CRITICAL: fix distribution in dentrado-macro, phantom group by GearId when missing?
 * TODO: FATAL: TOCTOU race in `force_active`
 * TODO: Crash safety (e. g. stack overflow in task), security&limits in general...
+* Use separate bidi streams nstead of a single one for all the separate subscriptions...
+* robots.txt... and decide with SSR+Hydration...
+```
+let's talk just about ServiceWorker for now.                                                                 
+                                                                                                                    
+ * How standard caching fits into all of this? I'm talking about web-browser's Cache-Control, ETag, etc.            
+ * index.html being network-first actually sounds a little strange for responsiveness, given that we're not playing 
+   on constantly redeploying?, and stale-while-revalidate for production sounds tolerable?                          
+ * Let's suppose the user has installed service-worker and loads page /hello. Should it:                            
+   a) Load plain old index.html and let it take the rest?                                                           
+   b) Actually perform request to /hello, letting the SSR do its job?                                               
+ * Do we need to remake our assets handling in a way that all the URLs are content-addressed? Sounds preferrable.   
+                                                                                                                    
+ My take on all of this:                                                                                            
+ * All assets are to be remade to be content-addressed (this introduces extra overhead on the server part, but      
+   probably worth it?)                                                                                              
+ * Cache-Control: aggressive for content-addressed assets (such as .wasm, media). No ETag functionality needed. No  
+   Cache-Control for /index.html and /hello (and other pages), no ETag.                                             
+ * If service worker is installed, it forces all the page requests to serve empty cached index.html,                
+   stale-while-revalidate in production, network-first in development.                                              
+ * If service worker is not installed, raw /hello (or whatever) request hits the server, and it serves SSR.         
+```
