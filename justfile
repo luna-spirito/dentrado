@@ -4,7 +4,7 @@ default: dev
 
 dev:
     cd apps/kolorinko-web && trunk build
-    cargo run -p kolorinko -- apps/kolorinko/config.dev.toml & sleep 1; xdg-open https://127.0.0.1:4433 || true; wait
+    cargo run -p kolorinko -- apps/kolorinko/config.dev.toml
 
 test:
     cargo nextest run --workspace || cargo test --workspace

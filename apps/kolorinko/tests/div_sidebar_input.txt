@@ -1,0 +1,198 @@
+[!--
+    Modified by Vizlox for the RPC Authority
+
+    Original sidebar code by Croquembouche from the SCP Wiki
+    http://www.wikidot.com/user:info/croquembouche
+--]
+
+[[div_ class="side-block"]]
+
+[[div_ class="menu-item"]]
+[/ Main]
+[[/div]]
+
+
+
+----
+
+[[div_ class="heading"]]
+RPC Database
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[a href="/rpc-archive"]]Archive I [[span class="subtitle"]](001-999)[[/span]][[/a]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[cosmic-embers-hub|Cosmic Embers]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[a href="/terrible-trio-event"]]New Event: ##var(--sidebar-crit-corner-color)|Terrible Trio##[[/a]]
+[[/div]]
+
+----
+
+[[div_ class="heading"]]
+Critic's Corner
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[criticcorner|Top Critic: Adejny]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[a href="/rpc-692"]]Critic's Pick: ##var(--sidebar-crit-corner-color)|RPC-692 -
+The Prettiest Girl in All The Land!##[[/a]]
+[[/div]]
+
+----
+
+[[div_ class="heading"]]
+Site
+[[/div]]
+
+
+[[div_ class="menu-item"]]
+[[[random:random-rpc| Random RPC]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[random:random-tale|Random Tale]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[top-rated-new-pages| Top Rated Pages]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[lowest-rated-pages| Unrated/Lowest Rated Pages]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[most-recently-created| Recently Created Pages]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[most-recently-edited| Recently Edited Pages]]]
+[[/div]]
+
+----
+
+[[div_ class="heading"]]
+RPC Community
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[forum:start|Forum]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[forum:recent-posts|Recent Posts]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[system:join|Join the Site!]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[Author Page]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[international| International Hub]]]
+[[/div]]
+
+----
+
+[[div_ class="heading"]]
+Member Info
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[Membership Guide]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[Site Rules]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[http://rpcsandbox.wikidot.com|RPC Sandbox]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[staffpage| Our Staff]]]
+[[/div]]
+
+----
+
+[[div_ class="heading"]]
+Guides & Policies
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[Guide Hub]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[Writers Guide]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[Tagging Guide]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[Formatting Guide]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[Widget Hub]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[editing-policy|Editing/Rewrite Policy]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[Criticism Guidelines]]]
+[[/div]]
+
+[[div_ class="menu-item"]]
+[[[Canon Policy]]]
+[[/div]]
+
+----
+
+[[div_ class="heading"]]
+Social Media
+[[/div]]
+
+[[div_ class="menu-item discord"]]
+[[[Discord]]]
+[[/div]]
+
+[[div_ class="menu-item twitter"]]
+[[[https://twitter.com/RPCauthority|Twitter]]]
+[[/div]]
+
+[[div_ class="menu-item reddit"]]
+[[[https://www.reddit.com/r/TheRPCauthority|Reddit]]]
+[[/div]]
+
+[[div_ class="menu-item steam"]]
+[[[https://steamcommunity.com/groups/ORPCGP|Steam Group]]]
+[[/div]]
+
+[[div_ class="menu-item redbubble"]]
+[[[https://www.redbubble.com/people/RPCAuthority/portfolio?asc=u|Redbubble Store]]]
+[[/div]]
+
+[[/div]]
+
+~~~~
+
+[[a href="#" class="close-menu"]]
+[[image http://rpcauthority.wdfiles.com/local--files/nav%3Aside/black.png style="z-index:-1; opacity: 0.3;"]]
+[[/a]]

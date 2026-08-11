@@ -226,51 +226,57 @@ fn paragraph_runs(content: &[Node]) -> Vec<Vec<Node>> {
     runs
 }
 
-/// Trim whitespace (including newlines) from the edges of a content slice —
-/// deeper than [`trim_ws`], which only drops whitespace-only nodes.
-fn trim_edges(content: &[Node]) -> Vec<Node> {
-    let mut v: Vec<Node> = content.to_vec();
-    loop {
-        let Some(first) = v.first_mut() else { break };
-        let remove = match first {
-            Node::Text(TextObj::Plain(s)) => {
-                let t = s.trim_start().to_string();
-                if t.is_empty() {
-                    true
-                } else {
-                    *s = t;
-                    false
+/// `[[div_]]` body rule: like [`render_block`] (block nodes standalone, inline
+/// runs grouped into `<p>` at blank lines) except the first and last inline
+/// runs are emitted unwrapped — Wikidot's `div_` quirk that leaves the rim text
+/// bare. A body of only block elements (a sidebar of nested `[[div_]]` /
+/// `----`) therefore renders as a flat sequence with no `<p>` at all.
+fn render_block_div_(site: &str, content: &Content) -> Vec<AnyView> {
+    enum Unit {
+        Block(AnyView),
+        Inline(Vec<AnyView>),
+    }
+    let mut units: Vec<Unit> = Vec::new();
+    let mut para: Vec<AnyView> = Vec::new();
+    for node in content {
+        if is_block(node) {
+            if !para.is_empty() {
+                units.push(Unit::Inline(std::mem::take(&mut para)));
+            }
+            units.push(Unit::Block(render_node(site, node)));
+        } else if let Node::Text(TextObj::Plain(t)) = node {
+            for tok in para_tokens(t) {
+                match tok {
+                    ParaToken::Text(s) => para.push(render_plain(&s)),
+                    ParaToken::Break => {
+                        if !para.is_empty() {
+                            units.push(Unit::Inline(std::mem::take(&mut para)));
+                        }
+                    }
                 }
             }
-            _ => false,
-        };
-        if remove {
-            v.remove(0);
         } else {
-            break;
+            para.push(render_node(site, node));
         }
     }
-    loop {
-        let Some(last) = v.last_mut() else { break };
-        let remove = match last {
-            Node::Text(TextObj::Plain(s)) => {
-                let t = s.trim_end().to_string();
-                if t.is_empty() {
-                    true
+    if !para.is_empty() {
+        units.push(Unit::Inline(std::mem::take(&mut para)));
+    }
+    let last = units.len().saturating_sub(1);
+    units
+        .into_iter()
+        .enumerate()
+        .map(|(i, unit)| match unit {
+            Unit::Block(view) => view,
+            Unit::Inline(inner) => {
+                if i > 0 && i < last {
+                    view! { <p>{inner}</p> }.into_any()
                 } else {
-                    *s = t;
-                    false
+                    view! { <>{inner}</> }.into_any()
                 }
             }
-            _ => false,
-        };
-        if remove {
-            v.pop();
-        } else {
-            break;
-        }
-    }
-    v
+        })
+        .collect()
 }
 
 fn is_block(node: &Node) -> bool {
@@ -420,41 +426,20 @@ fn render_container(site: &str, kind: &ContainerKind, content: &Content) -> AnyV
                 let inner = render_block(site, content);
                 return view! { <div class=class style=style>{inner}</div> }.into_any();
             }
-            // `[[div_]]` / `[[span]]`: inline body, auto-paragraphed at blank
-            // lines. Wikidot trims the body edges for `[[div_]]` (no `<br>` at
-            // the rim) and wraps only interior runs in `<p>`; `[[span]]` keeps
-            // its edge newlines (they become `<br>`) and is handled by
-            // [`render_block`] when its runs split into paragraphs.
-            let runs = paragraph_runs(content);
-            if runs.is_empty() {
-                return {
-                    let _: () = view! { <></> };
-                    ().into_any()
-                };
-            }
             if *inline {
+                // `[[span]]`: inline body. (A span whose body crosses blank
+                // lines is split into one `<p>` per run by [`render_block`] when
+                // it sits in block context.)
                 let inner = render_inline(site, content);
                 return view! { <span class=class style=style>{inner}</span> }.into_any();
             }
-            let runs: Vec<Vec<Node>> = runs
-                .iter()
-                .map(|r| trim_edges(r))
-                .filter(|r| !r.is_empty())
-                .collect();
-            let last = runs.len() - 1;
-            let parts: Vec<AnyView> = runs
-                .iter()
-                .enumerate()
-                .map(|(i, run)| {
-                    let inner = render_inline(site, run);
-                    if runs.len() > 1 && i > 0 && i < last {
-                        view! { <p>{inner}</p> }.into_any()
-                    } else {
-                        view! { <>{inner}</> }.into_any()
-                    }
-                })
-                .collect();
-            view! { <div class=class style=style>{parts}</div> }.into_any()
+            // `[[div_]]`: a block `<div>` that suppresses Wikidot's
+            // auto-paragraphing of its first and last inline run. Block
+            // children always render standalone (never inside a `<p>`), so a
+            // sidebar of nested `[[div_]]` / `----` renders as a flat sequence;
+            // interior blank-line-separated inline runs still get `<p>`.
+            let inner = render_block_div_(site, content);
+            view! { <div class=class style=style>{inner}</div> }.into_any()
         }
         ContainerKind::Color(c) => view! {
             <span style=format!("color: {c}")>{render_inline(site, content)}</span>
