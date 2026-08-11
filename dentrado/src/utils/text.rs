@@ -1,6 +1,6 @@
 #![allow(clippy::pedantic)]
 
-use im::HashMap as ImHashMap;
+use imbl::HashMap as ImHashMap;
 use similar::{Algorithm, DiffOp, capture_diff_slices};
 use std::collections::BTreeSet;
 

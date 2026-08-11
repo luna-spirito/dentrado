@@ -1,4 +1,4 @@
-use im::OrdMap;
+use imbl::OrdMap;
 use std::ops::Bound;
 
 use crate::core::gear::IsRuntime;
@@ -224,7 +224,7 @@ impl<X: Clone> SgOrdMap<X> {
         };
 
         match self.buckets.entry(bucket) {
-            im::ordmap::Entry::Occupied(mut entries) => {
+            imbl::ordmap::Entry::Occupied(mut entries) => {
                 let entries = entries.get_mut();
                 match bucket_binary_search(entries, key.1, store, |e| e.local_id).await {
                     Ok(idx) => {
@@ -242,7 +242,7 @@ impl<X: Clone> SgOrdMap<X> {
                     }
                 }
             }
-            im::ordmap::Entry::Vacant(entry) => {
+            imbl::ordmap::Entry::Vacant(entry) => {
                 entry.insert(vec![new_entry]);
                 None
             }
@@ -558,7 +558,7 @@ impl<X: Clone + PartialEq> SgOrdMap<X> {
         other: &Self,
         store: &GroupStore<'_, R, S>,
     ) -> Vec<SgDiffItem<X>> {
-        use im::ordmap::DiffItem;
+        use imbl::ordmap::DiffItem;
 
         let mut result = Vec::new();
 

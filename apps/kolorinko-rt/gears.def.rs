@@ -27,7 +27,7 @@ pub(crate) async fn repo(
     tick: bool,
     cache: &mut RepoCache,
 ) -> Rc<RepoData> {
-    crate::wikidot_page::repo(&repo_meta, tick, cache)
+    crate::wikidot_page::repo(&repo_meta, tick, cache).await
 }
 
 #[dentrado::gear(
@@ -43,7 +43,7 @@ pub(crate) async fn repo_l_article_latest(
     repo_data: Rc<RepoData>,
     _cache: &mut RepoLArticleCache,
 ) -> ArticleLatest {
-    crate::wikidot_page::repo_l_article_latest(&repo_data, &site, &slug)
+    crate::wikidot_page::repo_l_article_latest(&repo_data, &site, &slug).await
 }
 
 #[dentrado::gear(

@@ -1,4 +1,5 @@
-use im::OrdMap;
+use imbl::OrdMap;
+use std::borrow::Borrow;
 use std::{collections::BTreeSet, hash::Hash};
 
 use crate::core::gear::IsRuntime;
@@ -51,10 +52,10 @@ where
 
     #[must_use]
     pub(crate) fn diff_from(&self, old: &Self) -> TimelineDelta<DepK, DepV> {
-        use im::ordmap::DiffItem;
+        use imbl::ordmap::DiffItem;
 
         let mut added_keys: OrdMap<DepK, SgOrdMap<DepV>> = OrdMap::new();
-        let mut removed_keys: im::OrdSet<DepK> = im::OrdSet::new();
+        let mut removed_keys: imbl::OrdSet<DepK> = imbl::OrdSet::new();
         let mut changed_keys: OrdMap<DepK, SgOrdMap<DepV>> = OrdMap::new();
 
         for item in old.writes.diff(&self.writes) {
@@ -103,7 +104,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct TimelineDelta<DepK: Ord + Clone + Hash, DepV: Clone + PartialEq + Hash + Ord> {
     pub(crate) added_keys: OrdMap<DepK, SgOrdMap<DepV>>,
-    pub(crate) removed_keys: im::OrdSet<DepK>,
+    pub(crate) removed_keys: imbl::OrdSet<DepK>,
     pub(crate) changed_keys: OrdMap<DepK, SgOrdMap<DepV>>,
 }
 
@@ -120,9 +121,9 @@ pub(crate) struct EventEffects<
     K: Ord + Clone + Hash,
     V: Clone + PartialEq + Hash + Ord,
 > {
-    pub(crate) reads: im::OrdSet<K>,
+    pub(crate) reads: imbl::OrdSet<K>,
     pub(crate) writes: OrdMap<K, V>,
-    pub(crate) dep_reads: OrdMap<Dep, im::OrdSet<DepK>>,
+    pub(crate) dep_reads: OrdMap<Dep, imbl::OrdSet<DepK>>,
 }
 
 pub struct HandlerCtx<
@@ -137,7 +138,7 @@ pub struct HandlerCtx<
     D: ?Sized,
 > {
     pub event_id: SGEventId,
-    reads: &'a mut im::OrdSet<K>,
+    reads: &'a mut imbl::OrdSet<K>,
     writes: &'a mut OrdMap<K, V>,
     pub(crate) self_writes: &'a OrdMap<K, SgOrdMap<V>>,
     ext: &'a mut OrdMap<Dep, ExtDep<DepK, DepV>>,
@@ -180,22 +181,22 @@ where
         let writes = (self.dep_resolver)(dep).await;
 
         match self.ext.entry(dep.clone()) {
-            im::ordmap::Entry::Vacant(entry) => {
+            imbl::ordmap::Entry::Vacant(entry) => {
                 entry.insert(ExtDep {
                     cached: writes.clone(),
                     reads: OrdMap::new(),
                 });
             }
-            im::ordmap::Entry::Occupied(_) => {}
+            imbl::ordmap::Entry::Occupied(_) => {}
         }
 
         let store = self.store;
         if let Some(ext_dep) = self.ext.get_mut(dep) {
             match ext_dep.reads.entry(dep_key.clone()) {
-                im::ordmap::Entry::Occupied(mut entry) => {
+                imbl::ordmap::Entry::Occupied(mut entry) => {
                     entry.get_mut().insert(self.event_id, store).await;
                 }
-                im::ordmap::Entry::Vacant(entry) => {
+                imbl::ordmap::Entry::Vacant(entry) => {
                     entry.insert(SgOrdSet::unit(self.event_id));
                 }
             }
@@ -336,7 +337,7 @@ where
     where
         D: async FnMut(&Dep) -> Timeline<DepK, DepV>,
     {
-        use im::ordmap::DiffItem;
+        use imbl::ordmap::DiffItem;
 
         let mut affected = BTreeSet::new();
         let dep_ids: Vec<Dep> = self.ext.keys().cloned().collect();
@@ -424,13 +425,13 @@ where
 
     fn remove_from_reads(reads: &mut OrdMap<K, SgOrdSet>, k: &K, event_id: &SGEventId) {
         match reads.entry(k.clone()) {
-            im::ordmap::Entry::Occupied(mut entry) => {
+            imbl::ordmap::Entry::Occupied(mut entry) => {
                 entry.get_mut().remove(event_id);
                 if entry.get().is_empty() {
                     entry.remove();
                 }
             }
-            im::ordmap::Entry::Vacant(_) => {}
+            imbl::ordmap::Entry::Vacant(_) => {}
         }
     }
 
@@ -441,10 +442,10 @@ where
         store: &GroupStore<'_, R, S>,
     ) {
         match reads.entry(k) {
-            im::ordmap::Entry::Occupied(mut entry) => {
+            imbl::ordmap::Entry::Occupied(mut entry) => {
                 entry.get_mut().insert(event_id, store).await;
             }
-            im::ordmap::Entry::Vacant(entry) => {
+            imbl::ordmap::Entry::Vacant(entry) => {
                 entry.insert(SgOrdSet::unit(event_id));
             }
         }
@@ -452,13 +453,13 @@ where
 
     fn remove_from_timeline(writes: &mut OrdMap<K, SgOrdMap<V>>, k: &K, event_id: &SGEventId) {
         match writes.entry(k.clone()) {
-            im::ordmap::Entry::Occupied(mut entry) => {
+            imbl::ordmap::Entry::Occupied(mut entry) => {
                 entry.get_mut().remove(event_id);
                 if entry.get().is_empty() {
                     entry.remove();
                 }
             }
-            im::ordmap::Entry::Vacant(_) => {}
+            imbl::ordmap::Entry::Vacant(_) => {}
         }
     }
 
@@ -470,13 +471,13 @@ where
     ) {
         if let Some(ext_dep) = ext.get_mut(dep) {
             match ext_dep.reads.entry(dep_key.clone()) {
-                im::ordmap::Entry::Occupied(mut entry) => {
+                imbl::ordmap::Entry::Occupied(mut entry) => {
                     entry.get_mut().remove(event_id);
                     if entry.get().is_empty() {
                         entry.remove();
                     }
                 }
-                im::ordmap::Entry::Vacant(_) => {}
+                imbl::ordmap::Entry::Vacant(_) => {}
             }
         }
     }
@@ -534,10 +535,10 @@ where
             let old_effects = self.effects.remove(&event_id);
             let (old_reads, old_writes, old_dep_reads) = match old_effects {
                 Some(oe) => (oe.reads, oe.writes, oe.dep_reads),
-                None => (im::OrdSet::new(), OrdMap::new(), OrdMap::new()),
+                None => (imbl::OrdSet::new(), OrdMap::new(), OrdMap::new()),
             };
 
-            let mut reads = im::OrdSet::new();
+            let mut reads = imbl::OrdSet::new();
             let mut writes = OrdMap::new();
             {
                 let mut hctx = HandlerCtx {
@@ -552,10 +553,10 @@ where
                 handler(&event_data, &mut hctx).await;
             }
 
-            for k in old_reads.iter().filter(|k| !reads.contains(k)) {
+            for k in old_reads.iter().filter(|k| !reads.contains(*k)) {
                 Self::remove_from_reads(&mut self.reads, k, &event_id);
             }
-            for k in reads.iter().filter(|k| !old_reads.contains(k)) {
+            for k in reads.iter().filter(|k| !old_reads.contains(*k)) {
                 Self::add_to_reads(&mut self.reads, k.clone(), event_id, store).await;
             }
 
@@ -574,7 +575,7 @@ where
 
             for k in old_writes
                 .keys()
-                .filter(|k| !writes.contains_key(k))
+                .filter(|k| !writes.contains_key(*k))
                 .cloned()
                 .collect::<Vec<_>>()
             {
@@ -590,13 +591,13 @@ where
                 };
 
                 match self.writes.entry(k.clone()) {
-                    im::ordmap::Entry::Occupied(mut entry) => {
+                    imbl::ordmap::Entry::Occupied(mut entry) => {
                         entry
                             .get_mut()
                             .insert(event_id, new_val.clone(), store)
                             .await;
                     }
-                    im::ordmap::Entry::Vacant(entry) => {
+                    imbl::ordmap::Entry::Vacant(entry) => {
                         entry.insert(SgOrdMap::unit(event_id, new_val.clone()));
                     }
                 }
@@ -614,16 +615,16 @@ where
                 }
             }
 
-            let mut new_dep_reads: OrdMap<Dep, im::OrdSet<DepK>> = OrdMap::new();
+            let mut new_dep_reads: OrdMap<Dep, imbl::OrdSet<DepK>> = OrdMap::new();
             for (dep, ext_dep) in &self.ext {
                 for (dep_key, readers) in &ext_dep.reads {
                     if readers.contains(&event_id) {
                         match new_dep_reads.entry(dep.clone()) {
-                            im::ordmap::Entry::Occupied(mut entry) => {
+                            imbl::ordmap::Entry::Occupied(mut entry) => {
                                 entry.get_mut().insert(dep_key.clone());
                             }
-                            im::ordmap::Entry::Vacant(entry) => {
-                                entry.insert(im::OrdSet::unit(dep_key.clone()));
+                            imbl::ordmap::Entry::Vacant(entry) => {
+                                entry.insert(imbl::OrdSet::unit(dep_key.clone()));
                             }
                         }
                     }

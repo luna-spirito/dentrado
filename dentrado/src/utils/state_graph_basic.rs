@@ -3,7 +3,7 @@ use crate::core::gear::EmptyRuntime;
 use crate::core::loc_ctx::StoredEvent;
 use crate::core::storage::{GroupStore, InMemoryStorage, Storage};
 use crate::types::{GroupEventId, LocGroupId, LocMsgTypeId, NodeId, SenderPk};
-use im::OrdMap;
+use imbl::OrdMap;
 use std::collections::BTreeMap;
 
 type SG<K, V> = StateGraph<(), (), (), K, V>;

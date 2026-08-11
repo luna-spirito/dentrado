@@ -18,19 +18,31 @@
 //! The dataset never materialises body text. It is built by walking the git
 //! **object database** pinned to a commit tip, storing each body as its blob
 //! `Oid` (cheap, content-addressed, immutable). Text is paged in lazily by the
-//! [`repo_l_article_latest`] lens — the only stage co-located with the
-//! `!Send` [`git2::Repository`] — through a shared bounded hot cache ([`Odb`]).
-//! Memory thus tracks the rendered working set, not the repository size, and a
-//! moving tip never tears a live snapshot: its Oids stay valid in the odb.
+//! [`repo_l_article_latest`] lens, reading each blob straight from the odb on
+//! demand (uncached at this layer — odb lookups are cheap, and the expensive
+//! parse step is dedup'd downstream by [`ParsedCache`]).
+//!
+//! libgit2 is synchronous and [`git2::Repository`] is `!Send`, so calling it
+//! straight from a gear would block the whole async core. Instead the
+//! `!Send` `Repository`, the reverse [`Index`], and the current dataset
+//! snapshot all live on one **dedicated worker thread** ([`GitWorker`]),
+//! created and pinned there — the `Repository` is never moved across a thread.
+//! The gears talk to it over a [`GitMailbox`] (a `flume` channel) and `.await`
+//! each reply, so every libgit2 call happens off the core. Memory tracks the
+//! rendered working set, not the repository size (body blobs are never retained
+//! here), and a moving tip never tears a live snapshot: its Oids stay valid in
+//! the odb.
 //!
 //! # Gears
-//! - [`repo`] (`local` oracle): polls the git remote on a timer and rebuilds
-//!   the dataset as [`Rc`]`<`[`RepoData`]`>` of blob Oids. Pinned to one core;
-//!   never crosses a thread, so it holds the `!Send` [`Odb`] via an [`Rc`].
+//! - [`repo`] (`local` oracle): on each timer tick asks the worker to fetch +
+//!   rebuild — incrementally, only the pages the `old_tip → new_tip` diff
+//!   touched — and adopts the worker's new [`RepoData`] snapshot (wrapped in
+//!   [`Rc`]). An unchanged tip yields `None`, so the prior `Rc` is kept and
+//!   dependents aren't re-run for nothing.
 //! - [`repo_l_article_latest`] (`follow` lens over `repo`): projects one page
-//!   into an owned [`ArticleLatest`] (metadata + latest body + revision list,
-//!   no bodies). Shippable, so `Send` (owned `String`s, no `Rc`/`Arc`); the one
-//!   place a body blob is read out of the odb.
+//!   into an owned [`ArticleLatest`] (metadata + latest body + revision list),
+//!   reading the latest body blob out of the worker's cache via the
+//!   [`GitMailbox`] carried in [`RepoData`]. Shippable (`Send`: owned `String`s).
 //! - [`article_latest_parsed`] (`event`): parses the latest body into
 //!   [`ArticleView`] with `[[include]]` directives **left unresolved**. Kept
 //!   separate from [`article_latest`] so the parse gears never depend on one
@@ -47,7 +59,7 @@ use crate::wikidot_parser::parse;
 use compio::fs;
 use dentrado::core::{core_ctx::GearCtx, storage::Storage};
 use git2::{ObjectType, Oid, Repository, Tree, TreeWalkMode};
-use im::HashMap as ImHashMap;
+use imbl::HashMap as ImHashMap;
 use kolorinko_render::rewrite;
 use kolorinko_rt::{AssetKind, RepoAssetOut, RepoAssetPath, SafePathComponent};
 use kolorinko_wikitext::{
@@ -57,7 +69,7 @@ use kolorinko_wikitext::{
 use log::error;
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     rc::Rc,
@@ -99,6 +111,11 @@ impl RepoMeta {
     pub(crate) const fn path(&self) -> &'static Path {
         self.path
     }
+
+    #[must_use]
+    pub(crate) const fn url(&self) -> &'static str {
+        self.url
+    }
 }
 
 // =========================================================================
@@ -118,15 +135,16 @@ type Key = (
     SafePathComponent,
 );
 
-/// All sites mirrored out of the repository at one point in time. A persistent
-/// [`im::HashMap`] so cloning the [`Rc`]`<RepoData>` is O(1) and an update is
-/// non-destructive (dependents holding a prior snapshot see a stable view).
-/// Carries the [`!Send`](Odb) odb handle so the [`repo_l_article_latest`] lens
-/// — the only co-located consumer — can materialise bodies on demand.
-#[derive(Default, Clone)]
+/// All sites mirrored out of the repository at one point in time, plus the
+/// [`GitMailbox`] back to the worker thread that owns their source
+/// [`Repository`]. A persistent [`imbl::HashMap`] so cloning the
+/// [`Rc`]`<RepoData>` is O(1) and an update is non-destructive (dependents
+/// holding a prior snapshot see a stable view). `Send`: no `Repository`, no
+/// `Rc` — it crosses the worker→core channel once, then lives behind an `Rc`
+/// on the oracle's core.
 pub(crate) struct RepoData {
     sites: ImHashMap<SafePathComponent, WDWebsite>,
-    odb: Option<Odb>,
+    mailbox: GitMailbox,
 }
 
 impl fmt::Debug for RepoData {
@@ -138,11 +156,30 @@ impl fmt::Debug for RepoData {
 }
 
 impl RepoData {
+    /// An empty snapshot that still carries `mailbox` (used when the worker has
+    /// no repository yet, or has died — body reads then resolve to `None`).
+    fn empty(mailbox: GitMailbox) -> Self {
+        Self {
+            sites: ImHashMap::new(),
+            mailbox,
+        }
+    }
+
     /// Look up one page by `(site, slug)`.
     #[must_use]
     fn article(&self, site: &SafePathComponent, slug: &Slug) -> Option<&Article> {
-        self.sites.get(site)?.articles.get(&slug.0)?.get(&slug.1)
+        find_article(&self.sites, site, slug)
     }
+}
+
+/// The nested-map lookup underlying [`RepoData::article`], factored out so the
+/// build/incremental tests can resolve a page from a bare sites map.
+fn find_article<'a>(
+    sites: &'a ImHashMap<SafePathComponent, WDWebsite>,
+    site: &SafePathComponent,
+    slug: &Slug,
+) -> Option<&'a Article> {
+    sites.get(site)?.articles.get(&slug.0)?.get(&slug.1)
 }
 
 /// One mirrored site: its pages nested by category, plus the site's theme roots
@@ -155,7 +192,8 @@ pub(crate) struct WDWebsite {
 
 /// One page: metadata, the full revision-history summary, and blob Oids for the
 /// latest body and **every** revision body. Bodies are never materialised here
-/// — they live in the git object database, paged in lazily via [`Odb::blob`].
+/// — they live in the git object database, paged in lazily via
+/// [`GitMailbox::blob`].
 #[derive(Clone, Debug)]
 pub(crate) struct Article {
     meta: ArticleMeta,
@@ -167,87 +205,275 @@ pub(crate) struct Article {
     bodies: ImHashMap<u64, Oid>,
 }
 
-/// Shared, lazily-materialised view over the git object database on the
-/// [`repo`] oracle's core: one [`Repository`] handle plus a bounded hot cache of
-/// already-read body blobs. `!Send` — it never leaves the oracle's core, so both
-/// the oracle (build/diff) and the [`repo_l_article_latest`] lens (body
-/// materialisation) reach it through the [`Rc`] cloned into every [`RepoData`].
-pub(crate) type Odb = Rc<OdbInner>;
+// =========================================================================
+// Git worker thread (owns the !Send `Repository`; serves the async gears)
+// =========================================================================
 
-pub(crate) struct OdbInner {
-    repo: Repository,
-    blobs: RefCell<Blobs>,
+/// A request to the git worker thread. Each carries its own one-shot reply
+/// channel; the oracle core sends one and `.await`s the reply, so it never
+/// blocks while libgit2 works on the worker thread.
+enum GitReq {
+    /// Fetch + rebuild if the tip moved. The reply is `Some` only when the
+    /// dataset actually changed; `None` lets the caller keep its cached `Rc`.
+    Tick {
+        reply: flume::Sender<Option<RepoData>>,
+    },
+    /// The current dataset without pulling (cold start / first non-tick run).
+    Snapshot { reply: flume::Sender<RepoData> },
+    /// Read one body blob out of the object database (frontmatter stripped).
+    Blob {
+        oid: Oid,
+        reply: flume::Sender<Option<String>>,
+    },
 }
 
-struct Blobs {
-    map: HashMap<Oid, Rc<str>>,
-    order: VecDeque<Oid>,
+/// Cloneable, `Send` handle to the git worker thread, embedded in [`RepoData`]
+/// so the [`repo_l_article_latest`] lens — co-located on the oracle's core —
+/// can materialise body blobs off-core. Cheap to clone (one `Arc` bump inside
+/// the `flume` sender).
+#[derive(Clone)]
+pub(crate) struct GitMailbox(flume::Sender<GitReq>);
+
+impl GitMailbox {
+    /// Fetch + rebuild if the tip moved; `Some` only when the dataset changed.
+    async fn tick(&self) -> Option<RepoData> {
+        let (tx, rx) = flume::bounded(1);
+        if self.0.send_async(GitReq::Tick { reply: tx }).await.is_err() {
+            return None;
+        }
+        rx.recv_async().await.unwrap_or(None)
+    }
+
+    /// Current dataset without pulling.
+    async fn snapshot(&self) -> RepoData {
+        let (tx, rx) = flume::bounded(1);
+        if self
+            .0
+            .send_async(GitReq::Snapshot { reply: tx })
+            .await
+            .is_err()
+        {
+            return RepoData::empty(self.clone());
+        }
+        rx.recv_async()
+            .await
+            .unwrap_or_else(|_| RepoData::empty(self.clone()))
+    }
+
+    /// Read one body blob off the worker thread. `None` if missing/bad UTF-8.
+    async fn blob(&self, oid: Oid) -> Option<String> {
+        let (tx, rx) = flume::bounded(1);
+        if self
+            .0
+            .send_async(GitReq::Blob { oid, reply: tx })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        rx.recv_async().await.unwrap_or(None)
+    }
 }
 
-impl OdbInner {
-    /// Soft cap on the hot blob cache. Beyond it the oldest inserted blob is
-    /// evicted (FIFO) — memory stays bounded to the rendered working set, not
-    /// the whole repository.
-    const CAP: usize = 8192;
+/// The git worker thread's owned state. Everything `!Send` or git-bound lives
+/// here: the [`Repository`] (created *on* this thread and never moved), the
+/// reverse [`Index`], the last tip, and the current sites snapshot. The thread
+/// runs [`GitWorker::run`], servicing [`GitReq`]s until every [`GitMailbox`]
+/// (and thus every [`RepoData`]) is gone. Body blobs are read **uncached** —
+/// git odb lookups are cheap (content-addressed) and run only on the oracle's
+/// timer tick; the expensive work (parsing) is dedup'd downstream by
+/// [`ParsedCache`](crate::wikidot_page::ParsedCache), so a worker-side blob
+/// cache would only duplicate that for no gain.
+struct GitWorker {
+    repo: Option<Repository>,
+    url: &'static str,
+    root: &'static Path,
+    mailbox: GitMailbox,
+    last_tip: Option<Oid>,
+    sites: ImHashMap<SafePathComponent, WDWebsite>,
+    index: Index,
+}
 
-    fn new(repo: Repository) -> Self {
+impl GitWorker {
+    fn new(url: &'static str, root: &'static Path, mailbox: GitMailbox) -> Self {
         Self {
-            repo,
-            blobs: RefCell::new(Blobs {
-                map: HashMap::new(),
-                order: VecDeque::new(),
-            }),
+            repo: None,
+            url,
+            root,
+            mailbox,
+            last_tip: None,
+            sites: ImHashMap::new(),
+            index: HashMap::new(),
         }
     }
 
-    /// Read body blob `oid` from the object database as a frontmatter-stripped
-    /// `Rc<str>`, caching it. Content-addressed and immutable, so the cache is
-    /// sound for the Oid's lifetime. `None` if the blob is missing or not valid
-    /// UTF-8.
-    fn blob(&self, oid: Oid) -> Option<Rc<str>> {
-        {
-            let b = self.blobs.borrow();
-            if let Some(s) = b.map.get(&oid) {
-                return Some(Rc::clone(s));
+    /// Service [`GitReq`]s until the mailbox closes. Runs on the worker thread;
+    /// `rx.recv()` blocks *this* thread, never the async core.
+    fn run(mut self, rx: flume::Receiver<GitReq>) {
+        while let Ok(req) = rx.recv() {
+            match req {
+                GitReq::Tick { reply } => {
+                    let _ = reply.send(self.tick());
+                }
+                GitReq::Snapshot { reply } => {
+                    self.snapshot();
+                    let _ = reply.send(self.data());
+                }
+                GitReq::Blob { oid, reply } => {
+                    let _ = reply.send(self.blob(oid));
+                }
             }
         }
-        let raw = blob_str(&self.repo, oid)?;
-        let s: Rc<str> = Rc::from(revision_body(&raw));
-        let mut b = self.blobs.borrow_mut();
-        b.map.insert(oid, Rc::clone(&s));
-        b.order.push_back(oid);
-        if b.order.len() > Self::CAP
-            && let Some(old) = b.order.pop_front()
-        {
-            b.map.remove(&old);
-        }
-        Some(s)
     }
+
+    /// Fetch + rebuild if the tip moved. `Some(data)` when the dataset changed
+    /// (the caller adopts a fresh snapshot); `None` when nothing changed (the
+    /// caller keeps its prior `Rc`). The first tick always pulls + builds.
+    fn tick(&mut self) -> Option<RepoData> {
+        self.ensure_repo();
+        let repo = self.repo.as_ref()?;
+        let outcome = pull_for_diff(repo);
+        if self.last_tip.is_none() {
+            let tip = current_tip(repo);
+            if let Some(t) = tip {
+                let (sites, index) = build_from_tree(repo, t, self.root);
+                self.sites = sites;
+                self.index = index;
+            }
+            self.last_tip = tip;
+            return Some(self.data());
+        }
+        let new_tip = match outcome {
+            Some(PullOutcome::SameTip) => return None,
+            Some(PullOutcome::Updated { new_tip }) => new_tip,
+            None => return None,
+        };
+        let old_tip = self.last_tip.expect("Some on the non-first path above");
+        let rebuilt: Option<(ImHashMap<SafePathComponent, WDWebsite>, Index)> =
+            match diff_affected_meta_paths(repo, old_tip, new_tip, self.root) {
+                Some(affected) if affected.is_empty() => None,
+                Some(affected) => {
+                    let mut index = self.index.clone();
+                    let new_tree = repo
+                        .find_commit(new_tip)
+                        .ok()
+                        .and_then(|c| repo.find_tree(c.tree_id()).ok());
+                    match new_tree.as_ref() {
+                        Some(tree) => {
+                            let sites = incremental_update(
+                                repo,
+                                tree,
+                                self.root,
+                                &self.sites,
+                                &mut index,
+                                affected,
+                            );
+                            Some((sites, index))
+                        }
+                        None => Some(build_from_tree(repo, new_tip, self.root)),
+                    }
+                }
+                None => Some(build_from_tree(repo, new_tip, self.root)),
+            };
+        self.last_tip = Some(new_tip);
+        if let Some((sites, index)) = rebuilt {
+            self.sites = sites;
+            self.index = index;
+            Some(self.data())
+        } else {
+            None
+        }
+    }
+
+    /// Build the dataset once (no pull) if it hasn't been built yet.
+    fn snapshot(&mut self) {
+        self.ensure_repo();
+        if self.last_tip.is_none() {
+            self.build();
+        }
+    }
+
+    fn build(&mut self) {
+        let Some(repo) = self.repo.as_ref() else {
+            return;
+        };
+        let tip = current_tip(repo);
+        if let Some(t) = tip {
+            let (sites, index) = build_from_tree(repo, t, self.root);
+            self.sites = sites;
+            self.index = index;
+        }
+        self.last_tip = tip;
+    }
+
+    /// Lazily open/clone the `Repository` on this thread, retrying on each tick
+    /// until it succeeds (a transient clone failure shouldn't doom the gear).
+    fn ensure_repo(&mut self) {
+        if self.repo.is_none() {
+            self.repo = open_or_clone(self.url, self.root);
+        }
+    }
+
+    /// A fresh [`RepoData`] snapshot (structurally shared `sites` + our mailbox).
+    fn data(&self) -> RepoData {
+        RepoData {
+            sites: self.sites.clone(),
+            mailbox: self.mailbox.clone(),
+        }
+    }
+
+    /// Read body blob `oid` straight from the odb (frontmatter stripped).
+    /// Uncached — see [`GitWorker`]: odb lookups are cheap and infrequent, and
+    /// the parse layer dedup's the expensive work. `None` if missing/bad UTF-8.
+    fn blob(&self, oid: Oid) -> Option<String> {
+        read_body(self.repo.as_ref()?, oid)
+    }
+}
+
+/// Spawn the dedicated git worker thread for `meta` and return its mailbox. The
+/// worker opens/clones the [`Repository`] *on its own thread* (it is `!Send` and
+/// must never cross a thread), then services [`GitReq`]s for the gear's life —
+/// keeping all synchronous libgit2 work off the async core.
+fn spawn_worker(meta: &RepoMeta) -> GitMailbox {
+    let (tx, rx) = flume::unbounded::<GitReq>();
+    let mailbox = GitMailbox(tx);
+    let worker_mailbox = mailbox.clone();
+    let url = meta.url();
+    let root = meta.path();
+    std::thread::Builder::new()
+        .name("kolorinko-git".into())
+        .spawn(move || GitWorker::new(url, root, worker_mailbox).run(rx))
+        .expect("spawn git worker thread");
+    mailbox
 }
 
 // =========================================================================
 // `repo` oracle gear
 // =========================================================================
 
-/// Reverse index used by [`incremental_update`]: each `_meta` file path → its
-/// nested-map [`Key`]. Kept across ticks so a moved tip can patch only the
-/// pages the git diff touched, locating the old key to remove when a page's
-/// slug changed or it was deleted.
-type Index = HashMap<PathBuf, Key>; // TODO
+/// Reverse index kept by [`GitWorker`]: each `_meta` file path → its nested-map
+/// [`Key`]. The path encodes the *physical* location `(site, p1, p2, id)`, but
+/// `Key = (site, cat, name)` holds the *logical* location whose `cat`/`name`
+/// come from the **slug inside the `_meta` file** — not from the path — so the
+/// key is genuinely non-derivable from the path. The index exists so an
+/// incremental update can O(1)-remove a page's old entry when its slug changed
+/// (rename) or it was deleted; without it you'd have to re-read the old tip's
+/// blob or scan the dataset by page id.
+type Index = HashMap<PathBuf, Key>;
 
-/// Per-instance cache for [`repo`]: the shared [`Odb`] (opened `Repository` +
-/// blob cache, kept across ticks), the last commit tip, the last-built dataset,
-/// and the reverse [`Index`]. Wrapped in `Rc<RefCell<…>>` so the cache (which
-/// must be `Clone + Debug`) is a cheap refcount bump.
+/// Per-instance cache for [`repo`]: the [`GitMailbox`] (the worker is spawned
+/// lazily on the first run) and the last adopted [`RepoData`] snapshot — the
+/// `Rc` returned on a non-tick run, and the stable pointer kept when a tick
+/// found the tip unchanged (so dependents aren't re-run for nothing). Wrapped
+/// in `Rc<RefCell<…>>` so the cache (which must be `Clone + Debug`) is a cheap
+/// refcount bump.
 #[derive(Default, Clone)]
-pub(crate) struct RepoCache(Rc<RefCell<RepoInner>>);
+pub(crate) struct RepoCache(Rc<RefCell<RepoOracleState>>);
 
 #[derive(Default)]
-struct RepoInner {
-    odb: Option<Odb>,
-    last_tip: Option<Oid>,
+struct RepoOracleState {
+    mailbox: Option<GitMailbox>,
     data: Option<Rc<RepoData>>,
-    index: Index,
 }
 
 impl fmt::Debug for RepoCache {
@@ -256,70 +482,50 @@ impl fmt::Debug for RepoCache {
     }
 }
 
-/// Run the [`repo`] oracle. On a tick: open/clone lazily, fetch + hard-reset,
-/// and on a moved tip patch the dataset **incrementally** — only the pages the
-/// `old_tip → new_tip` git diff touched are re-read (as blob Oids) from the new
-/// tip's tree, producing a new [`Rc`]`<`[`RepoData`]`>` that structurally shares
-/// almost all of the old one. Falls back to a full [`build_from_tree`] on the
-/// first build or when the diff can't be computed (e.g. a force-push
-/// garbage-collected the old tip). A same-tip or non-tick run returns the
-/// previously built dataset unchanged.
-pub(crate) fn repo(meta: &RepoMeta, tick: bool, cache: &mut RepoCache) -> Rc<RepoData> {
-    // TODO: Post to background thread?
-    let mut inner = cache.0.borrow_mut();
-    if inner.odb.is_none() {
-        inner.odb = open_or_clone(meta.url, meta.path).map(|r| Rc::new(OdbInner::new(r)));
-    }
-    // Clone the odb handle out so git ops below never borrow `inner` (the pulls,
-    // diffs, and tree reads are synchronous, but this keeps the borrows trivial).
-    let odb = inner.odb.clone();
-    if tick
-        && let Some(odb) = odb.as_ref()
-        && let Some(PullOutcome::Updated { new_tip }) = pull_for_diff(Some(&odb.repo))
-    {
-        let prev_tip = inner.last_tip;
-        let prev_data = inner.data.clone();
-        let rebuilt: Option<(RepoData, Index)> = match (prev_tip, prev_data.as_ref()) {
-            (Some(old_tip), Some(old_data)) if old_tip != new_tip => {
-                match diff_affected_meta_paths(&odb.repo, old_tip, new_tip, meta.path) {
-                    Some(affected) if affected.is_empty() => None,
-                    Some(affected) => {
-                        let mut index = inner.index.clone();
-                        let new_tree = odb
-                            .repo
-                            .find_commit(new_tip)
-                            .ok()
-                            .and_then(|c| odb.repo.find_tree(c.tree_id()).ok());
-                        let data = match new_tree.as_ref() {
-                            Some(t) => incremental_update(
-                                &odb.repo, t, meta.path, old_data, &mut index, affected,
-                            ),
-                            None => build_from_tree(odb, new_tip, meta.path).0,
-                        };
-                        Some((data, index))
-                    }
-                    None => Some(build_from_tree(odb, new_tip, meta.path)),
-                }
-            }
-            _ => Some(build_from_tree(odb, new_tip, meta.path)),
-        };
-        inner.last_tip = Some(new_tip);
-        if let Some((data, index)) = rebuilt {
-            inner.data = Some(Rc::new(data));
-            inner.index = index;
+/// Run the [`repo`] oracle. All git work is off-loaded to the worker thread
+/// (see [`spawn_worker`]): on a tick it fetches and incrementally rebuilds
+/// only the pages the `old_tip → new_tip` diff touched (falling back to a full
+/// [`build_from_tree`] on the first build or when the diff is uncomputable, e.g.
+/// a force-push GC'd the old tip); a non-tick run just serves the cached
+/// snapshot. The worker returns `None` when the tip didn't move, so the prior
+/// `Rc` is handed back unchanged. Each `borrow()` is its own statement — never
+/// a `match`/`if let` scrutinee — so no RefCell borrow is held across a
+/// re-borrow (the classic scrutinee-temporary foot-gun).
+pub(crate) async fn repo(meta: &RepoMeta, tick: bool, cache: &mut RepoCache) -> Rc<RepoData> {
+    let mailbox = cache.0.borrow().mailbox.clone();
+    let mailbox = match mailbox {
+        Some(mb) => mb,
+        None => {
+            let mb = spawn_worker(meta);
+            cache.0.borrow_mut().mailbox = Some(mb.clone());
+            mb
         }
+    };
+    // Non-tick: serve the cached snapshot without pulling.
+    if !tick {
+        let cached = cache.0.borrow().data.clone();
+        if let Some(data) = cached {
+            return data;
+        }
+        // Cold start (first run, before any tick): build once off-core, no pull.
+        let rc = Rc::new(mailbox.snapshot().await);
+        cache.0.borrow_mut().data = Some(Rc::clone(&rc));
+        return rc;
     }
-    if inner.data.is_none() {
-        let tip = current_tip(odb.as_ref().map(|o| &o.repo));
-        let (data, index) = match (odb.as_ref(), tip) {
-            (Some(o), Some(t)) => build_from_tree(o, t, meta.path),
-            _ => (RepoData::default(), inner.index.clone()),
-        };
-        inner.last_tip = tip;
-        inner.data = Some(Rc::new(data));
-        inner.index = index;
+    // Tick: pull + rebuild-if-changed off-core.
+    if let Some(data) = mailbox.tick().await {
+        let rc = Rc::new(data);
+        cache.0.borrow_mut().data = Some(Rc::clone(&rc));
+        return rc;
     }
-    Rc::clone(inner.data.as_ref().expect("dataset populated above"))
+    // Unchanged tip: keep the prior snapshot (empty fallback if the worker had
+    // no repository to clone on its very first, failed tick).
+    cache
+        .0
+        .borrow()
+        .data
+        .clone()
+        .unwrap_or_else(|| Rc::new(RepoData::empty(mailbox.clone())))
 }
 
 /// The outcome of a `git fetch` + hard-reset: the tip either moved or not.
@@ -332,9 +538,8 @@ enum PullOutcome {
 /// working tree. Returns the new tip classified against the previous one so the
 /// caller can skip a rebuild when nothing changed. `None` on fetch failure
 /// (logged); the caller keeps serving the last good dataset.
-fn pull_for_diff(repo: Option<&Repository>) -> Option<PullOutcome> {
-    let repo = repo?;
-    let old_tip = current_tip(Some(repo));
+fn pull_for_diff(repo: &Repository) -> Option<PullOutcome> {
+    let old_tip = current_tip(repo);
     match try_pull(repo) {
         Ok(new_tip) => Some(if Some(new_tip) == old_tip {
             PullOutcome::SameTip
@@ -348,8 +553,8 @@ fn pull_for_diff(repo: Option<&Repository>) -> Option<PullOutcome> {
     }
 }
 
-fn current_tip(repo: Option<&Repository>) -> Option<Oid> {
-    repo?.head().ok().and_then(|r| r.target())
+fn current_tip(repo: &Repository) -> Option<Oid> {
+    repo.head().ok().and_then(|r| r.target())
 }
 
 fn try_pull(repo: &Repository) -> Result<Oid, git2::Error> {
@@ -378,12 +583,17 @@ fn open_or_clone(url: &str, path: &Path) -> Option<Repository> {
 // Tree walk → RepoData (blob Oids only; no body text materialised)
 // =========================================================================
 
-/// Walk the commit's tree at `tip` and build a [`RepoData`]: for each site,
+/// Walk the commit's tree at `tip` and build the sites map: for each site,
 /// every `_meta/<p1>/<p2>/<pageid>` blob yields one [`Article`] (metadata parsed
 /// from the blob, body blob Oids recorded from the sibling `_pages_by_id`
-/// subtree). Bodies stay as Oids — never read into memory here.
-fn build_from_tree(odb: &Odb, tip: Oid, root: &Path) -> (RepoData, Index) {
-    let repo = &odb.repo;
+/// subtree). Bodies stay as Oids — never read into memory here. Returns the bare
+/// sites map + reverse [`Index`]; the worker attaches its mailbox to form the
+/// [`RepoData`] snapshot.
+fn build_from_tree(
+    repo: &Repository,
+    tip: Oid,
+    root: &Path,
+) -> (ImHashMap<SafePathComponent, WDWebsite>, Index) {
     let mut sites: ImHashMap<SafePathComponent, WDWebsite> = ImHashMap::new();
     let mut index: Index = HashMap::new();
     let root_tree = match repo
@@ -391,15 +601,7 @@ fn build_from_tree(odb: &Odb, tip: Oid, root: &Path) -> (RepoData, Index) {
         .and_then(|c| repo.find_tree(c.tree_id()))
     {
         Ok(t) => t,
-        Err(_) => {
-            return (
-                RepoData {
-                    sites,
-                    odb: Some(Rc::clone(odb)),
-                },
-                index,
-            );
-        }
+        Err(_) => return (sites, index),
     };
     // `(site, p1, p2, id)` keyed: the `_meta` blob Oid + per-revision body Oids.
     let mut metas: HashMap<(String, String, String, String), Oid> = HashMap::new();
@@ -490,13 +692,7 @@ fn build_from_tree(odb: &Odb, tip: Oid, root: &Path) -> (RepoData, Index) {
             sites.insert(site_c, w);
         }
     }
-    (
-        RepoData {
-            sites,
-            odb: Some(Rc::clone(odb)),
-        },
-        index,
-    )
+    (sites, index)
 }
 
 /// Read one [`Article`] out of `tree` at `(site, p1, p2, id)`: parse the `_meta`
@@ -568,6 +764,14 @@ fn rev_number(name: &str) -> Option<u64> {
 fn blob_str(repo: &Repository, oid: Oid) -> Option<String> {
     let blob = repo.find_blob(oid).ok()?;
     std::str::from_utf8(blob.content()).ok().map(String::from)
+}
+
+/// Read a body blob by Oid, stripping its frontmatter. Uncached (the worker
+/// reads blobs straight from the odb on demand); used directly by tests
+/// against a live `Repository`.
+fn read_body(repo: &Repository, oid: Oid) -> Option<String> {
+    let raw = blob_str(repo, oid)?;
+    Some(revision_body(&raw).to_string())
 }
 
 /// Strip a revision file's `---\n…\n---\n` frontmatter, returning the body.
@@ -661,16 +865,16 @@ fn slug_to_key(slug: &str) -> Option<(Option<SafePathComponent>, SafePathCompone
 /// `_meta` path). For each: drop the old nested-map entry (if any, via the
 /// [`Index`]), then re-read the page (as blob Oids) from the new tip's `tree`
 /// and re-insert under its current slug. Unaffected pages are structurally
-/// shared from [`old`] (`im::HashMap`), so only the touched pages are re-read.
+/// shared from [`old`] (`imbl::HashMap`), so only the touched pages are re-read.
 fn incremental_update(
     repo: &Repository,
     tree: &Tree,
     root: &Path,
-    old: &RepoData,
+    old: &ImHashMap<SafePathComponent, WDWebsite>,
     index: &mut Index,
     affected: HashSet<PathBuf>,
-) -> RepoData {
-    let mut sites = old.sites.clone();
+) -> ImHashMap<SafePathComponent, WDWebsite> {
+    let mut sites = old.clone();
     for meta_path in affected {
         if let Some(old_key) = index.remove(&meta_path) {
             remove_page(&mut sites, &old_key);
@@ -690,10 +894,7 @@ fn incremental_update(
         index.insert(meta_path, (site_c.clone(), cat.clone(), name.clone()));
         insert_page(&mut sites, site_c, cat, name, article);
     }
-    RepoData {
-        sites,
-        odb: old.odb.clone(),
-    }
+    sites
 }
 
 /// The set of `_meta` paths changed between two tips. Each git-diff delta path
@@ -767,7 +968,7 @@ fn meta_page_parts(meta_path: &Path, root: &Path) -> Option<(String, String, Str
 }
 
 /// Remove `(site, cat, name)` from the nested map, pruning a now-empty
-/// category or site. Each level is cloned once (`im::HashMap` is O(1)), so this
+/// category or site. Each level is cloned once (`imbl::HashMap` is O(1)), so this
 /// is O(log n) and shares the rest of the structure.
 fn remove_page(sites: &mut ImHashMap<SafePathComponent, WDWebsite>, (site, cat, name): &Key) {
     let Some(mut website) = sites.get(site).cloned() else {
@@ -827,23 +1028,27 @@ pub(crate) struct RepoLArticleCache;
 pub(crate) struct RepoLThemeRootsCache;
 
 /// Project one page out of `repo`'s dataset into a shippable [`ArticleLatest`],
-/// materialising the latest body blob out of the odb. A missing page (or an
-/// unopenable repository) yields an empty [`ArticleLatest`] (blank render).
-pub(crate) fn repo_l_article_latest(
+/// materialising the latest body blob via the worker thread (off-core). A
+/// missing page (or an unopenable repository) yields an empty [`ArticleLatest`]
+/// (blank render).
+pub(crate) async fn repo_l_article_latest(
     data: &RepoData,
     site: &SafePathComponent,
     slug: &Slug,
 ) -> ArticleLatest {
-    data.article(site, slug)
-        .and_then(|a| {
-            let body = data.odb.as_ref()?.blob(a.latest_body)?;
-            Some(ArticleLatest {
-                meta: a.meta.clone(),
-                body: (*body).to_string(),
-                revisions: a.revisions.clone(),
-            })
-        })
-        .unwrap_or_default()
+    let Some(a) = data.article(site, slug) else {
+        return ArticleLatest::default();
+    };
+    let meta = a.meta.clone();
+    let revisions = a.revisions.clone();
+    match data.mailbox.blob(a.latest_body).await {
+        Some(body) => ArticleLatest {
+            meta,
+            body,
+            revisions,
+        },
+        None => ArticleLatest::default(),
+    }
 }
 
 /// Project the site's theme-root URLs out of `repo`'s dataset.
@@ -1473,6 +1678,30 @@ mod tests {
         (None, SafePathComponent::new(name.into()).unwrap())
     }
 
+    /// Regression: `repo()`'s cold start spawns the worker and re-borrows the
+    /// cache `RefCell` in its `None` arm. A `borrow()` left in the `match`
+    /// scrutinee used to live through the arms and panic ("RefCell already
+    /// borrowed"). Pointing at an unreachable source keeps the worker
+    /// repository-less (empty dataset) while still exercising that path, and
+    /// proves the unchanged-tip path keeps the same `Rc`.
+    #[test]
+    fn repo_cold_start_reborrows_without_panic() {
+        use compio::runtime::Runtime;
+        let dir =
+            std::env::temp_dir().join(format!("kolorinko_repo_nopath_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path: &'static Path = Box::leak(dir.clone().into_boxed_path());
+        let meta = RepoMeta::new("file:///nonexistent/kolorinko-repo", path, 900);
+        let mut cache = RepoCache::default();
+        let rt = Runtime::new().unwrap();
+        // Cold start (non-tick): the `None` arm — the original panic site.
+        let first = rt.block_on(repo(&meta, false, &mut cache));
+        assert!(find_article(&first.sites, &site("nope"), &root_slug("nope")).is_none());
+        // Nothing to pull → worker returns None → the prior `Rc` is kept.
+        let second = rt.block_on(repo(&meta, true, &mut cache));
+        assert!(Rc::ptr_eq(&first, &second));
+    }
+
     #[test]
     fn build_and_materialise_from_odb() {
         let dir = std::env::temp_dir().join(format!("kolorinko_odb_{}", std::process::id()));
@@ -1502,18 +1731,21 @@ mod tests {
         );
         let tip = commit(&repo, "c1", &[]);
 
-        let odb: Odb = Rc::new(OdbInner::new(repo));
-        let (data, index) = build_from_tree(&odb, tip, &dir);
+        let (sites, index) = build_from_tree(&repo, tip, &dir);
 
-        // Two pages indexed; bodies stay as Oids until projected through the lens.
+        // Two pages indexed; bodies stay as Oids until read on demand.
         assert_eq!(index.len(), 2);
-        let foo = repo_l_article_latest(&data, &site("scp"), &root_slug("foo"));
-        assert_eq!(foo.body, "Foo body");
+        let foo = find_article(&sites, &site("scp"), &root_slug("foo")).unwrap();
+        assert_eq!(
+            read_body(&repo, foo.latest_body),
+            Some("Foo body".to_string())
+        );
         assert_eq!(foo.meta.slug, "foo");
         assert_eq!(foo.meta.page_id, "1305054470");
+        let bar = find_article(&sites, &site("scp"), &root_slug("bar")).unwrap();
         assert_eq!(
-            repo_l_article_latest(&data, &site("scp"), &root_slug("bar")).body,
-            "Bar body"
+            read_body(&repo, bar.latest_body),
+            Some("Bar body".to_string())
         );
     }
 
@@ -1546,11 +1778,11 @@ mod tests {
         );
         let tip1 = commit(&repo, "c1", &[]);
 
-        let odb: Odb = Rc::new(OdbInner::new(repo));
-        let (data, mut index) = build_from_tree(&odb, tip1, &dir);
+        let (sites, mut index) = build_from_tree(&repo, tip1, &dir);
+        let foo = find_article(&sites, &site("scp"), &root_slug("foo")).unwrap();
         assert_eq!(
-            repo_l_article_latest(&data, &site("scp"), &root_slug("foo")).body,
-            "Foo v1"
+            read_body(&repo, foo.latest_body),
+            Some("Foo v1".to_string())
         );
 
         // Edit only `foo` (new revision → moved blob Oid) and advance the tip.
@@ -1564,25 +1796,26 @@ mod tests {
             2,
             "---\nx:1\n---\nFoo v2",
         );
-        let parent = odb.repo.find_commit(tip1).unwrap();
-        let tip2 = commit(&odb.repo, "c2", &[&parent]);
+        let parent = repo.find_commit(tip1).unwrap();
+        let tip2 = commit(&repo, "c2", &[&parent]);
 
-        let affected = diff_affected_meta_paths(&odb.repo, tip1, tip2, &dir).unwrap();
-        let tree2 = odb
-            .repo
+        let affected = diff_affected_meta_paths(&repo, tip1, tip2, &dir).unwrap();
+        let tree2 = repo
             .find_commit(tip2)
-            .and_then(|c| odb.repo.find_tree(c.tree_id()))
+            .and_then(|c| repo.find_tree(c.tree_id()))
             .unwrap();
-        let next = incremental_update(&odb.repo, &tree2, &dir, &data, &mut index, affected);
+        let next = incremental_update(&repo, &tree2, &dir, &sites, &mut index, affected);
 
         // `bar` is structurally shared from the old snapshot; `foo` re-read.
+        let foo = find_article(&next, &site("scp"), &root_slug("foo")).unwrap();
         assert_eq!(
-            repo_l_article_latest(&next, &site("scp"), &root_slug("foo")).body,
-            "Foo v2"
+            read_body(&repo, foo.latest_body),
+            Some("Foo v2".to_string())
         );
+        let bar = find_article(&next, &site("scp"), &root_slug("bar")).unwrap();
         assert_eq!(
-            repo_l_article_latest(&next, &site("scp"), &root_slug("bar")).body,
-            "Bar v1"
+            read_body(&repo, bar.latest_body),
+            Some("Bar v1".to_string())
         );
     }
 

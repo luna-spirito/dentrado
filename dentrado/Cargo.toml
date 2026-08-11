@@ -16,7 +16,7 @@ futures = "0.3"
 synchrony = { version = "0.1.7", features = ["watch", "event"] }
 libc = "0.2"
 rkyv = { version = "0.8", features = ["bytecheck"] }
-im = "15"
+imbl = "7.0"
 slotmap = "1.1"
 serde_json = "1"
 base64 = "0.22"
