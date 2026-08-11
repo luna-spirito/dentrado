@@ -33,6 +33,17 @@ pub(crate) const PLACEHOLDER_INDEX: &str = "<!doctype html>\
 /// a fairly high level pays for itself in transfer size.
 const ZSTD_LEVEL: i32 = 12;
 
+/// Before paying for a full-strength pass on a large blob, probe a middle slice
+/// at a cheap level. Files larger than this are test-compressed first; if the
+/// slice refuses to shrink, the whole file is almost certainly already
+/// entropy-coded (JPEG/PNG/webp/woff2/video/…) and is stored raw instead of
+/// burning CPU on a guaranteed-futile level-12 pass.
+const PROBE_SIZE: usize = 64 * 1024;
+const PROBE_LEVEL: i32 = 1;
+/// Minimum sample compression ratio (compressed ÷ raw) below which a full pass
+/// is worthwhile. `0.98` ≈ "the sample shrank by more than 2 %".
+const PROBE_MIN_RATIO: f64 = 0.98;
+
 /// Load the built frontend into a `path → Body` map, keyed by request path
 /// (e.g. `/index.html`, `/pkg/kolorinko_web.js`). Each file is zstd-compressed
 /// when that helps; `/index.html` gets the WT cert hash injected **before**
@@ -56,12 +67,35 @@ pub(crate) fn load_assets(dir: &Path, wt_hash: Option<&[u8]>) -> HashMap<String,
 /// result is shared behind a [`Bytes`] so every serve is a refcount bump.
 /// Shared with the [`RepoAsset`] gear ([`crate::wikidot_page`]).
 ///
+/// Large blobs are first screened by [`likely_incompressible`]: a pre-compressed
+/// image/font/video fails to shrink on a cheap probe of a middle slice, so we
+/// skip the expensive full pass and store it raw.
+///
 /// [`RepoAsset`]: kolorinko_rt gear
 pub(crate) fn compress(bytes: Vec<u8>) -> Body {
+    if bytes.len() > PROBE_SIZE && likely_incompressible(&bytes) {
+        return Body::Raw(Bytes::from(bytes));
+    }
     match zstd::encode_all(&bytes[..], ZSTD_LEVEL) {
         Ok(z) if z.len() < bytes.len() => Body::Zstd(Bytes::from(z)),
         _ => Body::Raw(Bytes::from(bytes)),
     }
+}
+
+/// zstd-probe a deterministic middle slice of `bytes` at a cheap level; `true`
+/// when it failed to compress — a strong signal the whole file is already
+/// entropy-coded. Small files never reach here ([`compress`] only probes past
+/// `PROBE_SIZE`); a probe failure is also treated as compressible (fall through
+/// to the real pass) so a broken probe never loses compression.
+fn likely_incompressible(bytes: &[u8]) -> bool {
+    let mid = bytes.len() / 2;
+    let start = mid.saturating_sub(PROBE_SIZE / 2);
+    let end = (start + PROBE_SIZE).min(bytes.len());
+    let sample = &bytes[start..end];
+    let Ok(probed) = zstd::encode_all(sample, PROBE_LEVEL) else {
+        return false;
+    };
+    (probed.len() as f64) / (sample.len() as f64) >= PROBE_MIN_RATIO
 }
 
 /// The bytes to write for a response, plus the `Content-Encoding` to advertise
@@ -206,4 +240,45 @@ fn find_head_open(html: &[u8]) -> Option<usize> {
         .position(|w| w.eq_ignore_ascii_case(b"<head"))?;
     let gt = html[start..].iter().position(|&b| b == b'>')?;
     Some(start + gt + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Body::*, compress};
+
+    /// Text (highly compressible) comes back as `Zstd`, even when large.
+    #[test]
+    fn large_text_is_compressed() {
+        let big = "a".repeat(4 * super::PROBE_SIZE);
+        assert!(matches!(compress(big.into_bytes()), Zstd(_)));
+    }
+
+    /// A large pre-compressed blob (random bytes model JPEG/PNG entropy) is
+    /// stored `Raw` without paying for the full-strength pass.
+    #[test]
+    fn large_incompressible_is_raw() {
+        assert!(matches!(compress(random(4 * super::PROBE_SIZE)), Raw(_)));
+    }
+
+    /// Small files skip the probe and rely on the ratio guard, so a small
+    /// incompressible payload still resolves to `Raw`.
+    #[test]
+    fn small_incompressible_is_raw() {
+        assert!(matches!(compress(random(512)), Raw(_)));
+    }
+
+    /// Deterministic pseudo-random bytes (high entropy, no RNG deps): models
+    /// the payload of a pre-compressed image / font / video well enough to
+    /// defeat zstd.
+    fn random(n: usize) -> Vec<u8> {
+        let mut s: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut bytes = Vec::with_capacity(n);
+        for _ in 0..n {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            bytes.push(s as u8);
+        }
+        bytes
+    }
 }
