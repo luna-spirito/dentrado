@@ -12,7 +12,8 @@ feature-depth = 1
 yanked = "deny"
 ignore = [
     "RUSTSEC-2024-0436", # paste
-    "RUSTSEC-2026-0173" # proc-macro-error2
+    "RUSTSEC-2026-0173", # proc-macro-error2
+    "RUSTSEC-2026-0247" # bitmaps
 ]
 
 [licenses]

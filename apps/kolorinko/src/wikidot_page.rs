@@ -54,6 +54,11 @@
 //!   by a visited-set), producing the final [`ArticleView`]. Declaring each
 //!   include as a dependency makes the result reactive: an edit to any page in
 //!   the transitive include cone re-runs this gear.
+//! - [`shell`] (`follow` over `repo`): the whole site chrome in one shot — the
+//!   resolved `nav:top` / `nav:side` pages (declared as [`article_latest`]
+//!   [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get) deps)
+//!   plus the theme-root URLs — so the client fetches the site frame under a
+//!   single `site`-keyed subscription.
 
 use crate::wikidot_parser::parse;
 use compio::fs;
@@ -61,7 +66,7 @@ use dentrado::core::{core_ctx::GearCtx, storage::Storage};
 use git2::{ObjectType, Oid, Repository, Tree, TreeWalkMode};
 use imbl::HashMap as ImHashMap;
 use kolorinko_render::rewrite;
-use kolorinko_rt::{AssetKind, RepoAssetOut, RepoAssetPath, SafePathComponent};
+use kolorinko_rt::{AssetKind, RepoAssetOut, RepoAssetPath, SafePathComponent, SiteShell};
 use kolorinko_wikitext::{
     ArticleLatest, ArticleMeta, ArticleView, BlockCell, BlockRow, BlockTable, ContainerKind,
     Content, Include, List, ListItem, ListPages, Node, PageRef, RevMeta, Tab, TableCell, TextObj,
@@ -1023,9 +1028,11 @@ fn strip_quotes(s: &str) -> &str {
 #[derive(Default, Clone, Debug)]
 pub(crate) struct RepoLArticleCache;
 
-/// Trivial lens cache, same projection semantics as [`RepoLArticleCache`].
+/// Per-instance cache for [`shell`]: a pure aggregation re-derived each run
+/// from its `article_latest` dependencies and the live [`RepoData`], so it
+/// carries no state between runs.
 #[derive(Default, Clone, Debug)]
-pub(crate) struct RepoLThemeRootsCache;
+pub(crate) struct ShellCache;
 
 /// Project one page out of `repo`'s dataset into a shippable [`ArticleLatest`],
 /// materialising the latest body blob via the worker thread (off-core). A
@@ -1051,8 +1058,44 @@ pub(crate) async fn repo_l_article_latest(
     }
 }
 
-/// Project the site's theme-root URLs out of `repo`'s dataset.
-pub(crate) fn repo_l_theme_roots(data: &RepoData, site: &SafePathComponent) -> Vec<String> {
+/// The site's whole chrome in one shot: the fully include-resolved `nav:top`
+/// and `nav:side` pages plus the theme-root URLs. Each nav page is declared as
+/// an [`article_latest`](crate::runtime::article_latest)
+/// [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get) dependency
+/// (so an edit to either re-runs this gear); the theme roots are projected
+/// straight out of the followed [`RepoData`]. Keyed on `site` alone, so the
+/// client fetches the entire site frame under one subscription that survives
+/// page navigation within the site.
+pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
+    repo_meta: RepoMeta,
+    data: &RepoData,
+    site: SafePathComponent,
+    ctx: &mut GearCtx<KolorinkoRT, S>,
+) -> SiteShell {
+    let nav_top = crate::runtime::article_latest(repo_meta.clone(), site.clone(), nav_slug("top"))
+        .secondary_get(ctx)
+        .await;
+    let nav_side =
+        crate::runtime::article_latest(repo_meta.clone(), site.clone(), nav_slug("side"))
+            .secondary_get(ctx)
+            .await;
+    SiteShell {
+        nav_top: (*nav_top).clone(),
+        nav_side: (*nav_side).clone(),
+        theme_roots: theme_roots_of(data, &site),
+    }
+}
+
+/// `(nav, name)` slug for one of the per-site navigation pages (`nav:top`,
+/// `nav:side`).
+fn nav_slug(name: &str) -> Slug {
+    let category = SafePathComponent::new("nav".to_string()).unwrap();
+    let page = SafePathComponent::new(name.to_string()).unwrap();
+    (Some(category), page)
+}
+
+/// Project the site's theme-root URLs out of the dataset.
+fn theme_roots_of(data: &RepoData, site: &SafePathComponent) -> Vec<String> {
     data.sites
         .get(site)
         .map(|w| w.theme_roots.clone())

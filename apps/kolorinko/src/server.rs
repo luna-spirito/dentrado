@@ -64,7 +64,7 @@ use crate::{
     repo,
     runtime::{
         GearOut, GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, repo_asset,
-        repo_l_article_latest, repo_l_theme_roots,
+        repo_l_article_latest, shell,
     },
     wikidot_page::RepoMeta,
 };
@@ -437,9 +437,7 @@ async fn subscribe_wire(
                 .subscribe(core)
                 .await
         }
-        wire::GearId::RepoLThemeRoots(site) => {
-            repo_l_theme_roots(repo_meta, site).subscribe(core).await
-        }
+        wire::GearId::Shell(site) => shell(repo_meta, site).subscribe(core).await,
         wire::GearId::RepoAsset { site, kind, path } => {
             repo_asset(repo_meta, site, kind, path)
                 .subscribe(core)
@@ -448,16 +446,15 @@ async fn subscribe_wire(
     }
 }
 
-// TOO: Annihilate.
+// TODO: Annihilate. Also, no copies.
 fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
     match res {
         // Shippable gears carry their payload directly.
-        GearResult::Ship(GearOut::RepoLThemeRootsOut(a)) => {
-            Some(wire::GearOut::RepoLThemeRootsOut(a))
-        }
+        GearResult::Ship(_) => None,
         // Shared gears are shared *across cores* by reference; to the client
         // they serialize the same way, so clone the payload out of the handle.
         GearResult::Shared(s) => match &*s {
+            GearOutShared::ShellOut(a) => Some(wire::GearOut::ShellOut(a.clone())),
             GearOutShared::ArticleLatestOut(a) => Some(wire::GearOut::ArticleLatestOut(a.clone())),
             GearOutShared::ArticleLatestParsedOut(a) => {
                 Some(wire::GearOut::ArticleLatestParsedOut(a.clone()))

@@ -11,7 +11,7 @@
 
 use kolorinko_rt::SafePathComponent;
 use leptos::prelude::*;
-use wasm_bindgen::{closure::Closure, JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{Element, Event, MouseEvent};
 
 pub(crate) type Slug = (Option<SafePathComponent>, SafePathComponent);
@@ -38,18 +38,13 @@ fn parse_path(path: &str) -> Option<(SafePathComponent, Slug)> {
         )),
         [s, c, p] => Some((
             SafePathComponent::new((*s).into())?,
-            (Some(SafePathComponent::new((*c).into())?), SafePathComponent::new((*p).into())?),
+            (
+                Some(SafePathComponent::new((*c).into())?),
+                SafePathComponent::new((*p).into())?,
+            ),
         )),
         _ => None,
     }
-}
-
-/// Slug for one of the per-site navigation pages (`nav:side`, `nav:top`).
-pub(crate) fn nav_slug(name: &str) -> Slug {
-    (
-        Some(SafePathComponent::new("nav".into()).unwrap()),
-        SafePathComponent::new(name.into()).unwrap(),
-    )
 }
 
 #[derive(Clone)]
@@ -92,18 +87,33 @@ impl Router {
     /// Client-side navigate to an internal path: pushState + update signals,
     /// so subscriptions re-subscribe without a full reload.
     pub(crate) fn navigate(&self, path: String) {
-        let Some((site, slug)) = parse_path(&path) else { return };
+        let Some((site, slug)) = parse_path(&path) else {
+            return;
+        };
         if let Ok(h) = window().history() {
             let _ = h.push_state_with_url(&JsValue::NULL, "", Some(&path));
         }
-        self.site.set(site);
-        self.slug.set(slug);
+        self.set_route(site, slug);
     }
 
     fn sync_from_location(&self) {
         let path = window().location().pathname().unwrap_or_default();
         if let Some((site, slug)) = parse_path(&path) {
+            self.set_route(site, slug);
+        }
+    }
+
+    /// Set the route signals only when they actually change. `RwSignal::set`
+    /// notifies subscribers unconditionally (Leptos does no equality dedup), so a
+    /// plain `set` here would tear down and re-subscribe every signal-keyed
+    /// subscription — notably the `shell` gear — on every same-site navigation,
+    /// even though the site didn't change.
+    fn set_route(&self, site: SafePathComponent, slug: Slug) {
+        if self.site.with_untracked(|s| *s != site) {
+            println!("Setting new site");
             self.site.set(site);
+        }
+        if self.slug.with_untracked(|s| *s != slug) {
             self.slug.set(slug);
         }
     }
@@ -135,8 +145,12 @@ impl Router {
             let Some(el) = ev.target().and_then(|t| t.dyn_into::<Element>().ok()) else {
                 return;
             };
-            let Ok(Some(anchor)) = el.closest("a") else { return };
-            let Some(href) = anchor.get_attribute("href") else { return };
+            let Ok(Some(anchor)) = el.closest("a") else {
+                return;
+            };
+            let Some(href) = anchor.get_attribute("href") else {
+                return;
+            };
             let path = href.split(['?', '#']).next().unwrap_or(&href);
             if !path.starts_with('/') || path.starts_with("//") {
                 return;

@@ -22,11 +22,7 @@
     local,
     name = Repo,
 )]
-pub(crate) async fn repo(
-    repo_meta: RepoMeta,
-    tick: bool,
-    cache: &mut RepoCache,
-) -> Rc<RepoData> {
+pub(crate) async fn repo(repo_meta: RepoMeta, tick: bool, cache: &mut RepoCache) -> Rc<RepoData> {
     crate::wikidot_page::repo(&repo_meta, tick, cache).await
 }
 
@@ -63,17 +59,19 @@ pub(crate) async fn repo_asset(
 }
 
 #[dentrado::gear(
-    follow(target = GearId::Repo(_repo_meta)),
-    name = RepoLThemeRoots,
-    wire_skip(_repo_meta),
+    follow(target = GearId::Repo(repo_meta)),
+    shared,
+    name = Shell,
+    wire_skip(repo_meta),
 )]
-pub(crate) async fn repo_l_theme_roots(
-    _repo_meta: RepoMeta,
+pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
+    repo_meta: RepoMeta,
     site: SafePathComponent,
     repo_data: Rc<RepoData>,
-    _cache: &mut RepoLThemeRootsCache,
-) -> Vec<String> {
-    crate::wikidot_page::repo_l_theme_roots(&repo_data, &site)
+    ctx: &mut GearCtx<KolorinkoRT, S>,
+    _cache: &mut ShellCache,
+) -> SiteShell {
+    crate::wikidot_page::shell(repo_meta, &repo_data, site, ctx).await
 }
 
 #[dentrado::gear(

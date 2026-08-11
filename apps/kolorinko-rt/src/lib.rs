@@ -10,6 +10,8 @@
 
 use std::path::{Component, Path};
 
+use kolorinko_wikitext::ArticleView;
+
 /// A single validated path component (a Wikidot site/category/page-name
 /// segment). On the wire it serializes as a plain string; it derives
 /// [`Localizable`](dentrado_types::Localizable) so it can appear as a runtime
@@ -176,6 +178,17 @@ pub enum RepoAssetOut {
     Redirect { location: String },
 }
 
+/// One site's persistent chrome, fetched atomically in a single `site`-keyed
+/// subscription: the fully include-resolved `nav:top` and `nav:side` pages plus
+/// the site's theme-root URLs. Bundled so the client requests the whole site
+/// frame once and keeps it live across page navigation within the site.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SiteShell {
+    pub nav_top: ArticleView,
+    pub nav_side: ArticleView,
+    pub theme_roots: Vec<String>,
+}
+
 /// The wire schema + protocol envelope, generated from [`gears.def`](../gears.def.rs).
 ///
 /// `GearId` / `GearOut` / `GearQuery` (and one builder per shippable gear) are
@@ -187,7 +200,7 @@ pub enum RepoAssetOut {
 /// — the server never assigns ids.
 #[dentrado_macros::gears_schema(file = "gears.def.rs")]
 pub mod wire {
-    use crate::{AssetKind, RepoAssetOut, RepoAssetPath, SafePathComponent};
+    use crate::{AssetKind, RepoAssetOut, RepoAssetPath, SafePathComponent, SiteShell};
     use kolorinko_wikitext::{ArticleLatest, ArticleView};
 
     /// Client → server: start or stop a subscription. `sub` is the client's

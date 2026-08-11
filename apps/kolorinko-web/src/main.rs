@@ -4,7 +4,7 @@
 //! load it opens a WebTransport session ([`wt::connect_wt`]) and then drives
 //! everything reactively off the route ([`router::Router`]):
 //! - the current page (`article_latest`),
-//! - the site's `nav:top` and `nav:side` navigation pages.
+//! - the site shell (`shell`): its `nav:top` / `nav:side` pages and theme roots.
 //!
 //! Each is a typed subscription that re-subscribes when the route (its `site`
 //! and, for the page, its `slug`) changes. Navigation is client-side
@@ -77,17 +77,11 @@ fn layout(client: Rc<WtClient>) -> AnyView {
     let slug = router.slug;
 
     let page = subscribe(client.clone(), move || wire::article_latest(site.get(), slug.get()));
-    let nav_side = subscribe(client.clone(), move || {
-        wire::article_latest(site.get(), router::nav_slug("side"))
-    });
-    let theme_roots = subscribe(client.clone(), move || wire::repo_l_theme_roots(site.get()));
-    let nav_top =
-        subscribe(client, move || wire::article_latest(site.get(), router::nav_slug("top")));
+    let shell = subscribe(client, move || wire::shell(site.get()));
 
     // Keep one theme `<link>` in `<head>` for the current site. Re-runs on site
     // change and on repo updates; the stylesheet is served (and its `@import`/
     // `url()` references rewritten) by the kolorinko origin.
-    let theme_site = site;
     Effect::new(move |_| {
         let Some(window) = web_sys::window() else { return };
         let Some(doc) = window.document() else { return };
@@ -95,10 +89,10 @@ fn layout(client: Rc<WtClient>) -> AnyView {
         if let Some(old) = doc.get_element_by_id(THEME_LINK_ID) {
             old.remove();
         }
-        let Some(Some(root)) = theme_roots.get().map(|r| r.first().cloned()) else {
+        let Some(Some(root)) = shell.get().map(|s| s.theme_roots.first().cloned()) else {
             return;
         };
-        let s = theme_site.get().as_ref().to_string_lossy().to_string();
+        let s = site.get().as_ref().to_string_lossy().to_string();
         let Some(href) = asset_url(&s, "theme", &root) else { return };
         if let Ok(el) = doc.create_element("link") {
             let _ = el.set_attribute("id", THEME_LINK_ID);
@@ -119,10 +113,10 @@ fn layout(client: Rc<WtClient>) -> AnyView {
                     <div id="top-bar"
                         on:mouseover=menu::on_over
                         on:mouseout=menu::on_out
-                    >{move || view_nav(site.get(), nav_top.get(), true)}</div>
+                    >{move || view_nav(site.get(), shell.get().map(|s| s.nav_top), true)}</div>
                 </div>
                 <div id="content-wrap">
-                    <div id="side-bar">{move || view_nav(site.get(), nav_side.get(), false)}</div>
+                    <div id="side-bar">{move || view_nav(site.get(), shell.get().map(|s| s.nav_side), false)}</div>
                     <div id="main-content">
                         <div id="page-title">
                             {move || page.get().map(|a| a.meta.title).unwrap_or_default()}
