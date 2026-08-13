@@ -3,14 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>kolorinko</title>
-    <!--
-      Wikidot's own AGPL base theme (see wikidot-base-theme/NOTICE.md) — the
-      structural CSS for the page skeleton (#container, #header, #top-bar,
-      #side-bar, #main-content, tables, images, …). Site-specific themes layer
-      on top of it, exactly as on Wikidot. `copy-dir` ships it into dist at
-      build time; the stylesheet link loads it before any per-site theme.
-    -->
+    <title>dntrd</title>
+    <link data-trunk rel="icon" type="image/svg+xml" href="/favicon.svg">
     <link
       data-trunk
       rel="copy-dir"
@@ -19,7 +13,6 @@
     />
     <link rel="stylesheet" href="/wikidot-base-theme/css/style.css" />
     <style>
-      /* kolorinko-only bits not covered by the Wikidot base theme. */
       .kolorinko-status {
         color: #888;
       }
@@ -27,7 +20,6 @@
   </head>
   <body>
     <div id="container"></div>
-    <!-- Trunk builds the `kolorinko-web` bin to wasm and mounts it into #container. -->
     <link
       data-trunk
       rel="rust"

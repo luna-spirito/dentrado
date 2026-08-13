@@ -98,3 +98,4 @@ let's talk just about ServiceWorker for now.
 * `/repo` -- страшный endpoint.
 * Механизм обхода дерева необходимо генерализовать.
 * alt≠hash
+* Assume append-only for git?

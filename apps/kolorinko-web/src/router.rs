@@ -18,13 +18,16 @@ pub(crate) type Slug = (Option<SafePathComponent>, SafePathComponent);
 
 const FALLBACK_SITE: &str = "obscurative";
 const FALLBACK_PAGE: &str = "syntax";
+/// The landing page a bare `/<site>/` resolves to.
+const START_PAGE: &str = "start";
 
 fn window() -> web_sys::Window {
     web_sys::window().expect("no window")
 }
 
-/// `/<site>/<page>` or `/<site>/<category>/<page>` → `(site, slug)`. `None` for
-/// anything else (bare `/`, asset paths, wrong arity, unsafe segments).
+/// `/<site>[/<category>/<page>]` → `(site, slug)`. A bare `/<site>/` resolves
+/// to the site's `start` landing page. `None` for bare `/`, asset paths, wrong
+/// arity, or unsafe segments.
 fn parse_path(path: &str) -> Option<(SafePathComponent, Slug)> {
     let segs: Vec<&str> = path
         .trim_start_matches('/')
@@ -32,6 +35,10 @@ fn parse_path(path: &str) -> Option<(SafePathComponent, Slug)> {
         .filter(|s| !s.is_empty())
         .collect();
     match segs.as_slice() {
+        [s] => Some((
+            SafePathComponent::new((*s).into())?,
+            (None, SafePathComponent::new(START_PAGE.into())?),
+        )),
         [s, p] => Some((
             SafePathComponent::new((*s).into())?,
             (None, SafePathComponent::new((*p).into())?),

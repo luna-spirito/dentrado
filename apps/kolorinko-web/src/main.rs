@@ -76,16 +76,32 @@ fn layout(client: Rc<WtClient>) -> AnyView {
     let site = router.site;
     let slug = router.slug;
 
-    let page = subscribe(client.clone(), move || wire::article_latest(site.get(), slug.get()));
+    let page = subscribe(client.clone(), move || {
+        wire::article_latest(site.get(), slug.get())
+    });
     let shell = subscribe(client, move || wire::shell(site.get()));
+
+    // Keep the browser tab title in sync with the current page's title.
+    Effect::new(move |_| {
+        let Some(doc) = (|| web_sys::window()?.document())() else {
+            return;
+        };
+        if let Some(title) = page.get().map(|a| a.meta.title).filter(|t| !t.is_empty()) {
+            doc.set_title(&format!("{title} | dntrd"));
+        }
+    });
 
     // Keep one theme `<link>` in `<head>` for the current site. Re-runs on site
     // change and on repo updates; the stylesheet is served (and its `@import`/
     // `url()` references rewritten) by the kolorinko origin.
     Effect::new(move |_| {
-        let Some(window) = web_sys::window() else { return };
+        let Some(window) = web_sys::window() else {
+            return;
+        };
         let Some(doc) = window.document() else { return };
-        let Ok(Some(head)) = doc.query_selector("head") else { return };
+        let Ok(Some(head)) = doc.query_selector("head") else {
+            return;
+        };
         if let Some(old) = doc.get_element_by_id(THEME_LINK_ID) {
             old.remove();
         }
@@ -107,7 +123,7 @@ fn layout(client: Rc<WtClient>) -> AnyView {
         <div id="container-wrap">
             <div id="container">
                 <div id="header">
-                    <h1><a href="/"><span>{move || shell.get().and_then(|s| s.title).unwrap_or_else(|| site.get().as_ref().to_string_lossy().to_string())}</span></a></h1>
+                    <h1><a href={move || format!("/{}/", site.get().as_ref().to_string_lossy())}><span>{move || shell.get().and_then(|s| s.title).unwrap_or_else(|| site.get().as_ref().to_string_lossy().to_string())}</span></a></h1>
                     <h2><span>{move || shell.get().and_then(|s| s.subtitle).unwrap_or_default()}</span></h2>
                     <div id="top-bar"
                         on:mouseover=menu::on_over
@@ -162,7 +178,7 @@ fn view_nav(
         None => {
             let _: () = view! { <></> };
             ().into_any()
-        },
+        }
     }
 }
 
