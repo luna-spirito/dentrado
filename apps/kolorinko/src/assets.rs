@@ -156,29 +156,36 @@ fn walk(root: &Path, dir: &Path, wt_hash: Option<&[u8]>, map: &mut HashMap<Strin
     }
 }
 
+pub(crate) fn mime_for_ext(ext: &str) -> &'static str {
+    match ext {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript",
+        "wasm" => "application/wasm",
+        "css" => "text/css",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "eot" => "application/vnd.ms-fontobject",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
 /// Map a request path to a MIME type by extension.
 pub(crate) fn mime_for(path: &str) -> &'static str {
     match path.rsplit('.').next() {
-        Some("html") | Some("htm") => "text/html; charset=utf-8",
-        Some("js") | Some("mjs") => "text/javascript",
-        Some("wasm") => "application/wasm",
-        Some("css") => "text/css",
-        Some("json") => "application/json",
-        Some("svg") => "image/svg+xml",
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("ico") => "image/x-icon",
-        Some("ttf") => "font/ttf",
-        Some("otf") => "font/otf",
-        Some("woff") => "font/woff",
-        Some("woff2") => "font/woff2",
-        Some("eot") => "application/vnd.ms-fontobject",
-        Some("mp3") => "audio/mpeg",
-        Some("mp4") => "video/mp4",
-        Some("webm") => "video/webm",
-        Some("pdf") => "application/pdf",
+        Some(x) => mime_for_ext(x),
         _ => "application/octet-stream",
     }
 }

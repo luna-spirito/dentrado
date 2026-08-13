@@ -14,7 +14,7 @@ mod menu;
 mod router;
 mod wt;
 
-use kolorinko_render::{asset_url, render_block, wrap_topbar_lists};
+use kolorinko_render::{render_block, wrap_topbar_lists};
 use kolorinko_rt::wire;
 use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
@@ -89,11 +89,9 @@ fn layout(client: Rc<WtClient>) -> AnyView {
         if let Some(old) = doc.get_element_by_id(THEME_LINK_ID) {
             old.remove();
         }
-        let Some(Some(root)) = shell.get().map(|s| s.theme_roots.first().cloned()) else {
+        let Some(href) = shell.get().and_then(|s| s.theme_root) else {
             return;
         };
-        let s = site.get().as_ref().to_string_lossy().to_string();
-        let Some(href) = asset_url(&s, "theme", &root) else { return };
         if let Ok(el) = doc.create_element("link") {
             let _ = el.set_attribute("id", THEME_LINK_ID);
             let _ = el.set_attribute("rel", "stylesheet");
@@ -109,7 +107,8 @@ fn layout(client: Rc<WtClient>) -> AnyView {
         <div id="container-wrap">
             <div id="container">
                 <div id="header">
-                    <h1><a href="/">{move || site.get().as_ref().to_string_lossy().to_string()}</a></h1>
+                    <h1><a href="/"><span>{move || shell.get().and_then(|s| s.title).unwrap_or_else(|| site.get().as_ref().to_string_lossy().to_string())}</span></a></h1>
+                    <h2><span>{move || shell.get().and_then(|s| s.subtitle).unwrap_or_default()}</span></h2>
                     <div id="top-bar"
                         on:mouseover=menu::on_over
                         on:mouseout=menu::on_out

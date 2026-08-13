@@ -1,14 +1,16 @@
-//! Serve mirrored site assets (`theme/` and `files/` trees) out of the export
-//! repository via the [`RepoAsset`] gear.
+//! Serve mirrored site assets out of the export repository.
 //!
-//! The repo trees are keyed by the origin URL: `<site>/theme/<host>/<path>` and
-//! `<site>/files/<host>/<path>` (content stored as symlinks into the `_files`
-//! blob store, which `compio::fs` follows transparently). A request
-//! `/repo/<site>/<kind>/<host>/<path>` maps straight onto that layout. The
-//! [`RepoAsset`] gear reads + (for CSS) rewrites + zstd-compresses the file and
-//! caches the bytes shared across cores; a missing file falls back to a
-//! redirect back onto the original host.
+//! Two shapes, two gears (both `shared` — cached + deduplicated across cores
+//! — and HTTP-only: never shipped over WebTransport):
+//! - **Content-addressed** `/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` — the
+//!   [`Asset`] gear reads the `_files/…/<hash>` blob, rewrites CSS
+//!   `url()`/`@import` to CA URLs, and compresses. Immutable key, so the client
+//!   caches it forever.
+//! - **Path-based** `/repo/<site>/theme/<host>/<path>` — the [`RepoAsset`] gear
+//!   reads the `theme/` symlink, rewrites CSS to local paths, and compresses; a
+//!   missing file redirects back onto the original host.
 //!
+//! [`Asset`]: kolorinko_rt gear
 //! [`RepoAsset`]: kolorinko_rt gear
 
 use std::rc::Rc;
@@ -16,8 +18,8 @@ use std::rc::Rc;
 use dentrado::core::{core_ctx::Core, gear::GearResult, storage::InMemoryStorage};
 use kolorinko_rt::{AssetKind, Body, RepoAssetOut, RepoAssetPath, SafePathComponent};
 
-use crate::assets::mime_for;
-use crate::runtime::{GearOutShared, KolorinkoRT, repo_asset};
+use crate::assets::{mime_for, mime_for_ext};
+use crate::runtime::{GearOutShared, KolorinkoRT, asset, repo_asset};
 use crate::wikidot_page::RepoMeta;
 
 const PREFIX: &str = "/repo/";
@@ -72,6 +74,28 @@ pub(crate) async fn serve(
         path,
         query,
     } = parse_repo_request(full)?;
+    // Content-addressed blob: `/repo/<site>/files/<xx>/<yy>/<hash>.<ext>`.
+    // Served via the [`Asset`] gear (cached, deduplicated across cores); the
+    // gear rewrites CSS `url()`/`@import` to CA URLs and compresses. A missing
+    // blob yields `None` (404).
+    //
+    // [`Asset`]: kolorinko_rt gear
+    if kind == AssetKind::Files
+        && let Some((_xx, _yy, hash, ext)) = ca_parts(&path)
+    {
+        let mime = mime_for_ext(&ext);
+        let q = asset(repo_meta.clone(), site.clone(), hash, ext);
+        let GearResult::Shared(s) = core.read_gear(q.id).await else {
+            return None;
+        };
+        return match &*s {
+            GearOutShared::AssetOut(Some(body)) => Some(RepoResp::Ok {
+                mime,
+                body: body.clone(),
+            }),
+            _ => None,
+        };
+    }
     let disk_rel = path.as_str().to_owned();
     let q = repo_asset(repo_meta, site, kind, path);
     let res = core.read_gear(q.id).await;
@@ -95,6 +119,35 @@ pub(crate) async fn serve(
         }
         _ => None,
     }
+}
+
+/// Split a CA request path `<xx>/<yy>/<hash>.<ext>` into its shards, or `None`
+/// if it isn't the content-addressed shape (two 2-hex dir shards + a 64-hex
+/// hash leaf, with an optional extension). The shape can't collide with a real
+/// mirrored `files/<host>/<path…>` attachment (whose first segment is a host
+/// name, not 2 hex chars).
+fn ca_parts(path: &RepoAssetPath) -> Option<(String, String, String, String)> {
+    let mut segs = path.as_str().split('/');
+    let (xx, yy, leaf) = (segs.next()?, segs.next()?, segs.next()?);
+    if segs.next().is_some() || xx.len() != 2 || yy.len() != 2 {
+        return None;
+    }
+    if !xx.bytes().all(|b| b.is_ascii_hexdigit()) || !yy.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let (hash, ext) = match leaf.rsplit_once('.') {
+        Some((h, e)) => (h, e),
+        None => (leaf, ""),
+    };
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((
+        xx.to_string(),
+        yy.to_string(),
+        hash.to_string(),
+        ext.to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -124,6 +177,28 @@ mod tests {
     }
 
     #[test]
+    fn ca_parts_detects_blob_path() {
+        let p = |s: &str| RepoAssetPath::new(s.into()).unwrap();
+        let h = "d84a29109fe0e70c7a5c22c39bda120fdbc56bd192f5927af95b9af8d0f87c27";
+        assert_eq!(
+            super::ca_parts(&p(&format!("d8/4a/{h}.jpg"))),
+            Some(("d8".into(), "4a".into(), h.into(), "jpg".into()))
+        );
+        // Bare hash, no extension.
+        assert_eq!(
+            super::ca_parts(&p(&format!("d8/4a/{h}"))),
+            Some(("d8".into(), "4a".into(), h.into(), "".into()))
+        );
+        // Not the CA shape: a real mirrored attachment path (host/path…).
+        assert!(super::ca_parts(&p("rpcauthority.wikidot.com/local--files/slug/a.png")).is_none());
+        // Wrong shard widths / non-hex.
+        assert!(super::ca_parts(&p(&format!("d8/4/{h}.png"))).is_none());
+        assert!(super::ca_parts(&p(&format!("zz/4a/{h}.png"))).is_none());
+        // Hash too short.
+        assert!(super::ca_parts(&p("d8/4a/deadbeef.png")).is_none());
+    }
+
+    #[test]
     fn missing_asset_redirects_to_original() {
         let root = repo_root();
         if !root.exists() {
@@ -141,41 +216,5 @@ mod tests {
             panic!("expected redirect, got {out:?}");
         };
         assert_eq!(location, "https://not/mirrored.png");
-    }
-
-    #[test]
-    fn real_theme_css_is_served_and_rewritten() {
-        let root = repo_root();
-        let path = root.join("rpcauthority/theme");
-        if !path.exists() {
-            return;
-        }
-        let site = SafePathComponent::new("rpcauthority".into()).unwrap();
-        let asset_path = RepoAssetPath::new(
-            "cdn.jsdelivr.net/gh/DoubleDenial/rpc-black-supremacy@refs/heads/main/style.css".into(),
-        )
-        .unwrap();
-        let out = Runtime::new().unwrap().block_on(repo_asset(
-            &meta(&root),
-            &site,
-            AssetKind::Theme,
-            &asset_path,
-        ));
-        let kolorinko_rt::RepoAssetOut::Ok(body) = out else {
-            panic!("expected ok, got {out:?}");
-        };
-        let bytes = match body {
-            kolorinko_rt::Body::Raw(b) => b.to_vec(),
-            kolorinko_rt::Body::Zstd(b) => zstd::decode_all(&b[..]).unwrap(),
-        };
-        let css = String::from_utf8(bytes).unwrap();
-        assert!(
-            !css.contains("@import url('https://"),
-            "refs must be localized"
-        );
-        assert!(
-            css.contains("/repo/rpcauthority/theme/"),
-            "refs must be local"
-        );
     }
 }

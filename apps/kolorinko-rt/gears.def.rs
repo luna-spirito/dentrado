@@ -59,6 +59,39 @@ pub(crate) async fn repo_asset(
 }
 
 #[dentrado::gear(
+    follow(target = GearId::Repo(_repo_meta)),
+    shared,
+    name = RepoResource,
+    wire_skip(_repo_meta),
+)]
+pub(crate) fn repo_resource(
+    _repo_meta: RepoMeta,
+    site: SafePathComponent,
+    path: RepoAssetPath,
+    repo_data: Rc<RepoData>,
+    _cache: &mut RepoResourceCache,
+) -> Option<CaRef> {
+    crate::wikidot_page::repo_resource(&repo_data, &site, &path)
+}
+
+#[dentrado::gear(
+    event,
+    shared,
+    name = Asset,
+    wire_skip(repo_meta),
+)]
+pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
+    repo_meta: RepoMeta,
+    site: SafePathComponent,
+    hash: String,
+    ext: String,
+    ctx: &mut GearCtx<KolorinkoRT, S>,
+    _cache: &mut AssetCache,
+) -> Option<Body> {
+    crate::wikidot_page::asset(&repo_meta, &site, &hash, &ext, ctx).await
+}
+
+#[dentrado::gear(
     follow(target = GearId::Repo(repo_meta)),
     shared,
     name = Shell,

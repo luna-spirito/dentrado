@@ -1,11 +1,13 @@
 use std::rc::Rc;
 
 use crate::wikidot_page::{
-    LatestCache, ParsedCache, RepoAssetCache, RepoCache, RepoData, RepoLArticleCache, RepoMeta,
-    ShellCache,
+    AssetCache, LatestCache, ParsedCache, RepoAssetCache, RepoCache, RepoData, RepoLArticleCache,
+    RepoMeta, RepoResourceCache, ShellCache,
 };
 use dentrado::core::{core_ctx::GearCtx, storage::Storage};
-use kolorinko_rt::{AssetKind, RepoAssetOut, RepoAssetPath, SafePathComponent, SiteShell};
+use kolorinko_rt::{
+    AssetKind, Body, CaRef, RepoAssetOut, RepoAssetPath, SafePathComponent, SiteShell,
+};
 use kolorinko_wikitext::{ArticleLatest, ArticleView};
 
 /// The Kolorinko runtime.
@@ -26,9 +28,9 @@ mod gears {
 }
 
 // `GearId` stays internal: gear ids are constructed only through the generated
-// `GearQuery` builders. `GearOut` and the builders are re-exported for the
-// server's subscription/dispatch code.
+// `GearQuery` builders. `GearOutShared` and the builders are re-exported for
+// the server's subscription/dispatch code.
 pub(crate) use gears::{
-    GearOut, GearOutShared, article_latest, article_latest_parsed, repo_asset,
-    repo_l_article_latest, shell,
+    GearOutShared, article_latest, article_latest_parsed, asset, repo_asset, repo_l_article_latest,
+    repo_resource, shell,
 };

@@ -11,27 +11,39 @@
 /// `/repo/<site>/<kind>/<host>/<path>`. `None` for anything else.
 #[must_use]
 pub fn asset_url(site: &str, kind: &str, url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .or_else(|| url.strip_prefix("//"))?;
-    let no_frag = rest.split('#').next().unwrap_or(rest);
-    Some(format!("/repo/{site}/{kind}/{no_frag}"))
+    http_tail(url, None).map(|tail| format!("/repo/{site}/{kind}/{tail}"))
 }
 
 /// Rewrite every resolvable `@import`/`url()` reference in `css` to a local
-/// `/repo/<site>/<kind>/<host>/<path>` URL. `base` is the stylesheet's own
-/// original URL (needed to absolutize relative references); `None` keeps only
-/// absolute references. Non-HTTP references (`data:`, document fragments,
-/// unknown schemes) are left untouched.
+/// `/repo/<site>/<kind>/<host>/<path>` URL (the path-localizing form used by
+/// theme stylesheet serving). `base` is the stylesheet's own original URL
+/// (needed to absolutize relative references); `None` keeps only absolute refs.
+/// Non-HTTP references (`data:`, document fragments, unknown schemes) are left
+/// untouched.
 #[must_use]
 pub fn rewrite(css: &str, base: Option<&str>, site: &str, kind: &str) -> String {
+    rewrite_with(css, base, |tail| {
+        Some(format!("/repo/{site}/{kind}/{tail}"))
+    })
+}
+
+/// Rewrite every resolvable `@import`/`url()` reference in `css` via `local`,
+/// which maps each reference's `host/path` tail to its final URL (or `None` to
+/// leave it untouched). Used by `article_latest` to content-address inline
+/// `[[module css]]` references: `local` looks each tail up in the resolved
+/// resource map and yields a `/repo/…/<hash>.<ext>` URL.
+#[must_use]
+pub fn rewrite_with<F: Fn(&str) -> Option<String>>(
+    css: &str,
+    base: Option<&str>,
+    local: F,
+) -> String {
     let bytes = css.as_bytes();
     let n = bytes.len();
     let mut out = String::with_capacity(n);
     let mut i = 0usize;
     while i < n {
-        // Comment → opaque, skip verbatim.
+        // Comment → opaque, copy verbatim.
         if bytes[i] == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
             let end = css[i + 2..].find("*/").map_or(n, |p| i + 2 + p + 2);
             out.push_str(&css[i..end]);
@@ -57,7 +69,7 @@ pub fn rewrite(css: &str, base: Option<&str>, site: &str, kind: &str) -> String 
             i = j;
             if i < n && (bytes[i] == b'"' || bytes[i] == b'\'') {
                 let (s, used) = read_string(css, i, n);
-                match to_local(unquote(s.trim()), base, site, kind) {
+                match http_tail(unquote(s.trim()), base).and_then(|t| local(&t)) {
                     Some(loc) => {
                         out.push_str("url(\"");
                         out.push_str(&loc);
@@ -79,7 +91,7 @@ pub fn rewrite(css: &str, base: Option<&str>, site: &str, kind: &str) -> String 
             if j < n && bytes[j] == b'(' {
                 out.push_str(&css[i..j]);
                 let (inner, end) = read_url_inner(css, j + 1, n);
-                match to_local(unquote(inner.trim()), base, site, kind) {
+                match http_tail(unquote(inner.trim()), base).and_then(|t| local(&t)) {
                     Some(loc) => {
                         out.push_str("(\"");
                         out.push_str(&loc);
@@ -103,9 +115,70 @@ pub fn rewrite(css: &str, base: Option<&str>, site: &str, kind: &str) -> String 
     out
 }
 
-/// Resolve `u` (an `@import`/`url()` payload) to a local URL, or `None` if it
-/// is not an HTTP reference (or needs a base that isn't available).
-fn to_local(u: &str, base: Option<&str>, site: &str, kind: &str) -> Option<String> {
+/// Every absolute HTTP `host/path` tail referenced by `@import`/`url()` in
+/// `css` (base-less, so only absolute refs — relative refs in inline CSS have
+/// no base to resolve against). Deduplicated, in first-appearance order. Used
+/// by `article_latest` to pre-resolve the resource set before rewriting.
+#[must_use]
+pub fn http_refs(css: &str) -> Vec<String> {
+    let bytes = css.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    let mut out: Vec<String> = Vec::new();
+    let push = |t: String, out: &mut Vec<String>| {
+        if !out.iter().any(|x| x == &t) {
+            out.push(t);
+        }
+    };
+    while i < n {
+        if bytes[i] == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+            i = css[i + 2..].find("*/").map_or(n, |p| i + 2 + p + 2);
+            continue;
+        }
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            i += read_string(css, i, n).1;
+            continue;
+        }
+        if css[i..]
+            .get(..7)
+            .is_some_and(|s| s.eq_ignore_ascii_case("@import"))
+        {
+            i += 7;
+            i = skip_ws(bytes, i, n);
+            if i < n && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let (s, used) = read_string(css, i, n);
+                if let Some(t) = http_tail(unquote(s.trim()), None) {
+                    push(t, &mut out);
+                }
+                i += used;
+            }
+            continue;
+        }
+        if css[i..]
+            .get(..3)
+            .is_some_and(|s| s.eq_ignore_ascii_case("url"))
+        {
+            let j = skip_ws(bytes, i + 3, n);
+            if j < n && bytes[j] == b'(' {
+                let (inner, end) = read_url_inner(css, j + 1, n);
+                if let Some(t) = http_tail(unquote(inner.trim()), None) {
+                    push(t, &mut out);
+                }
+                i = end;
+                continue;
+            }
+        }
+        let ch = css[i..].chars().next().unwrap();
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Resolve `u` (an `@import`/`url()` payload, or any URL) to its `host/path`
+/// tail — the part after `http(s)://` / `//`, fragment dropped — using `base`
+/// to absolutize relative references. `None` for non-HTTP refs (`data:`,
+/// fragments, `mailto`, unknown schemes) or relative refs without a `base`.
+pub fn http_tail(u: &str, base: Option<&str>) -> Option<String> {
     if u.is_empty()
         || u.starts_with('#')
         || u.starts_with("data:")
@@ -120,11 +193,12 @@ fn to_local(u: &str, base: Option<&str>, site: &str, kind: &str) -> Option<Strin
         .or_else(|| u.strip_prefix("http://"))
         .or_else(|| u.strip_prefix("//"))
     {
-        return Some(local(site, kind, rest));
+        return Some(drop_frag(rest).to_owned());
     }
     let base = base?;
     if u.starts_with('/') {
-        return Some(local(site, kind, &format!("{}{}", origin_of(base), u)));
+        let abs = format!("{}{u}", origin_of(base));
+        return Some(drop_frag(&abs).to_owned());
     }
     if u.contains("://") {
         return None; // unknown scheme
@@ -133,13 +207,12 @@ fn to_local(u: &str, base: Option<&str>, site: &str, kind: &str) -> Option<Strin
     let rest = abs
         .strip_prefix("https://")
         .or_else(|| abs.strip_prefix("http://"))?;
-    Some(local(site, kind, rest))
+    Some(drop_frag(rest).to_owned())
 }
 
-/// Build the local path, dropping any fragment (never sent to the server).
-fn local(site: &str, kind: &str, host_and_path: &str) -> String {
-    let no_frag = host_and_path.split('#').next().unwrap_or(host_and_path);
-    format!("/repo/{site}/{kind}/{no_frag}")
+/// `host/path` with any trailing `#fragment` removed (never sent to the server).
+fn drop_frag(host_and_path: &str) -> &str {
+    host_and_path.split('#').next().unwrap_or(host_and_path)
 }
 
 /// `scheme://host` of `base` (everything up to the first path slash).
@@ -341,5 +414,35 @@ mod tests {
         );
         assert_eq!(asset_url(SITE, "files", "/local/a.png"), None);
         assert_eq!(asset_url(SITE, "files", ""), None);
+    }
+
+    #[test]
+    fn http_refs_collects_absolute_tails_dedup() {
+        let css = "@import url('https://h/a.png');\
+                   a{background:url(\"https://h/b.css\");background:url(https://h/a.png)}\
+                   @import \"https://fonts.x/y.css\" screen;\
+                   x{fill:url(#g);y:url(data:image/png;base64,AA==)}";
+        assert_eq!(
+            super::http_refs(css),
+            vec![
+                "h/a.png".to_string(),
+                "h/b.css".to_string(),
+                "fonts.x/y.css".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrite_with_uses_custom_localizer() {
+        // A content-addressing localizer: maps a known tail to a CA URL,
+        // leaves unknown tails untouched.
+        let css = "a{background:url(https://h/known.png)}b{c:url(https://h/miss.png)}";
+        let out = super::rewrite_with(css, None, |tail| {
+            (tail == "h/known.png").then(|| "/ca/DEADBEEF.png".to_string())
+        });
+        assert_eq!(
+            out,
+            "a{background:url(\"/ca/DEADBEEF.png\")}b{c:url(https://h/miss.png)}"
+        );
     }
 }

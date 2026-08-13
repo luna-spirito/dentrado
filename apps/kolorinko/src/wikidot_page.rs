@@ -62,14 +62,17 @@
 
 use crate::wikidot_parser::parse;
 use compio::fs;
-use dentrado::core::{core_ctx::GearCtx, storage::Storage};
+use dentrado::core::{core_ctx::GearCtx, gear::GearResult, storage::Storage};
 use git2::{ObjectType, Oid, Repository, Tree, TreeWalkMode};
 use imbl::HashMap as ImHashMap;
-use kolorinko_render::rewrite;
-use kolorinko_rt::{AssetKind, RepoAssetOut, RepoAssetPath, SafePathComponent, SiteShell};
+use kolorinko_render::{http_refs, http_tail, rewrite, rewrite_with};
+use kolorinko_rt::{
+    AssetKind, Body, CaRef, RepoAssetOut, RepoAssetPath, SafePathComponent, SiteShell,
+};
 use kolorinko_wikitext::{
     ArticleLatest, ArticleMeta, ArticleView, BlockCell, BlockRow, BlockTable, ContainerKind,
-    Content, Include, List, ListItem, ListPages, Node, PageRef, RevMeta, Tab, TableCell, TextObj,
+    Content, Include, LinkTarget, List, ListItem, ListPages, Node, PageRef, RevMeta, Tab,
+    TableCell, TextObj,
 };
 use log::error;
 use std::{
@@ -80,7 +83,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::runtime::KolorinkoRT;
+use crate::runtime::{GearOutShared, KolorinkoRT};
 
 // =========================================================================
 // Configuration
@@ -187,12 +190,22 @@ fn find_article<'a>(
     sites.get(site)?.articles.get(&slug.0)?.get(&slug.1)
 }
 
-/// One mirrored site: its pages nested by category, plus the site's theme roots
-/// (from `<site>/_meta/theme_roots`, one URL per line) applied by the client.
+/// One mirrored site: its pages nested by category; the site chrome from
+/// `<site>/shell` (title, subtitle, and the theme-root path into `files/`);
+/// and the content-addressed `files/` index — each mirrored attachment's
+/// `<host>/<path>` tail (percent-decoded) mapped to its [`CaRef`] (read from
+/// the `files/` symlink target, which points into the `_files/<xx>/<yy>/<hash>`
+/// blob store). The index resolves in-article URLs ([`repo_resource`]) and the
+/// theme root ([`shell`]).
 #[derive(Default, Clone, Debug)]
 pub(crate) struct WDWebsite {
     articles: ImHashMap<Option<SafePathComponent>, ImHashMap<SafePathComponent, Article>>,
-    theme_roots: Vec<String>,
+    title: Option<String>,
+    subtitle: Option<String>,
+    /// The theme stylesheet's `<host>/<path>` tail (`files/` prefix stripped);
+    /// resolved against [`WDWebsite::files`] to a CA URL by the [`shell`] gear.
+    theme_root: Option<RepoAssetPath>,
+    files: ImHashMap<RepoAssetPath, CaRef>,
 }
 
 /// One page: metadata, the full revision-history summary, and blob Oids for the
@@ -354,10 +367,12 @@ impl GitWorker {
             None => return None,
         };
         let old_tip = self.last_tip.expect("Some on the non-first path above");
+        // `files/` touches force a full rebuild (the symlink→hash index lives
+        // in `build_from_tree`); a pure-page change takes the incremental path.
         let rebuilt: Option<(ImHashMap<SafePathComponent, WDWebsite>, Index)> =
-            match diff_affected_meta_paths(repo, old_tip, new_tip, self.root) {
-                Some(affected) if affected.is_empty() => None,
-                Some(affected) => {
+            match diff_changes(repo, old_tip, new_tip, self.root) {
+                Some((affected, false)) if affected.is_empty() => None,
+                Some((affected, false)) => {
                     let mut index = self.index.clone();
                     let new_tree = repo
                         .find_commit(new_tip)
@@ -378,7 +393,7 @@ impl GitWorker {
                         None => Some(build_from_tree(repo, new_tip, self.root)),
                     }
                 }
-                None => Some(build_from_tree(repo, new_tip, self.root)),
+                _ => Some(build_from_tree(repo, new_tip, self.root)),
             };
         self.last_tip = Some(new_tip);
         if let Some((sites, index)) = rebuilt {
@@ -611,7 +626,11 @@ fn build_from_tree(
     // `(site, p1, p2, id)` keyed: the `_meta` blob Oid + per-revision body Oids.
     let mut metas: HashMap<(String, String, String, String), Oid> = HashMap::new();
     let mut bodies: HashMap<(String, String, String, String), ImHashMap<u64, Oid>> = HashMap::new();
-    let mut theme_roots: HashMap<String, Oid> = HashMap::new();
+    let mut shells: HashMap<String, Oid> = HashMap::new();
+    // `<site>/files/<host>/<path>` symlink → [`CaRef`], keyed by the
+    // percent-decoded `<host>/<path>` tail (matching the form `http_tail`
+    // yields from an in-article URL).
+    let mut files: HashMap<String, HashMap<RepoAssetPath, CaRef>> = HashMap::new();
     root_tree
         .walk(TreeWalkMode::PreOrder, |dir, entry| {
             if entry.kind() != Some(ObjectType::Blob) {
@@ -637,8 +656,42 @@ fn build_from_tree(
                             .insert(n, entry.id());
                     }
                 }
-                [site, "_meta", "theme_roots"] => {
-                    theme_roots.insert((*site).into(), entry.id());
+                [site, "shell"] => {
+                    shells.insert((*site).into(), entry.id());
+                }
+                // A `files/` attachment: a symlink (mode `0o120000`) whose blob
+                // content points into the `_files/` store, sharded
+                // `<d1>/<d2>/<rest>` (d1=key[0:2], d2=key[2:4], rest=key[4:]).
+                // The leaf is only the 60-char tail, so the full 64-char sha256
+                // is the concatenation of all components after `_files/`.
+                // Record the CA ref so `repo_resource` can resolve in-article URLs.
+                [site, "files", tail @ ..] if entry.filemode() == 0o120000 => {
+                    let Some(target) = blob_str(repo, entry.id()) else {
+                        return 0;
+                    };
+                    let Some((_, sharded)) = target.rsplit_once("_files/") else {
+                        return 0;
+                    };
+                    let hash: String = sharded.split('/').collect();
+                    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return 0;
+                    }
+                    let tail = tail.join("/");
+                    let Some(path) = RepoAssetPath::new(percent_decode(&tail)) else {
+                        return 0;
+                    };
+                    let ext = Path::new(name)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    files.entry((*site).to_string()).or_default().insert(
+                        path,
+                        CaRef {
+                            hash: hash.to_string(),
+                            ext,
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -679,23 +732,28 @@ fn build_from_tree(
         index.insert(meta_path, (site_c.clone(), cat.clone(), name.clone()));
         insert_page(&mut sites, site_c, cat, name, article);
     }
-    for (site, oid) in theme_roots {
+    for (site, oid) in shells {
         let Some(site_c) = SafePathComponent::new(site.clone()) else {
             continue;
         };
         let Some(text) = blob_str(repo, oid) else {
             continue;
         };
-        let roots: Vec<String> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect();
+        let (title, subtitle, theme_root) = parse_shell(&text);
         if let Some(mut w) = sites.get(&site_c).cloned() {
-            w.theme_roots = roots;
+            w.title = title;
+            w.subtitle = subtitle;
+            w.theme_root = theme_root;
             sites.insert(site_c, w);
         }
+    }
+    for (site, map) in files {
+        let Some(site_c) = SafePathComponent::new(site) else {
+            continue;
+        };
+        let mut w = sites.get(&site_c).cloned().unwrap_or_default();
+        w.files = map.into_iter().collect();
+        sites.insert(site_c, w);
     }
     (sites, index)
 }
@@ -769,6 +827,43 @@ fn rev_number(name: &str) -> Option<u64> {
 fn blob_str(repo: &Repository, oid: Oid) -> Option<String> {
     let blob = repo.find_blob(oid).ok()?;
     std::str::from_utf8(blob.content()).ok().map(String::from)
+}
+
+/// Percent-decode `%XX` escapes (e.g. the exporter's `component%3Atheme` →
+/// `component:theme`). Used to normalise `files/` index keys to the same form
+/// [`http_tail`] yields from an in-article URL (which carries the literal
+/// character), so a lookup matches regardless of which side encoded it.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Some(b) = hex_pair(bytes[i + 1], bytes[i + 2])
+        {
+            out.push(b);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// Decode one `%XX` byte, or `None` if either nibble isn't hex.
+fn hex_pair(a: u8, b: u8) -> Option<u8> {
+    Some((hex_digit(a)? << 4) | hex_digit(b)?)
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Read a body blob by Oid, stripping its frontmatter. Uncached (the worker
@@ -902,36 +997,52 @@ fn incremental_update(
     sites
 }
 
-/// The set of `_meta` paths changed between two tips. Each git-diff delta path
-/// (old and new side) is normalized via [`normalize_meta_path`]; non-page paths
-/// (e.g. `files/…`, top-level docs) are dropped. `None` if either tree is
-/// unreachable (force-push GC of the old tip) — the caller falls back to
-/// [`build_from_tree`].
-fn diff_affected_meta_paths(
+/// The set of `_meta` paths changed between two tips, plus whether any
+/// `files/` attachment was touched (which forces a full [`build_from_tree`] —
+/// the `files/` symlink→hash index lives there, so an incremental page patch
+/// would leave it stale). Each git-diff delta path (old and new side) is
+/// normalized via [`normalize_meta_path`]; non-page paths are dropped from the
+/// affected set. `None` if either tree is unreachable (force-push GC of the old
+/// tip) — the caller falls back to [`build_from_tree`].
+/// TODO: proper incremental design
+fn diff_changes(
     repo: &Repository,
     old_tip: Oid,
     new_tip: Oid,
     root: &Path,
-) -> Option<HashSet<PathBuf>> {
+) -> Option<(HashSet<PathBuf>, bool)> {
     let old_tree = repo.find_commit(old_tip).ok()?.tree().ok()?;
     let new_tree = repo.find_commit(new_tip).ok()?.tree().ok()?;
     let diff = repo
         .diff_tree_to_tree(Some(&old_tree), Some(&new_tree), None)
         .ok()?;
     let mut affected = HashSet::new();
+    let mut files_touched = false;
     for delta in diff.deltas() {
-        if let Some(rel) = delta.old_file().path() {
-            if let Some(mp) = normalize_meta_path(rel, root) {
-                affected.insert(mp);
-            }
-        }
-        if let Some(rel) = delta.new_file().path() {
-            if let Some(mp) = normalize_meta_path(rel, root) {
+        for rel in delta
+            .old_file()
+            .path()
+            .into_iter()
+            .chain(delta.new_file().path())
+        {
+            if is_files_path(rel) {
+                files_touched = true;
+            } else if let Some(mp) = normalize_meta_path(rel, root) {
                 affected.insert(mp);
             }
         }
     }
-    Some(affected)
+    Some((affected, files_touched))
+}
+
+/// `true` if `rel` is a repo-relative path under `<site>/files/` (an attachment
+/// whose content-addressed symlink may have moved). Only the second component is
+/// inspected, so any depth under `files/` is recognised.
+fn is_files_path(rel: &Path) -> bool {
+    rel.components()
+        .nth(1)
+        .and_then(|c| c.as_os_str().to_str())
+        .is_some_and(|s| s == "files")
 }
 
 /// Collapse a repo-relative delta path to its absolute `_meta` file path:
@@ -1019,6 +1130,35 @@ fn strip_quotes(s: &str) -> &str {
     }
 }
 
+/// Parse a `<site>/shell` file: `title`, `subtitle` (both quoted) and
+/// `theme_root` (a bare `files/<host>/<path>` path into the blob store).
+/// Returns the title/subtitle verbatim and the theme root as the validated
+/// `<host>/<path>` tail (`files/` prefix stripped) for resolution against the
+/// `files/` index. Unknown keys are ignored; a missing `theme_root` or one
+/// outside `files/` yields `None`.
+fn parse_shell(text: &str) -> (Option<String>, Option<String>, Option<RepoAssetPath>) {
+    let mut title = None;
+    let mut subtitle = None;
+    let mut theme_root = None;
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let v = v.trim();
+        match k.trim() {
+            "title" => title = Some(strip_quotes(v).to_string()),
+            "subtitle" => subtitle = Some(strip_quotes(v).to_string()),
+            "theme_root" => {
+                if let Some(tail) = v.strip_prefix("files/") {
+                    theme_root = RepoAssetPath::new(tail.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    (title, subtitle, theme_root)
+}
+
 // =========================================================================
 // `repo_l_article_latest` lens
 // =========================================================================
@@ -1079,10 +1219,24 @@ pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
         crate::runtime::article_latest(repo_meta.clone(), site.clone(), nav_slug("side"))
             .secondary_get(ctx)
             .await;
+    let (title, subtitle, theme_root) = data
+        .sites
+        .get(&site)
+        .map(|w| {
+            let theme_root = w
+                .theme_root
+                .as_ref()
+                .and_then(|p| w.files.get(p))
+                .map(|ca| ca_url(&site, ca));
+            (w.title.clone(), w.subtitle.clone(), theme_root)
+        })
+        .unwrap_or_default();
     SiteShell {
+        title,
+        subtitle,
+        theme_root,
         nav_top: (*nav_top).clone(),
         nav_side: (*nav_side).clone(),
-        theme_roots: theme_roots_of(data, &site),
     }
 }
 
@@ -1092,14 +1246,6 @@ fn nav_slug(name: &str) -> Slug {
     let category = SafePathComponent::new("nav".to_string()).unwrap();
     let page = SafePathComponent::new(name.to_string()).unwrap();
     (Some(category), page)
-}
-
-/// Project the site's theme-root URLs out of the dataset.
-fn theme_roots_of(data: &RepoData, site: &SafePathComponent) -> Vec<String> {
-    data.sites
-        .get(site)
-        .map(|w| w.theme_roots.clone())
-        .unwrap_or_default()
 }
 
 // =========================================================================
@@ -1151,6 +1297,131 @@ pub(crate) async fn repo_asset(
         Err(_) => RepoAssetOut::Redirect {
             location: format!("https://{}", path.as_str()),
         },
+    }
+}
+
+// =========================================================================
+// `repo_resource` gear — content-addressed resolution
+// =========================================================================
+
+/// No carry-over state: a [`repo_resource`] run is a pure lookup in the
+/// followed [`RepoData`] snapshot's `files/` index, re-derived whenever the
+/// export tip moves.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct RepoResourceCache;
+
+/// Resolve one `files/<host>/<path>` attachment to its content-addressed
+/// [`CaRef`] by table lookup in [`RepoData`]. The index is built from the
+/// `files/` symlinks (pointing into `_files/<xx>/<yy>/<hash>`) at tree-build
+/// time; `path` is the percent-decoded `<host>/<path>` tail. `None` when the
+/// URL is not mirrored (a hotlink) — the caller then leaves the original URL.
+pub(crate) fn repo_resource(
+    data: &RepoData,
+    site: &SafePathComponent,
+    path: &RepoAssetPath,
+) -> Option<CaRef> {
+    data.sites.get(site)?.files.get(path).cloned()
+}
+
+/// Serialize a [`CaRef`] to its served URL: `/repo/<site>/files/<xx>/<yy>/<hash>.<ext>`,
+/// embedding the sha256 (xx=key[0:2], yy=key[2:4], leaf=full hash) so the URL
+/// is self-describing and collision-free with real `files/<host>/<path>` paths
+/// (a 64-hex leaf never occurs naturally). The extension rides along so the
+/// server derives the MIME without a side table; an empty extension yields a
+/// bare `<hash>` leaf. The on-disk `_files/` layout (sharded rest-leaf) is
+/// reconstructed at read time.
+pub(crate) fn ca_url(site: &SafePathComponent, ca: &CaRef) -> String {
+    let site = site.as_ref().to_string_lossy();
+    let h = &ca.hash;
+    let ext = if ca.ext.is_empty() {
+        String::new()
+    } else {
+        format!(".{}", ca.ext)
+    };
+    format!("/repo/{site}/files/{}/{}/{}{}", &h[..2], &h[2..4], h, ext)
+}
+
+// =========================================================================
+// `asset` gear — content-addressed blob serving
+// =========================================================================
+
+/// No carry-over state: a run reads the blob fresh; the compressed bytes are
+/// cached by the runtime (`shared`: one allocation, refcounted across cores).
+#[derive(Default, Clone, Debug)]
+pub(crate) struct AssetCache;
+
+/// **PURE-FUNCTION ASSUMPTION (known to be wrong).** The CSS rewrite here
+/// resolves each `url()`/`@import` to its content-addressed form via
+/// [`get_ca`], but with a **non-tracking** (stale) read of the index. The
+/// gear's cache key is therefore just `(site, hash, ext)` — the rewrite is
+/// treated as a pure function of the blob, so a re-mirror that changes a
+/// sub-resource's hash does **not** invalidate the cached stylesheet. The
+/// cached CSS keeps pointing at the old (still-resolvable — CA blobs are
+/// immutable) sub-resource hash until evicted. Acceptable for now; revisit if
+/// stale stylesheets bite.
+///
+/// Serve one content-addressed blob `<site>/_files/<xx>/<yy>/<hash>`: read it,
+/// and for CSS rewrite every mirrored `url()`/`@import` to its CA URL, then
+/// compress. `None` when the blob is absent (the HTTP layer serves a 404).
+/// `shared` so the compressed bytes are cached + deduplicated across cores;
+/// HTTP-only — never shipped over WebTransport (`to_wire_out` drops it).
+pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
+    meta: &RepoMeta,
+    site: &SafePathComponent,
+    hash: &str,
+    ext: &str,
+    ctx: &mut GearCtx<KolorinkoRT, S>,
+) -> Option<Body> {
+    // A wire-constructed `GearId::Asset` could carry a malformed hash; only the
+    // HTTP path (`serve` → `ca_parts`) pre-validates. Guard before slicing.
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    // The exporter shards the blob store `_files/<d1>/<d2>/<rest>` with
+    // rest=key[4:] (the 60-char tail), so the leaf is NOT the full hash.
+    let file = meta
+        .path()
+        .join(site.as_ref())
+        .join("_files")
+        .join(&hash[..2])
+        .join(&hash[2..4])
+        .join(&hash[4..]);
+    let bytes = fs::read(&file).await.ok()?;
+    let body = if crate::assets::mime_for_ext(ext) == "text/css" {
+        let text = String::from_utf8_lossy(&bytes);
+        let refs = http_refs(&text);
+        let mut map: HashMap<String, String> = HashMap::new();
+        for tail in &refs {
+            if let Some(path) = RepoAssetPath::new(percent_decode(tail))
+                && let Some(ca) = get_ca(meta, site, path, ctx).await
+            {
+                map.insert(tail.clone(), ca_url(site, &ca));
+            }
+        }
+        crate::assets::compress(rewrite_with(&text, None, |t| map.get(t).cloned()).into_bytes())
+    } else {
+        crate::assets::compress(bytes)
+    };
+    Some(body)
+}
+
+/// Resolve one `host/path` tail to its [`CaRef`] via the [`repo_resource`] gear
+/// using a **non-tracking** (stale) read — so [`asset`]'s cache key stays the
+/// blob identity alone (see the PURE-FUNCTION note above). `None` when the URL
+/// is not mirrored (a hotlink).
+async fn get_ca<S: Storage<KolorinkoRT>>(
+    meta: &RepoMeta,
+    site: &SafePathComponent,
+    path: RepoAssetPath,
+    ctx: &mut GearCtx<KolorinkoRT, S>,
+) -> Option<CaRef> {
+    let id = crate::runtime::repo_resource(meta.clone(), site.clone(), path).id;
+    match ctx.core().read_gear_stale(id).await {
+        GearResult::Shared(s) => match &*s {
+            GearOutShared::RepoResourceOut(ca) => ca.clone(),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -1230,6 +1501,7 @@ pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
     let mut visited = HashSet::new();
     visited.insert((site.clone(), slug.0.clone(), slug.1.clone()));
     let content = resolve(content, &site, meta, &mut visited, ctx).await;
+    let content = resolve_resources(content, &site, meta, ctx).await;
     let content = apply_include_vars(content, &HashMap::new());
     ArticleView {
         meta: page_meta,
@@ -1273,6 +1545,242 @@ async fn resolve<S: Storage<KolorinkoRT>>(
         content = substitute_includes(content, site, &fetched);
     }
     content
+}
+
+/// Resolve every mirrored external resource — `[[image source]]`, `[[[url]]]`
+/// link targets, and `url()`/`@import` references inside `[[module css]]` — to
+/// its content-addressed `/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` URL and
+/// substitute. Each resource is declared as a [`repo_resource`]
+/// `secondary_get` dependency, so the result is reactive to an attachment
+/// being re-mirrored (new hash) anywhere in the (already include-resolved)
+/// tree. URLs that aren't mirrored (hotlinks) are left untouched so the client
+/// loads them straight from the origin.
+async fn resolve_resources<S: Storage<KolorinkoRT>>(
+    content: Content,
+    site: &SafePathComponent,
+    meta: &RepoMeta,
+    ctx: &mut GearCtx<KolorinkoRT, S>,
+) -> Content {
+    let mut tails: Vec<String> = Vec::new();
+    collect_external_refs(&content, &mut tails);
+    if tails.is_empty() {
+        return content;
+    }
+    let mut resolved: HashMap<String, CaRef> = HashMap::new();
+    for tail in &tails {
+        let Some(path) = RepoAssetPath::new(percent_decode(tail)) else {
+            continue;
+        };
+        let ca = crate::runtime::repo_resource(meta.clone(), site.clone(), path)
+            .secondary_get(ctx)
+            .await;
+        if let Some(ca_ref) = &*ca {
+            resolved.insert(tail.clone(), ca_ref.clone());
+        }
+    }
+    substitute_resources(content, site, &resolved)
+}
+
+/// Walk `content` and collect every mirrored-attachment `host/path` tail
+/// reachable from an image source, a URL link target, or a stylesheet
+/// reference — deduplicated, in first-appearance order. Mirrors the recursion
+/// of [`collect_include_targets`] over the node tree.
+fn collect_external_refs(content: &Content, out: &mut Vec<String>) {
+    let mut push = |t: String, out: &mut Vec<String>| {
+        if !out.iter().any(|x| x == &t) {
+            out.push(t);
+        }
+    };
+    for node in content {
+        match node {
+            Node::Image { source, .. } => {
+                if let Some(t) = ref_tail_of(source) {
+                    push(t, out);
+                }
+            }
+            Node::Link {
+                target: LinkTarget::Url(u),
+                ..
+            } => {
+                if let Some(t) = http_tail(u, None) {
+                    push(t, out);
+                }
+            }
+            Node::Stylesheet(css) => {
+                for t in http_refs(css) {
+                    push(t, out);
+                }
+            }
+            Node::Container { content, .. } | Node::Heading { content, .. } => {
+                collect_external_refs(content, out);
+            }
+            Node::Table(rows) => {
+                for row in rows {
+                    for cell in row {
+                        collect_external_refs(&cell.content, out);
+                    }
+                }
+            }
+            Node::BlockTable(t) => {
+                for row in &t.rows {
+                    collect_external_refs(&row.content, out);
+                }
+            }
+            Node::BlockCell(c) => collect_external_refs(&c.content, out),
+            Node::SupSubscript { sup, sub } => {
+                collect_external_refs(sup, out);
+                collect_external_refs(sub, out);
+            }
+            Node::Link { text, .. } | Node::Footnote(text) => collect_external_refs(text, out),
+            Node::Tabview(tabs) => {
+                for tab in tabs {
+                    collect_external_refs(&tab.name, out);
+                    collect_external_refs(&tab.content, out);
+                }
+            }
+            Node::ListPages(lp) => {
+                collect_external_refs(&lp.prepend, out);
+                collect_external_refs(&lp.repeat, out);
+                collect_external_refs(&lp.append, out);
+            }
+            Node::List(list) => {
+                for_each_content_in_list(list, &mut |c| collect_external_refs(c, out))
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The http `host/path` tail of an image `source`, but only when it is purely
+/// literal text (no module/include variables) — a variable URL can't be
+/// content-addressed statically and is left for the client to resolve at render.
+fn ref_tail_of(source: &[TextObj]) -> Option<String> {
+    let mut url = String::new();
+    for obj in source {
+        match obj {
+            TextObj::Plain(s) => url.push_str(s),
+            _ => return None,
+        }
+    }
+    http_tail(&url, None)
+}
+
+/// Replace every mirrored-attachment reference in `content` with its
+/// content-addressed URL from `resolved` (`host/path` tail → [`CaRef`]),
+/// recursing over the same node tree as [`collect_external_refs`]. References
+/// absent from `resolved` (un-mirrored hotlinks) pass through unchanged.
+fn substitute_resources(
+    content: Content,
+    site: &SafePathComponent,
+    resolved: &HashMap<String, CaRef>,
+) -> Content {
+    let ca_for = |tail: &str| resolved.get(tail).map(|ca| ca_url(site, ca));
+    content
+        .into_iter()
+        .map(|node| match node {
+            Node::Image {
+                align,
+                source,
+                params,
+            } => Node::Image {
+                align,
+                source: subst_source(source, ca_for),
+                params,
+            },
+            Node::Link { target, text } => {
+                let text = substitute_resources(text, site, resolved);
+                let target = match target {
+                    LinkTarget::Url(u) => match http_tail(&u, None).and_then(|t| ca_for(&t)) {
+                        Some(ca) => LinkTarget::Url(ca),
+                        None => LinkTarget::Url(u),
+                    },
+                    other => other,
+                };
+                Node::Link { target, text }
+            }
+            Node::Stylesheet(css) => Node::Stylesheet(rewrite_with(&css, None, ca_for)),
+            Node::Container { kind, content } => Node::Container {
+                kind,
+                content: substitute_resources(content, site, resolved),
+            },
+            Node::Heading { level, content } => Node::Heading {
+                level,
+                content: substitute_resources(content, site, resolved),
+            },
+            Node::Table(rows) => Node::Table(
+                rows.into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|cell| TableCell {
+                                colspan: cell.colspan,
+                                header: cell.header,
+                                align: cell.align,
+                                content: substitute_resources(cell.content, site, resolved),
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            ),
+            Node::BlockTable(t) => Node::BlockTable(BlockTable {
+                params: t.params,
+                rows: t
+                    .rows
+                    .into_iter()
+                    .map(|r| BlockRow {
+                        params: r.params,
+                        content: substitute_resources(r.content, site, resolved),
+                    })
+                    .collect(),
+            }),
+            Node::BlockCell(c) => Node::BlockCell(BlockCell {
+                header: c.header,
+                params: c.params,
+                content: substitute_resources(c.content, site, resolved),
+            }),
+            Node::SupSubscript { sup, sub } => Node::SupSubscript {
+                sup: substitute_resources(sup, site, resolved),
+                sub: substitute_resources(sub, site, resolved),
+            },
+            Node::Footnote(c) => Node::Footnote(substitute_resources(c, site, resolved)),
+            Node::Tabview(tabs) => Node::Tabview(
+                tabs.into_iter()
+                    .map(|tab| Tab {
+                        name: substitute_resources(tab.name, site, resolved),
+                        content: substitute_resources(tab.content, site, resolved),
+                    })
+                    .collect(),
+            ),
+            Node::ListPages(lp) => Node::ListPages(ListPages {
+                params: lp.params,
+                prepend: substitute_resources(lp.prepend, site, resolved),
+                repeat: substitute_resources(lp.repeat, site, resolved),
+                append: substitute_resources(lp.append, site, resolved),
+            }),
+            Node::List(list) => {
+                Node::List(map_list(list, &|c| substitute_resources(c, site, resolved)))
+            }
+            other => other,
+        })
+        .collect()
+}
+
+/// Rewrite a purely-literal image `source` (`[Plain(url)]`) to its CA URL when
+/// `ca_for` resolves it; leave sources with variables or non-http URLs as-is.
+fn subst_source<F: Fn(&str) -> Option<String>>(source: Vec<TextObj>, ca_for: F) -> Vec<TextObj> {
+    let url = source.iter().try_fold(String::new(), |mut acc, o| match o {
+        TextObj::Plain(s) => {
+            acc.push_str(s);
+            Some(acc)
+        }
+        _ => None,
+    });
+    if let Some(url) = url
+        && let Some(tail) = http_tail(&url, None)
+        && let Some(ca) = ca_for(&tail)
+    {
+        return vec![TextObj::Plain(ca)];
+    }
+    source
 }
 
 /// Walk `content` and record every `[[include]]` target not already in
@@ -1842,7 +2350,7 @@ mod tests {
         let parent = repo.find_commit(tip1).unwrap();
         let tip2 = commit(&repo, "c2", &[&parent]);
 
-        let affected = diff_affected_meta_paths(&repo, tip1, tip2, &dir).unwrap();
+        let affected = diff_changes(&repo, tip1, tip2, &dir).unwrap().0;
         let tree2 = repo
             .find_commit(tip2)
             .and_then(|c| repo.find_tree(c.tree_id()))
@@ -1930,5 +2438,155 @@ mod tests {
             params.get("style"),
             Some(&vec![TextObj::Plain("text-align: right".to_string())])
         );
+    }
+
+    #[test]
+    fn external_refs_are_collected_and_content_addressed() {
+        let site = SafePathComponent::new("scp".into()).unwrap();
+        let img_url = "https://scp.wikidot.com/local--files/foo/a.png";
+        let hot = "https://i.imgur.com/x.jpg";
+        let css = "a{background:url(https://scp.wikidot.com/local--files/foo/bg.png)}";
+        let content: Content = vec![
+            Node::Image {
+                align: None,
+                source: vec![TextObj::Plain(img_url.into())],
+                params: HashMap::new(),
+            },
+            Node::Link {
+                target: LinkTarget::Url(hot.into()),
+                text: vec![],
+            },
+            Node::Stylesheet(css.into()),
+        ];
+        // All three external refs are collected (the hotlink too); resolution
+        // later keeps only the mirrored ones.
+        let mut tails = Vec::new();
+        super::collect_external_refs(&content, &mut tails);
+        assert_eq!(
+            tails,
+            vec![
+                "scp.wikidot.com/local--files/foo/a.png".to_string(),
+                "i.imgur.com/x.jpg".to_string(),
+                "scp.wikidot.com/local--files/foo/bg.png".to_string(),
+            ]
+        );
+        // Only the mirrored scp tails resolve to CA refs; the hotlink doesn't.
+        let ca = CaRef {
+            hash: "d84a29109fe0e70c7a5c22c39bda120fdbc56bd192f5927af95b9af8d0f87c27".into(),
+            ext: "png".into(),
+        };
+        let resolved: HashMap<String, CaRef> = [
+            "scp.wikidot.com/local--files/foo/a.png",
+            "scp.wikidot.com/local--files/foo/bg.png",
+        ]
+        .iter()
+        .map(|t| (t.to_string(), ca.clone()))
+        .collect();
+        let out = super::substitute_resources(content, &site, &resolved);
+        // Image source → CA url.
+        let Node::Image { source, .. } = &out[0] else {
+            panic!("expected image")
+        };
+        assert_eq!(
+            source,
+            &vec![TextObj::Plain(
+                "/repo/scp/files/d8/4a/d84a29109fe0e70c7a5c22c39bda120fdbc56bd192f5927af95b9af8d0f87c27.png".into()
+            )]
+        );
+        // Hotlink left untouched.
+        let Node::Link {
+            target: LinkTarget::Url(u),
+            ..
+        } = &out[1]
+        else {
+            panic!("expected url link")
+        };
+        assert_eq!(u, hot);
+        // Stylesheet url() → CA url.
+        let Node::Stylesheet(css) = &out[2] else {
+            panic!("expected stylesheet")
+        };
+        assert!(css.contains("/repo/scp/files/d8/4a/"));
+        assert!(!css.contains("https://scp.wikidot.com"));
+    }
+
+    #[test]
+    fn parse_shell_reads_title_subtitle_and_theme_root() {
+        let text = "\
+title: \"RPC Authority\"
+subtitle: \"Research, Protection, Containment\"
+theme_root: files/cdn.jsdelivr.net/gh/x/y@main/style.css
+";
+        let (title, subtitle, theme_root) = super::parse_shell(text);
+        assert_eq!(title.as_deref(), Some("RPC Authority"));
+        assert_eq!(
+            subtitle.as_deref(),
+            Some("Research, Protection, Containment")
+        );
+        let theme_root = theme_root.expect("theme_root");
+        assert_eq!(
+            theme_root.as_str(),
+            "cdn.jsdelivr.net/gh/x/y@main/style.css"
+        );
+    }
+
+    #[test]
+    fn parse_shell_missing_or_non_files_theme_root_is_none() {
+        // No theme_root line.
+        let (t, s, r) = super::parse_shell("title: \"T\"\n");
+        assert_eq!(t.as_deref(), Some("T"));
+        assert!(s.is_none());
+        assert!(r.is_none());
+        // theme_root outside `files/` (a raw URL) is rejected.
+        let (_, _, r) = super::parse_shell("theme_root: https://example.com/style.css\n");
+        assert!(r.is_none());
+    }
+
+    /// Against the real export repo: a `files/` symlink must index to the
+    /// full 64-char sha256 (reconstructed from the sharded `_files/d1/d2/rest`
+    /// target), the `<site>/shell` manifest must parse (title/subtitle/theme_root),
+    /// and the theme root must resolve to a real blob via that index. Skipped
+    /// when the real repo isn't checked out.
+    #[test]
+    fn real_repo_indexes_sharded_files_and_shell() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kolorinko/repo");
+        if !root.join("rpcauthority/shell").exists() {
+            eprintln!("skipping: real repo not present");
+            return;
+        }
+        let repo = Repository::open(&root).expect("open repo");
+        let tip = repo.head().unwrap().peel_to_commit().unwrap().id();
+        let (sites, _index) = super::build_from_tree(&repo, tip, &root);
+        let w = sites.get(&site("rpcauthority")).expect("site indexed");
+        // The shell manifest round-trips.
+        assert_eq!(w.title.as_deref(), Some("RPC Authority"));
+        assert!(w.subtitle.as_ref().is_some_and(|s| !s.is_empty()));
+        let theme_path = w.theme_root.clone().expect("theme_root parsed");
+        // The files index resolves the theme path to a full 64-char sha256 —
+        // NOT the 60-char sharded leaf (the bug this guards against).
+        let ca = w.files.get(&theme_path).expect("theme in files index");
+        assert_eq!(ca.ext, "css");
+        assert_eq!(ca.hash.len(), 64);
+        assert!(ca.hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        // The reconstructed hash must locate the real blob: the on-disk leaf is
+        // `hash[4..]` (the rest), not the full hash.
+        let blob = root
+            .join("rpcauthority/_files")
+            .join(&ca.hash[..2])
+            .join(&ca.hash[2..4])
+            .join(&ca.hash[4..]);
+        assert!(blob.exists(), "blob {blob:?} should exist");
+        // And ca_url embeds the full hash under the matching shards.
+        let url = super::ca_url(&site("rpcauthority"), ca);
+        let prefix = format!(
+            "/repo/rpcauthority/files/{}/{}",
+            &ca.hash[..2],
+            &ca.hash[2..4]
+        );
+        assert!(
+            url.starts_with(&prefix),
+            "url {url} should start with {prefix}"
+        );
+        assert!(url.ends_with(".css"));
     }
 }

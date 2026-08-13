@@ -63,8 +63,8 @@ use crate::{
     assets::{Served, looks_like_asset, mime_for, serve_body},
     repo,
     runtime::{
-        GearOut, GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, repo_asset,
-        repo_l_article_latest, shell,
+        GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, asset, repo_asset,
+        repo_l_article_latest, repo_resource, shell,
     },
     wikidot_page::RepoMeta,
 };
@@ -438,10 +438,20 @@ async fn subscribe_wire(
                 .await
         }
         wire::GearId::Shell(site) => shell(repo_meta, site).subscribe(core).await,
+        // Assets are HTTP-only — never shipped over WebTransport. The match is
+        // exhaustive on the generated wire enum, but `to_wire_out` drops these.
         wire::GearId::RepoAsset { site, kind, path } => {
             repo_asset(repo_meta, site, kind, path)
                 .subscribe(core)
                 .await
+        }
+        wire::GearId::Asset { site, hash, ext } => {
+            asset(repo_meta, site, hash, ext).subscribe(core).await
+        }
+        // Server-internal resolution dependency of `article_latest`; the client
+        // never subscribes to it, but the match must be exhaustive.
+        wire::GearId::RepoResource { site, path } => {
+            repo_resource(repo_meta, site, path).subscribe(core).await
         }
     }
 }
@@ -462,7 +472,13 @@ fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
             GearOutShared::RepoLArticleLatestOut(a) => {
                 Some(wire::GearOut::RepoLArticleLatestOut(a.clone()))
             }
-            GearOutShared::RepoAssetOut(a) => Some(wire::GearOut::RepoAssetOut(a.clone())),
+            // Assets are served over plain HTTP, never the WebTransport wire —
+            // the browser fetches them via `<img>`/`<link>`/`url()`. Dropping
+            // here keeps their bytes out of the subscription channel.
+            GearOutShared::RepoAssetOut(_) => None,
+            GearOutShared::AssetOut(_) => None,
+            // Server-internal: never shipped to the client.
+            GearOutShared::RepoResourceOut(_) => None,
         },
         GearResult::Local(_) => None,
     }

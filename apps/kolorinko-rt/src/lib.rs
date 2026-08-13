@@ -168,6 +168,21 @@ pub enum Body {
     Zstd(bytes::Bytes),
 }
 
+/// A resolved content-addressed asset reference: the SHA-256 (lowercase hex)
+/// of its bytes plus the original filename extension. The extension rides in
+/// the *reference* (not in the CA blob's name, which is the bare hash) so the
+/// MIME is derivable without a side table — [`crate::wire`] never needs the
+/// blob's type, only this pair.
+///
+/// Serialized onto `/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` by the resolver.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CaRef {
+    /// 64-char lowercase hex SHA-256.
+    pub hash: String,
+    /// Extension without the dot (`"jpg"`, `"png"`, …).
+    pub ext: String,
+}
+
 /// Output of the [`RepoAsset`] gear: the asset's bytes (compressed when that
 /// helped) or a redirect back onto the original host when the file is missing.
 ///
@@ -179,14 +194,19 @@ pub enum RepoAssetOut {
 }
 
 /// One site's persistent chrome, fetched atomically in a single `site`-keyed
-/// subscription: the fully include-resolved `nav:top` and `nav:side` pages plus
-/// the site's theme-root URLs. Bundled so the client requests the whole site
-/// frame once and keeps it live across page navigation within the site.
+/// subscription: the site title + subtitle, the theme stylesheet as a
+/// content-addressed URL, and the fully include-resolved `nav:top` / `nav:side`
+/// pages. Bundled so the client requests the whole site frame once and keeps it
+/// live across page navigation within the site.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SiteShell {
+    pub title: Option<String>,
+    pub subtitle: Option<String>,
+    /// CA URL `/repo/<site>/files/<xx>/<yy>/<hash>.css`, or `None` if the site
+    /// has no theme root mirrored into `files/`.
+    pub theme_root: Option<String>,
     pub nav_top: ArticleView,
     pub nav_side: ArticleView,
-    pub theme_roots: Vec<String>,
 }
 
 /// The wire schema + protocol envelope, generated from [`gears.def`](../gears.def.rs).
@@ -200,7 +220,9 @@ pub struct SiteShell {
 /// — the server never assigns ids.
 #[dentrado_macros::gears_schema(file = "gears.def.rs")]
 pub mod wire {
-    use crate::{AssetKind, RepoAssetOut, RepoAssetPath, SafePathComponent, SiteShell};
+    use crate::{
+        AssetKind, Body, CaRef, RepoAssetOut, RepoAssetPath, SafePathComponent, SiteShell,
+    };
     use kolorinko_wikitext::{ArticleLatest, ArticleView};
 
     /// Client → server: start or stop a subscription. `sub` is the client's
