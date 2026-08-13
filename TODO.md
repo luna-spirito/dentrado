@@ -93,3 +93,7 @@ let's talk just about ServiceWorker for now.
    stale-while-revalidate in production, network-first in development.                                              
  * If service worker is not installed, raw /hello (or whatever) request hits the server, and it serves SSR.         
 ```
+* Разобраться с subscribe_wire & to_wire_out наконец
+* incremental diff_changes
+* `/repo` -- страшный endpoint.
+* Механизм обхода дерева необходимо генерализовать.

@@ -1,5 +1,4 @@
 use imbl::OrdMap;
-use std::borrow::Borrow;
 use std::{collections::BTreeSet, hash::Hash};
 
 use crate::core::gear::IsRuntime;
