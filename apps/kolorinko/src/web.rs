@@ -173,9 +173,6 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 let s = serve_body(&body, accept_zstd);
                 write_http(stream, 200, mime, s.encoding, &s.bytes, alt_svc).await
             }
-            Some(RepoResp::Redirect { location }) => {
-                write_redirect(stream, &location, alt_svc).await
-            }
             None if !looks_like_asset(key) => {
                 let s = serve_body(
                     assets.get("/index.html").expect("index.html always loaded"),
@@ -241,41 +238,8 @@ async fn write_http<S: AsyncWrite + Unpin>(
     body: &[u8],
     alt_svc: Option<&str>,
 ) -> io::Result<()> {
-    write_response(stream, status, mime, encoding, None, body, alt_svc).await
-}
-
-/// `302 Found` to `location`, used when a mirrored asset is missing so the
-/// browser falls back onto the original host.
-async fn write_redirect<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    location: &str,
-    alt_svc: Option<&str>,
-) -> io::Result<()> {
-    write_response(
-        stream,
-        302,
-        "text/plain",
-        None,
-        Some(location),
-        b"",
-        alt_svc,
-    )
-    .await
-}
-
-async fn write_response<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    status: u16,
-    mime: &str,
-    encoding: Option<&str>,
-    location: Option<&str>,
-    body: &[u8],
-    alt_svc: Option<&str>,
-) -> io::Result<()> {
     let status_text = match status {
         200 => "OK",
-        301 => "Moved Permanently",
-        302 => "Found",
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -288,11 +252,6 @@ async fn write_response<S: AsyncWrite + Unpin>(
     if let Some(enc) = encoding {
         head.push_str("Content-Encoding: ");
         head.push_str(enc);
-        head.push_str("\r\n");
-    }
-    if let Some(loc) = location {
-        head.push_str("Location: ");
-        head.push_str(loc);
         head.push_str("\r\n");
     }
     if let Some(alt) = alt_svc {

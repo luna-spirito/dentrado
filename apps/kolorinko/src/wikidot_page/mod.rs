@@ -65,10 +65,8 @@ use compio::fs;
 use dentrado::core::{core_ctx::GearCtx, gear::GearResult, storage::Storage};
 use git2::{ObjectType, Oid, Repository, Tree, TreeWalkMode};
 use imbl::HashMap as ImHashMap;
-use kolorinko_render::{http_refs, http_tail, rewrite, rewrite_with};
-use kolorinko_rt::{
-    AssetKind, Body, CaRef, RepoAssetOut, RepoAssetPath, SafePathComponent, SiteShell,
-};
+use kolorinko_render::{http_refs, http_tail, rewrite_with};
+use kolorinko_rt::{Body, CaRef, RepoAssetPath, SafePathComponent, SiteShell};
 use kolorinko_wikitext::{
     ArticleLatest, ArticleMeta, ArticleView, BlockCell, BlockRow, BlockTable, ContainerKind,
     Content, Include, LinkTarget, List, ListItem, ListPages, Node, PageRef, RevMeta, Tab,
@@ -111,9 +109,7 @@ use repo_gear::*;
 use tree_walk::*;
 
 pub(crate) use article_latest::{LatestCache, ParsedCache, article_latest, article_latest_parsed};
-pub(crate) use assets_gear::{
-    AssetCache, RepoAssetCache, RepoResourceCache, asset, ca_url, repo_asset, repo_resource,
-};
+pub(crate) use assets_gear::{AssetCache, RepoResourceCache, asset, ca_url, repo_resource};
 pub(crate) use config::RepoMeta;
 pub(crate) use dataset::{Article, RepoData, WDWebsite};
 pub(crate) use git_worker::GitMailbox;

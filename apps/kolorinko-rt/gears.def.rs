@@ -43,22 +43,6 @@ pub(crate) async fn repo_l_article_latest(
 }
 
 #[dentrado::gear(
-    event,
-    shared,
-    name = RepoAsset,
-    wire_skip(repo_meta),
-)]
-pub(crate) async fn repo_asset(
-    repo_meta: RepoMeta,
-    site: SafePathComponent,
-    kind: AssetKind,
-    path: RepoAssetPath,
-    _cache: &mut RepoAssetCache,
-) -> RepoAssetOut {
-    crate::wikidot_page::repo_asset(&repo_meta, &site, kind, &path).await
-}
-
-#[dentrado::gear(
     follow(target = GearId::Repo(_repo_meta)),
     shared,
     name = RepoResource,

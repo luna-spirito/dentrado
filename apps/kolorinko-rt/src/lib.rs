@@ -57,51 +57,10 @@ impl AsRef<Path> for SafePathComponent {
     }
 }
 
-/// Which mirrored subtree a [`RepoAsset`] gear reads from: `<site>/theme/…`
-/// (stylesheets, rewritten to local refs) or `<site>/files/…` (attachments).
-///
-/// [`RepoAsset`]: kolorinko_rt gear
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
-    dentrado_types::Localizable,
-)]
-pub enum AssetKind {
-    Theme,
-    Files,
-}
-
-impl AssetKind {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Theme => "theme",
-            Self::Files => "files",
-        }
-    }
-
-    /// Parse the `kind` segment of a `/repo/<site>/<kind>/…` URL, or `None`
-    /// for anything outside the `theme`/`files` namespaces.
-    #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "theme" => Some(Self::Theme),
-            "files" => Some(Self::Files),
-            _ => None,
-        }
-    }
-}
-
-/// A validated relative path under `<site>/<kind>/`: no `..`, no empty/`.`
-/// segments, not absolute. Carries the `<host>/<path…>` tail of a
-/// `/repo/<site>/<kind>/<host>/<path…>` request, so it doubles as the origin
-/// URL the missing-asset redirect falls back onto (`https://{this}`).
+/// A validated relative path: no `..`, no empty/`.` segments, not absolute.
+/// The `host/path…` tail of a mirrored attachment, keyed this way in the
+/// `files/` index so [`repo_resource`] can resolve it to a content-addressed
+/// [`CaRef`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado_types::Localizable)]
 pub struct RepoAssetPath(String);
 
@@ -140,9 +99,9 @@ impl AsRef<Path> for RepoAssetPath {
     }
 }
 
-// Validate on deserialize (not just `new`): a wire `GearId::RepoAsset` arriving
-// from a client must not carry a traversal path, since the gear joins it into
-// the repo tree. Mirrors `SafePathComponent`'s defensive deserialize.
+// Validate on deserialize (not just `new`): a wire `GearId::RepoResource`
+// arriving from a client must not carry a traversal path. Mirrors
+// `SafePathComponent`'s defensive deserialize.
 impl<'de> serde::Deserialize<'de> for RepoAssetPath {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Self::new(String::deserialize(d)?)
@@ -158,10 +117,10 @@ impl serde::Serialize for RepoAssetPath {
 
 /// The body of a served asset: stored zstd-compressed when compression helped,
 /// otherwise raw. Shared by static assets (loaded once at startup) and the
-/// [`RepoAsset`] gear's output. Carried behind a [`bytes::Bytes`] so serving is
+/// [`Asset`] gear's output. Carried behind a [`bytes::Bytes`] so serving is
 /// a refcount bump, never a memcpy.
 ///
-/// [`RepoAsset`]: kolorinko_rt gear
+/// [`Asset`]: kolorinko_rt gear
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Body {
     Raw(bytes::Bytes),
@@ -181,16 +140,6 @@ pub struct CaRef {
     pub hash: String,
     /// Extension without the dot (`"jpg"`, `"png"`, …).
     pub ext: String,
-}
-
-/// Output of the [`RepoAsset`] gear: the asset's bytes (compressed when that
-/// helped) or a redirect back onto the original host when the file is missing.
-///
-/// [`RepoAsset`]: kolorinko_rt gear
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum RepoAssetOut {
-    Ok(Body),
-    Redirect { location: String },
 }
 
 /// One site's persistent chrome, fetched atomically in a single `site`-keyed
@@ -220,9 +169,7 @@ pub struct SiteShell {
 /// — the server never assigns ids.
 #[dentrado_macros::gears_schema(file = "gears.def.rs")]
 pub mod wire {
-    use crate::{
-        AssetKind, Body, CaRef, RepoAssetOut, RepoAssetPath, SafePathComponent, SiteShell,
-    };
+    use crate::{Body, CaRef, RepoAssetPath, SafePathComponent, SiteShell};
     use kolorinko_wikitext::{ArticleLatest, ArticleView};
 
     /// Client → server: start or stop a subscription. `sub` is the client's

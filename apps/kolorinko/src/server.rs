@@ -63,7 +63,7 @@ use crate::{
     assets::{Served, looks_like_asset, mime_for, serve_body},
     repo,
     runtime::{
-        GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, asset, repo_asset,
+        GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, asset,
         repo_l_article_latest, repo_resource, shell,
     },
     wikidot_page::RepoMeta,
@@ -247,51 +247,36 @@ async fn handle_conn(
                 .get(http::header::ACCEPT_ENCODING)
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("zstd"));
-            let (status, mime, served, location): (u16, &'static str, Served, Option<String>) =
-                match assets.get(key) {
-                    Some(b) => (200, mime_for(key), serve_body(b, accept_zstd), None),
-                    None => match repo::serve(&full, repo_meta, &core).await {
-                        Some(repo::RepoResp::Ok { mime, body }) => {
-                            (200, mime, serve_body(&body, accept_zstd), None)
-                        }
-                        Some(repo::RepoResp::Redirect { location }) => (
-                            302,
-                            "text/plain",
-                            Served {
-                                bytes: Bytes::new(),
-                                encoding: None,
-                            },
-                            Some(location),
+            let (status, mime, served): (u16, &'static str, Served) = match assets.get(key) {
+                Some(b) => (200, mime_for(key), serve_body(b, accept_zstd)),
+                None => match repo::serve(&full, repo_meta, &core).await {
+                    Some(repo::RepoResp::Ok { mime, body }) => {
+                        (200, mime, serve_body(&body, accept_zstd))
+                    }
+                    None if !looks_like_asset(key) => (
+                        200,
+                        "text/html; charset=utf-8",
+                        serve_body(
+                            assets.get("/index.html").expect("index.html always loaded"),
+                            accept_zstd,
                         ),
-                        None if !looks_like_asset(key) => (
-                            200,
-                            "text/html; charset=utf-8",
-                            serve_body(
-                                assets.get("/index.html").expect("index.html always loaded"),
-                                accept_zstd,
-                            ),
-                            None,
-                        ),
-                        None => (
-                            404,
-                            "text/plain",
-                            Served {
-                                bytes: Bytes::from_static(b"not found\n"),
-                                encoding: None,
-                            },
-                            None,
-                        ),
-                    },
-                };
+                    ),
+                    None => (
+                        404,
+                        "text/plain",
+                        Served {
+                            bytes: Bytes::from_static(b"not found\n"),
+                            encoding: None,
+                        },
+                    ),
+                },
+            };
             let mut b = http::Response::builder()
                 .status(status)
                 .header("content-type", mime)
                 .header("content-length", served.bytes.len().to_string());
             if let Some(enc) = served.encoding {
                 b = b.header("content-encoding", enc);
-            }
-            if let Some(loc) = location {
-                b = b.header("location", loc);
             }
             let resp = b.body(()).unwrap();
             if let Err(e) = stream.send_response(resp).await {
@@ -440,11 +425,6 @@ async fn subscribe_wire(
         wire::GearId::Shell(site) => shell(repo_meta, site).subscribe(core).await,
         // Assets are HTTP-only — never shipped over WebTransport. The match is
         // exhaustive on the generated wire enum, but `to_wire_out` drops these.
-        wire::GearId::RepoAsset { site, kind, path } => {
-            repo_asset(repo_meta, site, kind, path)
-                .subscribe(core)
-                .await
-        }
         wire::GearId::Asset { site, hash, ext } => {
             asset(repo_meta, site, hash, ext).subscribe(core).await
         }
@@ -475,7 +455,6 @@ fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
             // Assets are served over plain HTTP, never the WebTransport wire —
             // the browser fetches them via `<img>`/`<link>`/`url()`. Dropping
             // here keeps their bytes out of the subscription channel.
-            GearOutShared::RepoAssetOut(_) => None,
             GearOutShared::AssetOut(_) => None,
             // Server-internal: never shipped to the client.
             GearOutShared::RepoResourceOut(_) => None,

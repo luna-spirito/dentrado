@@ -1,31 +1,11 @@
-//! CSS reference rewriting and URL localization for mirrored assets.
+//! CSS reference rewriting for content-addressed assets.
 //!
 //! Mirrored themes and pages keep their original absolute `@import`/`url(...)`
-//! text. [`rewrite`] rewrites those references to same-origin
-//! `/repo/<site>/<kind>/<host>/<path>` URLs (server-side for stylesheet files,
-//! client-side for inline `[[module css]]`), and [`asset_url`] localizes a
-//! single absolute URL for `<img>`/`<a>`. Everything else passes through
-//! byte-for-byte.
-
-/// Localize an absolute external URL (`http(s)://…` or `//…`) to
-/// `/repo/<site>/<kind>/<host>/<path>`. `None` for anything else.
-#[must_use]
-pub fn asset_url(site: &str, kind: &str, url: &str) -> Option<String> {
-    http_tail(url, None).map(|tail| format!("/repo/{site}/{kind}/{tail}"))
-}
-
-/// Rewrite every resolvable `@import`/`url()` reference in `css` to a local
-/// `/repo/<site>/<kind>/<host>/<path>` URL (the path-localizing form used by
-/// theme stylesheet serving). `base` is the stylesheet's own original URL
-/// (needed to absolutize relative references); `None` keeps only absolute refs.
-/// Non-HTTP references (`data:`, document fragments, unknown schemes) are left
-/// untouched.
-#[must_use]
-pub fn rewrite(css: &str, base: Option<&str>, site: &str, kind: &str) -> String {
-    rewrite_with(css, base, |tail| {
-        Some(format!("/repo/{site}/{kind}/{tail}"))
-    })
-}
+//! text. [`rewrite_with`] rewrites those references via a caller-supplied
+//! localizer — the caller resolves each `host/path` tail to its
+//! content-addressed URL (mirrored) or leaves it untouched (hotlink).
+//! [`http_refs`] collects those tails upfront so the caller can pre-resolve
+//! them. Everything else passes through byte-for-byte.
 
 /// Rewrite every resolvable `@import`/`url()` reference in `css` via `local`,
 /// which maps each reference's `host/path` tail to its final URL (or `None` to
@@ -319,103 +299,6 @@ fn unquote(s: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{asset_url, rewrite};
-
-    const BASE: &str = "https://cdn.jsdelivr.net/gh/a/b@refs/heads/main/style.css";
-    const SITE: &str = "rpcauthority";
-    const KIND: &str = "theme";
-
-    #[test]
-    fn absolute_imports_are_localized() {
-        let css = "@import url('https://fonts.googleapis.com/css?family=Exo+2');";
-        assert_eq!(
-            rewrite(css, Some(BASE), SITE, KIND),
-            "@import url(\"/repo/rpcauthority/theme/fonts.googleapis.com/css?family=Exo+2\");"
-        );
-    }
-
-    #[test]
-    fn import_string_target_keeps_media_query() {
-        let css = "@import \"http://maxcdn.bootstrapcdn.com/fa/css/f.min.css\" screen;";
-        assert_eq!(
-            rewrite(css, Some(BASE), SITE, KIND),
-            "@import url(\"/repo/rpcauthority/theme/maxcdn.bootstrapcdn.com/fa/css/f.min.css\") screen;"
-        );
-    }
-
-    #[test]
-    fn url_refs_are_localized() {
-        let css = "a{background:url(https://rpcauthority.wdfiles.com/x.png)}";
-        assert_eq!(
-            rewrite(css, Some(BASE), SITE, KIND),
-            "a{background:url(\"/repo/rpcauthority/theme/rpcauthority.wdfiles.com/x.png\")}"
-        );
-    }
-
-    #[test]
-    fn relative_refs_resolve_against_base() {
-        let css = "@font-face{src:url(../fonts/webfont.woff2)}";
-        assert_eq!(
-            rewrite(css, Some(BASE), SITE, KIND),
-            "@font-face{src:url(\"/repo/rpcauthority/theme/cdn.jsdelivr.net/gh/a/b@refs/heads/fonts/webfont.woff2\")}"
-        );
-    }
-
-    #[test]
-    fn relative_refs_skip_without_base() {
-        let css = "@font-face{src:url(../fonts/webfont.woff2)}";
-        assert_eq!(
-            rewrite(css, None, SITE, KIND),
-            "@font-face{src:url(../fonts/webfont.woff2)}"
-        );
-    }
-
-    #[test]
-    fn non_http_refs_are_left_alone() {
-        let css = "a{fill:url(#grad);x:url(data:image/png;base64,AA==)}";
-        assert_eq!(
-            rewrite(css, Some(BASE), SITE, KIND),
-            "a{fill:url(#grad);x:url(data:image/png;base64,AA==)}"
-        );
-    }
-
-    #[test]
-    fn comments_are_opaque() {
-        let css = "/* url(https://x.example/a.png) */ a{}";
-        assert_eq!(
-            rewrite(css, Some(BASE), SITE, KIND),
-            "/* url(https://x.example/a.png) */ a{}"
-        );
-    }
-
-    #[test]
-    fn fragment_is_dropped_query_kept() {
-        let css = "a{background:url('https://h/p.svg#foo')}";
-        assert_eq!(
-            rewrite(css, Some(BASE), SITE, KIND),
-            "a{background:url(\"/repo/rpcauthority/theme/h/p.svg\")}"
-        );
-    }
-
-    #[test]
-    fn quoted_url_inner_handled() {
-        let css = "b{background:url( \"https://h/q.png\" );}";
-        assert_eq!(
-            rewrite(css, Some(BASE), SITE, KIND),
-            "b{background:url(\"/repo/rpcauthority/theme/h/q.png\");}"
-        );
-    }
-
-    #[test]
-    fn asset_url_localizes_absolute_and_skips_others() {
-        assert_eq!(
-            asset_url(SITE, "files", "https://rpcauthority.wikidot.com/a/b.png"),
-            Some("/repo/rpcauthority/files/rpcauthority.wikidot.com/a/b.png".into())
-        );
-        assert_eq!(asset_url(SITE, "files", "/local/a.png"), None);
-        assert_eq!(asset_url(SITE, "files", ""), None);
-    }
-
     #[test]
     fn http_refs_collects_absolute_tails_dedup() {
         let css = "@import url('https://h/a.png');\

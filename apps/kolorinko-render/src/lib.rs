@@ -10,7 +10,7 @@
 mod css;
 mod render;
 
-pub use css::{asset_url, http_refs, http_tail, rewrite, rewrite_with};
+pub use css::{http_refs, http_tail, rewrite_with};
 pub use render::{render_block, wrap_topbar_lists};
 
 #[cfg(feature = "ssr")]
