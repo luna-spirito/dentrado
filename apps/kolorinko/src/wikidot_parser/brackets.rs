@@ -534,11 +534,13 @@ pub(crate) fn read_include_body<'a>() -> impl Parser<'a, In<'a>, &'a str, E<'a>>
 /// • space-separated — `source k1="v1" k2=v2` (quoted values, or bare values
 ///   running to the next depth-0 whitespace).
 ///
-/// A later assignment to the same key overwrites the earlier one. Only ASCII
+/// A later assignment to the same key is kept alongside the earlier one
+/// (in source order); the first non-empty value wins at substitution, which is
+/// what makes the `key={$key}|key=default` fallback idiom work. Only ASCII
 /// bytes act as delimiters and bracket pairs are scanned non-overlapping, so
 /// every slice lands on a UTF-8 character boundary and `[[[...]]]` stays
 /// depth-balanced (one `[[`/`]]` pair plus a literal `[`/`]`).
-pub(crate) fn parse_include_args(raw: &str) -> (PageRef, HashMap<String, Content>) {
+pub(crate) fn parse_include_args(raw: &str) -> (PageRef, Vec<(String, Content)>) {
     let b = raw.as_bytes();
     let n = b.len();
     let mut i = 0;
@@ -571,7 +573,7 @@ pub(crate) fn unquote(value: &str) -> &str {
 
 /// Record a `key=value` segment: split on the first `=`, parse the value as
 /// wikitext markup. Quoted values are unwrapped first.
-pub(crate) fn insert_kv(seg: &str, vars: &mut HashMap<String, Content>) {
+pub(crate) fn insert_kv(seg: &str, vars: &mut Vec<(String, Content)>) {
     let Some(eq) = seg.find('=') else {
         return;
     };
@@ -579,7 +581,7 @@ pub(crate) fn insert_kv(seg: &str, vars: &mut HashMap<String, Content>) {
     if key.is_empty() {
         return;
     }
-    vars.insert(key.to_string(), parse(unquote(&seg[eq + 1..])));
+    vars.push((key.to_string(), parse(unquote(&seg[eq + 1..]))));
 }
 
 /// Track `[[`/`]]` depth (and skip over `"..."` quotes) across `s`; return
@@ -623,9 +625,9 @@ pub(crate) fn has_depth0_pipe(s: &str) -> bool {
     false
 }
 
-pub(crate) fn parse_pipe_vars(remainder: &str) -> HashMap<String, Content> {
+pub(crate) fn parse_pipe_vars(remainder: &str) -> Vec<(String, Content)> {
     let b = remainder.as_bytes();
-    let mut vars = HashMap::new();
+    let mut vars = Vec::new();
     let mut seg_start = 0;
     let mut i = 0;
     let mut depth = 0i32;
@@ -665,11 +667,11 @@ pub(crate) fn parse_pipe_vars(remainder: &str) -> HashMap<String, Content> {
     vars
 }
 
-pub(crate) fn parse_space_vars(remainder: &str) -> HashMap<String, Content> {
+pub(crate) fn parse_space_vars(remainder: &str) -> Vec<(String, Content)> {
     let b = remainder.as_bytes();
     let n = b.len();
     let mut i = 0;
-    let mut vars: HashMap<String, Content> = HashMap::new();
+    let mut vars: Vec<(String, Content)> = Vec::new();
     while i < n {
         while i < n && b[i].is_ascii_whitespace() {
             i += 1;
@@ -725,7 +727,7 @@ pub(crate) fn parse_space_vars(remainder: &str) -> HashMap<String, Content> {
         };
         let key = remainder[key_start..key_end].trim();
         if !key.is_empty() {
-            vars.insert(key.to_string(), parse(value.trim()));
+            vars.push((key.to_string(), parse(value.trim())));
         }
     }
     vars

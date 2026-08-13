@@ -15,12 +15,31 @@ pub(crate) struct RepoResourceCache;
 /// `files/` symlinks (pointing into `_files/<xx>/<yy>/<hash>`) at tree-build
 /// time; `path` is the percent-decoded `<host>/<path>` tail. `None` when the
 /// URL is not mirrored (a hotlink) — the caller then leaves the original URL.
+///
+/// `.wdfiles.com` is Wikidot's file-serving CDN alias for the canonical
+/// `.wikidot.com` host: pages reference the alias, but the mirror indexes
+/// attachments under the canonical host. So a `.wdfiles.com` tail that misses
+/// is retried under `.wikidot.com` before concluding it is a hotlink.
 pub(crate) fn repo_resource(
     data: &RepoData,
     site: &SafePathComponent,
     path: &RepoAssetPath,
 ) -> Option<CaRef> {
-    data.sites.get(site)?.files.get(path).cloned()
+    let files = &data.sites.get(site)?.files;
+    files
+        .get(path)
+        .cloned()
+        .or_else(|| repo_alias(path).and_then(|alt| files.get(&alt).cloned()))
+}
+
+/// The canonical-host form of a `.wdfiles.com` [`RepoAssetPath`]: replace the
+/// `<sub>.wdfiles.com` host segment with `<sub>.wikidot.com`, keeping the rest
+/// of the path. `None` when the host is not a `.wdfiles.com` alias.
+fn repo_alias(path: &RepoAssetPath) -> Option<RepoAssetPath> {
+    let s = path.as_str();
+    let (host, rest) = s.split_once('/')?;
+    let sub = host.strip_suffix(".wdfiles.com")?;
+    RepoAssetPath::new(format!("{sub}.wikidot.com/{rest}"))
 }
 
 /// Serialize a [`CaRef`] to its served URL: `/repo/<site>/files/<xx>/<yy>/<hash>.<ext>`,
@@ -122,5 +141,28 @@ pub(super) async fn get_ca<S: Storage<KolorinkoRT>>(
             _ => None,
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_alias_maps_wdfiles_to_wikidot() {
+        let p = RepoAssetPath::new("rpcauthority.wdfiles.com/local--files/x/y.png".into()).unwrap();
+        assert_eq!(
+            repo_alias(&p).map(|a| a.as_str().to_owned()),
+            Some("rpcauthority.wikidot.com/local--files/x/y.png".to_owned()),
+        );
+    }
+
+    #[test]
+    fn repo_alias_skips_non_wdfiles_hosts() {
+        let canonical =
+            RepoAssetPath::new("rpcauthority.wikidot.com/local--files/x/y.png".into()).unwrap();
+        let foreign = RepoAssetPath::new("i.imgur.com/x.jpg".into()).unwrap();
+        assert_eq!(repo_alias(&canonical), None);
+        assert_eq!(repo_alias(&foreign), None);
     }
 }

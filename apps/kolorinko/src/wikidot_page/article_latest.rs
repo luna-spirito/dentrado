@@ -77,7 +77,7 @@ pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
     visited.insert((site.clone(), slug.0.clone(), slug.1.clone()));
     let content = resolve(content, &site, meta, &mut visited, ctx).await;
     let content = resolve_resources(content, &site, meta, ctx).await;
-    let content = apply_include_vars(content, &HashMap::new());
+    let content = apply_include_vars(content, &[]);
     ArticleView {
         meta: page_meta,
         revisions,
@@ -522,16 +522,38 @@ pub(super) fn substitute_includes(
 /// variable expands to its (recursively substituted) [`Content`]; inside an
 /// attribute or image source it is flattened to plain text. An unresolved
 /// variable falls back to its `//default`, or to nothing when it has none.
-pub(super) fn apply_include_vars(content: Content, vars: &HashMap<String, Content>) -> Content {
+///
+/// `vars` keeps duplicate keys in source order; a lookup takes the first
+/// non-empty value, so the `key={$key}|key=default` include idiom resolves to
+/// the passed value when set and to the default otherwise.
+pub(super) fn apply_include_vars(content: Content, vars: &[(String, Content)]) -> Content {
     content
         .into_iter()
         .flat_map(|n| subst_node(n, vars))
         .collect()
 }
 
-pub(super) fn subst_node(node: Node, vars: &HashMap<String, Content>) -> Content {
+/// A substitution value is "empty" when it renders to nothing — the form an
+/// unset `{$key}` passthrough takes (an empty [`Content`]). The fallback idiom
+/// skips such values to reach the literal default.
+fn content_is_empty(c: &[Node]) -> bool {
+    c.iter().all(|n| match n {
+        Node::Text(TextObj::Plain(s)) => s.is_empty(),
+        _ => false,
+    })
+}
+
+/// Look up `name` among ordered include `vars`, taking the first value that is
+/// not empty.
+fn include_var_value<'a>(vars: &'a [(String, Content)], name: &str) -> Option<&'a Content> {
+    vars.iter()
+        .find(|(k, v)| k == name && !content_is_empty(v))
+        .map(|(_, v)| v)
+}
+
+pub(super) fn subst_node(node: Node, vars: &[(String, Content)]) -> Content {
     match node {
-        Node::Text(TextObj::IncludeVar { name, default }) => match vars.get(&name) {
+        Node::Text(TextObj::IncludeVar { name, default }) => match include_var_value(vars, &name) {
             Some(v) => apply_include_vars(v.clone(), vars),
             None => default
                 .map(|d| apply_include_vars(d, vars))
@@ -655,7 +677,7 @@ pub(super) fn for_each_content_in_list<F: FnMut(&Content)>(list: &List, f: &mut 
     }
 }
 
-pub(super) fn subst_kind(kind: ContainerKind, vars: &HashMap<String, Content>) -> ContainerKind {
+pub(super) fn subst_kind(kind: ContainerKind, vars: &[(String, Content)]) -> ContainerKind {
     match kind {
         ContainerKind::Div {
             inline,
@@ -672,7 +694,7 @@ pub(super) fn subst_kind(kind: ContainerKind, vars: &HashMap<String, Content>) -
 
 pub(super) fn subst_params(
     params: HashMap<String, Vec<TextObj>>,
-    vars: &HashMap<String, Content>,
+    vars: &[(String, Content)],
 ) -> HashMap<String, Vec<TextObj>> {
     params
         .into_iter()
@@ -680,11 +702,11 @@ pub(super) fn subst_params(
         .collect()
 }
 
-pub(super) fn subst_textobjs(objs: Vec<TextObj>, vars: &HashMap<String, Content>) -> Vec<TextObj> {
+pub(super) fn subst_textobjs(objs: Vec<TextObj>, vars: &[(String, Content)]) -> Vec<TextObj> {
     let mut out: Vec<TextObj> = Vec::new();
     for o in objs {
         let resolved: Vec<TextObj> = match o {
-            TextObj::IncludeVar { name, default } => match vars.get(&name) {
+            TextObj::IncludeVar { name, default } => match include_var_value(vars, &name) {
                 Some(v) => flatten_textobjs(&apply_include_vars(v.clone(), vars)),
                 None => match default {
                     Some(d) => flatten_textobjs(&apply_include_vars(d, vars)),

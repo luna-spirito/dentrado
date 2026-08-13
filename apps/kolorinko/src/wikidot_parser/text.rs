@@ -46,17 +46,21 @@ where
 pub(crate) fn bare_http_link<'a>() -> impl Parser<'a, In<'a>, Node, E<'a>> + Clone + 'a {
     just("http")
         .ignore_then(just('s').or_not())
-        .ignore_then(just("://"))
-        .ignore_then(
+        .then_ignore(just("://"))
+        .then(
             any::<In<'a>, E<'a>>()
                 .filter(|c: &char| is_url_char(*c) || *c == '%')
                 .repeated()
                 .at_least(1)
                 .collect::<String>(),
         )
-        .map(|url| Node::Link {
-            target: LinkTarget::Url(url.clone()),
-            text: vec![Node::Text(TextObj::Plain(url))],
+        .map(|(secure, rest)| {
+            let scheme = if secure.is_some() { "https" } else { "http" };
+            let url = format!("{scheme}://{rest}");
+            Node::Link {
+                target: LinkTarget::Url(url.clone()),
+                text: vec![Node::Text(TextObj::Plain(url))],
+            }
         })
 }
 

@@ -97,3 +97,4 @@ let's talk just about ServiceWorker for now.
 * incremental diff_changes
 * `/repo` -- страшный endpoint.
 * Механизм обхода дерева необходимо генерализовать.
+* alt≠hash

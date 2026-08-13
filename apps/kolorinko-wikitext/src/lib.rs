@@ -318,8 +318,12 @@ pub struct PageRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Include {
     pub source: PageRef,
-    /// Substitution variables; each value is parsed markup.
-    pub vars: HashMap<String, Content>,
+    /// Substitution variables in source order, each value parsed markup.
+    /// Duplicate keys are preserved rather than collapsed: the Wikidot
+    /// `key={$key}|key=default` fallback idiom needs both the passthrough and
+    /// the literal default to survive parsing, with the first non-empty value
+    /// winning at substitution time.
+    pub vars: Vec<(String, Content)>,
 }
 
 /// One tab of a [`Node::Tabview`]. Corresponds to an entry of PureScript

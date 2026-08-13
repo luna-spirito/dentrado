@@ -215,12 +215,24 @@ mod tests {
             .collect()
     }
 
-    /// Extract the single plain-text value of an include variable.
-    fn var_str(vars: &HashMap<String, Content>, key: &str) -> Option<String> {
-        vars.get(key).and_then(|v| match v.as_slice() {
-            [Node::Text(TextObj::Plain(s))] => Some(s.clone()),
-            _ => None,
-        })
+    /// All values bound to a given key, in source order.
+    fn var_entries<'a>(vars: &'a [(String, Content)], key: &str) -> Vec<&'a Content> {
+        vars.iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| v)
+            .collect()
+    }
+
+    /// Extract the single plain-text value of an include variable's first
+    /// binding.
+    fn var_str(vars: &[(String, Content)], key: &str) -> Option<String> {
+        var_entries(vars, key)
+            .into_iter()
+            .next()
+            .and_then(|v| match v.as_slice() {
+                [Node::Text(TextObj::Plain(s))] => Some(s.clone()),
+                _ => None,
+            })
     }
 
     #[test]
@@ -280,12 +292,15 @@ mod tests {
     #[test]
     fn bare_url() {
         let c = parse("see https://example.com/x for info");
+        let Node::Link { target, text } = &c[1] else {
+            panic!("expected bare-url link, got {:?}", c[1]);
+        };
+        // The scheme is preserved (not stripped), keeping the URL absolute for
+        // correct rendering and content-addressed resolution.
+        assert!(matches!(target, LinkTarget::Url(u) if u == "https://example.com/x"));
         assert!(matches!(
-            c[1],
-            Node::Link {
-                target: LinkTarget::Url(_),
-                ..
-            }
+            text.as_slice(),
+            [Node::Text(TextObj::Plain(t))] if t == "https://example.com/x"
         ));
     }
 
@@ -441,8 +456,9 @@ mod tests {
 
     #[test]
     fn include_pipe_vars() {
-        // Pipe syntax: a later assignment to the same key wins, so the
-        // `k={$k}|k=default` idiom resolves to the default.
+        // Pipe syntax preserves duplicate keys in source order, so the
+        // `k={$k}|k=default` idiom keeps both the passthrough reference and the
+        // literal default; the first non-empty value wins at substitution.
         let c = parse(concat!(
             "[[include component:rate-base ",
             "align={$align}|align=right|",
@@ -453,13 +469,23 @@ mod tests {
             panic!("expected include, got {:?}", c[0]);
         };
         assert_eq!(source.path, vec!["rate-base".to_string()]);
-        assert_eq!(var_str(vars, "align"), Some("right".to_string()));
-        assert_eq!(var_str(vars, "votes"), Some("right".to_string()));
-        // No default for stars — the passthrough value is an IncludeVar node
-        // (a real reference to the outer `stars` var), not a literal string.
-        let stars = vars.get("stars").expect("stars var");
+        // `align`: the passthrough reference first, then the literal default.
+        let align = var_entries(vars, "align");
+        assert_eq!(align.len(), 2);
         assert!(matches!(
-            stars.as_slice(),
+            align[0].as_slice(),
+            [Node::Text(TextObj::IncludeVar { name, .. })] if name == "align"
+        ));
+        assert!(matches!(
+            align[1].as_slice(),
+            [Node::Text(TextObj::Plain(s))] if s == "right"
+        ));
+        assert_eq!(var_entries(vars, "votes").len(), 2);
+        // `stars` has only the passthrough (no default given).
+        let stars = var_entries(vars, "stars");
+        assert_eq!(stars.len(), 1);
+        assert!(matches!(
+            stars[0].as_slice(),
             [Node::Text(TextObj::IncludeVar { name, .. })] if name == "stars"
         ));
     }
@@ -482,7 +508,10 @@ mod tests {
         assert_eq!(var_str(vars, "ten"), Some("show".to_string()));
         // The translationblock value is parsed markup: three image nodes (plus
         // whitespace text between them), not a truncated string.
-        let tb = vars.get("translationblock").expect("translationblock var");
+        let tb = var_entries(vars, "translationblock")
+            .into_iter()
+            .next()
+            .expect("translationblock var");
         let images = tb
             .iter()
             .filter(|n| matches!(n, Node::Image { .. }))

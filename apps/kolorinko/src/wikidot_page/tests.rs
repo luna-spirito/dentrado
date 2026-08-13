@@ -196,10 +196,32 @@ fn ivar(name: &str) -> Node {
 
 #[test]
 fn include_var_resolves_to_value() {
-    let mut vars = HashMap::new();
-    vars.insert("align".to_string(), plain("right"));
+    let vars = vec![("align".to_string(), plain("right"))];
     let out = apply_include_vars(vec![ivar("align")], &vars);
     assert_eq!(out, plain("right"));
+}
+
+#[test]
+fn include_var_fallback_idiom_prefers_passed_value() {
+    // `k={$k}|k=default`: a passed value shadows the literal default.
+    let vars = vec![
+        ("name".to_string(), plain("conspiracy.png")),
+        ("name".to_string(), plain("unknown.png")),
+    ];
+    let out = apply_include_vars(vec![ivar("name")], &vars);
+    assert_eq!(out, plain("conspiracy.png"));
+}
+
+#[test]
+fn include_var_fallback_idiom_uses_default_when_passthrough_empty() {
+    // An empty passthrough (an unset `{$k}`) is skipped, so the literal
+    // default is used — the fallback half of the idiom.
+    let vars = vec![
+        ("name".to_string(), vec![]),
+        ("name".to_string(), plain("unknown.png")),
+    ];
+    let out = apply_include_vars(vec![ivar("name")], &vars);
+    assert_eq!(out, plain("unknown.png"));
 }
 
 #[test]
@@ -208,13 +230,13 @@ fn unresolved_include_var_uses_default() {
         name: "x".to_string(),
         default: Some(plain("fallback")),
     });
-    let out = apply_include_vars(vec![node], &HashMap::new());
+    let out = apply_include_vars(vec![node], &[]);
     assert_eq!(out, plain("fallback"));
 }
 
 #[test]
 fn unresolved_include_var_without_default_vanishes() {
-    let out = apply_include_vars(vec![ivar("x")], &HashMap::new());
+    let out = apply_include_vars(vec![ivar("x")], &[]);
     assert!(out.is_empty());
 }
 
@@ -237,8 +259,7 @@ fn include_var_in_div_param_flattens_to_text() {
         },
         content: vec![],
     };
-    let mut vars = HashMap::new();
-    vars.insert("align".to_string(), plain("right"));
+    let vars = vec![("align".to_string(), plain("right"))];
     let out = apply_include_vars(vec![div], &vars);
     let Node::Container {
         kind: ContainerKind::Div { params, .. },
