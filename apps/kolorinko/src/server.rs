@@ -247,7 +247,9 @@ async fn handle_conn(
             let mut b = http::Response::builder()
                 .status(reply.status)
                 .header("content-type", reply.mime)
-                .header("content-length", reply.served.bytes.len().to_string());
+                .header("content-length", reply.served.bytes.len().to_string())
+                .header("cache-control", reply.cache_control)
+                .header("vary", "Accept-Encoding");
             if let Some(enc) = reply.served.encoding {
                 b = b.header("content-encoding", enc);
             }

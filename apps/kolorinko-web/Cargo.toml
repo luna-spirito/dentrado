@@ -42,6 +42,8 @@ web-sys = { version = "0.3", features = [
   "ReadableStreamDefaultReader",
   "WritableStream",
   "WritableStreamDefaultWriter",
+  "Navigator",
+  "ServiceWorkerContainer",
 ] }
 
 # Standalone crate, built to wasm32-unknown-unknown via Trunk.

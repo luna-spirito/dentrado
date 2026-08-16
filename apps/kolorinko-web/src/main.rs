@@ -157,8 +157,36 @@ fn ssr_state() -> Option<SsrState> {
 
 fn main() {
     console_error_panic_hook::set_once();
+    register_service_worker();
     match ssr_state() {
         Some(state) => leptos::mount::hydrate_body(move || app(Some(state))),
         None => leptos::mount::mount_to_body(|| app(None)),
     }
 }
+
+/// Register the app-shell ServiceWorker (release builds only). It intercepts
+/// navigations and serves the cached CSR shell stale-while-revalidate, so real
+/// browsers bypass SSR; bots / first load / no-JS fall through to SSR. Dev
+/// builds skip registration so `trunk` edits aren't shadowed by a cached shell.
+#[cfg(not(debug_assertions))]
+fn register_service_worker() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let nav = window.navigator();
+    let sw = js_sys::Reflect::get(&nav, &"serviceWorker".into())
+        .unwrap_or(wasm_bindgen::JsValue::UNDEFINED);
+    if sw.is_undefined() {
+        return;
+    }
+    let container: web_sys::ServiceWorkerContainer = sw.into();
+    let promise = container.register("/sw.js");
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = wasm_bindgen_futures::JsFuture::from(promise).await {
+            leptos::logging::warn!("sw register: {e:?}");
+        }
+    });
+}
+
+#[cfg(debug_assertions)]
+fn register_service_worker() {}

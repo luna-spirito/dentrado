@@ -139,7 +139,16 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> io::Result<()> {
     let head = read_request_head(stream).await?;
     let Some((method, path)) = parse_request_line(&head) else {
-        write_http(stream, 400, "text/plain", None, b"bad request\n", alt_svc).await?;
+        write_http(
+            stream,
+            400,
+            "text/plain",
+            None,
+            b"bad request\n",
+            "no-store",
+            alt_svc,
+        )
+        .await?;
         return Ok(());
     };
 
@@ -150,6 +159,7 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
             "text/plain",
             None,
             b"method not allowed\n",
+            "no-store",
             alt_svc,
         )
         .await?;
@@ -163,6 +173,7 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         reply.mime,
         reply.served.encoding,
         &reply.served.bytes,
+        reply.cache_control,
         alt_svc,
     )
     .await?;
@@ -211,6 +222,7 @@ async fn write_http<S: AsyncWrite + Unpin>(
     mime: &str,
     encoding: Option<&str>,
     body: &[u8],
+    cache_control: &str,
     alt_svc: Option<&str>,
 ) -> io::Result<()> {
     let status_text = match status {
@@ -221,7 +233,7 @@ async fn write_http<S: AsyncWrite + Unpin>(
         _ => "OK",
     };
     let mut head = format!(
-        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {mime}\r\nContent-Length: {len}\r\nConnection: close\r\n",
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {mime}\r\nContent-Length: {len}\r\nConnection: close\r\nCache-Control: {cache_control}\r\nVary: Accept-Encoding\r\n",
         len = body.len(),
     );
     if let Some(enc) = encoding {
