@@ -33,7 +33,7 @@ pub(crate) fn run_cli(config_path: PathBuf, page: String, inject: bool) -> anyho
 fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
     let (site, slug) = parse_page(page)?;
     // Compute the site string before `site` is moved into the worker closure.
-    let site_str = site.as_ref().to_string_lossy().to_string();
+    let site_str = (*site).clone();
     let repo_meta = make_repo_meta(&config.repo);
 
     // One core is enough for a single render; it keeps the `repo` oracle,

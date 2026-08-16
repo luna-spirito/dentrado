@@ -94,11 +94,15 @@ fn view_nav(site: &str, nav: Option<ArticleView>, top_bar: bool) -> AnyView {
 }
 
 /// The browser tab title for a page title (possibly empty).
-pub fn document_title(page_title: &str) -> String {
+pub fn document_title(site: &str, title: &Option<String>, page_title: &str) -> String {
+    let site = match title.as_ref() {
+        Some(x) => x.as_str(),
+        None => site,
+    };
     if page_title.is_empty() {
-        TITLE_FALLBACK.to_string()
+        format!("{site} | {TITLE_FALLBACK}")
     } else {
-        format!("{page_title} | {TITLE_FALLBACK}")
+        format!("{page_title} - {site} | {TITLE_FALLBACK}")
     }
 }
 

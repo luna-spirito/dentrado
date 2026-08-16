@@ -50,7 +50,7 @@ fn repo_alias(path: &RepoAssetPath) -> Option<RepoAssetPath> {
 /// bare `<hash>` leaf. The on-disk `_files/` layout (sharded rest-leaf) is
 /// reconstructed at read time.
 pub(crate) fn ca_url(site: &SafePathComponent, ca: &CaRef) -> String {
-    let site = site.as_ref().to_string_lossy();
+    let site = &**site;
     let h = &ca.hash;
     let ext = if ca.ext.is_empty() {
         String::new()
@@ -100,7 +100,7 @@ pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
     // rest=key[4:] (the 60-char tail), so the leaf is NOT the full hash.
     let file = meta
         .path()
-        .join(site.as_ref())
+        .join(&**site)
         .join("_files")
         .join(&hash[..2])
         .join(&hash[2..4])

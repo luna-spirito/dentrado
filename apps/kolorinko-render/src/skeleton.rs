@@ -37,7 +37,10 @@ pub fn render_ssr_document(index: &str, site: &str, state: &SsrState) -> Option<
         state.to_embedded_json()
     );
     let doc = replace_placeholder(index, &format!("{app}{embedded}"))?;
-    let doc = set_title(&doc, &document_title(&state.page.meta.title));
+    let doc = set_title(
+        &doc,
+        &document_title(site, &state.shell.title, &state.page.meta.title),
+    );
     Some(match state.shell.theme_root.as_deref() {
         Some(href) => inject_before_head_end(&doc, &theme_link(href)),
         None => doc,
@@ -96,7 +99,7 @@ pub fn render_page_document(
         },
     );
 
-    let title = html_escape(&document_title(&page.meta.title));
+    let title = html_escape(&document_title(site, &shell.title, &page.meta.title));
     let style = base_css
         .map(|css| format!("<style>\n{css}\n</style>\n"))
         .unwrap_or_default();

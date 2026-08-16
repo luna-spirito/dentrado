@@ -19,8 +19,8 @@ mod router;
 mod wt;
 
 use kolorinko_render::{THEME_LINK_ID, document_title, layout};
-use kolorinko_rt::{SSR_STATE_ID, SsrState};
 use kolorinko_rt::wire;
+use kolorinko_rt::{SSR_STATE_ID, SsrState};
 use leptos::prelude::*;
 use std::{cell::Cell, rc::Rc};
 use wt::WtClient;
@@ -47,7 +47,11 @@ fn app(initial: Option<SsrState>) -> AnyView {
         });
     });
 
-    follow(client, move || wire::article_latest(site.get(), slug.get()), set_page);
+    follow(
+        client,
+        move || wire::article_latest(site.get(), slug.get()),
+        set_page,
+    );
     follow(client, move || wire::shell(site.get()), set_shell);
 
     // Keep the browser tab title in sync with the current page's title.
@@ -55,8 +59,12 @@ fn app(initial: Option<SsrState>) -> AnyView {
         let Some(doc) = (|| web_sys::window()?.document())() else {
             return;
         };
-        if let Some(title) = page.get().map(|a| a.meta.title).filter(|t| !t.is_empty()) {
-            doc.set_title(&document_title(&title));
+        if let Some(title) = page.get().map(|a| a.meta.title) {
+            doc.set_title(&document_title(
+                site.get().as_ref(),
+                &shell.get().and_then(|x| x.title),
+                &title,
+            ));
         }
     });
 
@@ -93,7 +101,7 @@ fn app(initial: Option<SsrState>) -> AnyView {
     });
 
     layout(
-        move || site.get().as_ref().to_string_lossy().to_string(),
+        move || (*site.get()).clone(),
         move || shell.get(),
         move || page.get(),
     )

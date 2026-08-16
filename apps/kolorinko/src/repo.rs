@@ -122,7 +122,7 @@ mod tests {
         let (site, hash, ext) =
             parse_ca_request(&format!("/repo/rpcauthority/files/d8/4a/{h}.jpg"))
                 .expect("CA request");
-        assert_eq!(site.as_ref().to_string_lossy(), "rpcauthority");
+        assert_eq!((*site).clone(), "rpcauthority");
         assert_eq!(hash, h);
         assert_eq!(ext, "jpg");
     }

@@ -8,7 +8,10 @@
 //! `#[dears]`/`#[gears]` reads the *same* file for its runtime, so there is no
 //! hand-written duplicate of the gear list.
 
-use std::path::{Component, Path};
+use std::{
+    ops::Deref,
+    path::{Component, Path},
+};
 
 use kolorinko_wikitext::ArticleView;
 
@@ -76,9 +79,11 @@ impl SafePathComponent {
     }
 }
 
-impl AsRef<Path> for SafePathComponent {
-    fn as_ref(&self) -> &Path {
-        self.0.as_ref()
+impl Deref for SafePathComponent {
+    type Target = String;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
