@@ -13,9 +13,14 @@ use crate::layout::{document_title, html_escape, layout, theme_link};
 /// what positional hydration matches against.
 fn render_app(site: &str, state: &SsrState) -> String {
     let (site, shell, page) = (site.to_string(), state.shell.clone(), state.page.clone());
+    let title = page.meta.title.clone();
     layout(
         move || site.clone(),
-        move || Some(shell.clone()),
+        move || shell.title.clone(),
+        move || shell.subtitle.clone(),
+        move || Some(shell.nav_top.clone()),
+        move || Some(shell.nav_side.clone()),
+        move || Some(title.clone()),
         move || Some(page.clone()),
     )
     .to_html()

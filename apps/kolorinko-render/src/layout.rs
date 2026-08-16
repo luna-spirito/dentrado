@@ -11,7 +11,6 @@
 //! the same tree from the same data — sharing this function is what guarantees
 //! that.
 
-use kolorinko_rt::SiteShell;
 use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
 
@@ -25,19 +24,22 @@ pub const THEME_LINK_ID: &str = "kolorinko-site-theme";
 pub const TITLE_FALLBACK: &str = "dntrd";
 
 /// Render the full page layout. `site` is the current site name (used for the
-/// header link and as the internal-link prefix), `shell` the site chrome (or
-/// `None` while it loads), `page` the current page (or `None` while it loads).
+/// header link and as the internal-link prefix); the shell getters expose one
+/// chrome field each — `None` while the shell loads — so each reactive node
+/// clones only the field it renders, never the whole [`SiteShell`]; `page`
+/// likewise for the current page (or `None` while it loads).
 pub fn layout(
     site: impl Fn() -> String + Clone + Send + 'static,
-    shell: impl Fn() -> Option<SiteShell> + Clone + Send + 'static,
+    shell_title: impl Fn() -> Option<String> + Clone + Send + 'static,
+    shell_subtitle: impl Fn() -> Option<String> + Clone + Send + 'static,
+    nav_top: impl Fn() -> Option<ArticleView> + Clone + Send + 'static,
+    nav_side: impl Fn() -> Option<ArticleView> + Clone + Send + 'static,
+    page_title: impl Fn() -> Option<String> + Clone + Send + 'static,
     page: impl Fn() -> Option<ArticleView> + Clone + Send + 'static,
 ) -> AnyView {
     // One clone per capture site: `view!` moves each closure into the tree.
     let [site_href, site_title, site_top, site_side, site_body] =
         [site.clone(), site.clone(), site.clone(), site.clone(), site];
-    let [shell_title, shell_sub, shell_top, shell_side] =
-        [shell.clone(), shell.clone(), shell.clone(), shell];
-    let [page_title, page_body] = [page.clone(), page];
     view! {
         <div id="container-wrap-wrap">
         <div id="container-wrap">
@@ -45,21 +47,19 @@ pub fn layout(
                 <div id="header">
                     <h1>
                         <a href=move || format!("/{}/", site_href())>
-                            <span>{move || {
-                                shell_title().and_then(|x| x.title).unwrap_or_else(&site_title)
-                            }}</span>
+                            <span>{move || shell_title().unwrap_or_else(&site_title)}</span>
                         </a>
                     </h1>
-                    <h2><span>{move || shell_sub().and_then(|s| s.subtitle).unwrap_or_default()}</span></h2>
-                    <div id="top-bar">{move || view_nav(&site_top(), shell_top().map(|s| s.nav_top), true)}</div>
+                    <h2><span>{move || shell_subtitle().unwrap_or_default()}</span></h2>
+                    <div id="top-bar">{move || view_nav(&site_top(), nav_top(), true)}</div>
                 </div>
                 <div id="content-wrap">
-                    <div id="side-bar">{move || view_nav(&site_side(), shell_side().map(|s| s.nav_side), false)}</div>
+                    <div id="side-bar">{move || view_nav(&site_side(), nav_side(), false)}</div>
                     <div id="main-content">
                         <div id="page-title">
-                            {move || page_title().map(|a| a.meta.title).unwrap_or_default()}
+                            {move || page_title().unwrap_or_default()}
                         </div>
-                        <div id="page-content">{move || match page_body() {
+                        <div id="page-content">{move || match page() {
                             Some(a) => {
                                 let blocks = render_block(&site_body(), &a.content);
                                 view! { <>{blocks}</> }.into_any()

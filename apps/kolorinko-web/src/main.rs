@@ -54,17 +54,23 @@ fn app(initial: Option<SsrState>) -> AnyView {
     );
     follow(client, move || wire::shell(site.get()), set_shell);
 
+    // Field-level getters: each reactive node clones only the field it
+    // renders, never the whole shell/page (see `layout`'s signature).
+    let site_name = move || (*site.get()).clone();
+    let shell_title = move || shell.with(|s| s.as_ref().and_then(|x| x.title.clone()));
+    let shell_subtitle = move || shell.with(|s| s.as_ref().and_then(|x| x.subtitle.clone()));
+    let nav_top = move || shell.with(|s| s.as_ref().map(|x| x.nav_top.clone()));
+    let nav_side = move || shell.with(|s| s.as_ref().map(|x| x.nav_side.clone()));
+    let page_title = move || page.with(|p| p.as_ref().map(|a| a.meta.title.clone()));
+    let page_body = move || page.get();
+
     // Keep the browser tab title in sync with the current page's title.
     Effect::new(move |_| {
         let Some(doc) = (|| web_sys::window()?.document())() else {
             return;
         };
-        if let Some(title) = page.get().map(|a| a.meta.title) {
-            doc.set_title(&document_title(
-                site.get().as_ref(),
-                &shell.get().and_then(|x| x.title),
-                &title,
-            ));
+        if let Some(title) = page_title() {
+            site.with(|s| doc.set_title(&document_title(s, &shell_title(), &title)));
         }
     });
 
@@ -76,7 +82,7 @@ fn app(initial: Option<SsrState>) -> AnyView {
         let Some(doc) = (|| web_sys::window()?.document())() else {
             return;
         };
-        let href = shell.get().and_then(|s| s.theme_root);
+        let href = shell.with(|s| s.as_ref().and_then(|x| x.theme_root.clone()));
         let link = match doc.get_element_by_id(THEME_LINK_ID) {
             Some(el) => el,
             None => match href {
@@ -101,9 +107,13 @@ fn app(initial: Option<SsrState>) -> AnyView {
     });
 
     layout(
-        move || (*site.get()).clone(),
-        move || shell.get(),
-        move || page.get(),
+        site_name,
+        shell_title,
+        shell_subtitle,
+        nav_top,
+        nav_side,
+        page_title,
+        page_body,
     )
 }
 
