@@ -50,3 +50,10 @@ web-sys = { version = "0.3", features = [
 # It is intentionally NOT a member of the dentrado workspace, whose other
 # crates target the host.
 [workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
