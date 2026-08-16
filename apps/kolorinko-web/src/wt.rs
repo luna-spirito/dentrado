@@ -28,7 +28,6 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use kolorinko_rt::wire::{ClientMsg, GearOut, GearQuery, ServerMsg};
-use leptos::prelude::*;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
@@ -101,16 +100,10 @@ impl WtClient {
 }
 
 /// Open a WebTransport session to the page origin and return a [`WtClient`].
-///
-/// `set_status` receives connection-lifecycle messages; per-subscription content
-/// arrives through callbacks registered via [`WtClient::subscribe`].
-pub(crate) async fn connect_wt(
-    set_status: WriteSignal<String>,
-) -> Result<Rc<WtClient>, JsValue> {
-    set_status.set("connecting (wt)…".into());
-
+/// Lifecycle errors surface as `Err`; everything after connect is logged to
+/// the browser console.
+pub(crate) async fn connect_wt() -> Result<Rc<WtClient>, JsValue> {
     let Some(window) = web_sys::window() else {
-        set_status.set("no window".into());
         return Err(JsValue::from_str("no window"));
     };
     let url = window.location().origin()?;
@@ -132,8 +125,6 @@ pub(crate) async fn connect_wt(
     let wt = WebTransport::new_with_options(&url, &options)?;
     JsFuture::from(wt.ready()).await?;
 
-    set_status.set("loading…".into());
-
     let bi_js = JsFuture::from(wt.create_bidirectional_stream()).await?;
     let bi: WebTransportBidirectionalStream = bi_js.dyn_into()?;
     let reader = ReadableStreamDefaultReader::new(&bi.readable())?;
@@ -148,7 +139,7 @@ pub(crate) async fn connect_wt(
             let read_res = match JsFuture::from(reader.read()).await {
                 Ok(r) => r,
                 Err(e) => {
-                    set_status.set(format!("wt read: {e:?}"));
+                    leptos::logging::warn!("wt read: {e:?}");
                     break;
                 }
             };
@@ -156,7 +147,7 @@ pub(crate) async fn connect_wt(
                 .map(|v| v.as_bool().unwrap_or(true))
                 .unwrap_or(true);
             if done {
-                set_status.set("wt closed".into());
+                leptos::logging::warn!("wt closed");
                 break;
             }
             let Ok(value) = js_sys::Reflect::get(&read_res, &JsValue::from("value")) else {
@@ -182,7 +173,7 @@ pub(crate) async fn connect_wt(
                     Ok(ServerMsg::Dropped { sub }) => {
                         route_subs.borrow_mut().remove(&sub);
                     }
-                    Err(e) => set_status.set(format!("decode: {e}")),
+                    Err(e) => leptos::logging::warn!("decode: {e}"),
                 }
             }
         }

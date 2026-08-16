@@ -37,8 +37,7 @@ use log::{info, warn};
 use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
 use kolorinko_rt::Body;
 
-use crate::assets::{looks_like_asset, mime_for, serve_body};
-use crate::repo::{self, RepoResp};
+use crate::respond;
 use crate::runtime::KolorinkoRT;
 use crate::tls::https_server_config;
 use crate::wikidot_page::RepoMeta;
@@ -126,11 +125,11 @@ async fn bind_reuseport(addr: &str) -> io::Result<TcpListener> {
     sock.listen(128).await
 }
 
-/// Handle one TLS connection: serve a static asset or a `/repo/` asset. Both
-/// are stored as a [`Body`] (zstd-compressed when that helped) and served
-/// compressed to clients that accept zstd, decompressed otherwise. The WT cert
-/// hash (if in hash-pinning mode) was already injected into `/index.html` once
-/// at load time by [`crate::assets::load_assets`].
+/// Handle one TLS connection: resolve the request through [`crate::respond`]
+/// (static assets, `/repo/` assets, SSR'd pages — all stored/served as a
+/// [`Body`], zstd to clients that accept it). The WT cert hash (if in
+/// hash-pinning mode) was already injected into `/index.html` once at load
+/// time by [`crate::assets::load_assets`].
 async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     assets: &Arc<HashMap<String, Body>>,
@@ -157,42 +156,18 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(());
     }
 
-    // Strip the query string for the asset-map lookup (`GET /?x=1` → `/`); the
-    // repo resolver keeps it (mirrored paths live on disk without the query).
-    let raw_path = path;
-    let path = path.split('?').next().unwrap_or(path);
-    let key: &str = if path == "/" { "/index.html" } else { path };
-    let accept_zstd = accepts_zstd(&head);
-    let res = match assets.get(key) {
-        Some(b) => {
-            let s = serve_body(b, accept_zstd);
-            write_http(stream, 200, mime_for(key), s.encoding, &s.bytes, alt_svc).await
-        }
-        None => match repo::serve(raw_path, repo_meta.clone(), core).await {
-            Some(RepoResp::Ok { mime, body }) => {
-                let s = serve_body(&body, accept_zstd);
-                write_http(stream, 200, mime, s.encoding, &s.bytes, alt_svc).await
-            }
-            None if !looks_like_asset(key) => {
-                let s = serve_body(
-                    assets.get("/index.html").expect("index.html always loaded"),
-                    accept_zstd,
-                );
-                write_http(
-                    stream,
-                    200,
-                    "text/html; charset=utf-8",
-                    s.encoding,
-                    &s.bytes,
-                    alt_svc,
-                )
-                .await
-            }
-            None => write_http(stream, 404, "text/plain", None, b"not found\n", alt_svc).await,
-        },
-    };
+    let reply = respond::resolve(path, accepts_zstd(&head), assets, repo_meta.clone(), core).await;
+    write_http(
+        stream,
+        reply.status,
+        reply.mime,
+        reply.served.encoding,
+        &reply.served.bytes,
+        alt_svc,
+    )
+    .await?;
     let _ = stream.shutdown().await; // send close_notify for a clean TLS close
-    res
+    Ok(())
 }
 
 /// Whether the request head advertises `zstd` in `Accept-Encoding` (header name

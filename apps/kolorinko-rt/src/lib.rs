@@ -12,6 +12,31 @@ use std::path::{Component, Path};
 
 use kolorinko_wikitext::ArticleView;
 
+/// A page slug: `(category, page)` — Wikidot's `category:name` flattened.
+pub type Slug = (Option<SafePathComponent>, SafePathComponent);
+
+/// The landing page a bare `/<site>/` resolves to.
+pub const START_PAGE: &str = "start";
+
+/// `/<site>[/<category>/<page>]` → `(site, slug)`. A bare `/<site>/` resolves
+/// to the site's `start` landing page. `None` for bare `/`, asset paths, wrong
+/// arity, or unsafe segments. Shared by the web client's router, the server's
+/// SSR dispatch, and the render CLI, so all three agree on what a route is.
+pub fn parse_route(path: &str) -> Option<(SafePathComponent, Slug)> {
+    let segs: Vec<&str> = path
+        .trim_start_matches('/')
+        .split(['/', '#', '?'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    let spc = |s: &str| SafePathComponent::new(s.to_string());
+    match segs.as_slice() {
+        [s] => Some((spc(s)?, (None, spc(START_PAGE)?))),
+        [s, p] => Some((spc(s)?, (None, spc(p)?))),
+        [s, c, p] => Some((spc(s)?, (Some(spc(c)?), spc(p)?))),
+        _ => None,
+    }
+}
+
 /// A single validated path component (a Wikidot site/category/page-name
 /// segment). On the wire it serializes as a plain string; it derives
 /// [`Localizable`](dentrado_types::Localizable) so it can appear as a runtime
@@ -156,6 +181,35 @@ pub struct SiteShell {
     pub theme_root: Option<String>,
     pub nav_top: ArticleView,
     pub nav_side: ArticleView,
+}
+
+/// Server-side-rendered page state embedded into the SSR document, so the
+/// client hydrates from exactly the data the server rendered with (then keeps
+/// the same signals live via WebTransport). [`SSR_STATE_ID`] is the `<script>`
+/// element id it travels in; its presence is also the client's hydrate-vs-mount
+/// signal.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SsrState {
+    pub page: ArticleView,
+    pub shell: SiteShell,
+}
+
+pub const SSR_STATE_ID: &str = "kolorinko-ssr";
+
+impl SsrState {
+    /// Serialize into the body of an `<script type="application/json">`
+    /// element. `<` is escaped as `\u003c` so page content can never close the
+    /// script element early.
+    pub fn to_embedded_json(&self) -> String {
+        serde_json::to_string(self)
+            .expect("SsrState serializes")
+            .replace('<', "\\u003c")
+    }
+
+    /// Inverse of [`to_embedded_json`]; `None` on malformed state.
+    pub fn from_embedded_json(json: &str) -> Option<Self> {
+        serde_json::from_str(json).ok()
+    }
 }
 
 /// The wire schema + protocol envelope, generated from [`gears.def`](../gears.def.rs).

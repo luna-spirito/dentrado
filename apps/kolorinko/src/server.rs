@@ -59,15 +59,12 @@ use kolorinko_rt::{
     wire::{self, ClientMsg, ServerMsg},
 };
 
-use crate::{
-    assets::{Served, looks_like_asset, mime_for, serve_body},
-    repo,
-    runtime::{
-        GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, asset,
-        repo_l_article_latest, repo_resource, shell,
-    },
-    wikidot_page::RepoMeta,
+use crate::respond;
+use crate::runtime::{
+    GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, asset,
+    repo_l_article_latest, repo_resource, shell,
 };
+use crate::wikidot_page::RepoMeta;
 
 /// Max concurrent WebTransport sessions advertised per HTTP/3 connection
 /// (`SETTINGS_H3_WEBTRANSPORT_MAX_SESSIONS`). Default-0 means "none", which
@@ -228,54 +225,30 @@ async fn handle_conn(
             .detach();
             return Ok(()); // h3_conn consumed by the session
         }
-        // HTTP/3 request — serve a static asset on this stream; the connection
-        // stays open for further multiplexed requests.
+        // HTTP/3 request — resolved through [`crate::respond`] (static assets,
+        // `/repo/` assets, SSR'd pages) on this stream; the connection stays
+        // open for further multiplexed requests.
         let assets = assets.clone();
         let core = core.clone();
         let repo_meta = repo_meta.clone();
         runtime::spawn(async move {
             let mut stream = stream;
-            let path = req.uri().path().to_string();
             let full = req
                 .uri()
                 .path_and_query()
                 .map(|p| p.as_str().to_string())
-                .unwrap_or_else(|| path.clone());
-            let key: &str = if path == "/" { "/index.html" } else { &path };
+                .unwrap_or_else(|| req.uri().path().to_string());
             let accept_zstd = req
                 .headers()
                 .get(http::header::ACCEPT_ENCODING)
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("zstd"));
-            let (status, mime, served): (u16, &'static str, Served) = match assets.get(key) {
-                Some(b) => (200, mime_for(key), serve_body(b, accept_zstd)),
-                None => match repo::serve(&full, repo_meta, &core).await {
-                    Some(repo::RepoResp::Ok { mime, body }) => {
-                        (200, mime, serve_body(&body, accept_zstd))
-                    }
-                    None if !looks_like_asset(key) => (
-                        200,
-                        "text/html; charset=utf-8",
-                        serve_body(
-                            assets.get("/index.html").expect("index.html always loaded"),
-                            accept_zstd,
-                        ),
-                    ),
-                    None => (
-                        404,
-                        "text/plain",
-                        Served {
-                            bytes: Bytes::from_static(b"not found\n"),
-                            encoding: None,
-                        },
-                    ),
-                },
-            };
+            let reply = respond::resolve(&full, accept_zstd, &assets, repo_meta, &core).await;
             let mut b = http::Response::builder()
-                .status(status)
-                .header("content-type", mime)
-                .header("content-length", served.bytes.len().to_string());
-            if let Some(enc) = served.encoding {
+                .status(reply.status)
+                .header("content-type", reply.mime)
+                .header("content-length", reply.served.bytes.len().to_string());
+            if let Some(enc) = reply.served.encoding {
                 b = b.header("content-encoding", enc);
             }
             let resp = b.body(()).unwrap();
@@ -283,7 +256,7 @@ async fn handle_conn(
                 warn!("h3 send_response: {e}");
                 return;
             }
-            if let Err(e) = stream.send_data(served.bytes).await {
+            if let Err(e) = stream.send_data(reply.served.bytes).await {
                 warn!("h3 send_data: {e}");
                 return;
             }

@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = ["Luna Spirito <guardspirit@protonmail.com>"]
 edition = "2024"
 license = "AGPL-3.0-or-later"
-description = "Leptos CSR frontend for the kolorinko server"
+description = "Leptos web frontend for the kolorinko server (CSR + SSR hydration)"
 
 [dependencies]
 console_error_panic_hook = "0.1"
@@ -14,7 +14,7 @@ kolorinko-wikitext = { path = "../kolorinko-wikitext" }
 kolorinko-render = { path = "../kolorinko-render", default-features = false, features = [
   "csr",
 ] }
-leptos = { version = "0.8", features = ["csr"] }
+leptos = { version = "0.8", features = ["csr", "hydrate"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wasm-bindgen = "0.2"

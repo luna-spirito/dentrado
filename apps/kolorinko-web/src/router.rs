@@ -9,49 +9,18 @@
 //!   into client-side navigation (pushState) instead of a full reload — so the
 //!   WebTransport session and its subscriptions stay live across page changes.
 
-use kolorinko_rt::SafePathComponent;
+use kolorinko_rt::{SafePathComponent, parse_route};
 use leptos::prelude::*;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{Element, Event, MouseEvent};
 
-pub(crate) type Slug = (Option<SafePathComponent>, SafePathComponent);
+pub(crate) type Slug = kolorinko_rt::Slug;
 
 const FALLBACK_SITE: &str = "obscurative";
 const FALLBACK_PAGE: &str = "syntax";
-/// The landing page a bare `/<site>/` resolves to.
-const START_PAGE: &str = "start";
 
 fn window() -> web_sys::Window {
     web_sys::window().expect("no window")
-}
-
-/// `/<site>[/<category>/<page>]` → `(site, slug)`. A bare `/<site>/` resolves
-/// to the site's `start` landing page. `None` for bare `/`, asset paths, wrong
-/// arity, or unsafe segments.
-fn parse_path(path: &str) -> Option<(SafePathComponent, Slug)> {
-    let segs: Vec<&str> = path
-        .trim_start_matches('/')
-        .split(['/', '#', '?'])
-        .filter(|s| !s.is_empty())
-        .collect();
-    match segs.as_slice() {
-        [s] => Some((
-            SafePathComponent::new((*s).into())?,
-            (None, SafePathComponent::new(START_PAGE.into())?),
-        )),
-        [s, p] => Some((
-            SafePathComponent::new((*s).into())?,
-            (None, SafePathComponent::new((*p).into())?),
-        )),
-        [s, c, p] => Some((
-            SafePathComponent::new((*s).into())?,
-            (
-                Some(SafePathComponent::new((*c).into())?),
-                SafePathComponent::new((*p).into())?,
-            ),
-        )),
-        _ => None,
-    }
 }
 
 #[derive(Clone)]
@@ -65,7 +34,7 @@ impl Router {
     /// rewritten (replaceState) to the demo default so a refresh is stable.
     pub(crate) fn bootstrap() -> Self {
         let path = window().location().pathname().unwrap_or_default();
-        let (site, slug) = match parse_path(&path) {
+        let (site, slug) = match parse_route(&path) {
             Some(v) => v,
             None => {
                 let href = format!("/{FALLBACK_SITE}/{FALLBACK_PAGE}");
@@ -94,7 +63,7 @@ impl Router {
     /// Client-side navigate to an internal path: pushState + update signals,
     /// so subscriptions re-subscribe without a full reload.
     pub(crate) fn navigate(&self, path: String) {
-        let Some((site, slug)) = parse_path(&path) else {
+        let Some((site, slug)) = parse_route(&path) else {
             return;
         };
         if let Ok(h) = window().history() {
@@ -105,7 +74,7 @@ impl Router {
 
     fn sync_from_location(&self) {
         let path = window().location().pathname().unwrap_or_default();
-        if let Some((site, slug)) = parse_path(&path) {
+        if let Some((site, slug)) = parse_route(&path) {
             self.set_route(site, slug);
         }
     }
@@ -165,7 +134,7 @@ impl Router {
             if path.rsplit('/').next().unwrap_or("").contains('.') {
                 return;
             }
-            if parse_path(path).is_some() {
+            if parse_route(path).is_some() {
                 ev.prevent_default();
                 self.navigate(path.to_string());
             }

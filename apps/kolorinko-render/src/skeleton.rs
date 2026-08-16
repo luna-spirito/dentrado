@@ -1,57 +1,109 @@
-//! SSR-only: render a fully-resolved page (plus its `nav:top` / `nav:side`
-//! pages) into a standalone HTML document matching the browser layout, for
-//! the `kolorinko render` debug CLI.
-//!
-//! Gated on `ssr` because it calls [`RenderHtml::to_html`] (via
-//! `leptos::prelude::*`, which re-exports `tachys::prelude::*`). The render
-//! functions in [`crate::render`] are mode-agnostic; this module wraps them in
-//! the `#container-wrap-wrap` skeleton [`kolorinko_web`]'s `layout` produces
-//! in the browser, then seals the result into a complete `<!doctype html>`
-//! document with the base theme CSS inlined (so the output is a self-contained
-//! file you can open directly).
-//!
-//! [`kolorinko_web`]: https://docs.rs/kolorinko-web
+//! SSR-only document assembly, shared by the live server's SSR response and
+//! the `kolorinko render` debug CLI. Gated on `ssr` because it calls
+//! [`RenderHtml::to_html`]; the layout itself is mode-agnostic.
 
+use kolorinko_rt::{SSR_STATE_ID, SiteShell, SsrState};
 use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
 
-use crate::render::render_block;
+use crate::layout::{document_title, html_escape, layout, theme_link};
 
-/// Render `page` (and optional `nav:top` / `nav:side` pages) into a complete
-/// HTML document. `base_css` — the Wikidot base theme stylesheet, read by the
-/// caller from the frontend dist — is inlined into `<head>` when given, so the
-/// output is a single self-contained file (no external `/wikidot-base-theme/…`
-/// link that only resolves when served).
+/// Render `state` (page + shell) for `site` through the shared [`layout`] into
+/// HTML — exactly the tree the client renders from the same state, which is
+/// what positional hydration matches against.
+fn render_app(site: &str, state: &SsrState) -> String {
+    let (site, shell, page) = (site.to_string(), state.shell.clone(), state.page.clone());
+    layout(
+        move || site.clone(),
+        move || Some(shell.clone()),
+        move || Some(page.clone()),
+    )
+    .to_html()
+}
+
+/// The `<div id="container"></div>` placeholder in the built frontend's
+/// `index.html`, replaced by the SSR'd app + embedded state.
+const APP_PLACEHOLDER: &str = r#"<div id="container"></div>"#;
+
+/// Seal an SSR'd page into the built frontend's `index.html` template: the
+/// rendered layout + embedded [`SsrState`] replace the app placeholder (so the
+/// client hydrates positionally from `<body>`'s first child), the `<title>`
+/// carries the page title, and the site theme `<link>` joins `<head>`. `None`
+/// when the template has no placeholder (unbuilt frontend).
+pub fn render_ssr_document(index: &str, site: &str, state: &SsrState) -> Option<String> {
+    let app = render_app(site, state);
+    let embedded = format!(
+        r#"<script type="application/json" id="{SSR_STATE_ID}">{}</script>"#,
+        state.to_embedded_json()
+    );
+    let doc = replace_placeholder(index, &format!("{app}{embedded}"))?;
+    let doc = set_title(&doc, &document_title(&state.page.meta.title));
+    Some(match state.shell.theme_root.as_deref() {
+        Some(href) => inject_before_head_end(&doc, &theme_link(href)),
+        None => doc,
+    })
+}
+
+/// Replace the placeholder — plus whatever whitespace the template wraps
+/// around it — with `replacement`. Hydration walks `<body>`'s children
+/// positionally from the first, so the app must land there with no stray text
+/// node before it, however the template is formatted.
+fn replace_placeholder(doc: &str, replacement: &str) -> Option<String> {
+    let at = doc.find(APP_PLACEHOLDER)?;
+    let start = doc[..at].trim_end().len();
+    let after = at + APP_PLACEHOLDER.len();
+    let end = doc[after..]
+        .find(|c: char| !c.is_whitespace())
+        .map_or(doc.len(), |i| after + i);
+    Some(format!("{}{replacement}{}", &doc[..start], &doc[end..]))
+}
+
+/// Replace the contents of the template's `<title>…</title>`.
+fn set_title(doc: &str, title: &str) -> String {
+    match (doc.find("<title>"), doc.find("</title>")) {
+        (Some(open), Some(close)) if open < close => {
+            let inner = open + "<title>".len();
+            format!("{}{}{}", &doc[..inner], html_escape(title), &doc[close..])
+        }
+        _ => doc.to_string(),
+    }
+}
+
+/// Insert `element` just before the template's `</head>`.
+fn inject_before_head_end(doc: &str, element: &str) -> String {
+    match doc.find("</head>") {
+        Some(end) => format!("{}{element}{}", &doc[..end], &doc[end..]),
+        None => doc.to_string(),
+    }
+}
+
+/// Render `page` under `shell` into a complete standalone HTML document (the
+/// debug CLI's output). `base_css` — the Wikidot base theme stylesheet, read by
+/// the caller from the frontend dist — is inlined into `<head>` when given, so
+/// the output is a single self-contained file (no external
+/// `/wikidot-base-theme/…` link that only resolves when served).
 pub fn render_page_document(
     site: &str,
+    shell: &SiteShell,
     page: &ArticleView,
-    nav_top: Option<&ArticleView>,
-    nav_side: Option<&ArticleView>,
     base_css: Option<&str>,
 ) -> String {
-    let body = view! {
-        <div id="container-wrap-wrap">
-        <div id="container-wrap">
-            <div id="container">
-                <div id="header">
-                    <h1><a href="/">{site.to_string()}</a></h1>
-                    <div id="top-bar">{nav_blocks(site, nav_top)}</div>
-                </div>
-                <div id="content-wrap">
-                    <div id="side-bar">{nav_blocks(site, nav_side)}</div>
-                    <div id="main-content">
-                        <div id="page-title">{page.meta.title.clone()}</div>
-                        <div id="page-content">{render_block(site, &page.content)}</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-        </div>
-    }
-    .to_html();
+    let body = render_app(
+        site,
+        &SsrState {
+            page: page.clone(),
+            shell: shell.clone(),
+        },
+    );
 
+    let title = html_escape(&document_title(&page.meta.title));
     let style = base_css
         .map(|css| format!("<style>\n{css}\n</style>\n"))
+        .unwrap_or_default();
+    let theme = shell
+        .theme_root
+        .as_deref()
+        .map(|href| format!("{}\n", theme_link(href)))
         .unwrap_or_default();
     format!(
         "<!doctype html>\n\
@@ -61,21 +113,8 @@ pub fn render_page_document(
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <title>{title}</title>\n\
          {style}\
+         {theme}\
          </head>\n\
-         <body>\n{body}\n</body>\n</html>\n",
-        title = html_escape(&page.meta.title)
+         <body>\n{body}\n</body>\n</html>\n"
     )
-}
-
-fn nav_blocks(site: &str, nav: Option<&ArticleView>) -> Vec<AnyView> {
-    match nav {
-        Some(a) => render_block(site, &a.content),
-        None => Vec::new(),
-    }
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }

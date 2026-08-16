@@ -1931,6 +1931,7 @@ dependencies = [
 name = "kolorinko-render"
 version = "0.1.0"
 dependencies = [
+ "kolorinko-rt",
  "kolorinko-wikitext",
  "leptos",
 ]
@@ -1944,6 +1945,7 @@ dependencies = [
  "dentrado-types",
  "kolorinko-wikitext",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
