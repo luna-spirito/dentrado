@@ -6,7 +6,7 @@
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 
 use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
-use kolorinko_rt::{Body, SafePathComponent, SiteShell, Slug, SsrState};
+use kolorinko_rt::{Body, SafePathComponent, SiteShell, Slug, SsrState, wire::GearOut};
 use kolorinko_wikitext::ArticleView;
 
 use crate::runtime::{KolorinkoRT, article_latest, shell};
@@ -43,10 +43,17 @@ async fn resolve(
     let page_sub = page_q.subscribe(core).await;
     let shell_sub = shell_q.subscribe(core).await;
     // The getters return `SharedView<…>` (a `!Send` refcount handle); clone the
-    // payloads out into owned values.
+    // payloads out into owned values. The hashes are of the wire encodings —
+    // exactly what a push would carry — so a hydrating client can skip
+    // re-fetching what the document already shows.
     let page: ArticleView = (*(page_q.getter)(page_sub.current())).clone();
     let shell: SiteShell = (*(shell_q.getter)(shell_sub.current())).clone();
-    SsrState { page, shell }
+    SsrState {
+        page_hash: crate::server::out_hash(&GearOut::ArticleLatestOut(page.clone())),
+        page,
+        shell_hash: crate::server::out_hash(&GearOut::ShellOut(shell.clone())),
+        shell,
+    }
 }
 
 /// The built frontend's `index.html` as a string (decompressed), or `None` if

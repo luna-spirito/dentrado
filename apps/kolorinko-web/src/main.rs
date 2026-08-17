@@ -4,7 +4,8 @@
 //! containing the rendered layout plus an embedded [`SsrState`] script; the
 //! client then *hydrates* — rendering the same [`layout`] from the same data
 //! (so the trees match positionally) and attaching reactivity — and only
-//! afterwards goes live: a WebTransport session ([`wt::connect_wt`])
+//! afterwards goes live: a WebTransport session ([`wt::connect`], reconnected
+//! automatically)
 //! re-subscribes the page and site shell, pushing updates into the very
 //! signals the layout renders from. When no embedded state exists (a plain
 //! `index.html` boot, e.g. Trunk dev), the same app client-side renders from
@@ -34,25 +35,24 @@ fn app(initial: Option<SsrState>) -> AnyView {
 
     let site = router.site;
     let slug = router.slug;
-    let (client, set_client) = signal_local(Option::<Rc<WtClient>>::None);
+    let client = Rc::new(wt::connect());
+    let page_hash = initial.as_ref().map(|s| s.page_hash.clone());
+    let shell_hash = initial.as_ref().map(|s| s.shell_hash.clone());
     let (page, set_page) = signal(initial.as_ref().map(|s| s.page.clone()));
     let (shell, set_shell) = signal(initial.map(|s| s.shell));
 
-    Effect::new(move |_| {
-        wasm_bindgen_futures::spawn_local(async move {
-            match wt::connect_wt().await {
-                Ok(c) => set_client.set(Some(c)),
-                Err(e) => leptos::logging::warn!("wt error: {e:?}"),
-            }
-        });
-    });
-
     follow(
-        client,
+        &client,
+        page_hash,
         move || wire::article_latest(site.get(), slug.get()),
         set_page,
     );
-    follow(client, move || wire::shell(site.get()), set_shell);
+    follow(
+        &client,
+        shell_hash,
+        move || wire::shell(site.get()),
+        set_shell,
+    );
 
     // Field-level getters: each reactive node clones only the field it
     // renders, never the whole shell/page (see `layout`'s signature).
@@ -119,29 +119,33 @@ fn app(initial: Option<SsrState>) -> AnyView {
 
 /// One subscription to a gear, keyed on `make_query`, feeding `set`.
 ///
-/// The effect re-runs whenever `client` or `make_query` reads a changed signal
-/// (WT session arrival, route site/slug), cancelling the previous handle and
-/// subscribing to the new one; each server push lands in `set`. A re-run for a
-/// *changed* query clears `set` (stale content shouldn't linger while the new
-/// page loads), but the first subscription keeps whatever is already there —
-/// the SSR state it hydrated from, until the first push confirms or replaces
-/// it.
+/// The effect re-runs whenever `make_query` reads a changed signal (route
+/// site/slug), cancelling the previous handle and subscribing to the new one;
+/// each server push lands in `set`. A re-run for a *changed* query clears
+/// `set` (stale content shouldn't linger while the new page loads), but the
+/// first subscription keeps whatever is already there — the SSR state it
+/// hydrated from, with `initial_hash` telling the server to skip re-sending
+/// exactly that. Reconnects don't re-run this: the client replays its
+/// registry (hash included) on each fresh session.
 fn follow<Out: Send + Sync + Clone + 'static>(
-    client: ReadSignal<Option<Rc<WtClient>>, LocalStorage>,
+    client: &Rc<WtClient>,
+    initial_hash: Option<String>,
     make_query: impl Fn() -> wire::GearQuery<Out> + 'static,
     set: WriteSignal<Option<Out>>,
 ) {
+    let client = client.clone();
     let prev = Cell::new(None::<u64>);
     Effect::new(move |_| {
-        let Some(c) = client.get() else {
-            return;
-        };
         let stale = prev.take();
+        // Only the hydration boot (first run) may claim to know the content.
+        let known = stale.is_none().then(|| initial_hash.clone()).flatten();
         if let Some(p) = stale {
-            c.cancel(p);
+            client.cancel(p);
             set.set(None);
         }
-        let sub = c.subscribe(make_query(), move |v: Out| set.set(Some(v)));
+        let sub = client.subscribe(make_query(), known.as_deref(), move |v: Out| {
+            set.set(Some(v))
+        });
         prev.set(Some(sub));
     });
 }

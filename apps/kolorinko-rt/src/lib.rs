@@ -193,10 +193,16 @@ pub struct SiteShell {
 /// the same signals live via WebTransport). [`SSR_STATE_ID`] is the `<script>`
 /// element id it travels in; its presence is also the client's hydrate-vs-mount
 /// signal.
+///
+/// The `*_hash` fields are the content hashes (see [`crate::wire`]) of the
+/// corresponding wire outputs: a hydrating client echoes them in `Subscribe`
+/// so the server re-sends nothing that the rendered page already shows.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SsrState {
     pub page: ArticleView,
+    pub page_hash: String,
     pub shell: SiteShell,
+    pub shell_hash: String,
 }
 
 pub const SSR_STATE_ID: &str = "kolorinko-ssr";
@@ -220,33 +226,41 @@ impl SsrState {
 /// The wire schema + protocol envelope, generated from [`gears.def`](../gears.def.rs).
 ///
 /// `GearId` / `GearOut` / `GearQuery` (and one builder per shippable gear) are
-/// emitted by the macro; `ClientMsg` / `ServerMsg` are the dumb subscribe/cancel
-/// /push envelope the server speaks generically (no domain `enum Request`).
+/// emitted by the macro; `ClientMsg` / `ServerMsg` are the dumb subscribe/push
+/// envelope the server speaks generically (no domain `enum Request`).
 ///
-/// The client picks every `sub` handle (a monotonic `u64`), so it can route
-/// each `Update` back to the `GearQuery::getter` it registered under that handle
-/// — the server never assigns ids.
+/// One bidi stream per subscription: the client's `Subscribe` is the stream's
+/// only outgoing frame, and either side closing the stream ends the
+/// subscription (client close = cancel, server close = dropped) — so no
+/// cancel/drop messages exist.
+///
+/// Content hashes (SHA-256 over the wire `GearOut` JSON, computed only by the
+/// server) let both sides skip re-sending unchanged payloads: the client
+/// echoes the hash it already holds (a previous push's, or the SSR state's)
+/// in `Subscribe`, and the server pushes only when the output's hash differs.
 #[dentrado_macros::gears_schema(file = "gears.def.rs")]
 pub mod wire {
     use crate::{Body, CaRef, RepoAssetPath, SafePathComponent, SiteShell};
     use kolorinko_wikitext::{ArticleLatest, ArticleView};
 
-    /// Client → server: start or stop a subscription. `sub` is the client's
-    /// own handle; the server echoes it back on every `Update`/`Dropped`.
+    /// Client → server: subscribe to a gear. This is the stream's only
+    /// client→server message. `hash` is the SHA-256 of the wire `GearOut` JSON
+    /// the client already holds — from the last push on this subscription, or
+    /// from the embedded SSR state on a hydration boot. `None` means "send
+    /// everything" (plain CSR boot).
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     #[serde(tag = "t", rename_all = "lowercase")]
     pub enum ClientMsg {
-        Subscribe { sub: u64, id: GearId },
-        Cancel { sub: u64 },
+        Subscribe { id: GearId, hash: Option<String> },
     }
 
-    /// Server → client: an update for a subscription, or notice that the
-    /// subscription ended (gear evicted / errored). The client decodes `out`
-    /// via the `GearQuery::getter` registered under `sub`.
+    /// Server → client: an output whose hash differs from what the client last
+    /// held. Unchanged outputs are skipped entirely (no frame), and the open
+    /// stream itself is the liveness guarantee. The hash is what the client
+    /// echoes back in `Subscribe` on the next (re)connection.
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     #[serde(tag = "t", rename_all = "lowercase")]
     pub enum ServerMsg {
-        Update { sub: u64, out: GearOut },
-        Dropped { sub: u64 },
+        Push { out: GearOut, hash: String },
     }
 }

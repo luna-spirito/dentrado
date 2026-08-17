@@ -72,7 +72,7 @@ impl<R: IsRuntime> GearMeta<R> {
 #[derive(Debug, Clone)]
 pub enum GearInput<R: IsRuntime> {
     Events(LocGroupId),
-    Timer { tick: bool },
+    Timer { tick: bool }, // TODO: Currently GearInput::Timer causes unnecessary cascade updates!
     Follow { out: GearResult<R> },
 }
 

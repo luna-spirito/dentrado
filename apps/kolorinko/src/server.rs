@@ -4,8 +4,8 @@
 //! - **HTTP/3 requests** (`GET /`, `GET /<asset>`) → static assets (the built
 //!   frontend), served from an in-memory map loaded at startup.
 //! - **WebTransport** (`CONNECT :protocol = webtransport`) → a [`run_session`]
-//!   loop that round-trips the dentrado gear protocol (NDJSON over one bidi
-//!   stream), with server push from per-page subscriptions.
+//!   loop accepting one bidirectional stream per subscription (NDJSON frames
+//!   with content-hash skip; see [`subscription_stream`]).
 //!
 //! # Every core binds the same QUIC port (SO_REUSEPORT)
 //! compio-quic's `Endpoint::server`/`ServerBuilder::bind` call `UdpSocket::bind`
@@ -19,8 +19,12 @@
 //!
 //! The cost is connection migration: a client that changes its source address
 //! (NAT rebinding, Wi-Fi → cellular) is re-hashed to a different core, where
-//! its connection state doesn't exist, so the connection drops.
-//! eBPF CID steering desired in long term.
+//! its connection state doesn't exist, so the connection drops. To make that
+//! drop fast instead of silent, every endpoint shares one stateless reset key
+//! (see [`stateless_reset_key`]): the foreign core answers the unknown DCID
+//! with a valid Stateless Reset, and the client tears down promptly rather
+//! than waiting out its retransmission budget. eBPF CID steering desired in
+//! long term.
 //!
 //! # TLS — two modes, switched by `--inject-wt-hash`
 //! - **Pooling mode** (flag unset, the default): the QUIC endpoint presents the
@@ -37,15 +41,15 @@
 //!
 //! [`Core::db_run_gear`]: dentrado::core::core_ctx::Core::db_run_gear
 
-use std::{collections::HashMap, io, rc::Rc, sync::Arc};
+use std::sync::{Arc, OnceLock};
+use std::{collections::HashMap, io, rc::Rc};
 
 use bytes::Bytes;
 use compio::runtime;
 use futures::{
-    channel::mpsc,
+    future::FutureExt,
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     select,
-    stream::StreamExt,
 };
 use log::{error, info, warn};
 
@@ -134,10 +138,30 @@ fn build_endpoint(bind: &str, inject_wt_hash: bool) -> io::Result<compio_quic::E
     let socket = reuseport_udp_socket(bind)?;
     compio_quic::Endpoint::new(
         socket,
-        compio_quic::EndpointConfig::default(),
+        compio_quic::EndpointConfig::new(stateless_reset_key()),
         Some(server_config),
         None,
     )
+}
+
+/// The process-wide QUIC stateless reset key, shared by every core's
+/// endpoint (see the module docs): a datagram whose DCID matches no connection
+/// — arriving at the wrong core after a 4-tuple re-hash, or at any core after
+/// this process restarted — is answered with a Stateless Reset (RFC 9000
+/// §10.3) the client can validate, instead of being silently dropped. Random
+/// per process, not persisted: tokens of the previous process's connections
+/// die with its key, and clients reconnect through their supervisor.
+fn stateless_reset_key() -> Arc<dyn compio_quic::crypto::HmacKey> {
+    static KEY: OnceLock<Arc<dyn compio_quic::crypto::HmacKey>> = OnceLock::new();
+    KEY.get_or_init(|| {
+        use ring::rand::SecureRandom;
+        let mut bytes = [0u8; 64];
+        ring::rand::SystemRandom::new()
+            .fill(&mut bytes)
+            .expect("system randomness");
+        Arc::new(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &bytes))
+    })
+    .clone()
 }
 
 /// Create a UDP socket bound to `bind` with `SO_REUSEADDR` + `SO_REUSEPORT`, so
@@ -280,94 +304,69 @@ async fn handle_conn(
     }
 }
 
-/// Drive one WebTransport session: wait for the client's bidi stream, then
-/// duplex request/reply + push.
+/// Drive one WebTransport session: accept bidirectional streams until the
+/// session closes. Each stream is one subscription ([`subscription_stream`]).
 async fn run_session(
     session: h3_webtransport::server::WebTransportSession<compio_quic::Connection, Bytes>,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     repo_meta: &RepoMeta,
 ) {
-    let bidi = loop {
-        match session.accept_bi().await {
-            Ok(Some(h3_webtransport::server::AcceptedBi::BidiStream(_id, b))) => break b,
-            Ok(Some(h3_webtransport::server::AcceptedBi::Request(..))) => continue,
-            Ok(None) => return, // session closed
-            Err(e) => {
-                warn!("wt accept_bi: {e}");
-                return;
+    while let Ok(Some(accepted)) = session.accept_bi().await {
+        match accepted {
+            h3_webtransport::server::AcceptedBi::BidiStream(_id, stream) => {
+                runtime::spawn(subscription_stream(stream, core.clone(), repo_meta.clone()))
+                    .detach();
             }
-        }
-    };
-
-    // Split into read/write halves: a reader task pulls requests while the main
-    // loop pushes replies. `AsyncReadExt::split`'s BiLock serializes the two,
-    // which our request/reply cadence never needs to overlap.
-    let (reader, writer) = bidi.split();
-
-    let (tx_cmd, mut rx_cmd) = mpsc::unbounded::<ClientMsg>();
-    let (tx_msg, mut rx_msg) = mpsc::unbounded::<ServerMsg>();
-    // One push task per active `sub` handle; dropping the `JoinHandle` (on
-    // `Cancel` or at disconnect) cancels the task and releases its
-    // `Subscription`, so a disconnected client's gears lose interest
-    // automatically.
-    let mut subs: HashMap<u64, runtime::JoinHandle<()>> = HashMap::new();
-
-    let reader_task = runtime::spawn(async move {
-        let mut r = reader;
-        let mut line = Vec::<u8>::new();
-        loop {
-            match read_frame(&mut r, &mut line).await {
-                Ok(Some(msg)) => {
-                    if tx_cmd.unbounded_send(msg).is_err() {
-                        return; // main loop gone
-                    }
-                }
-                Ok(None) => return, // clean half-close
-                Err(e) => {
-                    warn!("wt read: {e}");
-                    return;
-                }
-            }
-        }
-    });
-    reader_task.detach();
-
-    let mut writer = writer;
-    loop {
-        let close = select! {
-            cmd = rx_cmd.next() => match cmd {
-                Some(ClientMsg::Subscribe { sub, id }) => {
-                    // Replace any existing subscription under this handle.
-                    drop(subs.remove(&sub));
-                    let core = core.clone();
-                    let repo_meta = repo_meta.clone();
-                    let tx = tx_msg.clone();
-                    let handle = runtime::spawn(async move {
-                        push(sub, id, repo_meta, &core, tx).await;
-                    });
-                    subs.insert(sub, handle);
-                    false
-                }
-                Some(ClientMsg::Cancel { sub }) => {
-                    subs.remove(&sub); // drop → cancel task + release subscription
-                    false
-                }
-                None => true, // reader ended → client gone
-            },
-            msg = rx_msg.next() => match msg {
-                Some(m) => match write_frame(&mut writer, &m).await {
-                    Ok(()) => false,
-                    Err(e) => { warn!("wt write: {e}"); true }
-                },
-                None => true, // tx_msg dropped → unreachable (we hold one)
-            },
-        };
-        if close {
-            break;
+            // Plain HTTP/3 requests can still arrive through an established
+            // session; we serve none after the connect.
+            h3_webtransport::server::AcceptedBi::Request(..) => {}
         }
     }
-    // `subs` drops here: every push task is cancelled, every `Subscription`
-    // released — disconnected clients stop subscribing automatically.
+}
+
+/// Drive one subscription stream: read the single `Subscribe`, then push the
+/// gear's output whenever its hash differs from what the client last held,
+/// until the subscription ends or the stream closes in either direction —
+/// a client half-close is a cancel, this side closing (task end) is a
+/// `Dropped`. One detached task per stream.
+async fn subscription_stream<S>(
+    bidi: h3_webtransport::stream::BidiStream<S, Bytes>,
+    core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    repo_meta: RepoMeta,
+) where
+    h3_webtransport::stream::BidiStream<S, Bytes>: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = bidi.split();
+    let mut line = Vec::new();
+    let ClientMsg::Subscribe { id, hash } = match read_frame(&mut reader, &mut line).await {
+        Ok(Some(msg)) => msg,
+        _ => return,
+    };
+    let s = subscribe_wire(id, repo_meta, &core).await;
+    let mut last = hash;
+    if let Some(out) = to_wire_out(s.current())
+        && push_if_changed(&mut writer, &out, &mut last).await.is_err()
+    {
+        return;
+    }
+    loop {
+        select! {
+            // The client never writes another frame; only the half-close
+            // (cancel) or a stream error matters.
+            frame = read_frame(&mut reader, &mut line).fuse() => match frame {
+                Ok(Some(_)) => continue,
+                _ => return,
+            },
+            res = s.next().fuse() => match to_wire_out(res) {
+                Some(out) => {
+                    if push_if_changed(&mut writer, &out, &mut last).await.is_err() {
+                        return;
+                    }
+                }
+                None => return, // subscription ended → closing = Dropped
+            },
+        }
+    }
 }
 
 // ---- wire dispatch ----------------------------------------------------------
@@ -438,23 +437,39 @@ fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
     }
 }
 
-/// Drive one subscription: ship the current output, then every subsequent
-/// update, then a final `Dropped`.
-async fn push(
-    sub: u64,
-    id: wire::GearId,
-    repo_meta: RepoMeta,
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
-    tx: mpsc::UnboundedSender<ServerMsg>,
-) {
-    let s = subscribe_wire(id, repo_meta, core).await;
-    if let Some(out) = to_wire_out(s.current()) {
-        let _ = tx.unbounded_send(ServerMsg::Update { sub, out });
+/// Push `out` on `w` unless its hash equals `last` (the client already holds
+/// it); on push, advance `last` to the new hash.
+async fn push_if_changed<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    out: &wire::GearOut,
+    last: &mut Option<String>,
+) -> io::Result<()> {
+    let hash = out_hash(out);
+    if last.as_deref() != Some(&hash) {
+        write_frame(
+            w,
+            &ServerMsg::Push {
+                out: out.clone(),
+                hash: hash.clone(),
+            },
+        )
+        .await?;
+        *last = Some(hash);
     }
-    while let Some(out) = to_wire_out(s.next().await) {
-        let _ = tx.unbounded_send(ServerMsg::Update { sub, out });
-    }
-    let _ = tx.unbounded_send(ServerMsg::Dropped { sub });
+    Ok(())
+}
+
+/// SHA-256 (hex) of a wire `GearOut`'s JSON encoding — the content hash the
+/// protocol skips unchanged pushes by (see [`kolorinko_rt::wire`]). Shared
+/// with the SSR state embedder ([`crate::ssr`]) so a hydrated page hashes
+/// exactly like a pushed one.
+pub(crate) fn out_hash(out: &wire::GearOut) -> String {
+    let json = serde_json::to_vec(out).expect("GearOut serializes");
+    ring::digest::digest(&ring::digest::SHA256, &json)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 // ---- newline-delimited JSON (NDJSON) framing ---------------------------------

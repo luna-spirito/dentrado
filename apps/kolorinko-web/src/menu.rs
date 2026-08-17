@@ -7,7 +7,7 @@
 //! shared SSR layout: the server renders pure HTML, and the listeners attach
 //! identically whether the layout was hydrated or client-rendered.
 
-use wasm_bindgen::{closure::Closure, JsCast};
+use wasm_bindgen::{JsCast, closure::Closure};
 use web_sys::MouseEvent;
 
 /// Install the delegated `mouseover` / `mouseout` pair (fire-and-forget: they

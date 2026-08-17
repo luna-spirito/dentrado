@@ -100,7 +100,12 @@ pub fn render_page_document(
         site,
         &SsrState {
             page: page.clone(),
+            // No content hashes: this is a static debug document, never a
+            // hydration source; an empty hash matches nothing, so a live
+            // client (if one ever loaded it) would simply get a full push.
+            page_hash: String::new(),
             shell: shell.clone(),
+            shell_hash: String::new(),
         },
     );
 
