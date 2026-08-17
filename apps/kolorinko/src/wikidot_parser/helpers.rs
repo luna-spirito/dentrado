@@ -17,7 +17,7 @@ pub(crate) fn parse_link_target(raw: &str) -> LinkTarget {
 /// A leading `space:` segment is a cross-space reference; the rest is the path.
 pub(crate) fn parse_page_ref(raw: &str) -> PageRef {
     let raw = raw.trim().trim_start_matches('/');
-    let lower = raw.to_ascii_lowercase();
+    let lower = raw.to_ascii_lowercase().replace(' ', "-");
     let parts: Vec<&str> = lower.split(':').collect();
     match parts.as_slice() {
         [] | [""] => PageRef {
