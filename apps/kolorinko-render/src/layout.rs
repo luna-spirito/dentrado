@@ -11,7 +11,7 @@
 //! the same tree from the same data — sharing this function is what guarantees
 //! that.
 
-use kolorinko_wikitext::ArticleView;
+use kolorinko_wikitext::{ArticleView, PageDep};
 use leptos::prelude::*;
 
 use crate::render::render_block;
@@ -40,6 +40,8 @@ pub fn layout(
     // One clone per capture site: `view!` moves each closure into the tree.
     let [site_href, site_title, site_top, site_side, site_body] =
         [site.clone(), site.clone(), site.clone(), site.clone(), site];
+    let [page_body, page_deps] = [page.clone(), page];
+    let show_deps = RwSignal::new(false);
     view! {
         <div id="container-wrap-wrap">
         <div id="container-wrap">
@@ -59,13 +61,35 @@ pub fn layout(
                         <div id="page-title">
                             {move || page_title().unwrap_or_default()}
                         </div>
-                        <div id="page-content">{move || match page() {
+                        <div id="page-content">{move || match page_body() {
                             Some(a) => {
                                 let blocks = render_block(&site_body(), &a.content);
                                 view! { <>{blocks}</> }.into_any()
                             }
                             None => view! { <p class="kolorinko-status">"loading…"</p> }.into_any(),
                         }}</div>
+                        // The page-options bar (Wikidot's Edit / Rate / Tags /
+                        // … section) — ours carries the dependency-tree toggle.
+                        <div id="page-options-bottom" class="page-options-bottom">
+                            <a
+                                id="deps-button"
+                                href="javascript:;"
+                                on:click=move |_| show_deps.update(|open| *open = !*open)
+                            >"Dependencies"</a>
+                        </div>
+                        {move || {
+                            let page_deps = page_deps.clone();
+                            show_deps.get().then(|| view! {
+                                <div id="action-area">
+                                    {move || match page_deps().map(|a| a.deps) {
+                                        Some(deps) if !deps.is_empty() => view_deps(&deps),
+                                        _ => view! {
+                                            <p class="kolorinko-status">"no dependencies"</p>
+                                        }.into_any(),
+                                    }}
+                                </div>
+                            })
+                        }}
                     </div>
                 </div>
             </div>
@@ -73,6 +97,25 @@ pub fn layout(
         </div>
     }
     .into_any()
+}
+
+/// A page's dependency tree as nested lists: each fetched include target
+/// links to its page (`/{site}/{category?}/{page}`, the same scheme internal
+/// links use), its own dependencies nested beneath it.
+fn view_deps(deps: &[PageDep]) -> AnyView {
+    let items: Vec<AnyView> = deps
+        .iter()
+        .map(|d| {
+            let name = d.page.as_str();
+            let (href, label) = match &d.category {
+                Some(cat) => (format!("/{}/{cat}/{name}", d.site), format!("{cat}:{name}")),
+                None => (format!("/{}/{}", d.site, name), name.to_string()),
+            };
+            let sub = (!d.deps.is_empty()).then(|| view_deps(&d.deps));
+            view! { <li><a href=href>{label}</a>{sub}</li> }.into_any()
+        })
+        .collect();
+    view! { <ul class="kolorinko-deps">{items}</ul> }.into_any()
 }
 
 /// Render a navigation page (`nav:top` / `nav:side`) — or nothing before it

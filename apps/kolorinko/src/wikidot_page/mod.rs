@@ -51,9 +51,10 @@
 //! - [`article_latest`] (`event`): resolves every `[[include]]` by
 //!   [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get)-ing
 //!   [`article_latest_parsed`] of the included pages (data-level cycles broken
-//!   by a visited-set), producing the final [`ArticleView`]. Declaring each
-//!   include as a dependency makes the result reactive: an edit to any page in
-//!   the transitive include cone re-runs this gear.
+//!   by a visited-set), producing the final [`ArticleView`] with the tree of
+//!   every fetched page as its `deps`. Declaring each include as a dependency
+//!   makes the result reactive: an edit to any page in the transitive include
+//!   cone re-runs this gear.
 //! - [`shell`] (`follow` over `repo`): the whole site chrome in one shot — the
 //!   resolved `nav:top` / `nav:side` pages (declared as [`article_latest`]
 //!   [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get) deps)
@@ -69,7 +70,7 @@ use kolorinko_render::{http_refs, http_tail, rewrite_with};
 use kolorinko_rt::{Body, CaRef, RepoAssetPath, SafePathComponent, SiteShell};
 use kolorinko_wikitext::{
     ArticleLatest, ArticleMeta, ArticleView, BlockCell, BlockRow, BlockTable, ContainerKind,
-    Content, Include, LinkTarget, List, ListItem, ListPages, Node, PageRef, RevMeta, Tab,
+    Content, Include, LinkTarget, List, ListItem, ListPages, Node, PageDep, PageRef, RevMeta, Tab,
     TableCell, TextObj,
 };
 use log::error;

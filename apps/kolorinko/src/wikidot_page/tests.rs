@@ -183,6 +183,53 @@ fn incremental_patch_on_tip_move() {
     );
 }
 
+fn key(cat: Option<&str>, name: &str) -> Key {
+    (
+        site("scp"),
+        cat.map(|c| SafePathComponent::new(c.into()).unwrap()),
+        SafePathComponent::new(name.into()).unwrap(),
+    )
+}
+
+#[test]
+fn dep_tree_nests_each_page_under_its_includer() {
+    let (root, b, c, d) = (
+        key(None, "root"),
+        key(None, "b"),
+        key(None, "c"),
+        key(Some("nav"), "d"),
+    );
+    // root includes b and c; b includes d — discovery order.
+    let edges = vec![
+        (root.clone(), b.clone()),
+        (root.clone(), c.clone()),
+        (b.clone(), d.clone()),
+    ];
+    let deps = dep_tree(&root, edges);
+    assert_eq!(
+        deps,
+        vec![
+            PageDep {
+                site: "scp".into(),
+                category: None,
+                page: "b".into(),
+                deps: vec![PageDep {
+                    site: "scp".into(),
+                    category: Some("nav".into()),
+                    page: "d".into(),
+                    deps: vec![],
+                }],
+            },
+            PageDep {
+                site: "scp".into(),
+                category: None,
+                page: "c".into(),
+                deps: vec![],
+            },
+        ]
+    );
+}
+
 fn plain(s: &str) -> Content {
     vec![Node::Text(TextObj::Plain(s.to_string()))]
 }

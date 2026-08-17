@@ -432,13 +432,28 @@ pub struct RevMeta {
     pub author: String,
 }
 
-/// A fully rendered page: metadata, edit-history summary, and the resolved
-/// [`Content`] (all `[[include]]` directives expanded).
+/// One `[[include]]` dependency of a rendered page: the included page's
+/// address, plus (recursively) the dependencies fetched while resolving it.
+/// Recorded by include resolution as pages are fetched, so it is exactly the
+/// set of requested articles — a spanning tree of the include graph (a page
+/// included from several places appears under its first includer).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageDep {
+    pub site: String,
+    pub category: Option<String>,
+    pub page: String,
+    pub deps: Vec<PageDep>,
+}
+
+/// A fully rendered page: metadata, edit-history summary, the resolved
+/// [`Content`] (all `[[include]]` directives expanded), and the tree of pages
+/// fetched while resolving those includes (empty before resolution).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArticleView {
     pub meta: ArticleMeta,
     pub revisions: Vec<RevMeta>,
     pub content: Content,
+    pub deps: Vec<PageDep>,
 }
 
 /// Shippable projection of one page: metadata, the latest revision's raw body,

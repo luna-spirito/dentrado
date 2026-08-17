@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::VecDeque;
 
 // =========================================================================
 // `article_latest_parsed` gear
@@ -36,6 +37,7 @@ pub(crate) async fn article_latest_parsed<S: Storage<KolorinkoRT>>(
         meta: latest.meta.clone(),
         revisions: latest.revisions.clone(),
         content: parse(&latest.body),
+        deps: Vec::new(),
     };
     *cache = ParsedCache {
         body: Some(latest.body.clone()),
@@ -59,7 +61,8 @@ pub(crate) struct LatestCache;
 /// data-level cycles (A includes B includes A). Declaring each include as a
 /// [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get) dependency
 /// makes the whole result reactive — an edit anywhere in the include cone
-/// re-runs this gear.
+/// re-runs this gear. The tree of every page fetched along the way rides
+/// along as the view's `deps`.
 pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
     meta: &RepoMeta,
     site: SafePathComponent,
@@ -72,40 +75,49 @@ pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
         meta: page_meta,
         revisions,
         content,
+        ..
     } = parsed.clone();
-    let mut visited = HashSet::new();
-    visited.insert((site.clone(), slug.0.clone(), slug.1.clone()));
-    let content = resolve(content, &site, meta, &mut visited, ctx).await;
-    let content = resolve_resources(content, &site, meta, ctx).await;
+    let root = (site, slug.0, slug.1);
+    let (content, deps) = resolve(content, &root, meta, ctx).await;
+    let content = resolve_resources(content, &root.0, meta, ctx).await;
     let content = apply_include_vars(content, &[]);
     ArticleView {
         meta: page_meta,
         revisions,
         content,
+        deps,
     }
 }
 
-/// Resolve every `[[include]]` directive anywhere inside `content`, splicing
-/// the included pages' content in place of each directive. Works in passes:
-/// each pass collects the include targets reachable from the current tree but
-/// not yet fetched, declares each as a `secondary_get` dependency (so the whole
-/// result is reactive to edits anywhere in the transitive include cone),
-/// fetches them, and substitutes; then repeats until a pass finds nothing
-/// new. A `visited` set breaks data-level cycles (A includes B includes A).
+/// Resolve every `[[include]]` directive anywhere inside the root page's
+/// content, splicing each included page's (recursively resolved) content in
+/// place of the directive, and return the resolved content together with the
+/// dependency tree — every page fetched, nested under the page whose body
+/// included it.
+///
+/// Fetching is breadth-first: each page's raw body is walked as it arrives,
+/// its include targets declared as [`article_latest_parsed`]
+/// [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get)
+/// dependencies (so the whole result is reactive to edits anywhere in the
+/// transitive include cone) and fetched, and the `(includer, target)` edge
+/// recorded; a `visited` set breaks data-level cycles (A includes B includes
+/// A). Assembly then runs in passes over the pre-fetched bodies — each pass
+/// substitutes one level of directives, so include vars cascade top-down
+/// (an includer's vars resolve a nested directive's `{$passthrough}` values
+/// before that directive itself is spliced) — until a pass finds nothing new.
 pub(super) async fn resolve<S: Storage<KolorinkoRT>>(
-    mut content: Content,
-    site: &SafePathComponent,
+    content: Content,
+    root: &Key,
     meta: &RepoMeta,
-    visited: &mut HashSet<Key>,
     ctx: &mut GearCtx<KolorinkoRT, S>,
-) -> Content {
-    loop {
+) -> (Content, Vec<PageDep>) {
+    let mut visited: HashSet<Key> = HashSet::from([root.clone()]);
+    let mut queue: VecDeque<(Key, Content)> = VecDeque::from([(root.clone(), content)]);
+    let mut raws: HashMap<Key, Content> = HashMap::new();
+    let mut edges: Vec<(Key, Key)> = Vec::new();
+    while let Some((origin, body)) = queue.pop_front() {
         let mut targets: Vec<(Key, SafePathComponent, Slug)> = Vec::new();
-        collect_include_targets(&content, site, visited, &mut targets);
-        if targets.is_empty() {
-            break;
-        }
-        let mut fetched: HashMap<Key, Content> = HashMap::new();
+        collect_include_targets(&body, &root.0, &visited, &mut targets);
         for (key, inc_site, inc_slug) in targets {
             visited.insert(key.clone());
             let parsed = crate::runtime::article_latest_parsed(
@@ -115,11 +127,50 @@ pub(super) async fn resolve<S: Storage<KolorinkoRT>>(
             )
             .secondary_get(ctx)
             .await;
-            fetched.insert(key, parsed.content.clone());
+            edges.push((origin.clone(), key.clone()));
+            raws.insert(key.clone(), parsed.content.clone());
+            queue.push_back((key, parsed.content.clone()));
         }
-        content = substitute_includes(content, site, &fetched);
+        raws.insert(origin, body);
     }
-    content
+    let mut content = raws.remove(root).unwrap_or_default();
+    let mut substituted: HashSet<Key> = HashSet::from([root.clone()]);
+    loop {
+        let mut targets: Vec<(Key, SafePathComponent, Slug)> = Vec::new();
+        collect_include_targets(&content, &root.0, &substituted, &mut targets);
+        if targets.is_empty() {
+            break;
+        }
+        let fetched: HashMap<Key, Content> = targets
+            .iter()
+            .map(|(key, _, _)| (key.clone(), raws.remove(key).unwrap_or_default()))
+            .collect();
+        substituted.extend(fetched.keys().cloned());
+        content = substitute_includes(content, &root.0, &fetched);
+    }
+    (content, dep_tree(root, edges))
+}
+
+/// Fold the discovery-order `(includer, included)` edges into the page's
+/// dependency tree: one [`PageDep`] per fetched page, nested under the page
+/// whose body first included it; `root`'s direct includes form the top level.
+pub(super) fn dep_tree(root: &Key, edges: Vec<(Key, Key)>) -> Vec<PageDep> {
+    let mut children: HashMap<Key, Vec<Key>> = HashMap::new();
+    for (includer, included) in edges {
+        children.entry(includer).or_default().push(included);
+    }
+    dep_children(&children, children.get(root).map_or(&[], Vec::as_slice))
+}
+
+fn dep_children(children: &HashMap<Key, Vec<Key>>, keys: &[Key]) -> Vec<PageDep> {
+    keys.iter()
+        .map(|key| PageDep {
+            site: (*key.0).clone(),
+            category: key.1.as_ref().map(|c| (**c).clone()),
+            page: (*key.2).clone(),
+            deps: dep_children(children, children.get(key).map_or(&[], Vec::as_slice)),
+        })
+        .collect()
 }
 
 /// Resolve every mirrored external resource — `[[image source]]`, `[[[url]]]`
@@ -363,7 +414,7 @@ pub(super) fn subst_source<F: Fn(&str) -> Option<String>>(
 
 /// Walk `content` and record every `[[include]]` target not already in
 /// `visited` (and not already batched in `out`), so [`resolve`] can fetch the
-/// whole pass at once. Sync recursion over the tree — no awaits.
+/// whole batch at once. Sync recursion over the tree — no awaits.
 pub(super) fn collect_include_targets(
     content: &Content,
     current_site: &SafePathComponent,
@@ -425,9 +476,10 @@ pub(super) fn collect_include_targets(
     }
 }
 
-/// Return `content` with every `[[include]]` whose target was fetched this
-/// pass replaced by that target's content (spliced inline); directives that
-/// couldn't be resolved (unknown target, or a data cycle) are left verbatim.
+/// Return `content` with every `[[include]]` whose target is among `fetched`
+/// (already resolved) replaced by that target's content (spliced inline);
+/// directives that couldn't be resolved (unknown target, or a data cycle) are
+/// left verbatim.
 pub(super) fn substitute_includes(
     content: Content,
     current_site: &SafePathComponent,
