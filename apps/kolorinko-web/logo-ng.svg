@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:graphite="https://graphite.art" viewBox="0 0 64 64" width="64" height="64"><defs><clipPath id="artboard-12031998624894171892"><rect x="0" y="0" width="64" height="64" /></clipPath></defs><g>
+<rect fill="#ffffff" fill-opacity="0" x="0" y="0" width="64" height="64"/>
+<g clip-path="url(#artboard-12031998624894171892)">
+	<g transform="matrix(1.35,0,0,1.35,32,32)">
+		<path d="M0.0000000000000009797174393178826,-16 L13.85640646055102,7.999999999999997 L-13.856406460551016,8.000000000000005 L0.0000000000000009797174393178826,-16 Z" transform="matrix(0.707106781,0.707106781,-0.707106781,0.707106781,-7.071067812,7.071067812)" fill="none" stroke-width="4" stroke-linejoin="bevel" stroke="#c75c16"/>
+		<path d="M0.0000000000000009797174393178826,-16 L13.85640646055102,7.999999999999997 L-13.856406460551016,8.000000000000005 L0.0000000000000009797174393178826,-16 Z" transform="matrix(-0.707106781,-0.707106781,0.707106781,-0.707106781,7.071067812,-7.071067812)" fill="none" stroke-width="4" stroke-linejoin="bevel" stroke="#c75c16"/>
+	</g>
+</g></g></svg>
