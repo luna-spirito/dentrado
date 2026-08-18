@@ -1,4 +1,5 @@
-//! Wikidot markup parser: a hand-written lexer plus a plain merge pass.
+//! Wikidot markup parser: a chumsky lexer over raw bytes plus a plain merge
+//! pass.
 //!
 //! The grammar follows the reference at
 //! <https://www.wikidot.com/doc-wiki-syntax:inline-formatting> and is a port of

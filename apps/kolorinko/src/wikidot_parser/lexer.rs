@@ -1,8 +1,10 @@
-//! One linear scan turning a page into rich [`Tok`]s. Total and lossless:
-//! every byte lands in exactly one token (the only exceptions are the spaces a
-//! construct's own grammar eats: after a `>` quote mark and inside a table
-//! cell prefix, both reconstructed from token spans when they degrade), so no
-//! input can fail to lex.
+//! The lexing pass: a chumsky parser over raw bytes (`&'src [u8]`, not `&str`:
+//! every delimiter and keyword is ASCII, so plain byte scans never split a
+//! multibyte character, and `&str` payloads are recovered at the end via
+//! [`sub`]). Total and lossless: every byte lands in exactly one token (the
+//! only exceptions are the spaces a construct's own grammar eats: after a `>`
+//! quote mark and inside a table cell prefix, both reconstructed from token
+//! spans when they degrade), so no input can fail to lex.
 //!
 //! Tokens are rich: bracket constructs arrive pre-split into openers and
 //! closers with their attributes parsed, inline markers (`//`, `##`, `%%`) are
@@ -13,8 +15,38 @@
 //! token spans.
 
 use super::*;
+use chumsky::{input::InputRef, prelude::*};
 
 pub(crate) type Params = HashMap<String, Vec<TextObj>>;
+
+type In<'a> = &'a [u8];
+type E<'a> = extra::Err<Rich<'a, u8>>;
+
+/// One dispatch step's worth of output, fully self-describing: every token
+/// it expands to carries its byte offsets, computed right in the arm that
+/// parsed it, so [`fold_tokens`] only flattens (the spaces a construct's
+/// grammar eats belong to no token, exactly as the hand-written lexer had
+/// it).
+#[derive(Clone)]
+enum TokenOut<'a> {
+    One(Tok<'a>, usize, usize),
+    /// One [`Tok::QuoteMark`] per `>` of the run, at `start + k`.
+    Quote {
+        start: usize,
+        count: usize,
+    },
+    /// `||` plus its cell prefix.
+    Pipe2 {
+        /// The `||` at `[start, start + 2)`.
+        start: usize,
+        /// The header `~` at `[t, t + 1)`.
+        tilde: Option<usize>,
+        /// The alignment char's span `[s, e)` — it swallows the prefix spaces
+        /// before it; the trailing ones are eaten by the step but belong to
+        /// no token (merge needs them when the pipes degrade to text).
+        align: Option<(usize, usize, AlignSide)>,
+    },
+}
 
 /// One listpages body slot (`[[head]]` / `[[body]]` / `[[foot]]`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +74,9 @@ pub(crate) enum Tok<'src> {
     QuoteMark,
     /// `+`…`++++++` + spaces at a line start.
     Heading(u32),
-    /// A full line of 4+ dashes at a line start.
+    /// A full line of 4+ dashes at a line start. The newline terminates the
+    /// rule but stays its own token — the merge's quote machinery needs it to
+    /// end a `> ----` quote line.
     Rule,
     /// `*` / `#` list marker with its indentation (spaces / NBSPs); the
     /// marker's trailing spaces are eaten.
@@ -168,39 +202,560 @@ pub(crate) enum OpenTag<'src> {
     Section(Option<SectionSlot>),
 }
 
+// =========================================================================
+// Parser
+// =========================================================================
+
+pub(crate) fn lex(src: &str) -> Vec<Token<'_>> {
+    tokens()
+        .parse(src.as_bytes())
+        .into_result()
+        .expect("total lexer")
+}
+
+fn tokens<'a>() -> impl Parser<'a, In<'a>, Vec<Token<'a>>, E<'a>> + Clone + 'a {
+    token_run().repeated().collect::<Vec<_>>().map(fold_tokens)
+}
+
+/// One dispatch step: a `>`-mark run, a `||` cell prefix, or any single token.
+/// The choice is total — the [`single`] fallback's `text_run` always consumes
+/// at least one byte — so `repeated` runs until end of input.
+fn token_run<'a>() -> impl Parser<'a, In<'a>, TokenOut<'a>, E<'a>> + Clone + 'a {
+    choice((
+        quote_marks(),
+        pipe2_prefix(),
+        single().map_with(|tok, e| {
+            let span: SimpleSpan = e.span();
+            TokenOut::One(tok, span.start, span.end)
+        }),
+    ))
+}
+
+/// Flatten the dispatch steps into tokens — nothing is re-derived here, the
+/// arms already computed every span.
+fn fold_tokens(items: Vec<TokenOut<'_>>) -> Vec<Token<'_>> {
+    let mut toks = Vec::with_capacity(items.len());
+    for out in items {
+        match out {
+            TokenOut::One(tok, start, end) => toks.push(Token { tok, start, end }),
+            TokenOut::Quote { start, count } => toks.extend((0..count).map(|k| Token {
+                tok: Tok::QuoteMark,
+                start: start + k,
+                end: start + k + 1,
+            })),
+            TokenOut::Pipe2 {
+                start,
+                tilde,
+                align,
+            } => {
+                toks.push(Token {
+                    tok: Tok::Pipe2,
+                    start,
+                    end: start + 2,
+                });
+                if let Some(t) = tilde {
+                    toks.push(Token {
+                        tok: Tok::Tilde,
+                        start: t,
+                        end: t + 1,
+                    });
+                }
+                if let Some((s, e, side)) = align {
+                    toks.push(Token {
+                        tok: Tok::CellAlign(side),
+                        start: s,
+                        end: e,
+                    });
+                }
+            }
+        }
+    }
+    toks
+}
+
+fn single<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    choice((
+        list_mark(),
+        just(b'\n').to(Tok::Newline),
+        heading(),
+        rule(),
+        center_eq(),
+        bracket(),
+        just(b"--]").to(Tok::CommentClose),
+        mark2(),
+        just(b"^^").to(Tok::SupMark),
+        just(b",,").to(Tok::SubMark),
+        color_open(),
+        module_var(),
+        include_var(),
+        escape(),
+        url(),
+        text_run(),
+    ))
+}
+
+/// A zero-width assertion of the line-start context. True at the beginning of
+/// input, right after a newline, and right after a `>`-mark run: the quote
+/// grammar eats the marks and their trailing spaces, so the remainder of the
+/// line lexes as if it were at a line start again (a `>`-run is the run of
+/// `>`s and spaces that leads back to the line start through at least one
+/// `>`).
+fn at_line_start<'a>() -> impl Parser<'a, In<'a>, (), E<'a>> + Clone + 'a {
+    custom(|inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let b = inp.full_slice();
+        let off = *inp.cursor().inner();
+        if off == 0 || b[off - 1] == b'\n' {
+            return Ok(());
+        }
+        let mut j = off;
+        let mut saw_gt = false;
+        while j > 0 && matches!(b[j - 1], b'>' | b' ') {
+            saw_gt |= b[j - 1] == b'>';
+            j -= 1;
+        }
+        if saw_gt && (j == 0 || b[j - 1] == b'\n') {
+            return Ok(());
+        }
+        Err(perr(inp, "expected start of line"))
+    })
+}
+
+/// Zero-width lookbehind: succeeds when the byte just before the cursor is
+/// not `c` (at the beginning of input there is no such byte, so it succeeds).
+fn not_after<'a>(c: u8) -> impl Parser<'a, In<'a>, (), E<'a>> + Clone + 'a {
+    custom(move |inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let b = inp.full_slice();
+        let off = *inp.cursor().inner();
+        if off > 0 && b[off - 1] == c {
+            Err(perr(inp, "forbidden preceding byte"))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+/// One indentation unit: a space or an NBSP (real pages indent lists with
+/// copy-pasted non-breaking spaces).
+fn ws<'a>() -> impl Parser<'a, In<'a>, (), E<'a>> + Clone + 'a {
+    choice((just(b' ').to(()), just(b"\xc2\xa0").to(())))
+}
+
+/// Spaces before `inner`, counted in characters; the whole thing fails (and
+/// the spaces are given back) unless `inner` matches right after them.
+fn indentation<'a, P, O>(inner: P) -> impl Parser<'a, In<'a>, (usize, O), E<'a>> + Clone + 'a
+where
+    P: Parser<'a, In<'a>, O, E<'a>> + Clone + 'a,
+    O: 'a,
+{
+    ws().repeated().count().then(inner)
+}
+
+/// Zero-width: the byte at the cursor differs from the one just before it —
+/// a list marker may not immediately repeat (`**` is bold, not a list).
+fn not_doubled<'a>() -> impl Parser<'a, In<'a>, (), E<'a>> + Clone + 'a {
+    custom(|inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let b = inp.full_slice();
+        let off = *inp.cursor().inner();
+        match (b.get(off), off.checked_sub(1)) {
+            (Some(c), Some(p)) if b[p] == *c => Err(perr(inp, "doubled list mark")),
+            _ => Ok(()),
+        }
+    })
+}
+
+/// The body up to `delim`, a newline, or end of input (the old `read_until`
+/// semantics); the delimiter, when found, is consumed. Returns the body and
+/// whether the delimiter (rather than the line's end) terminated it — the
+/// callers' `choice` fallbacks turn a miss into a short degrade token.
+fn read_until<'a>(
+    delim: &'static [u8],
+) -> impl Parser<'a, In<'a>, (&'a str, bool), E<'a>> + Clone + 'a {
+    custom(move |inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let b = inp.full_slice();
+        let start = *inp.cursor().inner();
+        let mut j = start;
+        while j < b.len() && b[j] != b'\n' && !b[j..].starts_with(delim) {
+            j += 1;
+        }
+        let found = b[j..].starts_with(delim);
+        let end = if found { j + delim.len() } else { j };
+        advance(inp, end - start);
+        Ok((sub(b, start, j), found))
+    })
+}
+
+/// A `>`-marker run: every `>` is one QuoteMark (a nesting level); the
+/// run's spaces are eaten. See [`Tok::QuoteMark`].
+fn quote_marks<'a>() -> impl Parser<'a, In<'a>, TokenOut<'a>, E<'a>> + Clone + 'a {
+    at_line_start()
+        .ignore_then(just(b'>').ignore_then(any().filter(|c| matches!(c, b'>' | b' ')).repeated()))
+        .map_with(|(), e| {
+            let span: SimpleSpan = e.span();
+            TokenOut::Quote {
+                start: span.start,
+                count: e.slice().iter().filter(|&c| *c == b'>').count(),
+            }
+        })
+}
+
+fn list_mark<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    at_line_start().ignore_then(
+        indentation(
+            choice((just(b'*'), just(b'#')))
+                .then_ignore(not_doubled())
+                .then_ignore(ws().repeated()),
+        )
+        .map(|(indent, marker)| Tok::ListMark {
+            ordered: marker == b'#',
+            indent,
+        }),
+    )
+}
+
+/// `+`…`++++++` + spaces at a line start. `repeated` is greedy and does not
+/// backtrack, but that never matters: after any shorter prefix of the same
+/// run the next byte is still `+`, so only the full run can be followed by
+/// the required space — a 7+ run hits the `at_most(6)` bound, fails the
+/// space, and falls through to the one-byte degrade, exactly like the old
+/// lexer's count check. (`count()` ignores `at_least`, so the lower bound is
+/// a `filter`.)
+fn heading<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    at_line_start().ignore_then(
+        just(b'+')
+            .repeated()
+            .at_most(6)
+            .count()
+            .filter(|&n| n >= 1)
+            .then_ignore(just(b' ').repeated().at_least(1))
+            .map(|n| Tok::Heading(n as u32))
+            .or(just(b'+').to(Tok::Text("+"))),
+    )
+}
+
+/// A full line of 4+ dashes at a line start. The newline (or end of input)
+/// terminates the run but is *not* consumed: it becomes the `Newline` token
+/// that ends the line — merge's quote machinery relies on that for a
+/// `> ----` quote line. The `\n`-or-EOF lookahead is zero-width, which pure
+/// combinators cannot express, hence the `custom`.
+fn rule<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    at_line_start().ignore_then(custom(|inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let b = inp.full_slice();
+        let start = *inp.cursor().inner();
+        let mut j = start;
+        while b.get(j) == Some(&b'-') {
+            j += 1;
+        }
+        if j - start >= 4 && matches!(b.get(j), None | Some(&b'\n')) {
+            advance(inp, j - start);
+            Ok(Tok::Rule)
+        } else {
+            Err(perr(inp, "expected rule"))
+        }
+    }))
+}
+
+fn center_eq<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    at_line_start()
+        .ignore_then(just(b'='))
+        .ignore_then(just(b' ').repeated())
+        .to(Tok::CenterEq)
+}
+
+/// `||` plus its cell prefix: `~` (header), then optional spaces around an
+/// alignment char. The prefix's spaces are eaten (they are part of its
+/// grammar); a [`Tok::CellAlign`]'s span swallows the spaces before the char
+/// (merge needs them when the pipes degrade to text).
+fn pipe2_prefix<'a>() -> impl Parser<'a, In<'a>, TokenOut<'a>, E<'a>> + Clone + 'a {
+    just(b"||")
+        .ignore_then(
+            just(b'~')
+                .map_with(|_, e| {
+                    let span: SimpleSpan = e.span();
+                    span.start
+                })
+                .or_not(),
+        )
+        .then(
+            just(b' ')
+                .repeated()
+                .ignore_then(choice((just(b'<'), just(b'='), just(b'>'))).map(align_side))
+                .map_with(|side, e| {
+                    let span: SimpleSpan = e.span();
+                    (span.start, span.end, side)
+                })
+                .then_ignore(just(b' ').repeated())
+                .or_not(),
+        )
+        .map_with(|(tilde, align), e| {
+            let span: SimpleSpan = e.span();
+            TokenOut::Pipe2 {
+                start: span.start,
+                tilde,
+                align,
+            }
+        })
+}
+
+fn align_side(c: u8) -> AlignSide {
+    match c {
+        b'<' => AlignSide::Left,
+        b'=' => AlignSide::Center,
+        b'>' => AlignSide::Right,
+        _ => unreachable!(),
+    }
+}
+
+/// `//`, `**`, `__`, `--` — or a lone sigil as a one-byte text token (the
+/// old parser's character fallback).
+fn mark2<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    choice((
+        just(b"//").to(Tok::Mark(TextStyle::Italic)),
+        just(b"**").to(Tok::Mark(TextStyle::Bold)),
+        just(b"__").to(Tok::Mark(TextStyle::Underline)),
+        just(b"--").to(Tok::Mark(TextStyle::Strikethrough)),
+        just(b'/').to(Tok::Text("/")),
+        just(b'*').to(Tok::Text("*")),
+        just(b'_').to(Tok::Text("_")),
+        just(b'-').to(Tok::Text("-")),
+    ))
+}
+
+/// `##spec|` — the `|` must appear on this line (the old `read_until` stopped
+/// at newlines); otherwise the `##` is a closer (or plain text when it
+/// degrades).
+fn color_open<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    choice((
+        just(b"##")
+            .ignore_then(read_until(b"|"))
+            .filter(|(_, found)| *found)
+            .map(|(spec, _)| Tok::ColorOpen(spec)),
+        just(b"##").to(Tok::ColorClose),
+    ))
+}
+
+fn module_var<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    choice((
+        just(b"%%")
+            .ignore_then(read_until(b"%%"))
+            .filter(|(_, found)| *found)
+            .map(|(raw, _)| match raw.split_once('|') {
+                Some((name, default)) => Tok::ModuleVar {
+                    name,
+                    default: Some(default),
+                },
+                None => Tok::ModuleVar {
+                    name: raw,
+                    default: None,
+                },
+            }),
+        just(b"%%").to(Tok::Text("%%")),
+    ))
+}
+
+fn include_var<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    choice((
+        just(b"{$")
+            .ignore_then(read_until(b"}"))
+            .filter(|(_, found)| *found)
+            .map(|(raw, _)| match raw.split_once("//") {
+                Some((name, default)) => Tok::IncludeVar {
+                    name,
+                    default: Some(default),
+                },
+                None => Tok::IncludeVar {
+                    name: raw,
+                    default: None,
+                },
+            }),
+        just(b"{$").to(Tok::Text("{$")),
+    ))
+}
+
+fn escape<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    just(b"@@")
+        .ignore_then(read_until(b"@@"))
+        .map(|(body, _)| Tok::Escape(body))
+}
+
+fn url<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    choice((just(b"http://").to(()), just(b"https://").to(())))
+        .ignore_then(any().filter(|c| is_url_char(*c)).repeated())
+        .map_with(|(), e| Tok::Url(str::from_utf8(e.slice()).expect("char boundary")))
+}
+
+/// A maximal run of bytes that cannot begin a construct. `>` `+` `=` never
+/// stop it mid-line (their line constructs were already tried and declined),
+/// and `h` stops it only when it starts a URL.
+fn text_run<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    custom(|inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let b = inp.full_slice();
+        let start = *inp.cursor().inner();
+        let mut j = start;
+        while j < b.len() {
+            let stop = match b[j] {
+                b'\n' | b'[' | b'@' | b'%' | b'{' | b'#' | b'/' | b'*' | b'_' | b'-' | b'^'
+                | b',' | b'|' => true,
+                b'h' => b[j..].starts_with(b"http://") || b[j..].starts_with(b"https://"),
+                _ => false,
+            };
+            if stop {
+                break;
+            }
+            j += 1;
+        }
+        // The run can only stop at an ASCII byte; when it stops immediately
+        // (a lone sigil), that byte is consumed alone so lexing stays total.
+        // At end of input there is nothing to consume: fail so `repeated`
+        // terminates.
+        if j == start {
+            if j >= b.len() {
+                return Err(perr(inp, "expected any byte"));
+            }
+            j += 1;
+        }
+        advance(inp, j - start);
+        Ok(Tok::Text(sub(b, start, j)))
+    })
+}
+
+/// Everything starting at a `[`: `[!--`, `[[[…]]]`, a known `[[…]]`
+/// construct, `[url text]`, or a lone `[`/`[[` degrade.
+fn bracket<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    choice((
+        just(b"[!--").to(Tok::CommentOpen),
+        link3(),
+        known_bracket(),
+        not_after(b'[').ignore_then(link1()),
+        just(b"[[")
+            .to(Tok::Text("[["))
+            .or(just(b"[").to(Tok::Text("["))),
+    ))
+}
+
+/// `[[[target|text]]]` — or, when the construct does not close on this
+/// shape, the two-bracket degrade.
+fn link3<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    custom(|inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let b = inp.full_slice();
+        let start = *inp.cursor().inner();
+        if !b[start..].starts_with(b"[[[") {
+            return Err(perr(inp, "expected '[[['"));
+        }
+        match lex_link3(b, start) {
+            Some((end, target, text)) => {
+                advance(inp, end - start);
+                Ok(Tok::Link3 { target, text })
+            }
+            // `[[[` whose body did not close: degrade to a `[[` text token
+            // (the third `[` is then re-lexed by the next dispatch step).
+            None => {
+                advance(inp, 2);
+                Ok(Tok::Text("[["))
+            }
+        }
+    })
+}
+
+/// A known `[[…]]` construct: a closer, an opener, or a listpages section
+/// marker (keywords matched by the [`OPENERS`]/[`CLOSERS`] tables).
+fn known_bracket<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    custom(|inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let b = inp.full_slice();
+        let start = *inp.cursor().inner();
+        if !b[start..].starts_with(b"[[") {
+            return Err(perr(inp, "expected '[[ construct'"));
+        }
+        let Some((end, tok)) = lex_bracket(b, start) else {
+            return Err(perr(inp, "unknown '[[ construct'"));
+        };
+        advance(inp, end - start);
+        Ok(tok)
+    })
+}
+
+/// `[url text]` / `[url]`, rejected when the `[` is followed by `[`, `!`,
+/// `]` or a newline. The leading `[` is consumed by [`just`] so the cursor
+/// entering [`lex_link1`] is past it (the helper reads from the bracket's
+/// position, `after - 1`).
+fn link1<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    just(b'[').ignore_then(custom(|inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let b = inp.full_slice();
+        let after = *inp.cursor().inner();
+        let Some((end, target, text)) = lex_link1(b, after - 1) else {
+            return Err(perr(inp, "expected link"));
+        };
+        advance(inp, end - after);
+        Ok(Tok::Link1 { target, text })
+    }))
+}
+
+// =========================================================================
+// Byte helpers
+// =========================================================================
+
+fn perr<'a>(inp: &mut InputRef<'a, '_, In<'a>, E<'a>>, msg: &'static str) -> Rich<'a, u8> {
+    let cur = inp.cursor();
+    Rich::custom(inp.span_since(&cur), msg)
+}
+
+fn advance<'a>(inp: &mut InputRef<'a, '_, In<'a>, E<'a>>, n: usize) {
+    for _ in 0..n {
+        inp.next();
+    }
+}
+
+/// A `&str` payload over a byte range. The scans only stop at ASCII
+/// delimiters (or char starts when stepping by [`char_len_at`]), so both ends
+/// are always char boundaries and the slice is valid UTF-8.
+fn sub(b: &[u8], start: usize, end: usize) -> &str {
+    str::from_utf8(&b[start..end]).expect("char boundary")
+}
+
+/// The length of the UTF-8 character starting at `k` (0 past the end; a
+/// continuation byte — unreachable at scan positions — reads as 1).
+fn char_len_at(b: &[u8], k: usize) -> usize {
+    match b.get(k) {
+        None => 0,
+        Some(0xC0..=0xDF) => 2,
+        Some(0xE0..=0xEF) => 3,
+        Some(0xF0..=0xF4) => 4,
+        Some(_) => 1,
+    }
+}
+
 /// Attribute-context whitespace: real pages carry copy-pasted non-breaking
 /// spaces inside module headers (`[[module ListPages\u{a0}category=…]]`).
-fn is_param_ws(src: &str, i: usize) -> bool {
-    src[i..].starts_with(' ') || src[i..].starts_with('\u{a0}')
+fn is_param_ws(b: &[u8], i: usize) -> bool {
+    b.get(i) == Some(&b' ') || b[i..].starts_with(&[0xC2, 0xA0])
 }
 
-fn is_prop_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || c == '#'
+fn is_prop_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'#')
 }
 
-fn is_url_char(c: char) -> bool {
+fn is_url_char(c: u8) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(
             c,
-            '-' | '.'
-                | '_'
-                | '~'
-                | ':'
-                | '/'
-                | '?'
-                | '#'
-                | '@'
-                | '!'
-                | '$'
-                | '&'
-                | '\''
-                | '('
-                | ')'
-                | '*'
-                | '+'
-                | ','
-                | ';'
-                | '='
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b':'
+                | b'/'
+                | b'?'
+                | b'#'
+                | b'@'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
         )
 }
 
@@ -265,10 +820,14 @@ const CLOSERS: &[(&[u8], ClosedTag)] = &[
     ),
 ];
 
+/// The tail parser of an opener keyword: bytes right after the keyword →
+/// the construct's end offset and its parsed tag.
+type Tail = fn(&[u8], usize) -> Option<(usize, OpenTag)>;
+
 /// The opener keywords and their tail parsers (a keyword matches by prefix,
 /// exactly like the old `kw_ci` combinators; `hcell` shadows `cell`, `table`
 /// and `tabview` shadow `tab`).
-const OPENERS: &[(&[u8], fn(&str, usize) -> Option<(usize, OpenTag)>)] = &[
+const OPENERS: &[(&[u8], Tail)] = &[
     (b"collapsible", collapsible_tail),
     (b"tabview", tabview_tail),
     (b"hcell", hcell_tail),
@@ -304,8 +863,7 @@ fn skip_spaces(b: &[u8], mut k: usize) -> usize {
 /// Earliest of `delim` searching from `k`, not crossing a newline (the old
 /// `read_until` semantics: delimiters, `\n`, or end of input — earliest wins).
 /// `None` when `delim` never occurs before the line ends.
-fn read_to(src: &str, k: usize, delim: &[u8]) -> Option<usize> {
-    let b = src.as_bytes();
+fn read_to(b: &[u8], k: usize, delim: &[u8]) -> Option<usize> {
     let mut j = k;
     while j < b.len() {
         if b[j] == b'\n' {
@@ -319,340 +877,19 @@ fn read_to(src: &str, k: usize, delim: &[u8]) -> Option<usize> {
     None
 }
 
-pub(crate) fn lex(src: &str) -> Vec<Token<'_>> {
-    let b = src.as_bytes();
-    let mut toks: Vec<Token> = Vec::new();
-    let mut i = 0usize;
-    let mut at_ls = true;
-
-    macro_rules! push {
-        ($tok:expr, $start:expr, $end:expr) => {{
-            let is_nl = matches!($tok, Tok::Newline);
-            toks.push(Token {
-                tok: $tok,
-                start: $start,
-                end: $end,
-            });
-            at_ls = is_nl;
-        }};
-    }
-
-    while i < b.len() {
-        // A list marker, possibly indented, may only appear at a line start.
-        // On a miss the general dispatch below still applies (`**bold**`,
-        // `##color##` are inline markup, indent spaces are text).
-        if at_ls
-            && matches!(b[i], b'*' | b'#' | b' ' | 0xC2)
-            && let Some((end, ordered, indent)) = lex_list_mark(src, i)
-        {
-            let start = i;
-            i = end;
-            push!(Tok::ListMark { ordered, indent }, start, i);
-            continue;
-        }
-        let start = i;
-        match b[i] {
-            b'\n' => {
-                i += 1;
-                push!(Tok::Newline, start, i);
-            }
-            // A `>`-marker run: `>`s and spaces from the line start. Every `>`
-            // is one QuoteMark (a nesting level). The rest of the line is
-            // lexed as a fresh line start — stripping one marker level (what
-            // the quote merge does) restores exactly that context, so `> + h`
-            // is a heading and `> ----` a rule *inside* the quote.
-            b'>' if at_ls => {
-                while i < b.len() && (b[i] == b'>' || b[i] == b' ') {
-                    if b[i] == b'>' {
-                        let s = i;
-                        i += 1;
-                        toks.push(Token {
-                            tok: Tok::QuoteMark,
-                            start: s,
-                            end: i,
-                        });
-                    } else {
-                        i += 1;
-                    }
-                }
-                at_ls = true;
-            }
-            b'+' if at_ls => {
-                let mut n = 0;
-                while i + n < b.len() && b[i + n] == b'+' {
-                    n += 1;
-                }
-                if (1..=6).contains(&n) && b.get(i + n) == Some(&b' ') {
-                    i += n;
-                    while i < b.len() && b[i] == b' ' {
-                        i += 1;
-                    }
-                    push!(Tok::Heading(n as u32), start, i);
-                } else {
-                    i += 1;
-                    push!(Tok::Text(&src[start..i]), start, i);
-                }
-            }
-            b'-' if at_ls && {
-                let mut j = i;
-                while j < b.len() && b[j] == b'-' {
-                    j += 1;
-                }
-                j - i >= 4 && matches!(b.get(j), None | Some(b'\n'))
-            } =>
-            {
-                while i < b.len() && b[i] == b'-' {
-                    i += 1;
-                }
-                push!(Tok::Rule, start, i);
-            }
-            b'=' if at_ls => {
-                i += 1;
-                while i < b.len() && b[i] == b' ' {
-                    i += 1;
-                }
-                push!(Tok::CenterEq, start, i);
-            }
-            b'|' if b.get(i + 1) == Some(&b'|') => {
-                i += 2;
-                push!(Tok::Pipe2, start, i);
-                // Cell prefix: `~` immediately after `||`, then optional
-                // spaces around an alignment char. Spaces are eaten (they are
-                // part of the prefix grammar) and restored from the span when
-                // the pipe degrades to text.
-                if b.get(i) == Some(&b'~') {
-                    let s = i;
-                    i += 1;
-                    push!(Tok::Tilde, s, i);
-                }
-                let after_tilde = i;
-                let mut j = i;
-                while j < b.len() && b[j] == b' ' {
-                    j += 1;
-                }
-                let side = match b.get(j) {
-                    Some(b'<') => Some(AlignSide::Left),
-                    Some(b'=') => Some(AlignSide::Center),
-                    Some(b'>') => Some(AlignSide::Right),
-                    _ => None,
-                };
-                if let Some(side) = side {
-                    i = j + 1;
-                    push!(Tok::CellAlign(side), after_tilde, i);
-                    while i < b.len() && b[i] == b' ' {
-                        i += 1;
-                    }
-                }
-            }
-            b'[' => {
-                if src[i..].starts_with("[!--") {
-                    i += 4;
-                    push!(Tok::CommentOpen, start, i);
-                } else if src[i..].starts_with("[[[") {
-                    if let Some((end, target, text)) = lex_link3(src, i) {
-                        i = end;
-                        push!(Tok::Link3 { target, text }, start, i);
-                    } else {
-                        i += 2;
-                        push!(Tok::Text("[["), start, i);
-                    }
-                } else if src[i..].starts_with("[[") {
-                    if let Some((end, tok)) = lex_bracket(src, i) {
-                        i = end;
-                        push!(tok, start, i);
-                    } else {
-                        i += 2;
-                        push!(Tok::Text("[["), start, i);
-                    }
-                } else if b.get(i.wrapping_sub(1)) != Some(&b'[')
-                    && let Some((end, target, text)) = lex_link1(src, i)
-                {
-                    i = end;
-                    push!(Tok::Link1 { target, text }, start, i);
-                } else {
-                    i += 1;
-                    push!(Tok::Text("["), start, i);
-                }
-            }
-            b'-' if src[i..].starts_with("--]") => {
-                i += 3;
-                push!(Tok::CommentClose, start, i);
-            }
-            b'-' | b'/' | b'*' | b'_' => {
-                let style = match b[i] {
-                    b'/' => TextStyle::Italic,
-                    b'*' => TextStyle::Bold,
-                    b'_' => TextStyle::Underline,
-                    _ => TextStyle::Strikethrough,
-                };
-                if b.get(i + 1) == Some(&b[i]) {
-                    i += 2;
-                    push!(Tok::Mark(style), start, i);
-                } else {
-                    i += 1;
-                    push!(Tok::Text(&src[start..i]), start, i);
-                }
-            }
-            b'^' if b.get(i + 1) == Some(&b'^') => {
-                i += 2;
-                push!(Tok::SupMark, start, i);
-            }
-            b',' if b.get(i + 1) == Some(&b',') => {
-                i += 2;
-                push!(Tok::SubMark, start, i);
-            }
-            b'#' if b.get(i + 1) == Some(&b'#') => {
-                // `##spec|` — the `|` must appear on this line (the old
-                // `read_until` stopped at newlines); otherwise the `##` is a
-                // closer (or plain text when it degrades).
-                let mut j = i + 2;
-                while j < b.len() && b[j] != b'|' && b[j] != b'\n' {
-                    j += 1;
-                }
-                if b.get(j) == Some(&b'|') {
-                    let spec = &src[i + 2..j];
-                    i = j + 1;
-                    push!(Tok::ColorOpen(spec), start, i);
-                } else {
-                    i += 2;
-                    push!(Tok::ColorClose, start, i);
-                }
-            }
-            b'%' if b.get(i + 1) == Some(&b'%') => {
-                let mut j = i + 2;
-                while j < b.len() && b[j] != b'\n' && !src[j..].starts_with("%%") {
-                    j += src[j..].chars().next().map_or(1, char::len_utf8);
-                }
-                if src[j..].starts_with("%%") {
-                    let raw = &src[i + 2..j];
-                    let (name, default) = match raw.split_once('|') {
-                        Some((n, d)) => (n, Some(d)),
-                        None => (raw, None),
-                    };
-                    i = j + 2;
-                    push!(Tok::ModuleVar { name, default }, start, i);
-                } else {
-                    i += 2;
-                    push!(Tok::Text("%%"), start, i);
-                }
-            }
-            b'{' if src[i..].starts_with("{$") => {
-                let mut j = i + 2;
-                while j < b.len() && b[j] != b'}' && b[j] != b'\n' {
-                    j += 1;
-                }
-                if b.get(j) == Some(&b'}') {
-                    let raw = &src[i + 2..j];
-                    let (name, default) = match raw.split_once("//") {
-                        Some((n, d)) => (n, Some(d)),
-                        None => (raw, None),
-                    };
-                    i = j + 1;
-                    push!(Tok::IncludeVar { name, default }, start, i);
-                } else {
-                    i += 2;
-                    push!(Tok::Text("{$"), start, i);
-                }
-            }
-            b'@' if b.get(i + 1) == Some(&b'@') => {
-                let mut j = i + 2;
-                while j < b.len() && b[j] != b'\n' && !src[j..].starts_with("@@") {
-                    j += src[j..].chars().next().map_or(1, char::len_utf8);
-                }
-                let body = &src[i + 2..j];
-                i = if src[j..].starts_with("@@") { j + 2 } else { j };
-                push!(Tok::Escape(body), start, i);
-            }
-            b'h' if src[i..].starts_with("http://") || src[i..].starts_with("https://") => {
-                let scheme_len = if src[i..].starts_with("https://") {
-                    8
-                } else {
-                    7
-                };
-                let mut j = i + scheme_len;
-                while src[j..].chars().next().is_some_and(is_url_char) {
-                    j += src[j..].chars().next().map_or(1, char::len_utf8);
-                }
-                i = j;
-                push!(Tok::Url(&src[start..i]), start, i);
-            }
-            _ => {
-                i = text_run_end(src, i, at_ls);
-                if i == start {
-                    i += src[start..].chars().next().map_or(1, char::len_utf8);
-                }
-                push!(Tok::Text(&src[start..i]), start, i);
-            }
-        }
-    }
-    toks
-}
-
-/// A maximal run of characters that cannot begin a construct. `>` `+` `=`
-/// only break the run at a line start (there they have line constructs); `h`
-/// only when it starts a URL.
-fn text_run_end(src: &str, from: usize, at_ls_start: bool) -> usize {
-    let b = src.as_bytes();
-    let mut j = from;
-    let mut at_ls = at_ls_start;
-    while j < b.len() {
-        let stop = match b[j] {
-            b'\n' | b'[' | b'@' | b'%' | b'{' | b'#' | b'/' | b'*' | b'_' | b'-' | b'^' | b','
-            | b'|' => true,
-            b'h' => src[j..].starts_with("http://") || src[j..].starts_with("https://"),
-            b'>' | b'+' | b'=' => at_ls,
-            _ => false,
-        };
-        if stop {
-            break;
-        }
-        j += src[j..].chars().next().map_or(1, char::len_utf8);
-        at_ls = false;
-    }
-    j
-}
-
-/// An indented (or bare) `*` / `#` list marker. Returns the end offset (past
-/// the marker's trailing spaces / NBSPs), the ordering, and the indent width
-/// in characters.
-fn lex_list_mark(src: &str, i: usize) -> Option<(usize, bool, usize)> {
-    let b = src.as_bytes();
-    let mut j = i;
-    let mut indent = 0usize;
-    while b.get(j) == Some(&b' ') || src[j..].starts_with('\u{a0}') {
-        indent += 1;
-        j += src[j..].chars().next().map_or(1, char::len_utf8);
-    }
-    let ordered = match b.get(j) {
-        Some(b'*') => false,
-        Some(b'#') => true,
-        _ => return None,
-    };
-    // `**bold**` / `##color##` are inline markup, not lists.
-    if b.get(j + 1) == Some(&b[j]) {
-        return None;
-    }
-    j += 1;
-    while is_param_ws(src, j) {
-        j += src[j..].chars().next().map_or(1, char::len_utf8);
-    }
-    Some((j, ordered, indent))
-}
-
 /// `[[[target|text]]]` — one token spanning to the first `]]]`.
-fn lex_link3(src: &str, i: usize) -> Option<(usize, &str, Option<&str>)> {
-    let b = src.as_bytes();
+fn lex_link3(b: &[u8], i: usize) -> Option<(usize, &str, Option<&str>)> {
     let mut j = i + 3;
     while j < b.len() && b[j] != b'|' && b[j] != b'\n' && !b[j..].starts_with(b"]]]") {
         j += 1;
     }
-    if b.get(j..).is_some_and(|r| r.starts_with(b"]]]")) {
-        return Some((j + 3, &src[i + 3..j], None));
+    if b[j..].starts_with(b"]]]") {
+        return Some((j + 3, sub(b, i + 3, j), None));
     }
     if b.get(j) != Some(&b'|') {
         return None;
     }
-    let target = &src[i + 3..j];
+    let target = sub(b, i + 3, j);
     let mut k = j + 1;
     while k < b.len() && !b[k..].starts_with(b"]]]") {
         // The old `content_before` body stopped at any `[[/…]]` closer, and
@@ -660,18 +897,17 @@ fn lex_link3(src: &str, i: usize) -> Option<(usize, &str, Option<&str>)> {
         if b[k..].starts_with(b"[[/") {
             return None;
         }
-        k += src[k..].chars().next().map_or(1, char::len_utf8);
+        k += 1;
     }
     if !b.get(k..).is_some_and(|r| r.starts_with(b"]]]")) {
         return None;
     }
-    Some((k + 3, target, Some(&src[j + 1..k])))
+    Some((k + 3, target, Some(sub(b, j + 1, k))))
 }
 
 /// `[url text]` / `[url]`, rejected when the `[` is followed by `[`, `!`,
 /// `]` or a newline (the predecessor check lives in the caller).
-fn lex_link1(src: &str, i: usize) -> Option<(usize, &str, Option<&str>)> {
-    let b = src.as_bytes();
+fn lex_link1(b: &[u8], i: usize) -> Option<(usize, &str, Option<&str>)> {
     match b.get(i + 1) {
         Some(b'[') | Some(b'!') | Some(b']') | Some(b'\n') | None => return None,
         _ => {}
@@ -680,7 +916,7 @@ fn lex_link1(src: &str, i: usize) -> Option<(usize, &str, Option<&str>)> {
     while j < b.len() && b[j] != b' ' && b[j] != b']' && b[j] != b'\n' {
         j += 1;
     }
-    let target = &src[i + 1..j];
+    let target = sub(b, i + 1, j);
     match b.get(j) {
         Some(b']') => Some((j + 1, target, None)),
         Some(b' ') => {
@@ -688,7 +924,7 @@ fn lex_link1(src: &str, i: usize) -> Option<(usize, &str, Option<&str>)> {
             while t_end < b.len() && b[t_end] != b']' {
                 t_end += 1;
             }
-            let text = &src[j + 1..t_end];
+            let text = sub(b, j + 1, t_end);
             let end = if t_end < b.len() { t_end + 1 } else { t_end };
             Some((end, target, Some(text)))
         }
@@ -699,8 +935,7 @@ fn lex_link1(src: &str, i: usize) -> Option<(usize, &str, Option<&str>)> {
 /// A known `[[…]]` construct at `i`: a closer, an opener, or a listpages
 /// section marker. Keywords sit directly after `[[` (the only exceptions:
 /// closers and section markers may carry inner spaces, and `[[ tab]]`).
-fn lex_bracket<'src>(src: &'src str, i: usize) -> Option<(usize, Tok<'src>)> {
-    let b = src.as_bytes();
+fn lex_bracket<'src>(b: &'src [u8], i: usize) -> Option<(usize, Tok<'src>)> {
     let j = i + 2;
     if b.get(j) == Some(&b'/') {
         let mut k = j + 1;
@@ -729,23 +964,23 @@ fn lex_bracket<'src>(src: &'src str, i: usize) -> Option<(usize, Tok<'src>)> {
     }
     // Exact alignment openers (no params, no inner spaces): `[[f<]]`, `[[==]]`…
     for (form, floating, side) in [
-        ("f<]]", true, AlignSide::Left),
-        ("f>]]", true, AlignSide::Right),
-        ("==]]", false, AlignSide::Justify),
-        ("<]]", false, AlignSide::Left),
-        (">]]", false, AlignSide::Right),
-        ("=]]", false, AlignSide::Center),
+        (&b"f<]]"[..], true, AlignSide::Left),
+        (&b"f>]]"[..], true, AlignSide::Right),
+        (&b"==]]"[..], false, AlignSide::Justify),
+        (&b"<]]"[..], false, AlignSide::Left),
+        (&b">]]"[..], false, AlignSide::Right),
+        (&b"=]]"[..], false, AlignSide::Center),
     ] {
-        if src[j..].starts_with(form) {
+        if b[j..].starts_with(form) {
             return Some((j + form.len(), Tok::Open(OpenTag::Align { floating, side })));
         }
     }
-    if let Some((end, tag)) = lex_image(src, j) {
+    if let Some((end, tag)) = lex_image(b, j) {
         return Some((end, Tok::Open(tag)));
     }
     for (kw, tail) in OPENERS {
         if ci_starts(&b[j..], kw)
-            && let Some((end, tag)) = tail(src, j + kw.len())
+            && let Some((end, tag)) = tail(b, j + kw.len())
         {
             return Some((end, Tok::Open(tag)));
         }
@@ -757,7 +992,7 @@ fn lex_bracket<'src>(src: &'src str, i: usize) -> Option<(usize, Tok<'src>)> {
     }
     if k > j
         && ci_starts(&b[k..], b"tab")
-        && let Some((end, name)) = tab_name(src, k + 3)
+        && let Some((end, name)) = tab_name(b, k + 3)
     {
         return Some((end, Tok::Open(OpenTag::Tab { name })));
     }
@@ -774,184 +1009,152 @@ fn marker_end(b: &[u8], mut m: usize) -> Option<usize> {
         .then_some(m + 2)
 }
 
-fn div_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    let b = src.as_bytes();
+fn div_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     let underscore = b.get(j) == Some(&b'_');
     let k = if underscore { j + 1 } else { j };
     let mut params = Params::new();
-    let k = lex_params(src, k, &mut params);
+    let k = lex_params(b, k, &mut params);
     let k = skip_spaces(b, k);
     b.get(k..)
         .is_some_and(|r| r.starts_with(b"]]"))
         .then(|| (k + 2, OpenTag::Div { underscore, params }))
 }
 
-fn span_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    container_tail(src, j, |params| OpenTag::Span { params })
+fn span_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    container_tail(b, j, |params| OpenTag::Span { params })
 }
 
-fn table_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    container_tail(src, j, |params| OpenTag::Table { params })
+fn table_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    container_tail(b, j, |params| OpenTag::Table { params })
 }
 
-fn row_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    container_tail(src, j, |params| OpenTag::Row { params })
+fn row_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    container_tail(b, j, |params| OpenTag::Row { params })
 }
 
-fn anchor_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    container_tail(src, j, |params| OpenTag::Anchor { params })
+fn anchor_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    container_tail(b, j, |params| OpenTag::Anchor { params })
 }
 
 /// `[[KW _? params spaces ]]` — the shape shared by span/table/row/a.
 fn container_tail<'src, F: Fn(Params) -> OpenTag<'src>>(
-    src: &'src str,
+    b: &'src [u8],
     j: usize,
     build: F,
 ) -> Option<(usize, OpenTag<'src>)> {
-    let b = src.as_bytes();
     let k = if b.get(j) == Some(&b'_') { j + 1 } else { j };
     let mut params = Params::new();
-    let k = lex_params(src, k, &mut params);
+    let k = lex_params(b, k, &mut params);
     let k = skip_spaces(b, k);
     b.get(k..)
         .is_some_and(|r| r.starts_with(b"]]"))
         .then(|| (k + 2, build(params)))
 }
 
-fn cell_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    cell_tail_with(src, j, false)
+fn cell_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    cell_tail_with(b, j, false)
 }
 
-fn hcell_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    cell_tail_with(src, j, true)
+fn hcell_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    cell_tail_with(b, j, true)
 }
 
-fn cell_tail_with(src: &str, j: usize, header: bool) -> Option<(usize, OpenTag<'_>)> {
-    let b = src.as_bytes();
+fn cell_tail_with(b: &[u8], j: usize, header: bool) -> Option<(usize, OpenTag<'_>)> {
     let mut params = Params::new();
-    let k = lex_params(src, j, &mut params);
+    let k = lex_params(b, j, &mut params);
     let k = skip_spaces(b, k);
     b.get(k..)
         .is_some_and(|r| r.starts_with(b"]]"))
         .then(|| (k + 2, OpenTag::Cell { header, params }))
 }
 
-fn collapsible_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    let b = src.as_bytes();
+fn collapsible_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     let mut params = Params::new();
-    let k = lex_params(src, j, &mut params);
+    let k = lex_params(b, j, &mut params);
     let k = skip_spaces(b, k);
     b.get(k..)
         .is_some_and(|r| r.starts_with(b"]]"))
         .then(|| (k + 2, OpenTag::Collapsible { params }))
 }
 
-fn tabview_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    let b = src.as_bytes();
+fn tabview_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     let mut params = Params::new();
-    let k = lex_params(src, j, &mut params);
+    let k = lex_params(b, j, &mut params);
     let k = skip_spaces(b, k);
     b.get(k..)
         .is_some_and(|r| r.starts_with(b"]]"))
         .then_some((k + 2, OpenTag::Tabview))
 }
 
-fn size_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    let b = src.as_bytes();
+fn size_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     if b.get(j) != Some(&b' ') {
         return None;
     }
-    let mut k = j;
-    while b.get(k) == Some(&b' ') {
-        k += 1;
-    }
-    let end = read_to(src, k, b"]]")?;
-    let arg = src[k..end].trim();
-    b.get(end..)
-        .is_some_and(|r| r.starts_with(b"]]"))
-        .then(|| (end + 2, OpenTag::Size(arg)))
+    let k = skip_spaces(b, j);
+    let end = read_to(b, k, b"]]")?;
+    let arg = sub(b, k, end).trim();
+    Some((end + 2, OpenTag::Size(arg)))
 }
 
-fn iftags_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    let b = src.as_bytes();
+fn iftags_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     if b.get(j) != Some(&b' ') {
         return None;
     }
-    let mut k = j;
-    while b.get(k) == Some(&b' ') {
-        k += 1;
-    }
-    let end = read_to(src, k, b"]]")?;
-    let filter = &src[k..end];
-    b.get(end..)
-        .is_some_and(|r| r.starts_with(b"]]"))
-        .then(|| (end + 2, OpenTag::IfTags(filter)))
+    let k = skip_spaces(b, j);
+    let end = read_to(b, k, b"]]")?;
+    Some((end + 2, OpenTag::IfTags(sub(b, k, end))))
 }
 
-fn code_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    let b = src.as_bytes();
-    let end = read_to(src, j, b"]]")?;
-    b.get(end..)
-        .is_some_and(|r| r.starts_with(b"]]"))
-        .then_some((end + 2, OpenTag::Code))
+fn code_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    let end = read_to(b, j, b"]]")?;
+    Some((end + 2, OpenTag::Code))
 }
 
-fn head_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    marker_end(src.as_bytes(), j).map(|end| (end, OpenTag::Section(Some(SectionSlot::Head))))
+fn head_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    marker_end(b, j).map(|end| (end, OpenTag::Section(Some(SectionSlot::Head))))
 }
 
-fn body_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    marker_end(src.as_bytes(), j).map(|end| (end, OpenTag::Section(Some(SectionSlot::Body))))
+fn body_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    marker_end(b, j).map(|end| (end, OpenTag::Section(Some(SectionSlot::Body))))
 }
 
-fn foot_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    marker_end(src.as_bytes(), j).map(|end| (end, OpenTag::Section(Some(SectionSlot::Foot))))
+fn foot_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    marker_end(b, j).map(|end| (end, OpenTag::Section(Some(SectionSlot::Foot))))
 }
 
 /// `[[tab name]]` at top level (no leading spaces; the spaced form is a
 /// special case in [`lex_bracket`]).
-fn tab_top_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    tab_name(src, j).map(|(end, name)| (end, OpenTag::Tab { name }))
+fn tab_top_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    tab_name(b, j).map(|(end, name)| (end, OpenTag::Tab { name }))
 }
 
 /// The `name]]` tail of a tab opener, spaces before the name included. The
 /// name runs to `]]` crossing newlines (the old body stopped at `]]` only).
-fn tab_name(src: &str, j: usize) -> Option<(usize, &str)> {
-    let b = src.as_bytes();
-    let mut k = j;
-    while b.get(k) == Some(&b' ') {
-        k += 1;
-    }
+fn tab_name(b: &[u8], j: usize) -> Option<(usize, &str)> {
+    let k = skip_spaces(b, j);
     let mut end = k;
     while end < b.len() && !b[end..].starts_with(b"]]") {
-        end += src[end..].chars().next().map_or(1, char::len_utf8);
+        end += 1;
     }
     b.get(end..)
         .is_some_and(|r| r.starts_with(b"]]"))
-        .then_some((end + 2, &src[k..end]))
+        .then_some((end + 2, sub(b, k, end)))
 }
 
-fn module_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    let b = src.as_bytes();
+fn module_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     if b.get(j) != Some(&b' ') {
         return None;
     }
-    let mut k = j;
-    while b.get(k) == Some(&b' ') {
-        k += 1;
+    let k = skip_spaces(b, j);
+    let lower = b[k..].to_ascii_lowercase();
+    if lower.starts_with(b"css") {
+        let end = read_to(b, k + 3, b"]]")?;
+        return Some((end + 2, OpenTag::Css));
     }
-    let lower = src[k..].to_ascii_lowercase();
-    if lower.starts_with("css") {
-        let end = read_to(src, k + 3, b"]]")?;
-        return b
-            .get(end..)
-            .is_some_and(|r| r.starts_with(b"]]"))
-            .then_some((end + 2, OpenTag::Css));
-    }
-    if lower.starts_with("listpages") {
+    if lower.starts_with(b"listpages") {
         let mut m = k + 9;
         let mut params = Params::new();
-        m = lex_params(src, m, &mut params);
+        m = lex_params(b, m, &mut params);
         m = skip_spaces(b, m);
         if b.get(m..).is_some_and(|r| r.starts_with(b"]]")) {
             return Some((m + 2, OpenTag::ListPages { params }));
@@ -965,26 +1168,22 @@ fn module_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
     if n == 0 {
         return None;
     }
-    let name = src[k..k + n].to_string();
+    let name = sub(b, k, k + n).to_string();
     let mut m = k + n;
-    while m < b.len() && b[m] != b'\n' && !src[m..].starts_with("]]") {
-        m += src[m..].chars().next().map_or(1, char::len_utf8);
+    while m < b.len() && b[m] != b'\n' && !b[m..].starts_with(b"]]") {
+        m += 1;
     }
-    if src[m..].starts_with("]]") {
+    if b[m..].starts_with(b"]]") {
         m += 2;
     }
     Some((m, OpenTag::Module(name)))
 }
 
-fn include_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    let b = src.as_bytes();
+fn include_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     if b.get(j) != Some(&b' ') {
         return None;
     }
-    let mut k = j;
-    while b.get(k) == Some(&b' ') {
-        k += 1;
-    }
+    let k = skip_spaces(b, j);
     // Balanced `]]` scan: a nested `[[…]]` inside a value must not close the
     // directive (port of the old `read_include_body`).
     let bytes = &b[k..];
@@ -1000,7 +1199,7 @@ fn include_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
                 return Some((
                     k + p + 2,
                     OpenTag::Include {
-                        raw: &src[k..k + p],
+                        raw: sub(b, k, k + p),
                     },
                 ));
             }
@@ -1012,14 +1211,13 @@ fn include_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
     None
 }
 
-fn image_tail(src: &str, j: usize) -> Option<(usize, OpenTag<'_>)> {
-    lex_image(src, j)
+fn image_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    lex_image(b, j)
 }
 
 /// `[[<image source params]]` with an optional alignment prefix.
-fn lex_image<'src>(src: &'src str, j: usize) -> Option<(usize, OpenTag<'src>)> {
-    let b = src.as_bytes();
-    let (align, mut m) = if src[j..].starts_with("f<") {
+fn lex_image(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    let (align, mut m) = if b[j..].starts_with(b"f<") {
         (
             Some(Align {
                 floating: true,
@@ -1027,7 +1225,7 @@ fn lex_image<'src>(src: &'src str, j: usize) -> Option<(usize, OpenTag<'src>)> {
             }),
             j + 2,
         )
-    } else if src[j..].starts_with("f>") {
+    } else if b[j..].starts_with(b"f>") {
         (
             Some(Align {
                 floating: true,
@@ -1060,12 +1258,10 @@ fn lex_image<'src>(src: &'src str, j: usize) -> Option<(usize, OpenTag<'src>)> {
     if b.get(m) != Some(&b' ') {
         return None;
     }
-    while b.get(m) == Some(&b' ') {
-        m += 1;
-    }
-    let (after_source, source) = collect_text_objs(src, m, &[" ", "]]"], &[]);
+    m = skip_spaces(b, m);
+    let (after_source, source) = collect_text_objs(b, m, &[b" ", b"]]"]);
     let mut params = Params::new();
-    let end = lex_params(src, after_source, &mut params);
+    let end = lex_params(b, after_source, &mut params);
     let end = skip_spaces(b, end);
     b.get(end..).is_some_and(|r| r.starts_with(b"]]")).then(|| {
         (
@@ -1082,38 +1278,37 @@ fn lex_image<'src>(src: &'src str, j: usize) -> Option<(usize, OpenTag<'src>)> {
 /// `key="value"` / `key=value` attributes. Ports the old `params_block`
 /// byte-for-byte, including the quirk that a key without `=` consumes the one
 /// character that follows it before giving up.
-fn lex_params(src: &str, mut k: usize, out: &mut Params) -> usize {
-    let b = src.as_bytes();
+fn lex_params(b: &[u8], mut k: usize, out: &mut Params) -> usize {
     loop {
-        while k < b.len() && is_param_ws(src, k) {
-            k += src[k..].chars().next().map_or(1, char::len_utf8);
+        while k < b.len() && is_param_ws(b, k) {
+            k += char_len_at(b, k);
         }
         match b.get(k) {
             None | Some(b']') | Some(b'\n') => return k,
             _ => {}
         }
         let key_start = k;
-        while src[k..].chars().next().is_some_and(is_prop_char) {
-            k += src[k..].chars().next().map_or(1, char::len_utf8);
+        while b.get(k).is_some_and(|c| is_prop_char(*c)) {
+            k += 1;
         }
         if k == key_start {
             return k;
         }
-        let key = src[key_start..k].to_ascii_lowercase();
+        let key = sub(b, key_start, k).to_ascii_lowercase();
         if b.get(k) != Some(&b'=') {
-            return k + src[k..].chars().next().map_or(0, char::len_utf8);
+            return k + char_len_at(b, k);
         }
         k += 1;
         let value = if b.get(k) == Some(&b'"') {
             k += 1;
-            let (nk, v) = collect_text_objs(src, k, &[], &['"']);
+            let (nk, v) = collect_text_objs(b, k, &[b"\""]);
             k = nk;
             if b.get(k) == Some(&b'"') {
                 k += 1;
             }
             v
         } else {
-            let (nk, v) = collect_text_objs(src, k, &[], &[' ', '\u{a0}', ']']);
+            let (nk, v) = collect_text_objs(b, k, &[b" ", b"\xc2\xa0", b"]"]);
             k = nk;
             v
         };
@@ -1122,51 +1317,39 @@ fn lex_params(src: &str, mut k: usize, out: &mut Params) -> usize {
 }
 
 /// A run of [`TextObj`]s — plain text interleaved with `%%var%%` and
-/// `{$var}` substitutions — up to any of `delims`, a `single_stop` char, a
-/// newline, or EOF. Ports the old `collect_text_objs` including its
-/// variable-reading quirks (a default may run past a newline; an include
-/// default is sub-parsed markup).
-fn collect_text_objs(
-    src: &str,
-    mut k: usize,
-    delims: &[&str],
-    single_stops: &[char],
-) -> (usize, Vec<TextObj>) {
-    let b = src.as_bytes();
+/// `{$var}` substitutions — up to any of `stops`, a newline, or EOF. Ports
+/// the old `collect_text_objs` including its variable-reading quirks (a
+/// default may run past a newline; an include default is sub-parsed markup).
+fn collect_text_objs(b: &[u8], mut k: usize, stops: &[&[u8]]) -> (usize, Vec<TextObj>) {
     let mut result = Vec::new();
     let mut buf = String::new();
     loop {
-        if k >= b.len() || b[k] == b'\n' || delims.iter().any(|d| src[k..].starts_with(d)) {
+        if k >= b.len() || b[k] == b'\n' || stops.iter().any(|s| b[k..].starts_with(s)) {
             break;
         }
-        if let Some(c) = src[k..].chars().next()
-            && single_stops.contains(&c)
-        {
-            break;
-        }
-        if src[k..].starts_with("%%") {
+        if b[k..].starts_with(b"%%") {
             if !buf.is_empty() {
                 result.push(TextObj::Plain(std::mem::take(&mut buf)));
             }
             k += 2;
             let name_start = k;
-            while src[k..].chars().next().is_some_and(is_prop_char) {
-                k += src[k..].chars().next().map_or(1, char::len_utf8);
+            while b.get(k).is_some_and(|c| is_prop_char(*c)) {
+                k += 1;
             }
-            let name = src[name_start..k].to_string();
+            let name = sub(b, name_start, k).to_string();
             let default = if b.get(k) == Some(&b'|') {
                 k += 1;
                 let d_start = k;
-                while k < b.len() && !src[k..].starts_with("%%") {
-                    k += src[k..].chars().next().map_or(1, char::len_utf8);
+                while k < b.len() && !b[k..].starts_with(b"%%") {
+                    k += 1;
                 }
-                let d = src[d_start..k].to_string();
-                if src[k..].starts_with("%%") {
+                let d = sub(b, d_start, k).to_string();
+                if b[k..].starts_with(b"%%") {
                     k += 2;
                 }
                 Some(d)
             } else {
-                if src[k..].starts_with("%%") {
+                if b[k..].starts_with(b"%%") {
                     k += 2;
                 }
                 None
@@ -1174,27 +1357,27 @@ fn collect_text_objs(
             result.push(TextObj::ModuleVar { name, default });
             continue;
         }
-        if src[k..].starts_with("{$") {
+        if b[k..].starts_with(b"{$") {
             if !buf.is_empty() {
                 result.push(TextObj::Plain(std::mem::take(&mut buf)));
             }
             k += 2;
             let name_start = k;
-            while src[k..].chars().next().is_some_and(is_prop_char) {
-                k += src[k..].chars().next().map_or(1, char::len_utf8);
+            while b.get(k).is_some_and(|c| is_prop_char(*c)) {
+                k += 1;
             }
-            let name = src[name_start..k].to_string();
-            let default = if src[k..].starts_with("//") {
+            let name = sub(b, name_start, k).to_string();
+            let default = if b[k..].starts_with(b"//") {
                 k += 2;
                 let d_start = k;
                 while k < b.len() && b[k] != b'}' {
                     k += 1;
                 }
-                let d = src[d_start..k].to_string();
+                let d = sub(b, d_start, k);
                 if b.get(k) == Some(&b'}') {
                     k += 1;
                 }
-                Some(parse(&d))
+                Some(parse(d))
             } else {
                 if b.get(k) == Some(&b'}') {
                     k += 1;
@@ -1204,9 +1387,9 @@ fn collect_text_objs(
             result.push(TextObj::IncludeVar { name, default });
             continue;
         }
-        let c = src[k..].chars().next().unwrap();
-        buf.push(c);
-        k += c.len_utf8();
+        let l = char_len_at(b, k);
+        buf.push_str(sub(b, k, k + l));
+        k += l;
     }
     if !buf.is_empty() {
         result.push(TextObj::Plain(buf));
