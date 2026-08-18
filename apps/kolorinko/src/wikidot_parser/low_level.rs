@@ -265,6 +265,29 @@ pub(crate) fn closer_at(
     None
 }
 
+/// [`closer_at`], but tolerant of a blockquote-continuation prefix: a closer
+/// sitting after `>` markers and spaces (`> [[/div]]` on a quote line) closes
+/// the innermost open element just like a bare one, without the markers
+/// leaking into its body as text. The returned length covers the markers.
+pub(crate) fn closer_at_marked(
+    full: &str,
+    off: usize,
+    comment: bool,
+) -> Option<(ContentExitReason, usize)> {
+    let bytes = full.as_bytes();
+    let mut marked = off;
+    while bytes.get(marked) == Some(&b'>') {
+        marked += 1;
+    }
+    if marked == off {
+        return closer_at(full, off, comment);
+    }
+    while bytes.get(marked) == Some(&b' ') {
+        marked += 1;
+    }
+    closer_at(full, marked, comment).map(|(reason, len)| (reason, marked - off + len))
+}
+
 /// The central, non-backtracking content loop. Parses one element at a time
 /// and stops at the first end of input, closing tag `[[/…]]`, or (when
 /// `comment` is true) comment close `--]` — **consuming** any closer it finds
@@ -305,7 +328,7 @@ where
             if off >= full.len() {
                 return Ok((nodes, off, ContentExitReason::Eof));
             }
-            if let Some((reason, len)) = closer_at(full, off, comment) {
+            if let Some((reason, len)) = closer_at_marked(full, off, comment) {
                 for _ in 0..len {
                     let _ = inp.next();
                 }
@@ -511,6 +534,13 @@ where
             let is_stop = inp.check(stop.clone()).is_ok();
             inp.rewind(cp);
             if is_stop {
+                return Ok(nodes);
+            }
+            // A closer never belongs to line-scoped content (blockquote line,
+            // table cell, …): stop before it so an enclosing loop can see it
+            // at a checked offset instead of swallowing it as text.
+            let off = *inp.cursor().inner();
+            if closer_at(inp.full_slice(), off, false).is_some() {
                 return Ok(nodes);
             }
             let cp = inp.save();

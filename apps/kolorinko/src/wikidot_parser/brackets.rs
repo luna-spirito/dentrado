@@ -405,7 +405,7 @@ pub(crate) fn module_block<
                 if off >= full.len() {
                     break;
                 }
-                if let Some((reason, len)) = closer_at(full, off, false) {
+                if let Some((reason, len)) = closer_at_marked(full, off, false) {
                     for _ in 0..len {
                         let _ = inp.next();
                     }

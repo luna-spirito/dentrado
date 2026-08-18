@@ -102,3 +102,4 @@ let's talk just about ServiceWorker for now.
 * Timer shouldn't resend on nothing-changed?
 * Client keep-alive? No keep-alive right now, he connection probably gets dropped after idle.
 * fix links in `nav:side`
+  * Yeah... they've used `[[a href]]`... yeahhhhhhhhh... We probably need to add popup to load OUR website instead?

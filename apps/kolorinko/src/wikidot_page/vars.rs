@@ -192,8 +192,17 @@ impl ModuleVars<'_> {
 }
 
 /// A substitution value is "empty" when it renders to nothing — the form an
-/// unset `{$key}` passthrough takes (an empty [`Content`]). The fallback idiom
-/// skips such values to reach the literal default.
+/// unset `{$key}` passthrough takes (an empty [`Content`]), or a bare
+/// passthrough of the binding's own name (`x={$x}`, Wikidot's "inherit the
+/// outer value, else default" idiom — no outer scope exists at substitution
+/// time, so it can only mean unset). Both are skipped so the fallback idiom
+/// reaches its literal default; skipping the self-passthrough is also what
+/// breaks the `x := {$x}` reference cycle.
+fn binding_is_empty(name: &str, c: &[Node]) -> bool {
+    content_is_empty(c)
+        || matches!(c, [Node::Text(TextObj::IncludeVar { name: n, .. })] if *n == name)
+}
+
 fn content_is_empty(c: &[Node]) -> bool {
     c.iter().all(|n| match n {
         Node::Text(TextObj::Plain(s)) => s.is_empty(),
@@ -205,7 +214,7 @@ fn content_is_empty(c: &[Node]) -> bool {
 /// not empty.
 fn include_var_value<'a>(vars: &'a [(String, Content)], name: &str) -> Option<&'a Content> {
     vars.iter()
-        .find(|(k, v)| k == name && !content_is_empty(v))
+        .find(|(k, v)| k == name && !binding_is_empty(k, v))
         .map(|(_, v)| v)
 }
 

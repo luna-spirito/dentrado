@@ -21,10 +21,26 @@ pub type Slug = (Option<SafePathComponent>, SafePathComponent);
 /// The landing page a bare `/<site>/` resolves to.
 pub const START_PAGE: &str = "start";
 
+/// `category:name` / `name` → a slug, mirroring how the dataset keys pages
+/// (the mirror's `slug_parts`): the colon form is Wikidot's canonical page
+/// URL and must resolve identically to the generated `/<site>/<cat>/<page>`
+/// links.
+fn slug_of(seg: &str) -> Option<Slug> {
+    match seg.split_once(':') {
+        Some((cat, name)) => Some((
+            Some(SafePathComponent::new(cat.to_string())?),
+            SafePathComponent::new(name.to_string())?,
+        )),
+        None => Some((None, SafePathComponent::new(seg.to_string())?)),
+    }
+}
+
 /// `/<site>[/<category>/<page>]` → `(site, slug)`. A bare `/<site>/` resolves
-/// to the site's `start` landing page. `None` for bare `/`, asset paths, wrong
-/// arity, or unsafe segments. Shared by the web client's router, the server's
-/// SSR dispatch, and the render CLI, so all three agree on what a route is.
+/// to the site's `start` landing page. A `/<site>/<category>:<page>` segment
+/// splits on the colon like the dataset keys it. `None` for bare `/`, asset
+/// paths, wrong arity, or unsafe segments. Shared by the web client's router,
+/// the server's SSR dispatch, and the render CLI, so all three agree on what
+/// a route is.
 pub fn parse_route(path: &str) -> Option<(SafePathComponent, Slug)> {
     let segs: Vec<&str> = path
         .trim_start_matches('/')
@@ -34,7 +50,7 @@ pub fn parse_route(path: &str) -> Option<(SafePathComponent, Slug)> {
     let spc = |s: &str| SafePathComponent::new(s.to_string());
     match segs.as_slice() {
         [s] => Some((spc(s)?, (None, spc(START_PAGE)?))),
-        [s, p] => Some((spc(s)?, (None, spc(p)?))),
+        [s, p] => Some((spc(s)?, slug_of(p)?)),
         [s, c, p] => Some((spc(s)?, (Some(spc(c)?), spc(p)?))),
         _ => None,
     }
