@@ -206,7 +206,8 @@ fn substitute_listpages(
 }
 
 /// Finalize the query for one module against the rendering page: `category`
-/// `.` (and the default) is the current category, and `range="."` (parsed as
+/// `.` (and the default) is the current category, `name` `.` (or its
+/// documented twin `=`) the current page's name, and `range="."` (parsed as
 /// `fullname="="`) selects the current page.
 fn resolve_query(params: &ListPagesParams, host: &HostCtx) -> ListPagesQuery {
     let mut p = params.clone();
@@ -219,6 +220,13 @@ fn resolve_query(params: &ListPagesParams, host: &HostCtx) -> ListPagesQuery {
     });
     if p.fullname.as_deref() == Some("=") {
         p.fullname = Some(host.fullname.clone());
+    }
+    if p.name.as_deref().is_some_and(|n| n == "." || n == "=") {
+        p.name = Some(
+            host.fullname
+                .rsplit_once(':')
+                .map_or(host.fullname.clone(), |(_, n)| n.to_string()),
+        );
     }
     ListPagesQuery(p)
 }
@@ -375,6 +383,11 @@ fn matches_page(a: &Article, params: &ListPagesParams, now: i64) -> bool {
     }
     if let Some(fullname) = &params.fullname
         && !fullname.eq_ignore_ascii_case(&a.meta.slug)
+    {
+        return false;
+    }
+    if let Some(sel) = &params.name
+        && !sel.eq_ignore_ascii_case(name)
     {
         return false;
     }

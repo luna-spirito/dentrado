@@ -370,6 +370,11 @@ pub struct ListPagesParams {
     /// "current page" range selector, is resolved at assembly time).
     #[serde(default)]
     pub fullname: Option<String>,
+    /// `name="…"` — select by page name without category. `"."` (and the
+    /// documented `"="`) is resolved to the current page's name at assembly
+    /// time.
+    #[serde(default)]
+    pub name: Option<String>,
     /// `pagetype="normal"` (default; no `_` prefix), `"hidden"`, or `"*"`.
     #[serde(default)]
     pub pagetype: Option<String>,

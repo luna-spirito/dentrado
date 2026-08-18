@@ -288,7 +288,7 @@ fn parse_space_vars(remainder: &str) -> Vec<(String, Content)> {
 
 /// `[[module ListPages …]]` argument map → selection parameters. Recognized
 /// selectors are parsed; values with no data behind them in the export
-/// (`rating`, `votes`, `parent`, `link_to`, `name`, …) and purely interactive
+/// (`rating`, `votes`, `parent`, `link_to`, …) and purely interactive
 /// arguments (`rss`, `urlAttrPrefix`, …) are ignored. An `@URL|default`
 /// reference keeps only its default — URL-passed arguments have no meaning in
 /// a static render.
@@ -309,6 +309,7 @@ pub(crate) fn listpages_params(attrs: &HashMap<String, Vec<TextObj>>) -> ListPag
             // assembly later substitutes for `fullname="="`.
             sel("range").filter(|r| r == ".").map(|_| "=".to_string())
         }),
+        name: sel("name"),
         pagetype: sel("pagetype"),
         order: sel("order").and_then(|v| parse_order(&v)),
         offset: sel("offset").and_then(|v| v.parse().ok()),
