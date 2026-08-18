@@ -22,13 +22,13 @@ fn include_target(
     Some((current_site.clone(), (category, name)))
 }
 
-/// Walk `content` and record every `[[include]]` target not already in
-/// `visited` (and not already batched in `out`), so [`resolve`](super::article_latest::resolve)
-/// can fetch the whole batch at once. Sync recursion over the tree — no awaits.
+/// Walk `content` and record every `[[include]]` target not already fetched
+/// (in `raws`) and not already batched in `out`, so [`resolve_include`] can
+/// fetch the whole cone at once. Sync recursion over the tree — no awaits.
 pub(super) fn collect_include_targets(
     content: &Content,
     current_site: &SafePathComponent,
-    visited: &HashSet<Key>,
+    raws: &HashMap<Key, Content>,
     out: &mut Vec<(Key, SafePathComponent, Slug)>,
 ) {
     for node in content {
@@ -36,38 +36,62 @@ pub(super) fn collect_include_targets(
             Node::Include(inc) => {
                 if let Some((inc_site, inc_slug)) = include_target(&inc.source, current_site)
                     && let key = (inc_site.clone(), inc_slug.0.clone(), inc_slug.1.clone())
-                    && !visited.contains(&key)
+                    && !raws.contains_key(&key)
                     && !out.iter().any(|(k, _, _)| *k == key)
                 {
                     out.push((key, inc_site, inc_slug));
                 }
             }
             other => {
-                other.visit_node(&mut |c| collect_include_targets(c, current_site, visited, out));
+                other.visit_node(&mut |c| collect_include_targets(c, current_site, raws, out));
             }
         }
     }
 }
 
-/// Return `content` with every `[[include]]` whose target is among `fetched`
-/// (already resolved) replaced by that target's content (spliced inline);
-/// directives that couldn't be resolved (unknown target, or a data cycle) are
-/// left verbatim.
+/// Assemble the body of the page at the head of `path` in one recursive
+/// pass: every `[[include]]` whose target's body is in `raws` and is not
+/// already on the recursion `path` (a data-level cycle) is replaced by that
+/// body with the directive's vars applied — which resolves the values of
+/// directives nested inside it too, so vars cascade top-down through the
+/// chain — and the spliced body is assembled in turn with the target pushed
+/// onto the path. One closing pass then erases what could not resolve (a
+/// back-edge directive, a `{$var}` outside any include — in bare text or an
+/// attribute value) to its defaults.
 pub(super) fn substitute_includes(
     content: Content,
     current_site: &SafePathComponent,
-    fetched: &HashMap<Key, Content>,
+    raws: &HashMap<Key, Content>,
+    path: &[Key],
 ) -> Content {
-    let mut walk = |c: Content| substitute_includes(c, current_site, fetched);
+    apply_include_vars(assemble_includes(content, current_site, raws, path), &[])
+}
+
+/// The structural half: splice each include's body (recursing with the
+/// target on the path); directives that cannot be spliced — a cycle, or a
+/// target with no fetched body — stay verbatim.
+fn assemble_includes(
+    content: Content,
+    current_site: &SafePathComponent,
+    raws: &HashMap<Key, Content>,
+    path: &[Key],
+) -> Content {
+    let mut walk = |c: Content| assemble_includes(c, current_site, raws, path);
     let mut out: Content = Vec::with_capacity(content.len());
     for node in content {
         match node {
             Node::Include(inc) => {
-                let resolved = include_target(&inc.source, current_site)
-                    .and_then(|(s, slug)| fetched.get(&(s, slug.0, slug.1)).map(Content::as_slice));
-                match resolved {
-                    Some(nodes) => out.extend(apply_include_vars(nodes.to_vec(), &inc.vars)),
-                    None => out.push(Node::Include(inc)),
+                let key = include_target(&inc.source, current_site)
+                    .map(|(site, slug)| (site, slug.0, slug.1));
+                if let Some(k) = key.as_ref().filter(|k| !path.contains(k))
+                    && let Some(raw) = raws.get(k)
+                {
+                    let spliced = apply_include_vars(raw.to_vec(), &inc.vars);
+                    let mut deeper = path.to_vec();
+                    deeper.push(k.clone());
+                    out.extend(assemble_includes(spliced, current_site, raws, &deeper));
+                } else {
+                    out.push(Node::Include(inc));
                 }
             }
             other => out.push(other.map_node(&mut walk)),

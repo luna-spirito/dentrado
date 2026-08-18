@@ -191,6 +191,105 @@ fn key(cat: Option<&str>, name: &str) -> Key {
     )
 }
 
+fn flat(content: &Content) -> String {
+    let mut s = String::new();
+    collect_plain(content, &mut s);
+    s
+}
+
+fn raws(pairs: Vec<(Key, &str)>) -> HashMap<Key, Content> {
+    pairs
+        .into_iter()
+        .map(|(k, body)| (k, parse(body)))
+        .collect()
+}
+
+#[test]
+fn include_assembly_splices_nested_cone_with_cascading_vars() {
+    // root includes b with x=1; b passes its {$x} through to c.
+    let raws = raws(vec![
+        (key(None, "b"), "B {$x} [[include c | y={$x}]]"),
+        (key(None, "c"), "C({$y})"),
+    ]);
+    let out = substitute_includes(
+        parse("[[include b | x=1]]"),
+        &site("scp"),
+        &raws,
+        &[key(None, "root")],
+    );
+    assert_eq!(flat(&out), "B 1 C(1)");
+}
+
+#[test]
+fn include_diamond_splices_target_in_both_branches() {
+    let raws = raws(vec![
+        (key(None, "b"), "B [[include d]]"),
+        (key(None, "c"), "C [[include d]]"),
+        (key(None, "d"), "D"),
+    ]);
+    let out = substitute_includes(
+        parse("[[include b]] [[include c]]"),
+        &site("scp"),
+        &raws,
+        &[key(None, "root")],
+    );
+    assert_eq!(flat(&out), "B D C D");
+}
+
+#[test]
+fn include_cycle_stops_at_the_back_edge() {
+    // b includes c includes b: both splice once, the back-edge stays a
+    // literal directive and its var values erase to defaults.
+    let raws = raws(vec![
+        (key(None, "b"), "B0 [[include c | z=9]]"),
+        (key(None, "c"), "C0 [[include b | z={$z}]]"),
+    ]);
+    let out = substitute_includes(
+        parse("[[include b | z=7]]"),
+        &site("scp"),
+        &raws,
+        &[key(None, "root")],
+    );
+    assert_eq!(flat(&out), "B0 C0 ");
+    let back_edge = out.iter().find_map(|n| match n {
+        Node::Include(Include { source, .. }) if source.path == ["b".to_string()] => Some(source),
+        _ => None,
+    });
+    assert!(back_edge.is_some(), "no literal back-edge: {:#?}", out);
+}
+
+#[test]
+fn include_vars_outside_any_include_erase_to_defaults() {
+    let out = substitute_includes(
+        parse("a {$x//dflt} b {$y}"),
+        &site("scp"),
+        &HashMap::new(),
+        &[key(None, "root")],
+    );
+    assert_eq!(flat(&out), "a dflt b ");
+}
+
+#[test]
+fn include_vars_in_root_level_attributes_erase_to_defaults() {
+    let out = substitute_includes(
+        parse("[[div style=\"color:{$c//red}\"]]x[[/div]]"),
+        &site("scp"),
+        &HashMap::new(),
+        &[key(None, "root")],
+    );
+    let Node::Container {
+        kind: ContainerKind::Div { params, .. },
+        ..
+    } = &out[0]
+    else {
+        panic!("expected div: {out:#?}")
+    };
+    assert_eq!(
+        params.get("style"),
+        Some(&vec![TextObj::Plain("color:red".to_string())])
+    );
+}
+
 #[test]
 fn dep_tree_nests_each_page_under_its_includer() {
     let (root, b, c, d) = (

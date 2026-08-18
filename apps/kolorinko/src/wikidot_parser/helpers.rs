@@ -322,9 +322,18 @@ pub(crate) fn listpages_params(attrs: &HashMap<String, Vec<TextObj>>) -> ListPag
 /// One attribute's value flattened to a trimmed string: plain text with
 /// `%%var%%`/`{$var$}` defaults spliced in (an unset variable contributes
 /// nothing), and an `@URL|default` reference reduced to its default.
+/// Module attribute names are case-insensitive on Wikidot (`perPage` and
+/// `perpage` are the same parameter), so a miss on the exact key falls back
+/// to a case-insensitive scan.
 pub(crate) fn attr_value(attrs: &HashMap<String, Vec<TextObj>>, key: &str) -> Option<String> {
+    let objs = attrs.get(key).or_else(|| {
+        attrs
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v)
+    })?;
     let mut s = String::new();
-    for o in attrs.get(key)? {
+    for o in objs {
         match o {
             TextObj::Plain(t) => s.push_str(t),
             TextObj::ModuleVar { default, .. } => {

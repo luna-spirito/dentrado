@@ -689,4 +689,19 @@ mod tests {
                 .any(|n| matches!(n, Node::Text(TextObj::Plain(s)) if s.contains("more")))
         );
     }
+
+    /// Module attribute names are case-insensitive: the documented `perPage`
+    /// form must reach the same `per_page` parameter as `perpage`.
+    #[test]
+    fn listpages_perpage_is_case_insensitive() {
+        let c = parse(
+            "[[module ListPages category=\"rumor-a\" perPage=\"250\" separate=\"no\"]]\\n[[/module]]",
+        );
+        let Node::ListPages(lp) = &c[0] else {
+            panic!("expected ListPages: {c:#?}")
+        };
+        assert_eq!(lp.params.category.as_deref(), Some("rumor-a"));
+        assert_eq!(lp.params.per_page, Some(250));
+        assert!(!lp.params.separate);
+    }
 }

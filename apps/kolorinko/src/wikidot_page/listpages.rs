@@ -25,10 +25,9 @@ pub(super) struct HostCtx {
 /// wrapped in Wikidot's `list-pages-box` / `list-pages-item` containers.
 pub(super) async fn resolve_listpages<S: Storage<KolorinkoRT>>(
     content: Content,
-    site: &SafePathComponent,
+    state: &mut ResolveState,
     meta: &RepoMeta,
     host: &HostCtx,
-    visited: &mut HashSet<Key>,
     ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> (Content, Vec<PageDep>) {
     let mut queries: Vec<ListPagesQuery> = Vec::new();
@@ -38,47 +37,46 @@ pub(super) async fn resolve_listpages<S: Storage<KolorinkoRT>>(
     }
     let mut results: HashMap<ListPagesQuery, ListPagesResult> = HashMap::new();
     for query in &queries {
-        let result = crate::runtime::repo_l_list_pages(meta.clone(), site.clone(), query.clone())
-            .secondary_get(ctx)
-            .await;
+        let result =
+            crate::runtime::repo_l_list_pages(meta.clone(), state.site.clone(), query.clone())
+                .secondary_get(ctx)
+                .await;
         results.insert(query.clone(), (*result).clone());
     }
     // A template referencing `%%content%%` embeds each listed page's rendered
-    // body, fetched by the caller (see `article_latest`).
-    let (bodies, listed) =
-        resolve_content_bodies(&content, site, meta, host, &results, visited, ctx).await;
+    // body, fetched and resolved below.
+    let listed = resolve_content_bodies(&content, meta, host, &results, state, ctx).await;
     (
-        substitute_listpages(content, &results, &bodies, site, host),
+        substitute_listpages(content, &results, &state.bodies, &state.site, host),
         listed,
     )
 }
 
 /// Fetch and fully resolve the body of every page a `%%content%%` template in
-/// `content` needs, keyed by fullname, together with each fetched page as a
-/// [`PageDep`] (its own resolution deps nested under it). Each page is
-/// declared as an [`article_latest_parsed`] `secondary_get` dependency
-/// (reactive to its edits) and run through [`resolve_full`] in its own
-/// context; `visited` is extended with each page so a transclusion cycle
-/// stops here.
+/// `content` needs, cached in `state.bodies` by fullname (so a page reached
+/// from several modules or transclusions is resolved once per run), together
+/// with each resolved page as a [`PageDep`] (its own resolution deps nested
+/// under it). Each page is declared as an [`article_latest_parsed`]
+/// `secondary_get` dependency (reactive to its edits) and run through
+/// [`resolve_full`] in its own context; `state.resolved` — extended before
+/// each resolution — is what stops a transclusion cycle (a listed page
+/// embedding, transitively, a page already being resolved).
 async fn resolve_content_bodies<S: Storage<KolorinkoRT>>(
     content: &Content,
-    site: &SafePathComponent,
     meta: &RepoMeta,
     host: &HostCtx,
     results: &HashMap<ListPagesQuery, ListPagesResult>,
-    visited: &mut HashSet<Key>,
+    state: &mut ResolveState,
     ctx: &mut GearCtx<KolorinkoRT, S>,
-) -> (HashMap<String, Content>, Vec<PageDep>) {
-    let pages = content_needing_bodies(content, site, host, results);
-    let mut bodies = HashMap::new();
+) -> Vec<PageDep> {
+    let pages = content_needing_bodies(content, &state.site, host, results);
     let mut deps = Vec::new();
     for (key, slug, page) in pages {
-        if visited.contains(&key) {
+        if state.bodies.contains_key(&page.fullname()) || !state.resolved.insert(key.clone()) {
             continue;
         }
-        visited.insert(key.clone());
         let parsed =
-            crate::runtime::article_latest_parsed(meta.clone(), site.clone(), slug.clone())
+            crate::runtime::article_latest_parsed(meta.clone(), state.site.clone(), slug.clone())
                 .secondary_get(ctx)
                 .await;
         let host = HostCtx {
@@ -86,20 +84,12 @@ async fn resolve_content_bodies<S: Storage<KolorinkoRT>>(
             category: page.category.clone(),
             tags: page.tags.clone(),
         };
-        let (content, page_deps) = resolve_full(
-            parsed.content.clone(),
-            site.clone(),
-            slug,
-            host,
-            visited,
-            meta,
-            ctx,
-        )
-        .await;
-        bodies.insert(page.fullname(), content);
+        let (content, page_deps) =
+            resolve_full(parsed.content.clone(), slug, host, state, meta, ctx).await;
+        state.bodies.insert(page.fullname(), content);
         deps.push(page_dep(&key, page_deps));
     }
-    (bodies, deps)
+    deps
 }
 
 /// Collect every listed page — as a resolution `(Key, Slug, ListedPage)` —

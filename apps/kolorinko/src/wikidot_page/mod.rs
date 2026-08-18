@@ -55,9 +55,9 @@
 //!   `[[include]]` splicing and `[[module ListPages]]` instantiation via
 //!   [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get)-ing
 //!   [`article_latest_parsed`] / [`repo_l_list_pages`] (data-level cycles
-//!   broken by a visited-set) — producing the final [`ArticleView`] with the
-//!   tree of every fetched page as its `deps`. Declaring each fetch as a
-//!   dependency makes the result reactive: an edit to any page in the
+//!   broken by a path-based guard) — producing the final [`ArticleView`]
+//!   with the tree of every fetched page as its `deps`. Declaring each fetch
+//!   as a dependency makes the result reactive: an edit to any page in the
 //!   transitive include/transclusion cone re-runs this gear.
 //! - [`shell`] (`follow` over `repo`): the whole site chrome in one shot — the
 //!   resolved `nav:top` / `nav:side` pages (declared as [`article_latest`]

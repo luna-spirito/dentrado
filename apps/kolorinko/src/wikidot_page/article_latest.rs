@@ -81,8 +81,8 @@ pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
         category: slug.0.as_ref().map(|c| (**c).clone()),
         tags: page_meta.tags.clone(),
     };
-    let mut visited = HashSet::from([(site.clone(), slug.0.clone(), slug.1.clone())]);
-    let (content, deps) = resolve_full(content, site, slug, host, &mut visited, meta, ctx).await;
+    let mut state = ResolveState::new(site.clone());
+    let (content, deps) = resolve_full(content, slug, host, &mut state, meta, ctx).await;
     ArticleView {
         meta: page_meta,
         revisions,
@@ -91,70 +91,89 @@ pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
     }
 }
 
+/// State shared by one [`resolve_full`] run and every `%%content%%`
+/// transclusion it recurses into: the (constant) site, the parsed body of
+/// every fetched page — fetch once, splice wherever a directive or a
+/// transclusion re-encounters it — the resolved `%%content%%` bodies keyed
+/// by fullname, and the pages whose resolution has already run, which is
+/// what stops transclusion cycles.
+pub(super) struct ResolveState {
+    pub(super) site: SafePathComponent,
+    pub(super) raws: HashMap<Key, Content>,
+    pub(super) bodies: HashMap<String, Content>,
+    pub(super) resolved: HashSet<Key>,
+}
+
+impl ResolveState {
+    fn new(site: SafePathComponent) -> Self {
+        Self {
+            site,
+            raws: HashMap::new(),
+            bodies: HashMap::new(),
+            resolved: HashSet::new(),
+        }
+    }
+}
+
 /// The full resolution pipeline — `[[include]]`, `[[module ListPages]]`,
-/// `[[iftags]]`, mirrored resources, then include-vars — run on `content` in
-/// the context of page (`site`, `slug`, `host`), returning the resolved
-/// content together with its dependency tree: the include cone plus every
-/// listed page fetched for a `%%content%%` transclusion. Shared between the
-/// gear's own resolution and the recursive resolution of a `%%content%%`
-/// transclusion (a ListPages template embedding a listed page's rendered
-/// body), so a single growing `visited` set breaks every data-level cycle
-/// (A includes/transcludes B … A) the same way [`resolve`] does for includes.
+/// `[[iftags]]`, mirrored resources — run on `content` in the context of
+/// page (`site`, `slug`, `host`), returning the resolved content together
+/// with its dependency tree: the include cone plus every listed page fetched
+/// for a `%%content%%` transclusion. Shared between the gear's own resolution
+/// and the recursive resolution of a `%%content%%` transclusion (a ListPages
+/// template embedding a listed page's rendered body), all through one
+/// [`ResolveState`]: bodies are fetched and resolved once per run no matter
+/// how many transclusions reach for them, and a page already being resolved
+/// (the rendering page, or a listed page further up the recursion) is never
+/// re-entered.
 pub(super) async fn resolve_full<S: Storage<KolorinkoRT>>(
     content: Content,
-    site: SafePathComponent,
     slug: Slug,
     host: HostCtx,
-    visited: &mut HashSet<Key>,
+    state: &mut ResolveState,
     meta: &RepoMeta,
     ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> (Content, Vec<PageDep>) {
     Box::pin(async move {
-        // TODO: Single-pass would be nice, but whatever
-        let root = (site.clone(), slug.0.clone(), slug.1.clone());
-        let (content, mut deps) = resolve_include(content, &root, visited, meta, ctx).await;
-        let (content, listed) = resolve_listpages(content, &site, meta, &host, visited, ctx).await;
+        let origin = (state.site.clone(), slug.0, slug.1);
+        state.resolved.insert(origin.clone());
+        let (content, mut deps) = resolve_include(content, &origin, state, meta, ctx).await;
+        let (content, listed) = resolve_listpages(content, state, meta, &host, ctx).await;
         deps.extend(listed);
         let content = evaluate_iftags(content, &host.tags);
-        let content = resolve_resources(content, &site, meta, ctx).await;
-        (apply_include_vars(content, &[]), deps)
+        let content = resolve_resources(content, &state.site, meta, ctx).await;
+        (content, deps)
     })
     .await
 }
 
-/// Resolve every `[[include]]` directive anywhere inside the root page's
-/// content, splicing each included page's content in place of the directive,
-/// and return the resolved content together with the dependency tree — every
-/// page fetched, nested under the page whose body included it.
-///
-/// Fetching is breadth-first: each page's raw body is walked as it arrives,
-/// its include targets — those not already in `visited` (which must hold
-/// `root` and grows with every fetch, so a directive into an
-/// already-resolved page stays verbatim) — declared as
-/// [`article_latest_parsed`]
+/// Resolve every `[[include]]` directive anywhere inside the body of
+/// `origin`: first the whole include cone is fetched breadth-first — each
+/// page declared as an [`article_latest_parsed`]
 /// [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get)
-/// dependencies (so the whole result is reactive to edits anywhere in the
-/// transitive include cone) and fetched, and the `(includer, target)` edge
-/// recorded; this breaks data-level cycles (A includes B includes A).
-/// Assembly then runs in passes over the pre-fetched bodies — each pass
-/// substitutes one level of directives, so include vars cascade top-down
-/// (an includer's vars resolve a nested directive's `{$passthrough}` values
-/// before that directive itself is spliced) — until a pass finds nothing new.
+/// dependency (so the result is reactive to edits anywhere in the cone) and
+/// cached in `state.raws`, so a diamond A→B→D, A→C→D fetches D once — then
+/// the body is assembled in a single recursive pass
+/// ([`substitute_includes`]) that breaks data-level cycles (A includes B
+/// includes A) by tracking the recursion path. Returns the assembled
+/// content with the dependency tree: one node per fetched page, nested
+/// under the page whose body first included it.
 pub(super) async fn resolve_include<S: Storage<KolorinkoRT>>(
     content: Content,
-    root: &Key,
-    visited: &mut HashSet<Key>,
+    origin: &Key,
+    state: &mut ResolveState,
     meta: &RepoMeta,
     ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> (Content, Vec<PageDep>) {
-    let mut queue: VecDeque<(Key, Content)> = VecDeque::from([(root.clone(), content)]);
-    let mut raws: HashMap<Key, Content> = HashMap::new();
     let mut edges: Vec<(Key, Key)> = Vec::new();
-    while let Some((origin, body)) = queue.pop_front() {
+    let mut queue: VecDeque<(Key, Content)> = VecDeque::from([(origin.clone(), content.clone())]);
+    while let Some((includer, body)) = queue.pop_front() {
         let mut targets: Vec<(Key, SafePathComponent, Slug)> = Vec::new();
-        collect_include_targets(&body, &root.0, visited, &mut targets);
+        collect_include_targets(&body, &state.site, &state.raws, &mut targets);
         for (key, inc_site, inc_slug) in targets {
-            visited.insert(key.clone());
+            if key == *origin {
+                continue;
+            }
             let parsed = crate::runtime::article_latest_parsed(
                 meta.clone(),
                 inc_site.clone(),
@@ -162,26 +181,18 @@ pub(super) async fn resolve_include<S: Storage<KolorinkoRT>>(
             )
             .secondary_get(ctx)
             .await;
-            edges.push((origin.clone(), key.clone()));
-            raws.insert(key.clone(), parsed.content.clone());
+            edges.push((includer.clone(), key.clone()));
+            state.raws.insert(key.clone(), parsed.content.clone());
             queue.push_back((key, parsed.content.clone()));
         }
-        raws.insert(origin, body);
     }
-    let mut content = raws.remove(root).unwrap_or_default();
-    let mut substituted: HashSet<Key> = HashSet::from([root.clone()]);
-    loop {
-        let mut targets: Vec<(Key, SafePathComponent, Slug)> = Vec::new();
-        collect_include_targets(&content, &root.0, &substituted, &mut targets);
-        if targets.is_empty() {
-            break;
-        }
-        let fetched: HashMap<Key, Content> = targets
-            .iter()
-            .map(|(key, _, _)| (key.clone(), raws.remove(key).unwrap_or_default()))
-            .collect();
-        substituted.extend(fetched.keys().cloned());
-        content = substitute_includes(content, &root.0, &fetched);
-    }
-    (content, dep_tree(root, edges))
+    (
+        substitute_includes(
+            content,
+            &state.site,
+            &state.raws,
+            std::slice::from_ref(origin),
+        ),
+        dep_tree(origin, edges),
+    )
 }
