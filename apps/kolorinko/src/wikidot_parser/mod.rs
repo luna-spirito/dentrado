@@ -1,4 +1,4 @@
-//! Wikidot markup parser, built on `chumsky` 0.13.
+//! Wikidot markup parser: a hand-written lexer plus a plain merge pass.
 //!
 //! The grammar follows the reference at
 //! <https://www.wikidot.com/doc-wiki-syntax:inline-formatting> and is a port of
@@ -6,71 +6,38 @@
 //!
 //! ## Architecture
 //!
-//! The central combinator is [`content_loop`]: it parses a stream of [`Node`]s
-//! and stops — *without backtracking* — at the first of: end of input, any
-//! closing tag `[[/…]]`, or a comment close `--]` (only inside a comment). It
-//! reports *why* it stopped (via [`ContentExitReason`]) and leaves the closer
-//! in the stream for the responsible container to claim. Every container
-//! (`[[div]]`, `[[span]]`, `[[code]]`, `[!--`, …) parses its opener, runs
-//! `content_loop`, then either consumes its own closer (a match → build the
-//! node) or, on a mismatch/EOF, *flattens*: emits the verbatim opener as a
-//! [`Node::Raw`] followed by the body it already parsed, and leaves the foreign
-//! closer for its ancestor. This makes malformed input degrade gracefully and
-//! keeps parsing linear — a missing closer never re-parses the whole page.
-//!
-//! [`content_before`] is the non-consuming variant for inline/line contexts
-//! (style spans, headings, link text) that stop at a caller-supplied sigil.
-//!
-//! The element grammar is left-recursive through containers, so the element
-//! parser is tied into a knot with [`recursive`] inside [`build_element`].
-//!
-//! ## Input
-//!
-//! Input is `&'src str`, not `&[u8]`: Wikidot pages are UTF-8 with plenty of
-//! non-ASCII (Cyrillic, etc.), and operating on `&str` lets us slice, search
-//! and match characters directly.
+//! [`lex`] turns the page into a flat, total [`Token`] stream — rich tokens
+//! carrying pre-split openers/closers, parsed attributes and byte spans — and
+//! [`merge::Merger`] pairs them into [`Node`]s in one non-backtracking walk.
+//! Every container (`[[div]]`, `[[span]]`, `[!--`, …) merges its body until
+//! its own closer; on a mismatch or EOF it *flattens*: the verbatim opener
+//! becomes a [`Node::Raw`] followed by the body it already merged, and the
+//! foreign stop propagates to the ancestor that owns the consumed closer.
+//! Malformed input therefore degrades gracefully and merging stays linear.
 //!
 //! ## Graceful degradation
 //!
 //! Like the original, the parser is total: any input parses to *something*.
-//! Unrecognized `[[…]]` constructs and stray sigils fall through to a
-//! single-character fallback that becomes plain text, and a final
-//! [`merge_text`] pass fuses the resulting fragments back together (so e.g. an
-//! unknown `[[toc]]` reassembles into a single text node rather than seven).
+//! Unknown `[[…]]` constructs and stray sigils fall through to text tokens,
+//! and a final [`merge_text`] pass fuses adjacent fragments (so an unknown
+//! `[[toc]]` reassembles into a single text node rather than seven).
 
 pub mod types;
 
 pub(crate) use crate::wikidot_parser::types::*;
-pub(crate) use chumsky::{input::InputRef, prelude::*};
 pub(crate) use std::collections::HashMap;
 
-mod attrs;
-mod blocks;
-mod brackets;
-mod element;
 mod helpers;
-mod inline;
-mod low_level;
-mod text;
+pub(crate) mod lexer;
+pub(crate) mod merge;
 
-pub(crate) use attrs::*;
-pub(crate) use blocks::*;
-pub(crate) use brackets::*;
-pub(crate) use element::*;
 pub(crate) use helpers::*;
-pub(crate) use inline::*;
-pub(crate) use low_level::*;
-pub(crate) use text::*;
 
 // =========================================================================
-// Tags & exit reasons
+// Closing tags
 // =========================================================================
 
 /// Every opening tag that pairs with a matching `[[/…]]` closer.
-///
-/// [`content_loop`] recognizes *any* of these closers (so a container stops at
-/// a foreign closer too, flattens, and propagates the reason) and reports
-/// which one via [`ContentExitReason::ClosedTag`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ClosedTag {
     Div,
@@ -101,9 +68,9 @@ pub enum ClosedTag {
 }
 
 impl ClosedTag {
-    /// The keyword/sequence after `[[` (and after `[[/` in the closer), used to
-    /// recognize the matching closing tag.
-    fn opener_str(&self) -> String {
+    /// The keyword/sequence after `[[` (and after `[[/` in the closer), used
+    /// to reconstruct a stray closer as raw text.
+    pub(crate) fn opener_str(&self) -> String {
         match self {
             ClosedTag::Div => "div".into(),
             ClosedTag::Span => "span".into(),
@@ -132,68 +99,15 @@ impl ClosedTag {
     }
 }
 
-/// Why a [`content_loop`] run stopped.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ContentExitReason {
-    /// Reached end of input.
-    Eof,
-    /// A closing tag `[[/…]]` was found and consumed. Carries which tag it was.
-    ClosedTag(ClosedTag),
-    /// A comment close `--]` was found and consumed (only reported inside a comment).
-    ClosedComment,
-}
-
-// =========================================================================
-// Type aliases
-// =========================================================================
-
-/// Parser input: a borrowed slice of the source page.
-pub type In<'a> = &'a str;
-
-/// Default parse extra: [`Rich`] errors over `char` tokens.
-pub type E<'a> = extra::Err<Rich<'a, char>>;
-
 // =========================================================================
 // Public entry points
 // =========================================================================
 
-/// Top-level content parser: parses a whole page, absorbing any stray closing
-/// tags as raw text, until EOF.
-///
-/// [`content_loop`] stops at the first closer it sees; at the top level no
-/// container is open, so any closer is stray and is folded back into a
-/// [`Node::Raw`] before parsing resumes. Returns the page content and (always
-/// [`ContentExitReason::Eof`] on success) the stop reason.
-pub fn content<'a>() -> impl Parser<'a, In<'a>, (Content, ContentExitReason), E<'a>> + Clone + 'a {
-    let element = build_element();
-    custom(move |inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
-        let element = element.clone();
-        let mut nodes = Content::new();
-        loop {
-            let (sub, reason) = inp.parse(content_loop(element.clone(), false))?;
-            nodes.extend(sub);
-            match &reason {
-                ContentExitReason::Eof => return Ok((nodes, reason)),
-                // A stray closer was consumed by the loop; re-emit it verbatim.
-                ContentExitReason::ClosedComment => nodes.push(Node::Raw("--]".to_string())),
-                ContentExitReason::ClosedTag(tag) => {
-                    nodes.push(Node::Raw(format!("[[/{}]]", tag.opener_str())))
-                }
-            }
-        }
-    })
-}
-
-/// Parse a whole page, fusing adjacent text fragments with [`merge_text`].
-///
-/// Errors are collected but currently discarded (the parser is total and
-/// produces output regardless); a future revision can surface them.
+/// Parse a whole page into [`Content`], fusing adjacent text fragments with
+/// [`merge_text`]. Total: any input parses to something.
 pub fn parse(input: &str) -> Content {
-    let (content, _reason) = content()
-        .parse(input)
-        .into_result()
-        .unwrap_or((Vec::new(), ContentExitReason::Eof));
-    merge_text(content)
+    let toks = lexer::lex(input);
+    merge::parse_toks(input, &toks)
 }
 
 #[cfg(test)]
@@ -641,7 +555,7 @@ mod tests {
         // document must parse without panicking.
         let src = "…module Rate]]";
         let _ = parse(src); // must not panic
-        // And the keyword match itself: `…include foo` should still recognize
+        // And the keyword match itself: `…[[include foo]]` should still recognize
         // the include directive through the multibyte prefix.
         let c = parse("…[[include foo]]");
         assert!(c.iter().any(|n| matches!(n, Node::Text(_))));

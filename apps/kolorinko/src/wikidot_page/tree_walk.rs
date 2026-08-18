@@ -312,17 +312,15 @@ pub(super) fn parse_meta(text: &str) -> ParsedMeta {
             let mut f = line.split('\t');
             if let (Some(r), Some(rid), Some(ts), Some(a)) =
                 (f.next(), f.next(), f.next(), f.next())
-            {
-                if let (Ok(rev), Ok(timestamp)) =
+                && let (Ok(rev), Ok(timestamp)) =
                     (r.trim().parse::<u64>(), ts.trim().parse::<i64>())
-                {
-                    revisions.push(RevMeta {
-                        revision: rev,
-                        revision_id: rid.trim().to_string(),
-                        timestamp,
-                        author: a.trim().to_string(),
-                    });
-                }
+            {
+                revisions.push(RevMeta {
+                    revision: rev,
+                    revision_id: rid.trim().to_string(),
+                    timestamp,
+                    author: a.trim().to_string(),
+                });
             }
         } else if let Some((k, v)) = line.split_once(':') {
             match k.trim() {

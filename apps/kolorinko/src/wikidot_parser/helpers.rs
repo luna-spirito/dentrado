@@ -1,4 +1,7 @@
-//! Link / page-ref / tag-filter helpers, colour normalisation, and the post-processing pass that fuses adjacent text fragments.
+//! Pure string helpers: link / page-ref / tag-filter parsing, colour
+//! normalisation, include-argument splitting, listpages parameter
+//! interpretation, and the post-processing pass that fuses adjacent text
+//! fragments.
 
 use super::*;
 
@@ -55,6 +58,10 @@ pub(crate) fn parse_tag_filter(raw: &str) -> (Vec<String>, Vec<String>) {
     (has_all, has_none)
 }
 
+fn is_hex_char(c: char) -> bool {
+    c.is_ascii_hexdigit()
+}
+
 /// Normalize a `##color|` argument: prefix with `#` if it's a bare hex triplet
 /// of a valid length (3/4/6/8 digits).
 pub(crate) fn normalize_color(c: String) -> String {
@@ -63,6 +70,218 @@ pub(crate) fn normalize_color(c: String) -> String {
     } else {
         c
     }
+}
+
+// ── Include arguments ─────────────────────────────────────────────────────
+
+/// Split the body of a `[[include ...]]` into the source page reference and
+/// its variable substitution map. Values are parsed as real wikitext markup
+/// ([`Content`]), so `{$x}` becomes an [`TextObj::IncludeVar`] node (enabling
+/// nested passthrough) and `[[image ...]]` becomes an [`Node::Image`].
+///
+/// Two assignment syntaxes are recognised, distinguished by a depth-0 `|`:
+/// • pipe-separated — `source | k1=v1 | k2=v2` (a value runs to the next
+///   depth-0 `|`, so it may contain spaces and balanced `[[...]]` markup).
+/// • space-separated — `source k1="v1" k2=v2` (quoted values, or bare values
+///   running to the next depth-0 whitespace).
+///
+/// A later assignment to the same key is kept alongside the earlier one
+/// (in source order); the first non-empty value wins at substitution, which is
+/// what makes the `key={$key}|key=default` fallback idiom work. Only ASCII
+/// bytes act as delimiters and bracket pairs are scanned non-overlapping, so
+/// every slice lands on a UTF-8 character boundary and `[[[...]]]` stays
+/// depth-balanced (one `[[`/`]]` pair plus a literal `[`/`]`).
+pub(crate) fn parse_include_args(raw: &str) -> (PageRef, Vec<(String, Content)>) {
+    let b = raw.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    while i < n && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let src_start = i;
+    while i < n && !b[i].is_ascii_whitespace() && b[i] != b'|' {
+        i += 1;
+    }
+    let source = parse_page_ref(&raw[src_start..i]);
+    let remainder = &raw[i..];
+    let vars = if has_depth0_pipe(remainder) {
+        parse_pipe_vars(remainder)
+    } else {
+        parse_space_vars(remainder)
+    };
+    (source, vars)
+}
+
+/// Strip one layer of surrounding double quotes, if present.
+pub(crate) fn unquote(value: &str) -> &str {
+    let t = value.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        &t[1..t.len() - 1]
+    } else {
+        t
+    }
+}
+
+/// Record a `key=value` segment: split on the first `=`, parse the value as
+/// wikitext markup. Quoted values are unwrapped first.
+fn insert_kv(seg: &str, vars: &mut Vec<(String, Content)>) {
+    let Some(eq) = seg.find('=') else {
+        return;
+    };
+    let key = seg[..eq].trim();
+    if key.is_empty() {
+        return;
+    }
+    vars.push((key.to_string(), merge::parse_sub(unquote(&seg[eq + 1..]))));
+}
+
+/// Track `[[`/`]]` depth (and skip over `"..."` quotes) across `s`; return
+/// whether a `|` occurs at bracket depth 0 outside quotes — the marker of the
+/// pipe-separated assignment syntax.
+fn has_depth0_pipe(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut depth = 0i32;
+    let mut quote = false;
+    while i < b.len() {
+        if quote {
+            if b[i] == b'"' {
+                quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if i + 1 < b.len() && b[i] == b'[' && b[i + 1] == b'[' {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if i + 1 < b.len() && b[i] == b']' && b[i + 1] == b']' {
+            if depth > 0 {
+                depth -= 1;
+            }
+            i += 2;
+            continue;
+        }
+        if b[i] == b'"' {
+            quote = true;
+            i += 1;
+            continue;
+        }
+        if depth == 0 && b[i] == b'|' {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn parse_pipe_vars(remainder: &str) -> Vec<(String, Content)> {
+    let b = remainder.as_bytes();
+    let mut vars = Vec::new();
+    let mut seg_start = 0;
+    let mut i = 0;
+    let mut depth = 0i32;
+    let mut quote = false;
+    while i < b.len() {
+        if quote {
+            if b[i] == b'"' {
+                quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if i + 1 < b.len() && b[i] == b'[' && b[i + 1] == b'[' {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if i + 1 < b.len() && b[i] == b']' && b[i + 1] == b']' {
+            if depth > 0 {
+                depth -= 1;
+            }
+            i += 2;
+            continue;
+        }
+        if b[i] == b'"' {
+            quote = true;
+            i += 1;
+            continue;
+        }
+        if depth == 0 && b[i] == b'|' {
+            insert_kv(&remainder[seg_start..i], &mut vars);
+            seg_start = i + 1;
+        }
+        i += 1;
+    }
+    insert_kv(&remainder[seg_start..], &mut vars);
+    vars
+}
+
+fn parse_space_vars(remainder: &str) -> Vec<(String, Content)> {
+    let b = remainder.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    let mut vars: Vec<(String, Content)> = Vec::new();
+    while i < n {
+        while i < n && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let key_start = i;
+        while i < n && b[i] != b'=' && !b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let key_end = i;
+        if key_start == key_end || i >= n || b[i] != b'=' {
+            while i < n && !b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+        let value = if i < n && b[i] == b'"' {
+            i += 1;
+            let v_start = i;
+            while i < n && b[i] != b'"' {
+                i += 1;
+            }
+            let v = remainder[v_start..i].to_string();
+            if i < n {
+                i += 1;
+            }
+            v
+        } else {
+            let v_start = i;
+            let mut depth = 0i32;
+            while i < n {
+                if i + 1 < n && b[i] == b'[' && b[i + 1] == b'[' {
+                    depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if i + 1 < n && b[i] == b']' && b[i + 1] == b']' {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if depth == 0 && b[i].is_ascii_whitespace() {
+                    break;
+                }
+                i += 1;
+            }
+            remainder[v_start..i].to_string()
+        };
+        let key = remainder[key_start..key_end].trim();
+        if !key.is_empty() {
+            vars.push((key.to_string(), merge::parse_sub(value.trim())));
+        }
+    }
+    vars
 }
 
 // ── ListPages module arguments ────────────────────────────────────────────
@@ -261,7 +480,7 @@ fn parse_order(v: &str) -> Option<ListOrder> {
 }
 
 /// Recursively merge adjacent [`Node::Text(Plain(_))`] nodes so the fallback
-/// single-char path doesn't fragment output (e.g. `[[toc]]` → one text node).
+/// text path doesn't fragment output (e.g. `[[toc]]` → one text node).
 pub(crate) fn merge_text(content: Content) -> Content {
     let mut out: Content = Vec::with_capacity(content.len());
     for node in content {

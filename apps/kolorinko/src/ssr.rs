@@ -24,7 +24,7 @@ pub(crate) async fn document(
 ) -> Option<String> {
     let state = resolve(repo_meta, core, site.clone(), slug).await;
     let index = index_template(assets)?;
-    kolorinko_render::render_ssr_document(&index, &*site, &state)
+    kolorinko_render::render_ssr_document(&index, &site, &state)
 }
 
 /// Resolve the page and shell for one route. Subscribes both before reading
