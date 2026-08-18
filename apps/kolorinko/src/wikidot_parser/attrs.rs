@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// Attribute-context whitespace: real pages carry copy-pasted non-breaking
+/// spaces inside module headers (`[[module ListPages\u{a0}category=…]]`).
+fn is_param_ws(c: char) -> bool {
+    c == ' ' || c == '\u{a0}'
+}
+
 /// Parse `key="value"` / `key=value` attributes until `]` or newline. Values
 /// may contain `%%vars%%` and `{$vars$}`.
 pub(crate) fn params_block<'a>()
@@ -9,7 +15,7 @@ pub(crate) fn params_block<'a>()
     custom(|inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
         let mut map: HashMap<String, Vec<TextObj>> = HashMap::new();
         loop {
-            while matches!(inp.peek(), Some(' ')) {
+            while matches!(inp.peek(), Some(c) if is_param_ws(c)) {
                 inp.next();
             }
             let full = inp.full_slice();
@@ -38,7 +44,7 @@ pub(crate) fn params_block<'a>()
                 }
                 v
             } else {
-                collect_text_objs(inp, &[], &[' ', ']'])
+                collect_text_objs(inp, &[], &[' ', '\u{a0}', ']'])
             };
             map.insert(key, value);
         }

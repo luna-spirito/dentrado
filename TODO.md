@@ -101,3 +101,4 @@ let's talk just about ServiceWorker for now.
 * Assume append-only for git?
 * Timer shouldn't resend on nothing-changed?
 * Client keep-alive? No keep-alive right now, he connection probably gets dropped after idle.
+* fix links in `nav:side`

@@ -9,6 +9,11 @@ use super::*;
 #[derive(Default, Clone, Debug)]
 pub(crate) struct RepoLArticleCache;
 
+/// Trivial lens cache for [`repo_l_list_pages`]: a pure projection of `repo`,
+/// recomputed on every `follow` kick.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct RepoLListPagesCache;
+
 /// Per-instance cache for [`shell`]: a pure aggregation re-derived each run
 /// from its `article_latest` dependencies and the live [`RepoData`], so it
 /// carries no state between runs.
@@ -36,6 +41,23 @@ pub(crate) async fn repo_l_article_latest(
             revisions,
         },
         None => ArticleLatest::default(),
+    }
+}
+
+/// Project one ListPages selection out of `repo`'s dataset: the site's pages
+/// matching the (context-resolved) module parameters, ordered and truncated
+/// to the first pagination page. An unknown site yields an empty selection.
+pub(crate) fn repo_l_list_pages(
+    data: &RepoData,
+    site: &SafePathComponent,
+    query: &ListPagesQuery,
+) -> ListPagesResult {
+    match data.sites.get(site) {
+        Some(w) => select(w, &query.0),
+        None => ListPagesResult {
+            pages: Vec::new(),
+            total: 0,
+        },
     }
 }
 

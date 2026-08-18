@@ -1,11 +1,13 @@
 use std::rc::Rc;
 
 use crate::wikidot_page::{
-    AssetCache, LatestCache, ParsedCache, RepoCache, RepoData, RepoLArticleCache, RepoMeta,
-    RepoResourceCache, ShellCache,
+    AssetCache, LatestCache, ParsedCache, RepoCache, RepoData, RepoLArticleCache,
+    RepoLListPagesCache, RepoMeta, RepoResourceCache, ShellCache,
 };
 use dentrado::core::{core_ctx::GearCtx, storage::Storage};
-use kolorinko_rt::{Body, CaRef, RepoAssetPath, SafePathComponent, SiteShell};
+use kolorinko_rt::{
+    Body, CaRef, ListPagesQuery, ListPagesResult, RepoAssetPath, SafePathComponent, SiteShell,
+};
 use kolorinko_wikitext::{ArticleLatest, ArticleView};
 
 /// The Kolorinko runtime.
@@ -30,5 +32,5 @@ mod gears {
 // the server's subscription/dispatch code.
 pub(crate) use gears::{
     GearOutShared, article_latest, article_latest_parsed, asset, repo_l_article_latest,
-    repo_resource, shell,
+    repo_l_list_pages, repo_resource, shell,
 };

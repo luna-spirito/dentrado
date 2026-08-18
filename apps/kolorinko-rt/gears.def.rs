@@ -45,6 +45,22 @@ pub(crate) async fn repo_l_article_latest(
 #[dentrado::gear(
     follow(target = GearId::Repo(_repo_meta)),
     shared,
+    name = RepoLListPages,
+    wire_skip(_repo_meta),
+)]
+pub(crate) fn repo_l_list_pages(
+    _repo_meta: RepoMeta,
+    site: SafePathComponent,
+    query: ListPagesQuery,
+    repo_data: Rc<RepoData>,
+    _cache: &mut RepoLListPagesCache,
+) -> ListPagesResult {
+    crate::wikidot_page::repo_l_list_pages(&repo_data, &site, &query)
+}
+
+#[dentrado::gear(
+    follow(target = GearId::Repo(_repo_meta)),
+    shared,
     name = RepoResource,
     wire_skip(_repo_meta),
 )]

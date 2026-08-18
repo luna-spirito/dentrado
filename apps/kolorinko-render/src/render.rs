@@ -8,7 +8,7 @@
 
 use kolorinko_wikitext::{
     Align, AlignSide, BlockCell, BlockTable, ContainerKind, Content, LinkTarget, List, Node,
-    TableCell, TextObj, TextStyle,
+    TableCell, TextObj, TextStyle, civil_from_days, days_from_civil,
 };
 use leptos::prelude::*;
 
@@ -337,9 +337,7 @@ fn render_node(site: &str, node: &Node) -> AnyView {
         Node::Include(_) => {
             view! { <span class="include-placeholder">"[include]"</span> }.into_any()
         }
-        Node::Date { timestamp, .. } => {
-            view! { <span class="odate">{format!("#{timestamp}")}</span> }.into_any()
-        }
+        Node::Date { timestamp, format } => render_date(*timestamp, format.as_deref()),
         Node::Module(_) => {
             let _: () = view! { <></> };
             ().into_any()
@@ -796,4 +794,104 @@ fn normalize_size(arg: &str) -> String {
         return arg.into();
     }
     arg.into()
+}
+
+/// Render a concrete date (`%%created_at|format%%` bound by a ListPages
+/// instantiation) as Wikidot's `odate` span: the human-readable text formatted
+/// per the strftime-ish `format` (default `%d %b %Y %H:%M`), with `time_`/
+/// `format_` classes carrying the raw data for user scripts.
+fn render_date(timestamp: i64, format: Option<&str>) -> AnyView {
+    let mut class = format!("odate time_{timestamp}");
+    if let Some(f) = format {
+        class.push_str(" format_");
+        class.push_str(&urlencode_component(f));
+    }
+    let shown = format_date(timestamp, format);
+    view! { <span class=class>{shown}</span> }.into_any()
+}
+
+/// Percent-encode a `format_` class fragment the way Wikidot does: keep
+/// URI-unreserved characters, escape everything else (notably `%` → `%25`).
+fn urlencode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Format a Unix timestamp (UTC) with the strftime directives Wikidot date
+/// variables accept. Unrecognized directives are kept verbatim.
+fn format_date(ts: i64, fmt: Option<&str>) -> String {
+    let fmt = fmt.unwrap_or("%d %b %Y %H:%M UTC");
+    let days = ts.div_euclid(86_400);
+    let secs = ts.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let (hh, mm, ss) = (secs / 3600, secs % 3600 / 60, secs % 60);
+    let weekday = (days.rem_euclid(7) + 4) % 7; // 1970-01-01 was a Thursday
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let yday = days - days_from_civil(y, 1, 1) + 1;
+    let mut out = String::with_capacity(fmt.len());
+    let mut dirs = fmt.chars().peekable();
+    while let Some(c) = dirs.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match dirs.next() {
+            Some('Y') => out.push_str(&y.to_string()),
+            Some('y') => out.push_str(&format!("{:02}", y.rem_euclid(100))),
+            Some('m') => out.push_str(&format!("{m:02}")),
+            Some('d') => out.push_str(&format!("{d:02}")),
+            Some('e') => out.push_str(&format!("{d:2}")),
+            Some('H') => out.push_str(&format!("{hh:02}")),
+            Some('I') => out.push_str(&format!("{:02}", hh % 12)),
+            Some('M') => out.push_str(&format!("{mm:02}")),
+            Some('S') => out.push_str(&format!("{ss:02}")),
+            Some('p') => out.push_str(if hh < 12 { "AM" } else { "PM" }),
+            Some('a') => out.push_str(WEEKDAYS[weekday as usize]),
+            Some('A') => out.push_str(match weekday {
+                0 => "Sunday",
+                1 => "Monday",
+                2 => "Tuesday",
+                3 => "Wednesday",
+                4 => "Thursday",
+                5 => "Friday",
+                _ => "Saturday",
+            }),
+            Some('b') | Some('h') => out.push_str(MONTHS[(m - 1) as usize]),
+            Some('B') => out.push_str(match m {
+                1 => "January",
+                2 => "February",
+                3 => "March",
+                4 => "April",
+                5 => "May",
+                6 => "June",
+                7 => "July",
+                8 => "August",
+                9 => "September",
+                10 => "October",
+                11 => "November",
+                _ => "December",
+            }),
+            Some('j') => out.push_str(&format!("{yday:03}")),
+            Some('Z') => out.push_str("UTC"),
+            Some('%') => out.push('%'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
 }

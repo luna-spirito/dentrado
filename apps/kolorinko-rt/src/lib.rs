@@ -8,12 +8,12 @@
 //! `#[dears]`/`#[gears]` reads the *same* file for its runtime, so there is no
 //! hand-written duplicate of the gear list.
 
+use kolorinko_wikitext::{ArticleView, ListPagesParams};
+
 use std::{
     ops::Deref,
     path::{Component, Path},
 };
-
-use kolorinko_wikitext::ArticleView;
 
 /// A page slug: `(category, page)` — Wikidot's `category:name` flattened.
 pub type Slug = (Option<SafePathComponent>, SafePathComponent);
@@ -172,6 +172,61 @@ pub struct CaRef {
     pub ext: String,
 }
 
+/// A `[[module ListPages]]` selection as a gear-id payload: the module's
+/// parsed parameters, context selectors (`category="."`, `tags="="`, …)
+/// already resolved against the rendering page. Plain data with no local
+/// ids, so localization is the identity.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    dentrado_types::Localizable,
+)]
+#[serde(transparent)]
+pub struct ListPagesQuery(#[localizable(skip)] pub ListPagesParams);
+
+/// One page selected by a ListPages module: everything a template body can
+/// reference through `%%…%%` variables.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ListedPage {
+    /// Page name without category.
+    pub name: String,
+    /// Page category, `None` for a root (`_default`) page.
+    pub category: Option<String>,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub created_by: String,
+    pub created_at: i64,
+    pub updated_by: String,
+    pub updated_at: i64,
+    pub revisions: u64,
+}
+
+impl ListedPage {
+    /// Canonical Wikidot fullname: `category:name`, or just the name for a
+    /// root page.
+    #[must_use]
+    pub fn fullname(&self) -> String {
+        match &self.category {
+            Some(c) => format!("{c}:{}", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+/// The outcome of a ListPages selection: the (ordered, truncated to the first
+/// pagination page) matching pages plus the total match count, which the
+/// `%%total%%` template variable reports ignoring the limit.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ListPagesResult {
+    pub pages: Vec<ListedPage>,
+    pub total: i64,
+}
+
 /// One site's persistent chrome, fetched atomically in a single `site`-keyed
 /// subscription: the site title + subtitle, the theme stylesheet as a
 /// content-addressed URL, and the fully include-resolved `nav:top` / `nav:side`
@@ -240,7 +295,9 @@ impl SsrState {
 /// in `Subscribe`, and the server pushes only when the output's hash differs.
 #[dentrado_macros::gears_schema(file = "gears.def.rs")]
 pub mod wire {
-    use crate::{Body, CaRef, RepoAssetPath, SafePathComponent, SiteShell};
+    use crate::{
+        Body, CaRef, ListPagesQuery, ListPagesResult, RepoAssetPath, SafePathComponent, SiteShell,
+    };
     use kolorinko_wikitext::{ArticleLatest, ArticleView};
 
     /// Client → server: subscribe to a gear. This is the stream's only

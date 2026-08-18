@@ -66,7 +66,7 @@ use kolorinko_rt::{
 use crate::respond;
 use crate::runtime::{
     GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, asset,
-    repo_l_article_latest, repo_resource, shell,
+    repo_l_article_latest, repo_l_list_pages, repo_resource, shell,
 };
 use crate::wikidot_page::RepoMeta;
 
@@ -396,6 +396,11 @@ async fn subscribe_wire(
                 .subscribe(core)
                 .await
         }
+        wire::GearId::RepoLListPages { site, query } => {
+            repo_l_list_pages(repo_meta, site, query)
+                .subscribe(core)
+                .await
+        }
         wire::GearId::Shell(site) => shell(repo_meta, site).subscribe(core).await,
         // Assets are HTTP-only — never shipped over WebTransport. The match is
         // exhaustive on the generated wire enum, but `to_wire_out` drops these.
@@ -426,6 +431,9 @@ fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
             GearOutShared::RepoLArticleLatestOut(a) => {
                 Some(wire::GearOut::RepoLArticleLatestOut(a.clone()))
             }
+            // Server-internal resolution dependency of `article_latest`; the
+            // client never subscribes to it.
+            GearOutShared::RepoLListPagesOut(_) => None,
             // Assets are served over plain HTTP, never the WebTransport wire —
             // the browser fetches them via `<img>`/`<link>`/`url()`. Dropping
             // here keeps their bytes out of the subscription channel.

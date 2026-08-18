@@ -381,37 +381,96 @@ pub(crate) fn module_block<
                 |body| vec![Node::Stylesheet(body.trim().to_string())],
             ))?
         } else if lower.starts_with("listpages") {
-            inp.parse(
+            let attrs = inp.parse(
                 kw_ci("listpages".to_string())
-                    .ignore_then(read_until(&["]]"]).ignored())
+                    .ignore_then(params_block())
+                    .then_ignore(spaces())
                     .then_ignore(just("]]")),
             )?;
             let opener_end = *inp.cursor().inner();
-            let (repeat, reason) = inp.parse(content_loop(element.clone(), false))?;
-            if reason == ContentExitReason::ClosedTag(ClosedTag::Module) {
-                (
-                    vec![Node::ListPages(ListPages {
-                        params: ListPagesParams {
-                            category: None,
-                            tags: None,
-                            created_by: None,
-                            created_at: None,
-                            updated_at: None,
-                            order: None,
-                            offset: None,
-                            limit: None,
-                        },
-                        prepend: Vec::new(),
-                        repeat,
-                        append: Vec::new(),
-                    })],
-                    None,
-                )
+            // The body's four slots: without `[[head]]`/`[[body]]`/`[[foot]]`
+            // sections everything is the per-page repeat; with a `[[body]]`
+            // section it takes over that role and stray content is dropped.
+            let (mut head, mut body, mut foot, mut main) = (
+                Content::new(),
+                Content::new(),
+                Content::new(),
+                Content::new(),
+            );
+            let mut slot = SectionSlot::Main;
+            let mut body_section = false;
+            let mut stop = ContentExitReason::Eof;
+            loop {
+                let off = *inp.cursor().inner();
+                if off >= full.len() {
+                    break;
+                }
+                if let Some((reason, len)) = closer_at(full, off, false) {
+                    for _ in 0..len {
+                        let _ = inp.next();
+                    }
+                    stop = reason;
+                    break;
+                }
+                if let Some((section, open, len)) = section_marker(full, off) {
+                    for _ in 0..len {
+                        let _ = inp.next();
+                    }
+                    slot = if open { section } else { SectionSlot::Main };
+                    body_section |= section == SectionSlot::Body;
+                    continue;
+                }
+                let cp = inp.save();
+                match inp.parse(element.clone()) {
+                    Ok((sub, reason)) => {
+                        match slot {
+                            SectionSlot::Head => &mut head,
+                            SectionSlot::Body => &mut body,
+                            SectionSlot::Foot => &mut foot,
+                            SectionSlot::Main => &mut main,
+                        }
+                        .extend(sub);
+                        if let Some(reason) = reason {
+                            stop = reason;
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        inp.rewind(cp);
+                        if inp.next().is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let mut lp = ListPages {
+                params: listpages_params(&attrs),
+                prepend: head,
+                repeat: if body_section { body } else { main },
+                append: foot,
+            };
+            if stop == ContentExitReason::ClosedTag(ClosedTag::Module) {
+                // `prependLine`/`appendLine` fill the same slots as (and are
+                // overridden by) the `[[head]]`/`[[foot]]` sections.
+                if lp.prepend.is_empty()
+                    && let Some(line) = attr_value(&attrs, "prependline")
+                {
+                    lp.prepend = parse(&line);
+                }
+                if lp.append.is_empty()
+                    && let Some(line) = attr_value(&attrs, "appendline")
+                {
+                    lp.append = parse(&line);
+                }
+                (vec![Node::ListPages(lp)], None)
             } else {
-                let mut out = Vec::with_capacity(repeat.len() + 1);
+                let mut out =
+                    Vec::with_capacity(lp.prepend.len() + lp.repeat.len() + lp.append.len() + 1);
                 out.push(Node::Raw(full[opener_start..opener_end].to_string()));
-                out.extend(repeat);
-                (out, Some(reason))
+                out.extend(lp.prepend);
+                out.extend(lp.repeat);
+                out.extend(lp.append);
+                (out, Some(stop))
             }
         } else {
             // Single-tag module (`[[module Rate]]`, …) with no closer.
@@ -431,6 +490,62 @@ pub(crate) fn module_name<'a>() -> impl Parser<'a, In<'a>, String, E<'a>> + Clon
         .repeated()
         .at_least(1)
         .collect::<String>()
+}
+
+/// One slot of a ListPages module body: the `[[head]]` / `[[body]]` / `[[foot]]`
+/// sections, or the stray content outside them.
+#[derive(Clone, Copy, PartialEq)]
+enum SectionSlot {
+    Head,
+    Body,
+    Foot,
+    Main,
+}
+
+/// A `[[head]]`/`[[body]]`/`[[foot]]` section marker of a ListPages module
+/// body (open or close), case-insensitive with optional inner spaces. Returns
+/// the slot, whether it opens, and the consumed byte length.
+fn section_marker(full: &str, off: usize) -> Option<(SectionSlot, bool, usize)> {
+    let tail = full.as_bytes().get(off..)?;
+    if !tail.starts_with(b"[[") {
+        return None;
+    }
+    for (kw, slot) in [
+        (&b"head"[..], SectionSlot::Head),
+        (b"body", SectionSlot::Body),
+        (b"foot", SectionSlot::Foot),
+    ] {
+        for open in [true, false] {
+            if let Some(len) = marker_len(tail, kw, open) {
+                return Some((slot, open, len));
+            }
+        }
+    }
+    None
+}
+
+/// Length of a `[[KW]]` (open) or `[[/KW]]` (close) marker at the start of
+/// `tail`, or `None` when it doesn't match.
+fn marker_len(tail: &[u8], kw: &[u8], open: bool) -> Option<usize> {
+    let mut i = 2;
+    while tail.get(i) == Some(&b' ') {
+        i += 1;
+    }
+    if !open {
+        if tail.get(i) != Some(&b'/') {
+            return None;
+        }
+        i += 1;
+    }
+    if tail.get(i..i + kw.len())?.eq_ignore_ascii_case(kw) {
+        i += kw.len();
+    } else {
+        return None;
+    }
+    while tail.get(i) == Some(&b' ') {
+        i += 1;
+    }
+    (tail.get(i..i + 2)? == b"]]").then_some(i + 2)
 }
 
 /// `[[tabview]] … [[tab Name]] … [[/tab]] … [[/tabview]]`.

@@ -20,6 +20,11 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+mod dates;
+mod traverse;
+
+pub use dates::{civil_from_days, days_from_civil};
+
 /// A parsed page: a flat list of top-level nodes.
 pub type Content = Vec<Node>;
 
@@ -350,22 +355,46 @@ pub struct ListPages {
     pub append: Content,
 }
 
-/// Selection / ordering parameters of a [`ListPages`] module.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Selection / ordering parameters of a [`ListPages`] module, as parsed from
+/// the `[[module ListPages …]]` argument list. Selectors that reference the
+/// *current* page (`category="."`, `tags="="`, …) are kept verbatim here and
+/// resolved against the rendering page when the module is assembled.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ListPagesParams {
     pub category: Option<String>,
     pub tags: Option<TagsFilter>,
     pub created_by: Option<String>,
     pub created_at: Option<TimeFilter>,
     pub updated_at: Option<TimeFilter>,
+    /// `fullname="…"` — select exactly one page (also how `range="."`, the
+    /// "current page" range selector, is resolved at assembly time).
+    #[serde(default)]
+    pub fullname: Option<String>,
+    /// `pagetype="normal"` (default; no `_` prefix), `"hidden"`, or `"*"`.
+    #[serde(default)]
+    pub pagetype: Option<String>,
     pub order: Option<ListOrder>,
     pub offset: Option<i64>,
     pub limit: Option<i64>,
+    /// `perPage="n"` — a static render shows the first pagination page only.
+    #[serde(default)]
+    pub per_page: Option<i64>,
+    /// `separate="no"` compiles the items into one container instead of a
+    /// `list-pages-item` div each. Default `true`.
+    #[serde(default = "default_true")]
+    pub separate: bool,
+    /// `wrapper="no"` omits the outer `list-pages-box` div. Default `true`.
+    #[serde(default = "default_true")]
+    pub wrapper: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Parsed `tags="…"`: a space- / comma-separated list of `+req`, `-excl` and
 /// plain tags.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TagsFilter {
     /// Tags of which at least one must be present (plain tags).
     pub any: Vec<String>,
@@ -373,12 +402,15 @@ pub struct TagsFilter {
     pub all: Vec<String>,
     /// Tags that must not be present (`-tag`).
     pub none: Vec<String>,
+    /// `tags="-"` — pages with no tags at all.
+    #[serde(default)]
+    pub no_tags: bool,
 }
 
 /// A time filter for `created_at` / `updated_at`. Corresponds to PureScript
 /// `TempAmpl`; the stored integer is always a count of seconds (for the
 /// relative forms) or a Unix timestamp (for the absolute forms).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TimeFilter {
     /// `last N unit` → within the last N seconds. PureScript `ALast`.
     Last(i64),
@@ -395,7 +427,7 @@ pub enum TimeFilter {
 }
 
 /// Ordering of a [`ListPages`] result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ListOrder {
     /// Sort key (`"name"`, `"created_at"`, `"rating"`, …).
     pub by: String,

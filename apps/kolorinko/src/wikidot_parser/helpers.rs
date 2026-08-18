@@ -65,6 +65,201 @@ pub(crate) fn normalize_color(c: String) -> String {
     }
 }
 
+// ── ListPages module arguments ────────────────────────────────────────────
+
+/// `[[module ListPages …]]` argument map → selection parameters. Recognized
+/// selectors are parsed; values with no data behind them in the export
+/// (`rating`, `votes`, `parent`, `link_to`, `name`, …) and purely interactive
+/// arguments (`rss`, `urlAttrPrefix`, …) are ignored. An `@URL|default`
+/// reference keeps only its default — URL-passed arguments have no meaning in
+/// a static render.
+pub(crate) fn listpages_params(attrs: &HashMap<String, Vec<TextObj>>) -> ListPagesParams {
+    let sel = |key: &str| attr_value(attrs, key);
+    ListPagesParams {
+        category: sel("category").or_else(|| sel("categories")),
+        tags: sel("tags")
+            .or_else(|| sel("tag"))
+            .map(|v| parse_tags_filter(&v)),
+        created_by: sel("created_by"),
+        created_at: sel("created_at")
+            .or_else(|| sel("date"))
+            .and_then(|v| parse_time_filter(&v)),
+        updated_at: sel("updated_at").and_then(|v| parse_time_filter(&v)),
+        fullname: sel("fullname").or_else(|| {
+            // `range="."` selects the current page — the same page the
+            // assembly later substitutes for `fullname="="`.
+            sel("range").filter(|r| r == ".").map(|_| "=".to_string())
+        }),
+        pagetype: sel("pagetype"),
+        order: sel("order").and_then(|v| parse_order(&v)),
+        offset: sel("offset").and_then(|v| v.parse().ok()),
+        limit: sel("limit").and_then(|v| v.parse().ok()),
+        per_page: sel("perpage").and_then(|v| v.parse().ok()),
+        separate: sel("separate").is_none_or(|v| parse_yes(&v)),
+        wrapper: sel("wrapper").is_none_or(|v| parse_yes(&v)),
+    }
+}
+
+/// One attribute's value flattened to a trimmed string: plain text with
+/// `%%var%%`/`{$var$}` defaults spliced in (an unset variable contributes
+/// nothing), and an `@URL|default` reference reduced to its default.
+pub(crate) fn attr_value(attrs: &HashMap<String, Vec<TextObj>>, key: &str) -> Option<String> {
+    let mut s = String::new();
+    for o in attrs.get(key)? {
+        match o {
+            TextObj::Plain(t) => s.push_str(t),
+            TextObj::ModuleVar { default, .. } => {
+                if let Some(d) = default {
+                    s.push_str(d);
+                }
+            }
+            TextObj::IncludeVar { .. } => {}
+        }
+    }
+    let s = s.trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(default) = s.strip_prefix("@URL") {
+        return default
+            .strip_prefix('|')
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty());
+    }
+    Some(s)
+}
+
+/// `"yes"`/`"true"` (and anything unrecognized) → `true`; `"no"`/`"false"`/
+/// `"0"` → `false`.
+fn parse_yes(v: &str) -> bool {
+    !matches!(v.trim().to_ascii_lowercase().as_str(), "no" | "false" | "0")
+}
+
+/// A `tags="…"` selector: `-` alone means "no tags", otherwise a space- /
+/// comma-separated list of `+required`, `-excluded` and plain (additive, OR)
+/// tags.
+fn parse_tags_filter(v: &str) -> TagsFilter {
+    if v.trim() == "-" {
+        return TagsFilter {
+            no_tags: true,
+            ..TagsFilter::default()
+        };
+    }
+    let mut f = TagsFilter::default();
+    for token in v.split([',', ' ']).filter(|t| !t.is_empty()) {
+        match token.strip_prefix('+') {
+            Some(t) => f.all.push(t.to_string()),
+            None => match token.strip_prefix('-') {
+                Some(t) => f.none.push(t.to_string()),
+                None => f.any.push(token.to_string()),
+            },
+        }
+    }
+    f
+}
+
+/// A `created_at`/`updated_at` selector: `last n unit`, `older than n unit`,
+/// or an optionally prefixed (`>` `<` `>=` `<=` `=`) `yyyy[.mm[.dd]]` date
+/// (all UTC).
+fn parse_time_filter(v: &str) -> Option<TimeFilter> {
+    let lower = v.trim().to_ascii_lowercase();
+    let relative = lower
+        .strip_prefix("last ")
+        .or_else(|| lower.strip_prefix("older than "));
+    if let Some(rest) = relative {
+        let secs = relative_secs(rest)?;
+        return Some(if lower.starts_with("older") {
+            TimeFilter::OlderThan(secs)
+        } else {
+            TimeFilter::Last(secs)
+        });
+    }
+    let v = v.trim();
+    let (prefix, date) = ["<=", ">=", "<>", "<", ">", "="]
+        .into_iter()
+        .find_map(|p| v.strip_prefix(p).map(|d| (p, d.trim())))
+        .unwrap_or(("=", v));
+    let (start, end) = date_range(date)?;
+    Some(match prefix {
+        "=" => TimeFilter::Between(start, end),
+        ">" => TimeFilter::After(end),
+        ">=" => TimeFilter::After(start),
+        "<" => TimeFilter::Before(start),
+        "<=" => TimeFilter::Before(end),
+        _ => return None,
+    })
+}
+
+/// `n unit` → seconds (`n` defaults to 1; `hour`/`day`/`week`/`month`,
+/// singular or plural).
+fn relative_secs(rest: &str) -> Option<i64> {
+    let rest = rest.trim();
+    let (n, unit) = rest.split_once(' ').unwrap_or(("1", rest));
+    let n: i64 = n.trim().parse().ok()?;
+    let unit = unit.trim().to_ascii_lowercase();
+    let unit = unit.strip_suffix('s').unwrap_or(&unit);
+    let per = match unit {
+        "hour" => 3600,
+        "day" => 86_400,
+        "week" => 604_800,
+        "month" => 2_592_000,
+        _ => return None,
+    };
+    Some(n * per)
+}
+
+/// `yyyy`, `yyyy.mm` or `yyyy.mm.dd` → the `[start, end)` Unix-timestamp range
+/// it covers (UTC): the whole year, month, or day respectively.
+fn date_range(v: &str) -> Option<(i64, i64)> {
+    let mut parts = v.split('.');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m_str = parts.next();
+    let d_str = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    let m: i64 = m_str.map_or(Ok(1), str::parse).ok()?;
+    let d: i64 = d_str.map_or(Ok(1), str::parse).ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let start = days_from_civil(y, m, d).checked_mul(86_400)?;
+    let end = match (m_str, d_str) {
+        (None, None) => days_from_civil(y + 1, 1, 1).checked_mul(86_400)?,
+        (Some(_), None) => {
+            let (ny, nm) = month_after(y, m);
+            days_from_civil(ny, nm, 1).checked_mul(86_400)?
+        }
+        _ => start + 86_400,
+    };
+    Some((start, end))
+}
+
+/// The civil month after `(y, m)`.
+fn month_after(y: i64, m: i64) -> (i64, i64) {
+    if m == 12 { (y + 1, 1) } else { (y, m + 1) }
+}
+
+/// An `order="…"` argument: a property name with an optional trailing
+/// `desc` (default ascending; `desc desc` cancels out).
+fn parse_order(v: &str) -> Option<ListOrder> {
+    let v = v.trim();
+    let (by, ascending) = if let Some(b) = v.strip_suffix("desc desc") {
+        (b.trim(), true)
+    } else if let Some(b) = v.strip_suffix(" desc") {
+        (b.trim(), false)
+    } else {
+        (v, true)
+    };
+    if by.is_empty() {
+        return None;
+    }
+    Some(ListOrder {
+        by: by.to_string(),
+        ascending,
+    })
+}
+
 /// Recursively merge adjacent [`Node::Text(Plain(_))`] nodes so the fallback
 /// single-char path doesn't fragment output (e.g. `[[toc]]` → one text node).
 pub(crate) fn merge_text(content: Content) -> Content {
@@ -78,85 +273,8 @@ pub(crate) fn merge_text(content: Content) -> Content {
                     out.push(Node::Text(TextObj::Plain(s)));
                 }
             }
-            other => out.push(map_node_content(other, merge_text)),
+            other => out.push(other.map_node(&mut merge_text)),
         }
     }
     out
-}
-
-/// Apply a transformation to every nested [`Content`] within a node.
-pub(crate) fn map_node_content<F: Fn(Content) -> Content>(node: Node, f: F) -> Node {
-    match node {
-        Node::Container { kind, content } => Node::Container {
-            kind,
-            content: f(content),
-        },
-        Node::Heading { level, content } => Node::Heading {
-            level,
-            content: f(content),
-        },
-        Node::Image {
-            align,
-            source,
-            params,
-        } => Node::Image {
-            align,
-            source,
-            params,
-        },
-        Node::Table(rows) => Node::Table(
-            rows.into_iter()
-                .map(|row| {
-                    row.into_iter()
-                        .map(|cell| TableCell {
-                            colspan: cell.colspan,
-                            header: cell.header,
-                            align: cell.align,
-                            content: f(cell.content),
-                        })
-                        .collect()
-                })
-                .collect(),
-        ),
-        Node::BlockTable(t) => Node::BlockTable(BlockTable {
-            params: t.params,
-            rows: t
-                .rows
-                .into_iter()
-                .map(|r| BlockRow {
-                    params: r.params,
-                    content: f(r.content),
-                })
-                .collect(),
-        }),
-        Node::BlockCell(c) => Node::BlockCell(BlockCell {
-            header: c.header,
-            params: c.params,
-            content: f(c.content),
-        }),
-        Node::SupSubscript { sup, sub } => Node::SupSubscript {
-            sup: f(sup),
-            sub: f(sub),
-        },
-        Node::Link { target, text } => Node::Link {
-            target,
-            text: f(text),
-        },
-        Node::Footnote(c) => Node::Footnote(f(c)),
-        Node::Tabview(tabs) => Node::Tabview(
-            tabs.into_iter()
-                .map(|t| types::Tab {
-                    name: f(t.name),
-                    content: f(t.content),
-                })
-                .collect(),
-        ),
-        Node::ListPages(mut lp) => {
-            lp.prepend = f(lp.prepend);
-            lp.repeat = f(lp.repeat);
-            lp.append = f(lp.append);
-            Node::ListPages(lp)
-        }
-        other => other,
-    }
 }
