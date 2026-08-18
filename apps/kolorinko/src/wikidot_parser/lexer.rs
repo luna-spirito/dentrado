@@ -1320,7 +1320,7 @@ fn lex_params(b: &[u8], mut k: usize, out: &mut Params) -> usize {
 /// `{$var}` substitutions — up to any of `stops`, a newline, or EOF. Ports
 /// the old `collect_text_objs` including its variable-reading quirks (a
 /// default may run past a newline; an include default is sub-parsed markup).
-fn collect_text_objs(b: &[u8], mut k: usize, stops: &[&[u8]]) -> (usize, Vec<TextObj>) {
+pub(crate) fn collect_text_objs(b: &[u8], mut k: usize, stops: &[&[u8]]) -> (usize, Vec<TextObj>) {
     let mut result = Vec::new();
     let mut buf = String::new();
     loop {

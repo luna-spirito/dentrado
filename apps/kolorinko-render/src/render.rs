@@ -670,6 +670,10 @@ fn filename_of(url: &str) -> String {
 fn render_link(site: &str, target: &LinkTarget, text: &Content) -> AnyView {
     let href = match target {
         LinkTarget::Url(u) => u.clone(),
+        // Still carries unresolved variable slots (no listed page in scope):
+        // flatten with the same default / verbatim `%%name%%` fallback as any
+        // other text run and use it as the href.
+        LinkTarget::Unresolved(objs) => text_objs_to_string(objs),
         LinkTarget::Page(p) => {
             let rest = p.path.join("/");
             match &p.space {

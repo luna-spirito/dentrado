@@ -76,14 +76,7 @@ pub(super) fn collect_external_refs(content: &Content, out: &mut Vec<String>) {
 /// literal text (no module/include variables) — a variable URL can't be
 /// content-addressed statically and is left for the client to resolve at render.
 fn ref_tail_of(source: &[TextObj]) -> Option<String> {
-    let mut url = String::new();
-    for obj in source {
-        match obj {
-            TextObj::Plain(s) => url.push_str(s),
-            _ => return None,
-        }
-    }
-    http_tail(&url, None)
+    TextObj::plain_concat(source).and_then(|url| http_tail(&url, None))
 }
 
 /// Replace every mirrored-attachment reference in `content` with its
@@ -128,14 +121,7 @@ pub(super) fn substitute_resources(
 /// Rewrite a purely-literal image `source` (`[Plain(url)]`) to its CA URL when
 /// `ca_for` resolves it; leave sources with variables or non-http URLs as-is.
 fn subst_source<F: Fn(&str) -> Option<String>>(source: Vec<TextObj>, ca_for: F) -> Vec<TextObj> {
-    let url = source.iter().try_fold(String::new(), |mut acc, o| match o {
-        TextObj::Plain(s) => {
-            acc.push_str(s);
-            Some(acc)
-        }
-        _ => None,
-    });
-    if let Some(url) = url
+    if let Some(url) = TextObj::plain_concat(&source)
         && let Some(tail) = http_tail(&url, None)
         && let Some(ca) = ca_for(&tail)
     {

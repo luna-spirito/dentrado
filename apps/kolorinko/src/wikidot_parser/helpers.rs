@@ -6,13 +6,34 @@
 use super::*;
 
 /// Turn a raw link target string into a [`LinkTarget`]: external URL if it
-/// starts with `http://`/`https://`, otherwise an internal wiki page reference.
+/// starts with `http://`/`https://` (or is a same-page `#fragment`),
+/// otherwise an internal wiki page reference.
 pub(crate) fn parse_link_target(raw: &str) -> LinkTarget {
     let trimmed = raw.trim();
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") || trimmed.starts_with('#')
+    {
         return LinkTarget::Url(trimmed.to_string());
     }
     LinkTarget::Page(parse_page_ref(trimmed))
+}
+
+/// Turn an attribute-carried link target — any target the lexer hands over
+/// as text that may hold `{$var}`/`%%var%%` slots (the `href` value of
+/// `[[a …]]`, the target of `[[[…]]]` / `[…]`) — into a [`LinkTarget`]: a
+/// fully literal value classifies through [`parse_link_target`], one with
+/// variable slots stays [`LinkTarget::Unresolved`] until substitution (or
+/// the render fallback) flattens it.
+pub(crate) fn parse_link_target_objs(objs: &[TextObj]) -> LinkTarget {
+    TextObj::plain_concat(objs).map_or_else(
+        || LinkTarget::Unresolved(objs.to_vec()),
+        |s| parse_link_target(&s),
+    )
+}
+
+/// Split a raw link-target string into [`TextObj`]s, recognizing `%%var%%`
+/// / `{$var}` slots; a slot-free target stays a single [`TextObj::Plain`].
+pub(crate) fn text_objs_of(raw: &str) -> Vec<TextObj> {
+    lexer::collect_text_objs(raw.as_bytes(), 0, &[]).1
 }
 
 /// Parse a `[[include]]` source or internal link path into a [`PageRef`].

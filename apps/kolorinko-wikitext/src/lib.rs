@@ -138,6 +138,21 @@ pub enum TextObj {
     },
 }
 
+impl TextObj {
+    /// A run of text objs concatenated into a plain string — `Some` only
+    /// while every part is [`TextObj::Plain`]; any variable slot in the run
+    /// makes it `None`.
+    pub fn plain_concat(objs: &[TextObj]) -> Option<String> {
+        objs.iter().try_fold(String::new(), |mut acc, o| match o {
+            TextObj::Plain(s) => {
+                acc.push_str(s);
+                Some(acc)
+            }
+            _ => None,
+        })
+    }
+}
+
 /// A node in the parsed page tree. Corresponds to PureScript `PagxPart`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Node {
@@ -303,10 +318,16 @@ pub struct BlockCell {
 /// paths (with `:` rewritten to `/`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinkTarget {
-    /// External `http://` / `https://` URL.
+    /// External `http://` / `https://` URL (or a same-page `#fragment`).
     Url(String),
     /// Internal wiki page reference (`database:vika-owl`, `science`, …).
     Page(PageRef),
+    /// A target from any link kind (`[[a href=…]]`, `[[[…]]]`, `[…]`) that
+    /// still carries variable slots (`{$x}` / `%%x%%`): not classifiable as
+    /// URL or page until the variables resolve. Substitution re-classifies
+    /// the flattened text; whatever is still unresolved at render falls back
+    /// to its text projection.
+    Unresolved(Vec<TextObj>),
 }
 
 /// A reference to a wiki page, shared by [`LinkTarget`] and [`Include`].

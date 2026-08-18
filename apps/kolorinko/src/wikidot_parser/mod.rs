@@ -220,6 +220,84 @@ mod tests {
     }
 
     #[test]
+    fn anchor_href_bare_and_rooted_paths_are_pages() {
+        // `[[a href="terrible-trio-event"]]` and the root-absolute form are
+        // internal page references, not external URLs.
+        for href in ["terrible-trio-event", "/terrible-trio-event"] {
+            let c = parse(&format!("[[a href=\"{href}\"]]x[[/a]]"));
+            let Node::Link { target, .. } = &c[0] else {
+                panic!("expected link, got {:?}", c[0])
+            };
+            let LinkTarget::Page(p) = target else {
+                panic!("expected page target, got {target:?}")
+            };
+            assert_eq!(p.space, None);
+            assert_eq!(p.path, ["terrible-trio-event"]);
+        }
+    }
+
+    #[test]
+    fn anchor_href_url_and_fragment_stay_urls() {
+        let c =
+            parse("[[a href=\"https://x.io/y\"]]y[[/a]] [[a href=\"#toc\"]]top[[/a]] [[a]]x[[/a]]");
+        for (i, want) in [(0, "https://x.io/y"), (2, "#toc"), (4, "#")] {
+            let Node::Link { target, .. } = &c[i] else {
+                panic!("expected link at {i}, got {:?}", c[i])
+            };
+            assert!(
+                matches!(target, LinkTarget::Url(u) if u == want),
+                "link {i}: {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_href_with_include_var_stays_unresolved() {
+        // The variable slot must survive parsing (it used to be silently
+        // dropped from the href).
+        let c = parse("[[a href=\"https://www.obscurative.ru/{$page}\"]]x[[/a]]");
+        let Node::Link { target, .. } = &c[0] else {
+            panic!("expected link, got {:?}", c[0])
+        };
+        let LinkTarget::Unresolved(objs) = target else {
+            panic!("expected unresolved target, got {target:?}")
+        };
+        assert!(matches!(
+            objs.as_slice(),
+            [TextObj::Plain(p), TextObj::IncludeVar { name, .. }] if p == "https://www.obscurative.ru/" && name == "page"
+        ));
+    }
+
+    #[test]
+    fn triple_link_var_target_is_unresolved() {
+        // Any link target with variable slots — not only `[[a href=…]]` —
+        // stays `Unresolved` until substitution classifies the flattened
+        // text (the `%%fullname%%` used to hide as a literal `Page` path).
+        let c = parse("[[[%%fullname%%|t]]] [[[{$page}]]]");
+        let Node::Link { target, text } = &c[0] else {
+            panic!("expected link, got {:?}", c[0])
+        };
+        assert!(matches!(
+            target,
+            LinkTarget::Unresolved(o) if matches!(&o[..], [TextObj::ModuleVar { name, .. }] if name == "fullname")
+        ));
+        assert!(matches!(text.as_slice(), [Node::Text(TextObj::Plain(t))] if t == "t"));
+        // No explicit text: the target's own objs become the visible text,
+        // so a resolved `{$page}` shows through in the label too.
+        let Node::Link { target, text } = &c[2] else {
+            panic!("expected link, got {:?}", c[2])
+        };
+        assert!(matches!(
+            target,
+            LinkTarget::Unresolved(o) if matches!(&o[..], [TextObj::IncludeVar { name, .. }] if name == "page")
+        ));
+        assert!(matches!(
+            text.as_slice(),
+            [Node::Text(TextObj::IncludeVar { name, .. })] if name == "page"
+        ));
+    }
+
+    #[test]
     fn div_block() {
         let c = parse("[[div style=\"color:red\"]]\nhi **there**\n[[/div]]");
         assert!(matches!(

@@ -290,34 +290,18 @@ fn subst_node(node: Node, vars: &Vars) -> Content {
     }
 }
 
-/// Rewrite an internal link target that is a bare module variable — the
-/// `[[[%%fullname%%|…]]]` idiom, whose target the parser keeps as a literal
-/// string (link targets carry no variable slots) — against the listed page in
-/// scope. Every other target passes through.
+/// Resolve a link target under the visible [`Vars`]: an
+/// [`LinkTarget::Unresolved`] — a target from any link kind that carried
+/// `{$var}`/`%%var%%` slots — is substituted text-wise and, once fully
+/// literal, re-classified through [`parse_link_target`]; a still-unresolved
+/// target stays verbatim for the render fallback. Every other target passes
+/// through.
 fn subst_link_target(target: LinkTarget, vars: &Vars) -> LinkTarget {
-    let LinkTarget::Page(p) = &target else {
+    let LinkTarget::Unresolved(objs) = target else {
         return target;
     };
-    let Some(m) = &vars.module else {
-        return target;
-    };
-    let name = (p.space.is_none()
-        && p.path.len() == 1
-        && p.path[0].starts_with("%%")
-        && p.path[0].ends_with("%%"))
-    .then(|| &p.path[0][2..p.path[0].len() - 2]);
-    match name.and_then(|n| m.resolve(n, None)) {
-        Some(content) => {
-            let mut s = String::new();
-            collect_plain(&content, &mut s);
-            if s.is_empty() {
-                target
-            } else {
-                parse_link_target(&s)
-            }
-        }
-        None => target,
-    }
+    let objs = subst_textobjs(objs, vars);
+    TextObj::plain_concat(&objs).map_or(LinkTarget::Unresolved(objs), |s| parse_link_target(&s))
 }
 
 fn subst_kind(kind: ContainerKind, vars: &Vars) -> ContainerKind {
@@ -478,6 +462,74 @@ mod tests {
         assert_eq!(p.space.as_deref(), Some("rumor-n"));
         assert_eq!(p.path, ["foo"]);
         assert_eq!(plain(text), "Foo");
+    }
+
+    fn page_content(s: &str) -> Content {
+        vec![Node::Text(TextObj::Plain(s.to_string()))]
+    }
+
+    #[test]
+    fn unresolved_anchor_href_resolves_via_include_vars() {
+        let vars = [("page".to_string(), page_content("terrible-trio-event"))];
+        let out = apply_include_vars(
+            parse("[[a href=\"https://www.obscurative.ru/{$page}\"]]x[[/a]]"),
+            &vars,
+        );
+        let Node::Link { target, .. } = &out[0] else {
+            panic!("expected link: {out:?}")
+        };
+        assert!(matches!(
+            target,
+            LinkTarget::Url(u) if u == "https://www.obscurative.ru/terrible-trio-event"
+        ));
+    }
+
+    #[test]
+    fn unresolved_anchor_href_reclassifies_as_page() {
+        // `{$page}` alone resolves to a bare page slug: the flattened target
+        // must classify as a page, not an external URL.
+        let vars = [("page".to_string(), page_content("terrible-trio-event"))];
+        let out = apply_include_vars(parse("[[a href=\"{$page}\"]]x[[/a]]"), &vars);
+        let Node::Link { target, .. } = &out[0] else {
+            panic!("expected link: {out:?}")
+        };
+        let LinkTarget::Page(p) = target else {
+            panic!("expected page target: {target:?}")
+        };
+        assert_eq!(p.path, ["terrible-trio-event"]);
+    }
+
+    #[test]
+    fn unresolved_anchor_href_module_var_resolves_in_scope() {
+        let site = SafePathComponent::new("site".into()).unwrap();
+        let page = listed("foo", Some("rumor-n"), "Foo", &[]);
+        let vars = page_vars(&site, &page, None);
+        let out = apply_vars(parse("[[a href=\"%%name%%\"]]x[[/a]]"), &vars);
+        let Node::Link { target, .. } = &out[0] else {
+            panic!("expected link: {out:?}")
+        };
+        let LinkTarget::Page(p) = target else {
+            panic!("expected page target: {target:?}")
+        };
+        assert_eq!(p.path, ["foo"]);
+    }
+
+    #[test]
+    fn unresolved_anchor_href_without_scope_stays_verbatim() {
+        // No listed page in scope: the module var slot survives for the
+        // render fallback instead of being dropped or half-substituted.
+        let vars = Vars::include_only(&[]);
+        let out = apply_vars(parse("[[a href=\"/tag/%%name%%\"]]x[[/a]]"), &vars);
+        let Node::Link { target, .. } = &out[0] else {
+            panic!("expected link: {out:?}")
+        };
+        let LinkTarget::Unresolved(objs) = target else {
+            panic!("expected unresolved target: {target:?}")
+        };
+        assert!(matches!(
+            objs.as_slice(),
+            [TextObj::Plain(_), TextObj::ModuleVar { name, .. }] if name == "name"
+        ));
     }
 
     #[test]

@@ -356,13 +356,13 @@ impl<'src> Merger<'src> {
             unreachable!()
         };
         self.pos += 1;
-        let target = target.trim();
+        let objs = text_objs_of(target.trim());
         (
             vec![Node::Link {
-                target: parse_link_target(target),
+                target: parse_link_target_objs(&objs),
                 text: match text {
                     Some(t) => parse_sub(t),
-                    None => vec![self.text_node(target)],
+                    None => objs.into_iter().map(Node::Text).collect(),
                 },
             }],
             None,
@@ -374,12 +374,13 @@ impl<'src> Merger<'src> {
             unreachable!()
         };
         self.pos += 1;
+        let objs = text_objs_of(target.trim());
         (
             vec![Node::Link {
-                target: parse_link_target(target),
+                target: parse_link_target_objs(&objs),
                 text: match text {
                     Some(t) => vec![self.text_node(t.trim())],
-                    None => vec![self.text_node(target)],
+                    None => objs.into_iter().map(Node::Text).collect(),
                 },
             }],
             None,
@@ -696,19 +697,12 @@ impl<'src> Merger<'src> {
         let OpenTag::Anchor { params } = tag else {
             unreachable!()
         };
-        self.balanced_node(opener, ClosedTag::Anchor, move |content| {
-            let href = params
-                .get("href")
-                .and_then(|v| v.first())
-                .and_then(|t| match t {
-                    TextObj::Plain(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "#".to_string());
-            Node::Link {
-                target: LinkTarget::Url(href),
-                text: content,
-            }
+        self.balanced_node(opener, ClosedTag::Anchor, move |content| Node::Link {
+            target: params.get("href").map_or_else(
+                || LinkTarget::Url("#".to_string()),
+                |v| parse_link_target_objs(v),
+            ),
+            text: content,
         })
     }
 
