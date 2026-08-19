@@ -38,7 +38,7 @@ fn trim_ws(content: &Content) -> &[Node] {
 /// inside their paragraph as soft breaks (`<br>`).
 pub fn render_block(site: &str, content: &Content) -> Vec<AnyView> {
     let mut out: Vec<AnyView> = Vec::with_capacity(content.len());
-    let mut para: Vec<AnyView> = Vec::new();
+    let mut para: Vec<Piece> = Vec::new();
     for node in content {
         if is_block(node) {
             flush(&mut para, &mut out);
@@ -46,7 +46,7 @@ pub fn render_block(site: &str, content: &Content) -> Vec<AnyView> {
         } else if let Node::Text(TextObj::Plain(t)) = node {
             for tok in para_tokens(t) {
                 match tok {
-                    ParaToken::Text(s) => para.push(render_plain(&s)),
+                    ParaToken::Text(s) => para.push(Piece::Text(s)),
                     ParaToken::Break => flush(&mut para, &mut out),
                 }
             }
@@ -74,10 +74,10 @@ pub fn render_block(site: &str, content: &Content) -> Vec<AnyView> {
                     );
                 }
             } else {
-                para.push(render_node(site, node));
+                para.push(Piece::Node(render_node(site, node)));
             }
         } else {
-            para.push(render_node(site, node));
+            para.push(Piece::Node(render_node(site, node)));
         }
     }
     flush(&mut para, &mut out);
@@ -86,8 +86,11 @@ pub fn render_block(site: &str, content: &Content) -> Vec<AnyView> {
 
 /// Split a text run into paragraph tokens: a blank line — two or more newlines
 /// separated only by spaces/tabs — is a [`ParaToken::Break`] (paragraph
-/// boundary); everything else is a text segment whose single newlines remain
-/// as soft breaks. Segment edges are trimmed to match Wikidot's clean `<p>`s.
+/// boundary); everything else is a verbatim text segment whose single newlines
+/// remain as soft breaks. No edge trimming here: whether a segment sits at a
+/// paragraph rim (trim, so `<p>`s stay clean) or at a seam between adjacent
+/// inline nodes (keep verbatim, whitespace included) is only known when the
+/// paragraph is assembled — see [`para_views`].
 enum ParaToken {
     Text(String),
     Break,
@@ -117,7 +120,7 @@ fn para_tokens(s: &str) -> Vec<ParaToken> {
             }
             if newlines >= 2 {
                 if i > start {
-                    toks.push(ParaToken::Text(s[start..i].trim().to_string()));
+                    toks.push(ParaToken::Text(s[start..i].to_string()));
                 }
                 toks.push(ParaToken::Break);
                 start = k;
@@ -128,18 +131,56 @@ fn para_tokens(s: &str) -> Vec<ParaToken> {
         i += 1;
     }
     if start < n {
-        let rest = s[start..].trim();
-        if !rest.is_empty() {
-            toks.push(ParaToken::Text(rest.to_string()));
-        }
+        toks.push(ParaToken::Text(s[start..].to_string()));
     }
     toks
 }
 
-fn flush(para: &mut Vec<AnyView>, out: &mut Vec<AnyView>) {
-    if !para.is_empty() {
-        let p = std::mem::take(para);
-        out.push(view! { <p>{p}</p> }.into_any());
+/// A paragraph under assembly: verbatim text segments and pre-rendered inline
+/// nodes, stitched together (and rim-trimmed) by [`para_views`].
+enum Piece {
+    Text(String),
+    Node(AnyView),
+}
+
+/// Assemble a paragraph: trim whitespace off the paragraph's outer edges,
+/// dropping text pieces left empty and moving inward past them — Wikidot's
+/// `<p>`s never open or close with a `<br>` or stray spaces, however many
+/// text nodes sit at the rim. Trimming stops at the first surviving piece
+/// (text with content, or any pre-rendered inline node). Text between two
+/// inline nodes is a mid-paragraph seam and survives verbatim, single
+/// newlines and all. An all-whitespace paragraph yields no views (no `<p>`).
+fn para_views(para: &mut Vec<Piece>) -> Vec<AnyView> {
+    while let Some(Piece::Text(s)) = para.first_mut() {
+        *s = s.trim_start().to_string();
+        if s.is_empty() {
+            para.remove(0);
+        } else {
+            break;
+        }
+    }
+    while let Some(Piece::Text(s)) = para.last_mut() {
+        *s = s.trim_end().to_string();
+        if s.is_empty() {
+            para.pop();
+        } else {
+            break;
+        }
+    }
+    std::mem::take(para)
+        .into_iter()
+        .filter_map(|piece| match piece {
+            Piece::Text(s) if s.is_empty() => None,
+            Piece::Text(s) => Some(render_plain(&s)),
+            Piece::Node(view) => Some(view),
+        })
+        .collect()
+}
+
+fn flush(para: &mut Vec<Piece>, out: &mut Vec<AnyView>) {
+    let views = para_views(para);
+    if !views.is_empty() {
+        out.push(view! { <p>{views}</p> }.into_any());
     }
 }
 
@@ -234,32 +275,30 @@ fn render_block_div_(site: &str, content: &Content) -> Vec<AnyView> {
         Block(AnyView),
         Inline(Vec<AnyView>),
     }
+    let flush = |para: &mut Vec<Piece>, units: &mut Vec<Unit>| {
+        let views = para_views(para);
+        if !views.is_empty() {
+            units.push(Unit::Inline(views));
+        }
+    };
     let mut units: Vec<Unit> = Vec::new();
-    let mut para: Vec<AnyView> = Vec::new();
+    let mut para: Vec<Piece> = Vec::new();
     for node in content {
         if is_block(node) {
-            if !para.is_empty() {
-                units.push(Unit::Inline(std::mem::take(&mut para)));
-            }
+            flush(&mut para, &mut units);
             units.push(Unit::Block(render_node(site, node)));
         } else if let Node::Text(TextObj::Plain(t)) = node {
             for tok in para_tokens(t) {
                 match tok {
-                    ParaToken::Text(s) => para.push(render_plain(&s)),
-                    ParaToken::Break => {
-                        if !para.is_empty() {
-                            units.push(Unit::Inline(std::mem::take(&mut para)));
-                        }
-                    }
+                    ParaToken::Text(s) => para.push(Piece::Text(s)),
+                    ParaToken::Break => flush(&mut para, &mut units),
                 }
             }
         } else {
-            para.push(render_node(site, node));
+            para.push(Piece::Node(render_node(site, node)));
         }
     }
-    if !para.is_empty() {
-        units.push(Unit::Inline(std::mem::take(&mut para)));
-    }
+    flush(&mut para, &mut units);
     let last = units.len().saturating_sub(1);
     units
         .into_iter()
@@ -383,7 +422,9 @@ fn render_plain(s: &str) -> AnyView {
                 if i > 0 {
                     v.push(view! { <br /> }.into_any());
                 }
-                v.push(view! { {seg.to_string()} }.into_any());
+                if !seg.is_empty() {
+                    v.push(view! { {seg.to_string()} }.into_any());
+                }
                 v
             })
             .collect();
