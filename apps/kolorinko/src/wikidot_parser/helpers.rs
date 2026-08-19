@@ -8,7 +8,7 @@ use super::*;
 /// Turn a raw link target string into a [`LinkTarget`]: external URL if it
 /// starts with `http://`/`https://` (or is a same-page `#fragment`),
 /// otherwise an internal wiki page reference.
-pub(crate) fn parse_link_target(raw: &str) -> LinkTarget {
+pub fn parse_link_target(raw: &str) -> LinkTarget {
     let trimmed = raw.trim();
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") || trimmed.starts_with('#')
     {
@@ -23,7 +23,7 @@ pub(crate) fn parse_link_target(raw: &str) -> LinkTarget {
 /// fully literal value classifies through [`parse_link_target`], one with
 /// variable slots stays [`LinkTarget::Unresolved`] until substitution (or
 /// the render fallback) flattens it.
-pub(crate) fn parse_link_target_objs(objs: &[TextObj]) -> LinkTarget {
+pub fn parse_link_target_objs(objs: &[TextObj]) -> LinkTarget {
     TextObj::plain_concat(objs).map_or_else(
         || LinkTarget::Unresolved(objs.to_vec()),
         |s| parse_link_target(&s),
@@ -527,4 +527,13 @@ pub(crate) fn merge_text(content: Content) -> Content {
         }
     }
     out
+}
+
+/// The Text_Wiki Typography substitutions applied to plain text: `...` and
+/// `. . .` become an ellipsis. (`--` → em-dash is handled at the mark level.)
+pub(crate) fn typography(s: &str) -> String {
+    if !s.contains("...") && !s.contains(". . .") {
+        return s.to_string();
+    }
+    s.replace("...", "\u{2026}").replace(". . .", "\u{2026}")
 }

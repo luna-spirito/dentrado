@@ -435,6 +435,7 @@ fn external_refs_are_collected_and_content_addressed() {
         Node::Link {
             target: LinkTarget::Url(hot.into()),
             text: vec![],
+            class: None,
         },
         Node::Stylesheet(css.into()),
     ];

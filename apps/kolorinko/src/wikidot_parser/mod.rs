@@ -28,7 +28,7 @@ pub mod types;
 pub(crate) use crate::wikidot_parser::types::*;
 pub(crate) use std::collections::HashMap;
 
-mod helpers;
+pub mod helpers;
 pub(crate) mod lexer;
 pub(crate) mod merge;
 
@@ -48,6 +48,8 @@ pub enum ClosedTag {
     /// `[[module …]] … [[/module]]`. Covers `css`, `ListPages` and (in
     /// principle) any other module — the body is dispatched on the name.
     Module,
+    /// `[[footnote]] … [[/footnote]]`.
+    Footnote,
     Tab,
     Tabview,
     Table,
@@ -78,6 +80,7 @@ impl ClosedTag {
             ClosedTag::Size => "size".into(),
             ClosedTag::IfTags => "iftags".into(),
             ClosedTag::Module => "module".into(),
+            ClosedTag::Footnote => "footnote".into(),
             ClosedTag::Tab => "tab".into(),
             ClosedTag::Tabview => "tabview".into(),
             ClosedTag::Table => "table".into(),
@@ -196,7 +199,7 @@ mod tests {
     fn triple_link() {
         let c = parse("[[[science|Science page]]]");
         match &c[0] {
-            Node::Link { target, text } => {
+            Node::Link { target, text, .. } => {
                 assert!(matches!(target, LinkTarget::Page(_)));
                 assert_eq!(text.len(), 1);
             }
@@ -207,7 +210,7 @@ mod tests {
     #[test]
     fn bare_url() {
         let c = parse("see https://example.com/x for info");
-        let Node::Link { target, text } = &c[1] else {
+        let Node::Link { target, text, .. } = &c[1] else {
             panic!("expected bare-url link, got {:?}", c[1]);
         };
         // The scheme is preserved (not stripped), keeping the URL absolute for
@@ -221,8 +224,8 @@ mod tests {
 
     #[test]
     fn anchor_href_bare_and_rooted_paths_are_pages() {
-        // `[[a href="terrible-trio-event"]]` and the root-absolute form are
-        // internal page references, not external URLs.
+        // `[[a href="…"]]` is classified like any link: bare/rooted paths
+        // become internal page references.
         for href in ["terrible-trio-event", "/terrible-trio-event"] {
             let c = parse(&format!("[[a href=\"{href}\"]]x[[/a]]"));
             let Node::Link { target, .. } = &c[0] else {
@@ -253,8 +256,8 @@ mod tests {
 
     #[test]
     fn anchor_href_with_include_var_stays_unresolved() {
-        // The variable slot must survive parsing (it used to be silently
-        // dropped from the href).
+        // The variable slot must survive parsing inside the href; it stays
+        // unresolved until a ListPages/substitution pass binds it.
         let c = parse("[[a href=\"https://www.obscurative.ru/{$page}\"]]x[[/a]]");
         let Node::Link { target, .. } = &c[0] else {
             panic!("expected link, got {:?}", c[0])
@@ -264,7 +267,8 @@ mod tests {
         };
         assert!(matches!(
             objs.as_slice(),
-            [TextObj::Plain(p), TextObj::IncludeVar { name, .. }] if p == "https://www.obscurative.ru/" && name == "page"
+            [TextObj::Plain(p), TextObj::IncludeVar { name, .. }]
+                if p == "https://www.obscurative.ru/" && name == "page"
         ));
     }
 
@@ -274,7 +278,7 @@ mod tests {
         // stays `Unresolved` until substitution classifies the flattened
         // text (the `%%fullname%%` used to hide as a literal `Page` path).
         let c = parse("[[[%%fullname%%|t]]] [[[{$page}]]]");
-        let Node::Link { target, text } = &c[0] else {
+        let Node::Link { target, text, .. } = &c[0] else {
             panic!("expected link, got {:?}", c[0])
         };
         assert!(matches!(
@@ -284,7 +288,7 @@ mod tests {
         assert!(matches!(text.as_slice(), [Node::Text(TextObj::Plain(t))] if t == "t"));
         // No explicit text: the target's own objs become the visible text,
         // so a resolved `{$page}` shows through in the label too.
-        let Node::Link { target, text } = &c[2] else {
+        let Node::Link { target, text, .. } = &c[2] else {
             panic!("expected link, got {:?}", c[2])
         };
         assert!(matches!(
@@ -525,7 +529,7 @@ mod tests {
         // blob (which would indicate the parser gave up).
         assert!(c.len() > 4, "len = {}, nodes = {:#?}", c.len(), c);
         // The unknown `[[module Rate]]` becomes a suppressed Module node.
-        assert!(matches!(c[0], Node::Module(_)));
+        assert!(matches!(c[0], Node::Module { .. }));
         // A div container appears somewhere.
         assert!(
             c.iter()
@@ -547,7 +551,13 @@ mod tests {
         // `[[module Rate]]` is not a known module; it is consumed (not leaked
         // as text) and represented as a suppressed Module node.
         let c = parse("[[module Rate]]");
-        assert_eq!(c, vec![Node::Module("Rate".to_string())]);
+        assert_eq!(
+            c,
+            vec![Node::Module {
+                name: "Rate".to_string(),
+                params: Params::new()
+            }]
+        );
     }
 
     #[test]
@@ -561,30 +571,18 @@ mod tests {
     #[test]
     fn collapsible_is_div_container() {
         let c = parse("[[collapsible show=\"+\" hide=\"-\"]]\nbody **bold**\n[[/collapsible]]");
-        let Node::Container { kind, content } = &c[0] else {
-            panic!("expected container, got {c:#?}");
-        };
-        let ContainerKind::Div {
-            inline,
-            block,
-            params,
-        } = kind
+        let Node::Collapsible {
+            folded,
+            show,
+            hide,
+            content,
+        } = &c[0]
         else {
-            panic!("expected div, got {kind:#?}");
+            panic!("expected collapsible, got {c:#?}");
         };
-        assert!(!inline);
-        assert!(block);
-        assert_eq!(
-            params
-                .get("class")
-                .and_then(|v| v.first())
-                .and_then(|t| match t {
-                    TextObj::Plain(s) => Some(s.as_str()),
-                    _ => None,
-                }),
-            Some("collapsible-block")
-        );
-        // The body parsed as wikitext (bold span present).
+        assert!(folded);
+        assert_eq!(show, "+");
+        assert_eq!(hide, "-");
         assert!(content.iter().any(|n| matches!(
             n,
             Node::Container {

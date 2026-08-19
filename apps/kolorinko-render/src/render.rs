@@ -7,13 +7,19 @@
 //! instead of Wikidot's per-site subdomains.
 
 use kolorinko_wikitext::{
-    Align, AlignSide, BlockCell, BlockTable, ContainerKind, Content, LinkTarget, List, Node,
-    TableCell, TextObj, TextStyle, civil_from_days, days_from_civil,
+    Align, AlignSide, BlockCell, BlockTable, ClearSide, ContainerKind, Content, LinkTarget, List,
+    Node, TableCell, TextObj, TextStyle, civil_from_days, days_from_civil,
 };
 use leptos::prelude::*;
+use leptos::tachys::html::element::custom;
 
 pub(crate) fn render_inline(site: &str, content: &[Node]) -> Vec<AnyView> {
     content.iter().map(|n| render_node(site, n)).collect()
+}
+
+/// A view that renders to nothing at all (no hydration-marker residue).
+fn empty_view() -> AnyView {
+    Vec::<AnyView>::new().into_any()
 }
 
 /// Slice off leading/trailing nodes that are pure whitespace text, so inline
@@ -325,8 +331,9 @@ fn is_block(node: &Node) -> bool {
             | Node::BlockCell(_)
             | Node::Image { .. }
             | Node::HorizontalRule
-            | Node::Tabview(_)
-            | Node::Footnote(_)
+            | Node::Clearfloat(_)
+            | Node::Tabview { .. }
+            | Node::FootnoteBlock(_)
             | Node::Container {
                 kind: ContainerKind::Quote
                     | ContainerKind::Align(_)
@@ -339,7 +346,10 @@ fn is_block(node: &Node) -> bool {
             | Node::Include(_)
             | Node::Raw(_)
             | Node::Code(_)
+            | Node::ModuleBlock { .. }
+            | Node::Module { .. }
             | Node::List(_)
+            | Node::Collapsible { .. }
     )
 }
 
@@ -348,7 +358,18 @@ fn render_node(site: &str, node: &Node) -> AnyView {
         Node::Text(t) => render_text_obj(t),
         Node::Raw(s) => view! { <span style="white-space: pre-wrap">{s.clone()}</span> }.into_any(),
         Node::Container { kind, content } => render_container(site, kind, content),
-        Node::Heading { level, content } => render_heading(site, *level, content),
+        Node::Heading {
+            level,
+            anchor,
+            content,
+        } => render_heading(site, *level, anchor.as_deref(), content),
+        Node::AnchorTarget(name) => {
+            use leptos::tachys::html::attribute::custom::custom_attribute;
+            custom("a")
+                .add_any_attr(custom_attribute("name", name.clone()))
+                .child(Vec::<AnyView>::new())
+                .into_any()
+        }
         Node::Table(rows) => render_table(site, rows),
         Node::BlockTable(table) => render_grid_table(site, table),
         Node::BlockCell(cell) => view! { <>{render_inline(site, &cell.content)}</> }.into_any(),
@@ -357,7 +378,11 @@ fn render_node(site: &str, node: &Node) -> AnyView {
             source,
             params,
         } => render_image(align, source, params),
-        Node::Link { target, text } => render_link(site, target, text),
+        Node::Link {
+            target,
+            text,
+            class,
+        } => render_link(site, target, text, class.as_deref()),
         Node::SupSubscript { sup, sub } => view! {
             <>
                 {(!sup.is_empty()).then(|| view! { <sup>{render_inline(site, sup)}</sup> })}
@@ -367,20 +392,31 @@ fn render_node(site: &str, node: &Node) -> AnyView {
         .into_any(),
         Node::HorizontalRule => view! { <hr /> }.into_any(),
         Node::Stylesheet(css) => view! { <style>{css.clone()}</style> }.into_any(),
-        Node::Footnote(content) => view! {
-            <sup class="footnoteref">{render_inline(site, content)}</sup>
-        }
-        .into_any(),
-        Node::Tabview(tabs) => render_tabview(site, tabs),
+        Node::Footnote(_) | Node::FootnoteRef(_) => render_footnote_ref(node),
+        Node::FootnoteBlock(bodies) => render_footnote_block(site, bodies),
+        Node::Tabview { id, tabs } => render_tabview(site, *id, tabs),
         Node::ListPages(lp) => render_block(site, &lp.repeat).into_any(),
         Node::Include(_) => {
             view! { <span class="include-placeholder">"[include]"</span> }.into_any()
         }
         Node::Date { timestamp, format } => render_date(*timestamp, format.as_deref()),
-        Node::Module(_) => {
-            let _: () = view! { <></> };
-            ().into_any()
+        Node::IfExpr { then, .. } => view! { <>{render_inline(site, then)}</> }.into_any(),
+        Node::Collapsible { .. } => render_collapsible(site, node, None),
+        Node::User { name, avatar } => render_user(name, *avatar),
+        Node::Clearfloat(side) => {
+            let clear = match side {
+                ClearSide::Both => "both",
+                ClearSide::Left => "left",
+                ClearSide::Right => "right",
+            };
+            view! { <div style=format!("clear:{clear}; height: 0px; font-size: 1px")></div> }
+                .into_any()
         }
+        Node::Module { name, params } => match name.to_ascii_lowercase().as_str() {
+            "newpage" => render_new_page_form(params),
+            _ => empty_view(),
+        },
+        Node::ModuleBlock { name, params, body } => render_module_block(site, name, params, body),
         Node::Code(s) => view! {
             <div class="code"><pre><code>{s.clone()}</code></pre></div>
         }
@@ -450,22 +486,28 @@ fn render_container(site: &str, kind: &ContainerKind, content: &Content) -> AnyV
             <span style="text-decoration: line-through">{render_inline(site, content)}</span>
         }
         .into_any(),
+        ContainerKind::Tt => {
+            let inner = render_inline(site, content);
+            custom("tt").child(inner).into_any()
+        }
         ContainerKind::Div {
             inline,
             block,
             params,
         } => {
             let (class, style) = params_to_class_style(params);
+            let id = params_id(params);
+            let class = (!class.is_empty()).then_some(class);
             if *block {
                 let inner = render_block(site, content);
-                return view! { <div class=class style=style>{inner}</div> }.into_any();
+                return view! { <div id=id class=class style=style>{inner}</div> }.into_any();
             }
             if *inline {
                 // `[[span]]`: inline body. (A span whose body crosses blank
                 // lines is split into one `<p>` per run by [`render_block`] when
                 // it sits in block context.)
                 let inner = render_inline(site, content);
-                return view! { <span class=class style=style>{inner}</span> }.into_any();
+                return view! { <span id=id class=class style=style>{inner}</span> }.into_any();
             }
             // `[[div_]]`: a block `<div>` that suppresses Wikidot's
             // auto-paragraphing of its first and last inline run. Block
@@ -473,14 +515,14 @@ fn render_container(site: &str, kind: &ContainerKind, content: &Content) -> AnyV
             // sidebar of nested `[[div_]]` / `----` renders as a flat sequence;
             // interior blank-line-separated inline runs still get `<p>`.
             let inner = render_block_div_(site, content);
-            view! { <div class=class style=style>{inner}</div> }.into_any()
+            view! { <div id=id class=class style=style>{inner}</div> }.into_any()
         }
         ContainerKind::Color(c) => view! {
             <span style=format!("color: {c}")>{render_inline(site, content)}</span>
         }
         .into_any(),
         ContainerKind::Size(arg) => view! {
-            <span style=format!("font-size: {}", normalize_size(arg))>
+            <span style=format!("font-size:{}", normalize_size(arg))>
                 {render_inline(site, content)}
             </span>
         }
@@ -505,15 +547,15 @@ fn render_container(site: &str, kind: &ContainerKind, content: &Content) -> AnyV
     }
 }
 
-fn render_heading(site: &str, level: u32, content: &Content) -> AnyView {
-    let inner = render_inline(site, content);
+fn render_heading(site: &str, level: u32, anchor: Option<&str>, content: &Content) -> AnyView {
+    let inner = view! { <span>{render_inline(site, content)}</span> };
     match level.min(6) {
-        1 => view! { <h1>{inner}</h1> }.into_any(),
-        2 => view! { <h2>{inner}</h2> }.into_any(),
-        3 => view! { <h3>{inner}</h3> }.into_any(),
-        4 => view! { <h4>{inner}</h4> }.into_any(),
-        5 => view! { <h5>{inner}</h5> }.into_any(),
-        _ => view! { <h6>{inner}</h6> }.into_any(),
+        1 => view! { <h1 id=anchor>{inner}</h1> }.into_any(),
+        2 => view! { <h2 id=anchor>{inner}</h2> }.into_any(),
+        3 => view! { <h3 id=anchor>{inner}</h3> }.into_any(),
+        4 => view! { <h4 id=anchor>{inner}</h4> }.into_any(),
+        5 => view! { <h5 id=anchor>{inner}</h5> }.into_any(),
+        _ => view! { <h6 id=anchor>{inner}</h6> }.into_any(),
     }
 }
 
@@ -558,6 +600,7 @@ pub fn wrap_topbar_lists(content: &mut Content) {
                         item.content = vec![Node::Link {
                             target: LinkTarget::Url("javascript:;".to_string()),
                             text,
+                            class: None,
                         }];
                     }
                 }
@@ -709,7 +752,7 @@ fn filename_of(url: &str) -> String {
     url.rsplit('/').next().unwrap_or(url).to_string()
 }
 
-fn render_link(site: &str, target: &LinkTarget, text: &Content) -> AnyView {
+fn render_link(site: &str, target: &LinkTarget, text: &Content, class: Option<&str>) -> AnyView {
     let href = match target {
         LinkTarget::Url(u) => u.clone(),
         // Still carries unresolved variable slots (no listed page in scope):
@@ -725,21 +768,203 @@ fn render_link(site: &str, target: &LinkTarget, text: &Content) -> AnyView {
         }
     };
     let inner = render_inline(site, text);
-    view! { <a href=href>{inner}</a> }.into_any()
+    view! { <a class=class href=href>{inner}</a> }.into_any()
 }
 
-/// `[[tabview]]` → the YUI DOM skeleton (`.yui-navset`), first tab shown.
-fn render_tabview(site: &str, tabs: &[kolorinko_wikitext::Tab]) -> AnyView {
+/// `[[user name]]` / `[[*user name]]` → Wikidot's `printuser` span. The
+/// export carries no user ids, so the avatar image and the `onclick`
+/// handlers of the live site are not reproduced.
+fn render_user(name: &str, avatar: bool) -> AnyView {
+    let unix = unix_name(name);
+    let href = format!("http://www.wikidot.com/user:info/{unix}");
+    let class = if avatar {
+        "printuser avatarhover"
+    } else {
+        "printuser"
+    };
+    view! {
+        <span class=class><a href=href>{name.to_string()}</a></span>
+    }
+    .into_any()
+}
+
+/// Wikidot's `toUnixName`: lowercase, spaces and underscores to dashes.
+fn unix_name(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .map(|c| match c {
+            ' ' | '_' => '-',
+            other => other,
+        })
+        .collect()
+}
+
+/// A footnote reference (`[[footnote]]`, or the numbered ref the assembly
+/// pass left behind).
+fn render_footnote_ref(node: &Node) -> AnyView {
+    let n = match node {
+        Node::FootnoteRef(n) => *n,
+        _ => 1,
+    };
+    view! {
+        <sup class="footnoteref">
+            <a id=format!("footnoteref-{n}") href="javascript:;" class="footnoteref">
+                {n.to_string()}
+            </a>
+        </sup>
+    }
+    .into_any()
+}
+
+/// The collected footnote bodies, at `[[footnoteblock]]` (or the page foot).
+fn render_footnote_block(site: &str, bodies: &[Content]) -> AnyView {
+    if bodies.is_empty() {
+        return empty_view();
+    }
+    let items: Vec<AnyView> = bodies
+        .iter()
+        .enumerate()
+        .map(|(i, body)| {
+            let n = i + 1;
+            view! {
+                <div class="footnote-footer" id=format!("footnote-{n}")>
+                    <a href="javascript:;">{n.to_string()}</a>
+                    {". "}{render_inline(site, body)}
+                </div>
+            }
+            .into_any()
+        })
+        .collect();
+    view! {
+        <div class="footnotes-footer">
+            <div class="title">"Footnotes"</div>
+            {items}
+        </div>
+    }
+    .into_any()
+}
+
+/// `[[module NewPage …]]` → Wikidot's new-page form.
+fn render_module_block(
+    site: &str,
+    name: &str,
+    _params: &std::collections::HashMap<String, Vec<TextObj>>,
+    body: &Content,
+) -> AnyView {
+    match name.to_ascii_lowercase().as_str() {
+        // No forum data exists in the export; render the structural shell
+        // with a visible disclaimer so the empty box is self-explanatory.
+        "frontforum" => view! {
+            <div class="front-forum-box">
+                <div class="body-panel" style="text-align:center; color:#888; padding:1em">
+                    "No forum data available in this archive."
+                </div>
+            </div>
+        }
+        .into_any(),
+        // Body-capable modules without data: render nothing rather than a
+        // template full of unresolved `%%var%%` slots.
+        _ => view! { <>{render_block(site, body)}</> }.into_any(),
+    }
+}
+
+fn render_new_page_form(params: &std::collections::HashMap<String, Vec<TextObj>>) -> AnyView {
+    let size = params
+        .get("size")
+        .map(|v| text_objs_to_string(v))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "30".into());
+    let button = params
+        .get("button")
+        .map(|v| text_objs_to_string(v))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "create page".into());
+    let category = params
+        .get("category")
+        .map(|v| text_objs_to_string(v))
+        .filter(|s| !s.is_empty());
+    let tags = params
+        .get("tags")
+        .map(|v| text_objs_to_string(v))
+        .filter(|s| !s.is_empty());
+    view! {
+        <div class="new-page-box" style="text-align: center; margin: 1em 0">
+            <form action="dummy.html" method="get"
+                onsubmit="WIKIDOT.modules.NewPageHelperModule.listeners.create(event);">
+                <input class="text" name="pageName" type="text" size=size maxlength="128" style="margin: 1px" disabled />
+                <input type="submit" class="button" value=button style="margin: 1px;" disabled />
+                {category.map(|c| view! { <input type="hidden" name="categoryName" value=c /> }.into_any())}
+                {tags.map(|t| view! { <input type="hidden" name="tags" value=t /> }.into_any())}
+            </form>
+        </div>
+    }
+    .into_any()
+}
+
+/// `[[collapsible]]` → Wikidot's folded/unfolded two-part block with a
+/// client-side toggle. `size` is the `[[size …]]` argument of the idiom where
+/// a size span wraps only the show/hide links.
+fn render_collapsible(site: &str, node: &Node, _size: Option<&str>) -> AnyView {
+    let Node::Collapsible {
+        folded,
+        show,
+        hide,
+        content,
+    } = node
+    else {
+        unreachable!()
+    };
+    let open = RwSignal::new(!*folded);
+    let show = nbsp(show);
+    let hide = nbsp(hide);
+    let folded_link = view! {
+        <a class="collapsible-block-link" href="javascript:;"
+            on:click=move |_| open.set(true)>{show.clone()}</a>
+    };
+    let unfolded_link = view! {
+        <a class="collapsible-block-link" href="javascript:;"
+            on:click=move |_| open.set(false)>{hide.clone()}</a>
+    };
+    view! {
+        <div class="collapsible-block">
+            <div class="collapsible-block-folded" style=move || open.get().then_some("display:none")>
+                {folded_link}
+            </div>
+            <div class="collapsible-block-unfolded" style=move || (!open.get()).then_some("display:none")>
+                <div class="collapsible-block-unfolded-link">{unfolded_link}</div>
+                <div class="collapsible-block-content">{render_block(site, content)}</div>
+            </div>
+        </div>
+    }
+    .into_any()
+}
+
+/// Wikidot renders collapsible show/hide labels with every space turned into
+/// a non-breaking space (they must not wrap).
+fn nbsp(s: &str) -> String {
+    s.replace(' ', "\u{a0}")
+}
+
+/// `[[tabview]]` → the YUI DOM skeleton (`.yui-navset`) with a client-side
+/// tab switch; the first tab renders selected.
+fn render_tabview(site: &str, id: u32, tabs: &[kolorinko_wikitext::Tab]) -> AnyView {
     if tabs.is_empty() {
         return view! { <div class="yui-navset"></div> }.into_any();
     }
+    let selected = RwSignal::new(0usize);
     let nav: Vec<AnyView> = tabs
         .iter()
         .enumerate()
         .map(|(i, tab)| {
             let name = render_inline(site, &tab.name);
-            let class = if i == 0 { Some("selected") } else { None };
-            view! { <li class=class><em>{name}</em></li> }.into_any()
+            view! {
+                <li class=move || (selected.get() == i).then_some("selected")>
+                    <a href="javascript:;" on:click=move |_| selected.set(i)>
+                        <em>{name}</em>
+                    </a>
+                </li>
+            }
+            .into_any()
         })
         .collect();
     let panels: Vec<AnyView> = tabs
@@ -747,12 +972,17 @@ fn render_tabview(site: &str, tabs: &[kolorinko_wikitext::Tab]) -> AnyView {
         .enumerate()
         .map(|(i, tab)| {
             let body = render_block(site, &tab.content);
-            let style = if i == 0 { None } else { Some("display:none") };
-            view! { <div style=style>{body}</div> }.into_any()
+            view! {
+                <div id=format!("wiki-tab-{id}-{i}")
+                    style=move || (selected.get() != i).then_some("display:none")>
+                    {body}
+                </div>
+            }
+            .into_any()
         })
         .collect();
     view! {
-        <div class="yui-navset yui-navset-top">
+        <div id=format!("wiki-tabview-{id}") class="yui-navset">
             <ul class="yui-nav">{nav}</ul>
             <div class="yui-content">{panels}</div>
         </div>
@@ -771,18 +1001,45 @@ fn params_to_class_style(
         .get("style")
         .map(|v| text_objs_to_string(v))
         .unwrap_or_default();
+    // Collapse a stray trailing `;` so appending extra declarations never
+    // produces a `;;` (Wikidot's golden output always joins with a single `;`).
+    if style.ends_with(';') {
+        style.pop();
+    }
     for (k, v) in params {
         if matches!(k.as_str(), "class" | "style" | "id") {
             continue;
         }
         if !style.is_empty() {
-            style.push(';');
+            style.push_str("; ");
         }
         style.push_str(k);
         style.push(':');
+        style.push(' ');
         style.push_str(&text_objs_to_string(v));
     }
+    // tachys appends a trailing `;` when serializing a `style=` attribute,
+    // so the value we hand it must not already end with one.
+    while style.ends_with(';') {
+        style.pop();
+    }
     (class, (!style.is_empty()).then_some(style))
+}
+
+/// `[[div id="X" …]]` → Wikidot's `u-`-prefixed element id (a namespace the
+/// site's own CSS cannot collide with).
+fn params_id(params: &std::collections::HashMap<String, Vec<TextObj>>) -> Option<String> {
+    params
+        .get("id")
+        .map(|v| {
+            let raw = text_objs_to_string(v);
+            if raw.starts_with("u-") {
+                raw
+            } else {
+                format!("u-{raw}")
+            }
+        })
+        .filter(|s| s != "u-")
 }
 
 pub(crate) fn text_objs_to_string(objs: &[TextObj]) -> String {
@@ -852,7 +1109,9 @@ fn render_date(timestamp: i64, format: Option<&str>) -> AnyView {
         class.push_str(" format_");
         class.push_str(&urlencode_component(f));
     }
-    let shown = format_date(timestamp, format);
+    // The displayed text always uses the default format; the custom format
+    // lives only in the `format_…` class for user scripts.
+    let shown = format_date(timestamp, None);
     view! { <span class=class>{shown}</span> }.into_any()
 }
 
@@ -873,7 +1132,7 @@ fn urlencode_component(s: &str) -> String {
 /// Format a Unix timestamp (UTC) with the strftime directives Wikidot date
 /// variables accept. Unrecognized directives are kept verbatim.
 fn format_date(ts: i64, fmt: Option<&str>) -> String {
-    let fmt = fmt.unwrap_or("%d %b %Y %H:%M UTC");
+    let fmt = fmt.unwrap_or("%d %b %Y %H:%M");
     let days = ts.div_euclid(86_400);
     let secs = ts.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);

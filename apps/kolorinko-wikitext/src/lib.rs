@@ -25,8 +25,37 @@ mod traverse;
 
 pub use dates::{civil_from_days, days_from_civil};
 
+/// Assign `toc0`, `toc1`, … anchors to every heading in document order,
+/// matching the id scheme Wikidot emits for in-page table-of-contents links.
+/// Headings already carrying an explicit anchor (from `[[# name]]` syntax)
+/// are left untouched.
+pub fn assign_toc_anchors(content: &mut Content) {
+    let mut n = 0u32;
+    assign_toc_anchors_inner(content, &mut n);
+}
+
+fn assign_toc_anchors_inner(content: &mut Content, n: &mut u32) {
+    for node in content.iter_mut() {
+        if let Node::Heading {
+            anchor: a @ None, ..
+        } = node
+        {
+            *a = Some(format!("toc{}", *n));
+            *n += 1;
+        }
+        let owned = std::mem::replace(node, Node::Raw(String::new()));
+        *node = owned.map_node(&mut |mut c| {
+            assign_toc_anchors_inner(&mut c, n);
+            c
+        });
+    }
+}
+
 /// A parsed page: a flat list of top-level nodes.
 pub type Content = Vec<Node>;
+
+/// `key="value"` attributes of bracket constructs (`[[div …]]`, modules, …).
+pub type Params = HashMap<String, Vec<TextObj>>;
 
 /// Horizontal alignment, optionally floating (text wraps around it).
 ///
@@ -93,6 +122,9 @@ pub enum ContainerKind {
     /// `[[size …]] … [[/size]]`. The string is the raw size argument
     /// (`"120%"`, `"larger"`, `"2em"`, …). PureScript `TekstLargx`.
     Size(String),
+
+    /// `{{monospace}}` (`<tt>`).
+    Tt,
 
     /// `##color|text##` coloured text. PureScript `TekstKolor`.
     Color(String),
@@ -171,13 +203,18 @@ pub enum Node {
     },
 
     /// `+ Heading`, `++ Sub-heading`, … Inlined from the old `subtitol` table
-    /// (PureScript `Titol`). Anchor ids are a render-time concern, so they are
-    /// not stored here.
+    /// (PureScript `Titol`). `anchor` is the render target id (`id="tocN"`),
+    /// assigned by the page-assembly pass in document order; `None` until
+    /// then (a bare parse carries no numbering).
     Heading {
         /// Number of leading `+` characters.
         level: u32,
+        anchor: Option<String>,
         content: Content,
     },
+
+    /// `[[# name]]` — an inline anchor target (`<a name="…"></a>`).
+    AnchorTarget(String),
 
     /// `[[image source attr="val" …]]` (PureScript `Bild`). `source` is a list
     /// of [`TextObj`]s so it may contain substitutions, and so is each
@@ -211,9 +248,15 @@ pub enum Node {
     /// `Stilar`.
     Stylesheet(String),
 
-    /// A hyperlink. `[[[target|text]]]`, `[[[target]]]`, or a bare `http://…`.
-    /// PureScript `Ligil`.
-    Link { target: LinkTarget, text: Content },
+    /// A hyperlink. `[[[target|text]]]`, `[[[target]]]`, a bare `http://…`,
+    /// or `[[a class="…" href="…"]]text[[/a]]`. The target is classified
+    /// into a [`LinkTarget`] (auto-rewritten by the renderer); `class` carries
+    /// the optional `[[a]]` class attribute.
+    Link {
+        target: LinkTarget,
+        text: Content,
+        class: Option<String>,
+    },
 
     /// `[[include source vars…]]`. Inlined from the old `subpagx` table
     /// (PureScript `Subpagx`). The included page's own content is fetched
@@ -233,22 +276,73 @@ pub enum Node {
         format: Option<String>,
     },
 
-    /// `[[footnote]] … [[/footnote]]`. Inlined from the old `piednot` table.
-    /// The renderer collects these and emits the footnote block at the foot of
-    /// the page (or wherever `[[footnoteblock]]` stands).
+    /// `[[#ifexpr cond | then]]` / `[[#ifexpr cond | then | else]]` — a
+    /// conditional on module variables (`%%rating%%`, `%%total%%`, …),
+    /// evaluated at assembly time once the variables are in scope. The
+    /// condition is kept as raw text objects so variable substitution can
+    /// flatten it; both branches are parsed markup.
+    IfExpr {
+        cond: Vec<TextObj>,
+        then: Content,
+        els: Content,
+    },
+
+    /// `[[collapsible show="…" hide="…"]] … [[/collapsible]]`. Renders as the
+    /// two-part folded/unfolded DOM with a client-side toggle; `folded`
+    /// mirrors `folded="no"|"false"` (initially unfolded).
+    Collapsible {
+        folded: bool,
+        show: String,
+        hide: String,
+        content: Content,
+    },
+
+    /// `[[user name]]` (`avatar == false`) or `[[*user name]]` (`avatar ==
+    /// true`, avatar variant). The wikidot.com user-info link is derived from
+    /// the name; the export carries no user ids, so the avatar image and the
+    /// `onclick` handlers of the live site are not reproduced.
+    User { name: String, avatar: bool },
+
+    /// `~~~~` / `~~~~<` / `~~~~>` — a clear-float block.
+    Clearfloat(ClearSide),
+
+    /// `[[footnote]] … [[/footnote]]` at parse time; the page-assembly pass
+    /// collects the bodies in document order and rewrites each occurrence to
+    /// a [`Node::FootnoteRef`].
     Footnote(Content),
 
+    /// The numbered reference a collected footnote rendered to (`<sup
+    /// class="footnoteref">`).
+    FootnoteRef(u32),
+
+    /// `[[footnoteblock]]` — where the collected footnote bodies render.
+    /// A bare parse yields the empty marker; the page-assembly pass fills it
+    /// with the page's collected bodies (or appends a filled block at the end
+    /// of the content when no marker stands in the page).
+    FootnoteBlock(Vec<Content>),
+
     /// `[[tabview]] … [[tab Name]] … [[/tab]] … [[/tabview]]`. Inlined from the
-    /// old `Libro` / `subvoj` tables.
-    Tabview(Vec<Tab>),
+    /// old `Libro` / `subvoj` tables. `id` is the tabview's page-unique index
+    /// (assigned by the page-assembly pass) — the `wiki-tabview-<id>` /
+    /// `wiki-tab-<id>-<n>` element ids derive from it.
+    Tabview { id: u32, tabs: Vec<Tab> },
 
     /// `----` horizontal rule. PureScript `Hr`.
     HorizontalRule,
 
-    /// A single-tag `[[module Name …]]` with no `[[/module]]` closer (Rate,
-    /// PageTree, …). These are interactive/dynamic and have no static body;
-    /// the renderer suppresses them (emits nothing).
-    Module(String),
+    /// A single-tag `[[module Name …]]`. Interactive/dynamic modules with no
+    /// static body: the renderer suppresses them, except `NewPage` (the
+    /// new-page form).
+    Module { name: String, params: Params },
+
+    /// A paired `[[module Name …]] … [[/module]]` — a module with a body
+    /// template resolved at assembly time (FrontForum, CountPages, ListUsers,
+    /// …) into whatever content it produces.
+    ModuleBlock {
+        name: String,
+        params: Params,
+        body: Content,
+    },
 
     /// `[[code]] … [[/code]]` — verbatim preformatted source (not parsed as
     /// wikitext). Rendered as Wikidot's `<div class="code"><pre><code>…` block.
@@ -358,6 +452,14 @@ pub struct Include {
 pub struct Tab {
     pub name: Content,
     pub content: Content,
+}
+
+/// Which floats a [`Node::Clearfloat`] clears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClearSide {
+    Both,
+    Left,
+    Right,
 }
 
 /// `[[module ListPages …]]`. Corresponds to PureScript `ListPagx'`.

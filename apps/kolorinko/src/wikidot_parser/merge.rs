@@ -190,6 +190,10 @@ impl<'src> Merger<'src> {
             Tok::SubMark => Self::sub,
             Tok::ColorOpen(_) => Self::color_span,
             Tok::ColorClose => Self::degrade_tok,
+            Tok::Tt(_) => Self::tt,
+            Tok::Clearfloat(_) => Self::clearfloat,
+            Tok::AnchorTarget(_) => Self::anchor_target,
+            Tok::IfExpr { .. } => Self::if_expr,
             Tok::ModuleVar { .. } => Self::module_var,
             Tok::IncludeVar { .. } => Self::include_var,
             Tok::CommentClose => Self::stray_comment_close,
@@ -214,7 +218,54 @@ impl<'src> Merger<'src> {
     fn text(&mut self, tok: &Tok<'src>) -> (Content, Option<Stop>) {
         let Tok::Text(s) = tok else { unreachable!() };
         self.pos += 1;
-        (vec![self.text_node(s)], None)
+        // Typography (the Text_Wiki rule): `...` / `. . .` → ellipsis.
+        (vec![self.text_node(&typography(s))], None)
+    }
+
+    fn tt(&mut self, tok: &Tok<'src>) -> (Content, Option<Stop>) {
+        let Tok::Tt(body) = tok else { unreachable!() };
+        self.pos += 1;
+        (
+            vec![Node::Container {
+                kind: ContainerKind::Tt,
+                content: parse_sub(body),
+            }],
+            None,
+        )
+    }
+
+    fn clearfloat(&mut self, tok: &Tok<'src>) -> (Content, Option<Stop>) {
+        let Tok::Clearfloat(side) = *tok else {
+            unreachable!()
+        };
+        self.pos += 1;
+        if self.peek_is(|t| matches!(t, Tok::Newline)) {
+            self.pos += 1;
+        }
+        (vec![Node::Clearfloat(side)], None)
+    }
+
+    fn anchor_target(&mut self, tok: &Tok<'src>) -> (Content, Option<Stop>) {
+        let Tok::AnchorTarget(name) = tok else {
+            unreachable!()
+        };
+        self.pos += 1;
+        (vec![Node::AnchorTarget(name.to_string())], None)
+    }
+
+    fn if_expr(&mut self, tok: &Tok<'src>) -> (Content, Option<Stop>) {
+        let Tok::IfExpr { cond, then, els } = tok else {
+            unreachable!()
+        };
+        self.pos += 1;
+        (
+            vec![Node::IfExpr {
+                cond: text_objs_of(cond),
+                then: parse_sub(then),
+                els: els.map(parse_sub).unwrap_or_default(),
+            }],
+            None,
+        )
     }
 
     fn newline(&mut self, _tok: &Tok<'src>) -> (Content, Option<Stop>) {
@@ -237,6 +288,7 @@ impl<'src> Merger<'src> {
             vec![Node::Link {
                 target: LinkTarget::Url(u.to_string()),
                 text: vec![self.text_node(u)],
+                class: None,
             }],
             None,
         )
@@ -311,6 +363,7 @@ impl<'src> Merger<'src> {
         (
             vec![Node::Heading {
                 level,
+                anchor: None,
                 content: self.line_body(),
             }],
             None,
@@ -364,6 +417,7 @@ impl<'src> Merger<'src> {
                     Some(t) => parse_sub(t),
                     None => objs.into_iter().map(Node::Text).collect(),
                 },
+                class: None,
             }],
             None,
         )
@@ -382,14 +436,18 @@ impl<'src> Merger<'src> {
                     Some(t) => vec![self.text_node(t.trim())],
                     None => objs.into_iter().map(Node::Text).collect(),
                 },
+                class: None,
             }],
             None,
         )
     }
 
-    /// `//`, `**`, `__`, `--`. The old parser rejected an opener immediately
-    /// followed by a space (the `just(' ').not()` guard); `-- ` there is an
-    /// em-dash that swallows the space.
+    /// `//`, `**`, `__`, `--`. An opener immediately followed by a space is
+    /// not a span (the old `just(' ').not()` guard); `-- ` there is an
+    /// em-dash that swallows the space. A `--` with no closer on the line (or
+    /// one whose body has whitespace rims) is not strikethrough either — the
+    /// Text_Wiki regex requires non-space edges — so both marks render as
+    /// em-dashes around the free body.
     fn mark(&mut self, tok: &Tok<'src>) -> (Content, Option<Stop>) {
         let Tok::Mark(style) = *tok else {
             unreachable!()
@@ -405,7 +463,7 @@ impl<'src> Merger<'src> {
                     let rest = &rest[1..];
                     self.pos += 1;
                     if !rest.is_empty() {
-                        nodes.push(self.text_node(rest));
+                        nodes.push(self.text_node(&typography(rest)));
                     }
                 }
                 (nodes, None)
@@ -419,7 +477,38 @@ impl<'src> Merger<'src> {
                     None,
                 )
             }
+            (TextStyle::Strikethrough, false) => self.strikethrough(),
             (_, false) => (vec![self.style_body(style)], None),
+        }
+    }
+
+    /// A `--` opener with a non-space body: strikethrough only when a `--`
+    /// closer follows on the same line and the body has non-space rims;
+    /// otherwise each mark is an em-dash and the body stays free.
+    fn strikethrough(&mut self) -> (Content, Option<Stop>) {
+        let mut body =
+            self.body_until(|t| matches!(t, Tok::Mark(TextStyle::Strikethrough) | Tok::Newline));
+        if !self.peek_is(|t| matches!(t, Tok::Mark(TextStyle::Strikethrough))) {
+            let mut out = vec![self.text_node("—")];
+            out.append(&mut body);
+            return (out, None);
+        }
+        self.pos += 1;
+        let rim_ws = matches!(body.first(), Some(Node::Text(TextObj::Plain(s))) if s.starts_with(char::is_whitespace))
+            || matches!(body.last(), Some(Node::Text(TextObj::Plain(s))) if s.ends_with(char::is_whitespace));
+        if rim_ws {
+            let mut out = vec![self.text_node("—")];
+            out.append(&mut body);
+            out.push(self.text_node("—"));
+            (out, None)
+        } else {
+            (
+                vec![Node::Container {
+                    kind: ContainerKind::Style(TextStyle::Strikethrough),
+                    content: body,
+                }],
+                None,
+            )
         }
     }
 
@@ -642,6 +731,10 @@ impl<'src> Merger<'src> {
             OpenTag::Size(_) => Self::size_arm,
             OpenTag::IfTags(_) => Self::iftags_arm,
             OpenTag::Align { .. } => Self::align_arm,
+            OpenTag::User { .. } => Self::user_arm,
+            OpenTag::Footnote => Self::footnote_arm,
+            OpenTag::Footnoteblock => Self::footnoteblock_arm,
+            OpenTag::ModuleBlock { .. } => Self::module_block_arm,
             // `[[cell]]` / `[[hcell]]` are recognized at element level
             // anywhere (that is how a cell wrapped in `[[iftags]]` inside a
             // grid-table row parses); both close with `[[/cell]]`-style tags.
@@ -649,7 +742,7 @@ impl<'src> Merger<'src> {
             OpenTag::Code => Self::code_arm,
             OpenTag::Css => Self::css_arm,
             OpenTag::ListPages { .. } => Self::listpages_arm,
-            OpenTag::Module(_) => Self::module_arm,
+            OpenTag::Module { .. } => Self::module_arm,
             OpenTag::Include { .. } => Self::include_arm,
             OpenTag::Image { .. } => Self::image_arm,
             // Only meaningful as a tabview child / listpages marker / table
@@ -697,31 +790,86 @@ impl<'src> Merger<'src> {
         let OpenTag::Anchor { params } = tag else {
             unreachable!()
         };
+        // `[[a]]` is just a link that also carries a class: classify the href
+        // like any other target (so it gets auto-rewritten), and thread the
+        // class through to the renderer.
+        let class = attr_value(&params, "class").filter(|s| !s.is_empty());
+        let target = params
+            .get("href")
+            .map(|v| parse_link_target_objs(v))
+            .unwrap_or(LinkTarget::Url("#".to_string()));
         self.balanced_node(opener, ClosedTag::Anchor, move |content| Node::Link {
-            target: params.get("href").map_or_else(
-                || LinkTarget::Url("#".to_string()),
-                |v| parse_link_target_objs(v),
-            ),
+            target,
             text: content,
+            class,
+        })
+    }
+
+    fn user_arm(&mut self, _opener: (usize, usize), tag: OpenTag<'src>) -> (Content, Option<Stop>) {
+        let OpenTag::User { avatar, name } = tag else {
+            unreachable!()
+        };
+        (
+            vec![Node::User {
+                name: name.to_string(),
+                avatar,
+            }],
+            None,
+        )
+    }
+
+    fn footnote_arm(
+        &mut self,
+        opener: (usize, usize),
+        _tag: OpenTag<'src>,
+    ) -> (Content, Option<Stop>) {
+        self.balanced_node(opener, ClosedTag::Footnote, Node::Footnote)
+    }
+
+    fn footnoteblock_arm(
+        &mut self,
+        _opener: (usize, usize),
+        _tag: OpenTag<'src>,
+    ) -> (Content, Option<Stop>) {
+        (vec![Node::FootnoteBlock(Vec::new())], None)
+    }
+
+    fn module_block_arm(
+        &mut self,
+        opener: (usize, usize),
+        tag: OpenTag<'src>,
+    ) -> (Content, Option<Stop>) {
+        let OpenTag::ModuleBlock { name, params } = tag else {
+            unreachable!()
+        };
+        self.balanced_node(opener, ClosedTag::Module, move |body| Node::ModuleBlock {
+            name,
+            params,
+            body,
         })
     }
 
     fn collapsible_arm(
         &mut self,
         opener: (usize, usize),
-        _tag: OpenTag<'src>,
+        tag: OpenTag<'src>,
     ) -> (Content, Option<Stop>) {
-        self.balanced_node(opener, ClosedTag::Collapsible, |content| Node::Container {
-            kind: ContainerKind::Div {
-                inline: false,
-                block: true,
-                params: [(
-                    "class".to_string(),
-                    vec![TextObj::Plain("collapsible-block".to_string())],
-                )]
-                .into(),
-            },
-            content,
+        let OpenTag::Collapsible { params } = tag else {
+            unreachable!()
+        };
+        let show = attr_value(&params, "show").unwrap_or_else(|| "+ show block".into());
+        let hide = attr_value(&params, "hide").unwrap_or_else(|| "- hide block".into());
+        let folded = !matches!(
+            attr_value(&params, "folded").as_deref(),
+            Some("no") | Some("false")
+        );
+        self.balanced_node(opener, ClosedTag::Collapsible, move |content| {
+            Node::Collapsible {
+                folded,
+                show,
+                hide,
+                content,
+            }
         })
     }
 
@@ -820,10 +968,10 @@ impl<'src> Merger<'src> {
         _opener: (usize, usize),
         tag: OpenTag<'src>,
     ) -> (Content, Option<Stop>) {
-        let OpenTag::Module(name) = tag else {
+        let OpenTag::Module { name, params } = tag else {
             unreachable!()
         };
-        (vec![Node::Module(name)], None)
+        (vec![Node::Module { name, params }], None)
     }
 
     fn include_arm(
@@ -1047,7 +1195,7 @@ impl<'src> Merger<'src> {
             }
         }
         if stop == Stop::Tag(ClosedTag::Tabview) {
-            (vec![Node::Tabview(tabs)], None)
+            (vec![Node::Tabview { id: 0, tabs }], None)
         } else {
             let mut out = Vec::with_capacity(tabs.len() + stray.len() + 1);
             out.push(Node::Raw(self.src[opener.0..opener.1].to_string()));

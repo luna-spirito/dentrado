@@ -32,8 +32,13 @@ impl Node {
                 kind,
                 content: f(content),
             },
-            Node::Heading { level, content } => Node::Heading {
+            Node::Heading {
                 level,
+                anchor,
+                content,
+            } => Node::Heading {
+                level,
+                anchor,
                 content: f(content),
             },
             Node::Table(rows) => Node::Table(
@@ -67,19 +72,48 @@ impl Node {
                 sup: f(sup),
                 sub: f(sub),
             },
-            Node::Link { target, text } => Node::Link {
+            Node::Link {
+                target,
+                text,
+                class,
+            } => Node::Link {
                 target,
                 text: f(text),
+                class,
+            },
+            Node::IfExpr { cond, then, els } => Node::IfExpr {
+                cond,
+                then: f(then),
+                els: f(els),
+            },
+            Node::Collapsible {
+                folded,
+                show,
+                hide,
+                content,
+            } => Node::Collapsible {
+                folded,
+                show,
+                hide,
+                content: f(content),
+            },
+            Node::ModuleBlock { name, params, body } => Node::ModuleBlock {
+                name,
+                params,
+                body: f(body),
             },
             Node::Footnote(c) => Node::Footnote(f(c)),
-            Node::Tabview(tabs) => Node::Tabview(
-                tabs.into_iter()
+            Node::FootnoteBlock(bodies) => Node::FootnoteBlock(bodies.into_iter().map(f).collect()),
+            Node::Tabview { id, tabs } => Node::Tabview {
+                id,
+                tabs: tabs
+                    .into_iter()
                     .map(|t| Tab {
                         name: f(t.name),
                         content: f(t.content),
                     })
                     .collect(),
-            ),
+            },
             Node::ListPages(mut lp) => {
                 lp.prepend = f(lp.prepend);
                 lp.repeat = f(lp.repeat);
@@ -104,8 +138,14 @@ impl Node {
                 f(sup);
                 f(sub);
             }
-            Node::Link { text, .. } | Node::Footnote(text) => f(text),
-            Node::Tabview(tabs) => tabs.iter().for_each(|t| {
+            Node::IfExpr { then: content, .. }
+            | Node::Collapsible { content, .. }
+            | Node::ModuleBlock { body: content, .. }
+            | Node::Footnote(content)
+            | Node::Link { text: content, .. } => f(content),
+            Node::IfExpr { els, .. } => f(els),
+            Node::FootnoteBlock(bodies) => bodies.iter().for_each(f),
+            Node::Tabview { tabs, .. } => tabs.iter().for_each(|t| {
                 f(&t.name);
                 f(&t.content);
             }),
@@ -153,10 +193,13 @@ mod tests {
 
     #[test]
     fn map_descends_every_nested_content() {
-        let node = Node::Tabview(vec![Tab {
-            name: text("a"),
-            content: text("b"),
-        }]);
+        let node = Node::Tabview {
+            id: 0,
+            tabs: vec![Tab {
+                name: text("a"),
+                content: text("b"),
+            }],
+        };
         let out = node.map_node(&mut |c| {
             c.into_iter()
                 .map(|n| match n {
@@ -165,11 +208,11 @@ mod tests {
                 })
                 .collect()
         });
-        let Node::Tabview(tabs) = out else {
+        let Node::Tabview { tabs, .. } = out else {
             panic!("expected tabview")
         };
         let mut flat = String::new();
-        Node::Tabview(tabs).visit_node(&mut |c| {
+        Node::Tabview { id: 0, tabs }.visit_node(&mut |c| {
             for n in c {
                 if let Node::Text(TextObj::Plain(s)) = n {
                     flat.push_str(s);

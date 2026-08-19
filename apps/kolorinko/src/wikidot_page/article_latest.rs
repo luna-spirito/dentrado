@@ -82,7 +82,8 @@ pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
         tags: page_meta.tags.clone(),
     };
     let mut state = ResolveState::new(site.clone());
-    let (content, deps) = resolve_full(content, slug, host, &mut state, meta, ctx).await;
+    let (mut content, deps) = resolve_full(content, slug, host, &mut state, meta, ctx).await;
+    kolorinko_wikitext::assign_toc_anchors(&mut content);
     ArticleView {
         meta: page_meta,
         revisions,

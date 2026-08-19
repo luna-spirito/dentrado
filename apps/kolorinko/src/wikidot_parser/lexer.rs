@@ -124,6 +124,10 @@ pub(crate) enum Tok<'src> {
     ColorOpen(&'src str),
     /// `##` with no `|` before the end of the line.
     ColorClose,
+    /// `{{body}}` — monospace `<tt>` (same line; unmatched `{{` degrades).
+    Tt(&'src str),
+    /// `~~~~` / `~~~~<` / `~~~~>` — a clear-float block (own line).
+    Clearfloat(ClearSide),
     /// `%%name|default%%`.
     ModuleVar {
         name: &'src str,
@@ -138,6 +142,14 @@ pub(crate) enum Tok<'src> {
     Escape(&'src str),
     /// A bare `http(s)://…` URL.
     Url(&'src str),
+    /// `[[# name]]` — an inline anchor target.
+    AnchorTarget(&'src str),
+    /// `[[#ifexpr cond | then]]` / `[[#ifexpr cond | then | else]]`.
+    IfExpr {
+        cond: &'src str,
+        then: &'src str,
+        els: Option<&'src str>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -185,8 +197,22 @@ pub(crate) enum OpenTag<'src> {
     ListPages {
         params: Params,
     },
+    /// `[[user name]]` / `[[*user name]]` — a wikidot.com user reference.
+    User {
+        avatar: bool,
+        name: &'src str,
+    },
     /// A single-tag `[[module Name …]]` with no closer.
-    Module(String),
+    Module {
+        name: String,
+        params: Params,
+    },
+    /// A paired `[[module Name …]] … [[/module]]` — a module with a body
+    /// template (FrontForum, CountPages, ListUsers, …).
+    ModuleBlock {
+        name: String,
+        params: Params,
+    },
     /// `[[include …]]`; `raw` is split by [`parse_include_args`].
     Include {
         raw: &'src str,
@@ -200,6 +226,10 @@ pub(crate) enum OpenTag<'src> {
     /// `[[/head]]`-style closes (`None`). Recognized only inside a listpages
     /// body — stray ones degrade to text.
     Section(Option<SectionSlot>),
+    /// `[[footnote]] … [[/footnote]]`.
+    Footnote,
+    /// `[[footnoteblock]]` — where the collected footnote bodies render.
+    Footnoteblock,
 }
 
 // =========================================================================
@@ -279,6 +309,7 @@ fn single<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
         just(b'\n').to(Tok::Newline),
         heading(),
         rule(),
+        clearfloat(),
         center_eq(),
         bracket(),
         just(b"--]").to(Tok::CommentClose),
@@ -286,8 +317,9 @@ fn single<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
         just(b"^^").to(Tok::SupMark),
         just(b",,").to(Tok::SubMark),
         color_open(),
-        module_var(),
         include_var(),
+        tt(),
+        module_var(),
         escape(),
         url(),
         text_run(),
@@ -461,6 +493,45 @@ fn center_eq<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
         .to(Tok::CenterEq)
 }
 
+/// `~~~~` (`both`), `~~~~<` (`left`), `~~~~>` (`right`) — a whole line of
+/// four or more tildes with an optional side.
+fn clearfloat<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    at_line_start().ignore_then(custom(|inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let b = inp.full_slice();
+        let start = *inp.cursor().inner();
+        let mut j = start;
+        while b.get(j) == Some(&b'~') {
+            j += 1;
+        }
+        let side = match b.get(j) {
+            Some(b'<') => Some(ClearSide::Left),
+            Some(b'>') => Some(ClearSide::Right),
+            _ => None,
+        };
+        if side.is_some() {
+            j += 1;
+        }
+        if j - start >= 4 && matches!(b.get(j), None | Some(&b'\n')) {
+            advance(inp, j - start);
+            Ok(Tok::Clearfloat(side.unwrap_or(ClearSide::Both)))
+        } else {
+            Err(perr(inp, "expected clearfloat"))
+        }
+    }))
+}
+
+/// `{{body}}` — the body runs to the first `}}` on the same line; a `{{`
+/// with no closer on the line degrades to text.
+fn tt<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    choice((
+        just(b"{{")
+            .ignore_then(read_until(b"}}"))
+            .filter(|(_, found)| *found)
+            .map(|(body, _)| Tok::Tt(body)),
+        just(b"{").to(Tok::Text("{")),
+    ))
+}
+
 /// `||` plus its cell prefix: `~` (header), then optional spaces around an
 /// alignment char. The prefix's spaces are eaten (they are part of its
 /// grammar); a [`Tok::CellAlign`]'s span swallows the spaces before the char
@@ -531,6 +602,14 @@ fn color_open<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
             .map(|(spec, _)| Tok::ColorOpen(spec)),
         just(b"##").to(Tok::ColorClose),
     ))
+}
+
+/// `[[user name]]` / `[[*user name]]`: the name runs to `]]` on the line.
+fn user_tail(b: &[u8], j: usize, avatar: bool) -> Option<(usize, OpenTag<'_>)> {
+    let k = skip_spaces(b, j);
+    let end = read_to(b, k, b"]]")?;
+    let name = sub(b, k, end).trim();
+    (!name.is_empty()).then(|| (end + 2, OpenTag::User { avatar, name }))
 }
 
 fn module_var<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
@@ -730,7 +809,7 @@ fn is_param_ws(b: &[u8], i: usize) -> bool {
 }
 
 fn is_prop_char(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'#')
+    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'#' | b'-')
 }
 
 fn is_url_char(c: u8) -> bool {
@@ -765,6 +844,7 @@ const CLOSERS: &[(&[u8], ClosedTag)] = &[
     (b"collapsible", ClosedTag::Collapsible),
     (b"tabview", ClosedTag::Tabview),
     (b"iftags", ClosedTag::IfTags),
+    (b"footnote", ClosedTag::Footnote),
     (b"module", ClosedTag::Module),
     (b"table", ClosedTag::Table),
     (b"hcell", ClosedTag::Cell),
@@ -830,12 +910,16 @@ type Tail = fn(&[u8], usize) -> Option<(usize, OpenTag)>;
 const OPENERS: &[(&[u8], Tail)] = &[
     (b"collapsible", collapsible_tail),
     (b"tabview", tabview_tail),
+    (b"footnoteblock", footnoteblock_tail),
+    (b"footnote", footnote_tail),
     (b"hcell", hcell_tail),
     (b"table", table_tail),
     (b"iftags", iftags_tail),
     (b"module", module_tail),
     (b"include", include_tail),
     (b"image", image_tail),
+    (b"*user", star_user_tail),
+    (b"user", user_tail_str),
     (b"cell", cell_tail),
     (b"size", size_tail),
     (b"span", span_tail),
@@ -858,6 +942,26 @@ fn skip_spaces(b: &[u8], mut k: usize) -> usize {
         k += 1;
     }
     k
+}
+
+/// `[[*user name]]` — see [`user_tail`].
+fn star_user_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    user_tail(b, j, true)
+}
+
+/// `[[user name]]` — see [`user_tail`].
+fn user_tail_str(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    user_tail(b, j, false)
+}
+
+/// `[[footnote]]`.
+fn footnote_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    marker_end(b, j).map(|end| (end, OpenTag::Footnote))
+}
+
+/// `[[footnoteblock]]`.
+fn footnoteblock_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    marker_end(b, j).map(|end| (end, OpenTag::Footnoteblock))
 }
 
 /// Earliest of `delim` searching from `k`, not crossing a newline (the old
@@ -913,18 +1017,32 @@ fn lex_link1(b: &[u8], i: usize) -> Option<(usize, &str, Option<&str>)> {
         _ => {}
     }
     let mut j = i + 1;
-    while j < b.len() && b[j] != b' ' && b[j] != b']' && b[j] != b'\n' {
+    while j < b.len()
+        && b[j] != b' '
+        && !b[j..].starts_with(b"\xc2\xa0")
+        && b[j] != b']'
+        && b[j] != b'\n'
+    {
         j += 1;
     }
     let target = sub(b, i + 1, j);
     match b.get(j) {
         Some(b']') => Some((j + 1, target, None)),
-        Some(b' ') => {
-            let mut t_end = j;
+        Some(b' ') | Some(0xC2) => {
+            // Skip the whole separator run (spaces and/or NBSPs) so the text
+            // starts on a UTF-8 boundary.
+            let mut text_start = j;
+            while b[text_start..].starts_with(b"\xc2\xa0") {
+                text_start += 2;
+            }
+            while b.get(text_start) == Some(&b' ') {
+                text_start += 1;
+            }
+            let mut t_end = text_start;
             while t_end < b.len() && b[t_end] != b']' {
                 t_end += 1;
             }
-            let text = sub(b, j + 1, t_end);
+            let text = sub(b, text_start, t_end);
             let end = if t_end < b.len() { t_end + 1 } else { t_end };
             Some((end, target, Some(text)))
         }
@@ -962,6 +1080,12 @@ fn lex_bracket<'src>(b: &'src [u8], i: usize) -> Option<(usize, Tok<'src>)> {
         }
         return None;
     }
+    // `[[# name]]` anchor target / `[[#ifexpr …]]` conditional.
+    if b.get(j) == Some(&b'#')
+        && let Some((end, tok)) = lex_hash_construct(b, j)
+    {
+        return Some((end, tok));
+    }
     // Exact alignment openers (no params, no inner spaces): `[[f<]]`, `[[==]]`…
     for (form, floating, side) in [
         (&b"f<]]"[..], true, AlignSide::Left),
@@ -997,6 +1121,46 @@ fn lex_bracket<'src>(b: &'src [u8], i: usize) -> Option<(usize, Tok<'src>)> {
         return Some((end, Tok::Open(OpenTag::Tab { name })));
     }
     None
+}
+
+/// `[[# name]]` (anchor target — space after `#` required) or
+/// `[[#ifexpr cond | then]]` / `[[#ifexpr cond | then | else]]`.
+fn lex_hash_construct<'src>(b: &'src [u8], j: usize) -> Option<(usize, Tok<'src>)> {
+    if b.get(j + 1) == Some(&b' ') {
+        let k = skip_spaces(b, j + 1);
+        let mut end = k;
+        while end < b.len()
+            && b[end] != b']'
+            && (b[end].is_ascii_alphanumeric() || matches!(b[end], b'-' | b'_' | b'.' | b'%'))
+        {
+            end += 1;
+        }
+        if end > k && b[end..].starts_with(b"]]") {
+            return Some((end + 2, Tok::AnchorTarget(sub(b, k, end))));
+        }
+        return None;
+    }
+    if !b[j + 1..].to_ascii_lowercase().starts_with(b"ifexpr") {
+        return None;
+    }
+    let k = skip_spaces(b, j + 1 + 6);
+    let bar1 = read_to(b, k, b"|")?;
+    let cond = sub(b, k, bar1);
+    let (end, then, els) = match read_to(b, bar1 + 1, b"|") {
+        Some(bar2) => {
+            let close = read_to(b, bar2 + 1, b"]]")?;
+            (
+                close + 2,
+                sub(b, bar1 + 1, bar2),
+                Some(sub(b, bar2 + 1, close)),
+            )
+        }
+        None => {
+            let close = read_to(b, bar1 + 1, b"]]")?;
+            (close + 2, sub(b, bar1 + 1, close), None)
+        }
+    };
+    Some((end, Tok::IfExpr { cond, then, els }))
 }
 
 /// `kw spaces ]]` — the shared tail of the section markers (open form).
@@ -1169,14 +1333,33 @@ fn module_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
         return None;
     }
     let name = sub(b, k, k + n).to_string();
-    let mut m = k + n;
-    while m < b.len() && b[m] != b'\n' && !b[m..].starts_with(b"]]") {
-        m += 1;
-    }
-    if b[m..].starts_with(b"]]") {
-        m += 2;
-    }
-    Some((m, OpenTag::Module(name)))
+    let mut params = Params::new();
+    let m = lex_params(b, k + n, &mut params);
+    let m = skip_spaces(b, m);
+    let body = is_body_module(&name);
+    let m_end = if b.get(m..).is_some_and(|r| r.starts_with(b"]]")) {
+        m + 2
+    } else {
+        // A module header left unclosed on its line: consumed like the old
+        // lexer did, with whatever params it managed to read.
+        m
+    };
+    Some((
+        m_end,
+        if body {
+            OpenTag::ModuleBlock { name, params }
+        } else {
+            OpenTag::Module { name, params }
+        },
+    ))
+}
+
+/// Modules that pair with a `[[/module]]` closer and carry a body template.
+fn is_body_module(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "frontforum" | "countpages" | "listusers"
+    )
 }
 
 fn include_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {

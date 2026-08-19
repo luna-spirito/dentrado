@@ -102,7 +102,11 @@ pub(super) fn substitute_resources(
                 source: subst_source(source, ca_for),
                 params,
             },
-            Node::Link { target, text } => Node::Link {
+            Node::Link {
+                target,
+                text,
+                class,
+            } => Node::Link {
                 target: match target {
                     LinkTarget::Url(u) => match http_tail(&u, None).and_then(|t| ca_for(&t)) {
                         Some(ca) => LinkTarget::Url(ca),
@@ -111,6 +115,7 @@ pub(super) fn substitute_resources(
                     other => other,
                 },
                 text: walk(text),
+                class,
             },
             Node::Stylesheet(css) => Node::Stylesheet(rewrite_with(&css, None, ca_for)),
             other => other.map_node(&mut walk),

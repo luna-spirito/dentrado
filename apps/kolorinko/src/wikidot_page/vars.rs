@@ -115,6 +115,7 @@ impl ModuleVars<'_> {
             vec![Node::Link {
                 target: LinkTarget::Url(format!("{prefix}{tag}")),
                 text: text(tag.to_string()),
+                class: None,
             }]
         };
         let tags_linked = || {
@@ -154,6 +155,7 @@ impl ModuleVars<'_> {
                     path: vec![page.name.clone()],
                 }),
                 text: text(page.title.clone()),
+                class: None,
             }],
             "created_by" | "author" => text(page.created_by.clone()),
             "updated_by" | "author_edited" | "user_edited" => text(page.updated_by.clone()),
@@ -274,9 +276,14 @@ fn subst_node(node: Node, vars: &Vars) -> Content {
             params: subst_params(c.params, vars),
             content: apply_vars(c.content, vars),
         })],
-        Node::Link { target, text } => vec![Node::Link {
+        Node::Link {
+            target,
+            text,
+            class,
+        } => vec![Node::Link {
             target: subst_link_target(target, vars),
             text: apply_vars(text, vars),
+            class,
         }],
         Node::Include(inc) => vec![Node::Include(Include {
             source: inc.source,
@@ -453,7 +460,7 @@ mod tests {
         let page = listed("foo", Some("rumor-n"), "Foo", &[]);
         let vars = page_vars(&site, &page, None);
         let out = apply_vars(parse("[[[%%fullname%%|%%title%%]]]"), &vars);
-        let Node::Link { target, text } = &out[0] else {
+        let Node::Link { target, text, .. } = &out[0] else {
             panic!("expected link: {out:?}")
         };
         let LinkTarget::Page(p) = target else {
