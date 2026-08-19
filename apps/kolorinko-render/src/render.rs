@@ -600,8 +600,9 @@ fn render_table(site: &str, rows: &[Vec<TableCell>]) -> AnyView {
 /// `[[table]]` / `[[row]]` / `[[cell]]` grid table. Cells are gathered from
 /// each row's body — descending into `[[iftags]]` wrappers (kolorinko renders
 /// every conditional branch) — so the mixed wrapped/bare layout real templates
-/// use is handled uniformly. Cell content renders inline (no `<p>`), and no
-/// `<tbody>` is emitted, matching Wikidot.
+/// use is handled uniformly. Cell content renders inline (no `<p>`). A
+/// `<tbody>` is required: the HTML parser inserts one around bare `<tr>`s
+/// regardless, and SSR output without it cannot hydrate.
 fn render_grid_table(site: &str, table: &BlockTable) -> AnyView {
     let (class, style) = params_to_class_style(&table.params);
     let rows: Vec<AnyView> = table
@@ -617,7 +618,7 @@ fn render_grid_table(site: &str, table: &BlockTable) -> AnyView {
         })
         .collect();
     view! {
-        <table class=class style=style>{rows}</table>
+        <table class=class style=style><tbody>{rows}</tbody></table>
     }
     .into_any()
 }
