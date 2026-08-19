@@ -341,13 +341,13 @@ pub(crate) fn listpages_params(attrs: &HashMap<String, Vec<TextObj>>) -> ListPag
     }
 }
 
-/// One attribute's value flattened to a trimmed string: plain text with
+/// An attribute's value flattened to a string: plain text with
 /// `%%var%%`/`{$var$}` defaults spliced in (an unset variable contributes
 /// nothing), and an `@URL|default` reference reduced to its default.
-/// Module attribute names are case-insensitive on Wikidot (`perPage` and
-/// `perpage` are the same parameter), so a miss on the exact key falls back
-/// to a case-insensitive scan.
-pub(crate) fn attr_value(attrs: &HashMap<String, Vec<TextObj>>, key: &str) -> Option<String> {
+/// Whitespace is kept as written (`hide=" "` stays a real label).
+/// Attribute names match case-insensitively on a miss of the exact key
+/// (Wikidot's `perPage` and `perpage` are the same parameter).
+pub(crate) fn attr_value_raw(attrs: &HashMap<String, Vec<TextObj>>, key: &str) -> Option<String> {
     let objs = attrs.get(key).or_else(|| {
         attrs
             .iter()
@@ -366,7 +366,13 @@ pub(crate) fn attr_value(attrs: &HashMap<String, Vec<TextObj>>, key: &str) -> Op
             TextObj::IncludeVar { .. } => {}
         }
     }
-    let s = s.trim().to_string();
+    Some(s)
+}
+
+/// [`attr_value_raw`] trimmed, with empty values — and `@URL` refs without a
+/// default — treated as absent.
+pub(crate) fn attr_value(attrs: &HashMap<String, Vec<TextObj>>, key: &str) -> Option<String> {
+    let s = attr_value_raw(attrs, key)?.trim().to_string();
     if s.is_empty() {
         return None;
     }

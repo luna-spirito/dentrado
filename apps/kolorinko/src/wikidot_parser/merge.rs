@@ -29,10 +29,13 @@ pub(crate) enum Stop {
 }
 
 /// Parse a token slice as a standalone document, absorbing stray closers as
-/// raw text (the old `parse()`).
+/// raw text (the old `parse()`). Pending collapsible openers whose closer
+/// never came degrade to their verbatim text.
 pub(crate) fn parse_toks(src: &str, toks: &[Token]) -> Content {
     let mut m = Merger { src, toks, pos: 0 };
-    merge_text(m.content())
+    let mut content = m.content();
+    degrade_unclosed_collapsibles(&mut content);
+    merge_text(content)
 }
 
 /// Recursively parse a raw markup fragment (include values, variable
@@ -65,12 +68,6 @@ impl<'src> Merger<'src> {
 
     fn peek_is(&self, f: impl FnOnce(&Tok) -> bool) -> bool {
         self.peek().is_some_and(f)
-    }
-
-    /// The byte offset of the next token (or EOF), for slicing verbatim
-    /// bodies that end here.
-    fn here(&self) -> usize {
-        self.toks.get(self.pos).map_or(self.src.len(), |t| t.start)
     }
 
     fn text_node(&self, s: &str) -> Node {
@@ -119,9 +116,16 @@ impl<'src> Merger<'src> {
                 None => return (nodes, self.src.len(), Stop::Eof),
                 Some(Tok::Close(tag)) => {
                     let end = self.toks[self.pos].start;
-                    let stop = Stop::Tag(tag.clone());
+                    let tag = tag.clone();
                     self.pos += 1;
-                    return (nodes, end, stop);
+                    // A `[[/collapsible]]` closer pairs with the header
+                    // leaf planted in `nodes` (see [`Merger::collapsible_arm`]);
+                    // only when no leaf is unpaired here does it act as a
+                    // foreign stop an ancestor will pair.
+                    if matches!(tag, ClosedTag::Collapsible) && close_collapsible(&mut nodes) {
+                        continue;
+                    }
+                    return (nodes, end, Stop::Tag(tag));
                 }
                 Some(Tok::CommentClose) if comment => {
                     let end = self.toks[self.pos].start;
@@ -133,6 +137,12 @@ impl<'src> Merger<'src> {
             let start = self.toks[self.pos].start;
             let (sub, reason) = self.element();
             nodes.extend(sub);
+            // A container below flattened or crossed itself against a
+            // collapsible closer it consumed; try pairing it here before
+            // propagating further up.
+            if reason == Some(Stop::Tag(ClosedTag::Collapsible)) && close_collapsible(&mut nodes) {
+                continue;
+            }
             if let Some(stop) = reason {
                 return (nodes, start, stop);
             }
@@ -706,7 +716,10 @@ impl<'src> Merger<'src> {
     }
 
     /// The old `balanced`: body until any closer; on the matching one `build`
-    /// forms the node, otherwise flatten and propagate.
+    /// forms the node, otherwise flatten and propagate. One exception: a
+    /// `[[/collapsible]]` closer crossing this container still builds it
+    /// closer may sit arbitrarily deeper than its opener, and crossed divs
+    /// survive in the golden DOM.
     fn balanced_node(
         &mut self,
         opener: (usize, usize),
@@ -716,6 +729,8 @@ impl<'src> Merger<'src> {
         let (body, _, stop) = self.loop_until_closer_at(false);
         if stop == Stop::Tag(closer) {
             (vec![build(body)], None)
+        } else if stop == Stop::Tag(ClosedTag::Collapsible) {
+            (vec![build(body)], Some(stop))
         } else {
             self.raw_flatten(opener, body, stop)
         }
@@ -849,6 +864,11 @@ impl<'src> Merger<'src> {
         })
     }
 
+    /// `[[collapsible …]]` does not pair by `balanced` — the closer may sit
+    /// across container boundaries relative to the opener. Instead the
+    /// opener plants a [`Node::CollapsibleHeader`] leaf right here, riding
+    /// the tree through whatever containers close around it; the closer
+    /// (wherever it arrives) pairs it via [`close_collapsible`].
     fn collapsible_arm(
         &mut self,
         opener: (usize, usize),
@@ -857,20 +877,21 @@ impl<'src> Merger<'src> {
         let OpenTag::Collapsible { params } = tag else {
             unreachable!()
         };
-        let show = attr_value(&params, "show").unwrap_or_else(|| "+ show block".into());
-        let hide = attr_value(&params, "hide").unwrap_or_else(|| "- hide block".into());
+        let open = attr_value_raw(&params, "show").unwrap_or_else(|| "+ show block".into());
+        let close = attr_value_raw(&params, "hide").unwrap_or_else(|| "- hide block".into());
         let folded = !matches!(
             attr_value(&params, "folded").as_deref(),
             Some("no") | Some("false")
         );
-        self.balanced_node(opener, ClosedTag::Collapsible, move |content| {
-            Node::Collapsible {
+        (
+            vec![Node::CollapsibleHeader {
                 folded,
-                show,
-                hide,
-                content,
-            }
-        })
+                open,
+                close,
+                raw: self.src[opener.0..opener.1].to_string(),
+            }],
+            None,
+        )
     }
 
     fn size_arm(&mut self, opener: (usize, usize), tag: OpenTag<'src>) -> (Content, Option<Stop>) {
@@ -1220,6 +1241,40 @@ impl<'src> Merger<'src> {
             (Content::new(), None)
         } else {
             self.raw_flatten(opener, body, stop)
+        }
+    }
+}
+
+// ── collapsible pairing ─────────────────────────────────────────────────
+
+/// Pair a `[[/collapsible]]` closer with the header leaf planted earlier
+/// in `nodes` (the latest unpaired one in document order; see
+/// [`Merger::collapsible_arm`]). The node holding the leaf — inline
+/// wrappers around it included — becomes the collapsible's `header`
+/// wholesale; everything after it becomes the `body`.
+///
+/// `false` when no opener is pending at this level: the caller lets the
+/// closer propagate so an ancestor level can pair it (crossed containers
+/// stay intact; see [`Merger::balanced_node`]).
+fn close_collapsible(nodes: &mut Content) -> bool {
+    let Some(idx) = nodes.iter().rposition(node_has_pending) else {
+        return false;
+    };
+    let header = vec![nodes.remove(idx)];
+    let body = nodes.split_off(idx);
+    nodes.push(Node::Collapsible { header, body });
+    true
+}
+
+fn node_has_pending(node: &Node) -> bool {
+    match node {
+        Node::CollapsibleHeader { .. } => true,
+        // Paired: its header leaf is off the market.
+        Node::Collapsible { .. } => false,
+        node => {
+            let mut found = false;
+            node.visit_node(&mut |children| found |= children.iter().any(node_has_pending));
+            found
         }
     }
 }

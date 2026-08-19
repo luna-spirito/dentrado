@@ -13,8 +13,40 @@ use kolorinko_wikitext::{
 use leptos::prelude::*;
 use leptos::tachys::html::element::custom;
 
-pub(crate) fn render_inline(site: &str, content: &[Node]) -> Vec<AnyView> {
-    content.iter().map(|n| render_node(site, n)).collect()
+/// Rendering parameters threaded through every render function: the mirror
+/// site (internal link resolution) and, inside a collapsible's header
+/// subtree, which toggle link is being produced. The header subtree is
+/// walked once per link — see [`render_collapsible`].
+#[derive(Clone, Copy)]
+pub(crate) struct RenderCtx<'a> {
+    site: &'a str,
+    link: Option<CollapsibleLinkCtx>,
+}
+
+/// One toggle link of a collapsible: which label the
+/// [`crate::Node::CollapsibleHeader`] leaf shows, and the shared
+/// unfolded-state signal the click flips.
+#[derive(Clone, Copy)]
+pub(crate) struct CollapsibleLinkCtx {
+    unfolded: RwSignal<bool>,
+    open: bool,
+}
+
+impl<'a> RenderCtx<'a> {
+    fn new(site: &'a str) -> Self {
+        Self { site, link: None }
+    }
+
+    fn with_link(&self, link: CollapsibleLinkCtx) -> Self {
+        Self {
+            link: Some(link),
+            ..*self
+        }
+    }
+}
+
+pub(crate) fn render_inline(ctx: &RenderCtx, content: &[Node]) -> Vec<AnyView> {
+    content.iter().map(|n| render_node(ctx, n)).collect()
 }
 
 /// A view that renders to nothing at all (no hydration-marker residue).
@@ -43,12 +75,16 @@ fn trim_ws(content: &Content) -> &[Node] {
 /// blank lines inside a text node is a paragraph break; single newlines stay
 /// inside their paragraph as soft breaks (`<br>`).
 pub fn render_block(site: &str, content: &Content) -> Vec<AnyView> {
+    render_block_content(&RenderCtx::new(site), content)
+}
+
+fn render_block_content(ctx: &RenderCtx, content: &Content) -> Vec<AnyView> {
     let mut out: Vec<AnyView> = Vec::with_capacity(content.len());
     let mut para: Vec<Piece> = Vec::new();
     for node in content {
         if is_block(node) {
             flush(&mut para, &mut out);
-            out.push(render_node(site, node));
+            out.push(render_node(ctx, node));
         } else if let Node::Text(TextObj::Plain(t)) = node {
             for tok in para_tokens(t) {
                 match tok {
@@ -73,17 +109,17 @@ pub fn render_block(site: &str, content: &Content) -> Vec<AnyView> {
                 flush(&mut para, &mut out);
                 let (class, style) = params_to_class_style(params);
                 for run in runs {
-                    let inner = render_inline(site, &run);
+                    let inner = render_inline(ctx, &run);
                     out.push(
                         view! { <p><span class=class.clone() style=style.clone()>{inner}</span></p> }
                             .into_any(),
                     );
                 }
             } else {
-                para.push(Piece::Node(render_node(site, node)));
+                para.push(Piece::Node(render_node(ctx, node)));
             }
         } else {
-            para.push(Piece::Node(render_node(site, node)));
+            para.push(Piece::Node(render_node(ctx, node)));
         }
     }
     flush(&mut para, &mut out);
@@ -276,7 +312,7 @@ fn paragraph_runs(content: &[Node]) -> Vec<Vec<Node>> {
 /// runs are emitted unwrapped — Wikidot's `div_` quirk that leaves the rim text
 /// bare. A body of only block elements (a sidebar of nested `[[div_]]` /
 /// `----`) therefore renders as a flat sequence with no `<p>` at all.
-fn render_block_div_(site: &str, content: &Content) -> Vec<AnyView> {
+fn render_block_div_(ctx: &RenderCtx, content: &Content) -> Vec<AnyView> {
     enum Unit {
         Block(AnyView),
         Inline(Vec<AnyView>),
@@ -292,7 +328,7 @@ fn render_block_div_(site: &str, content: &Content) -> Vec<AnyView> {
     for node in content {
         if is_block(node) {
             flush(&mut para, &mut units);
-            units.push(Unit::Block(render_node(site, node)));
+            units.push(Unit::Block(render_node(ctx, node)));
         } else if let Node::Text(TextObj::Plain(t)) = node {
             for tok in para_tokens(t) {
                 match tok {
@@ -301,7 +337,7 @@ fn render_block_div_(site: &str, content: &Content) -> Vec<AnyView> {
                 }
             }
         } else {
-            para.push(Piece::Node(render_node(site, node)));
+            para.push(Piece::Node(render_node(ctx, node)));
         }
     }
     flush(&mut para, &mut units);
@@ -353,16 +389,16 @@ fn is_block(node: &Node) -> bool {
     )
 }
 
-fn render_node(site: &str, node: &Node) -> AnyView {
+fn render_node(ctx: &RenderCtx, node: &Node) -> AnyView {
     match node {
         Node::Text(t) => render_text_obj(t),
         Node::Raw(s) => view! { <span style="white-space: pre-wrap">{s.clone()}</span> }.into_any(),
-        Node::Container { kind, content } => render_container(site, kind, content),
+        Node::Container { kind, content } => render_container(ctx, kind, content),
         Node::Heading {
             level,
             anchor,
             content,
-        } => render_heading(site, *level, anchor.as_deref(), content),
+        } => render_heading(ctx, *level, anchor.as_deref(), content),
         Node::AnchorTarget(name) => {
             use leptos::tachys::html::attribute::custom::custom_attribute;
             custom("a")
@@ -370,9 +406,9 @@ fn render_node(site: &str, node: &Node) -> AnyView {
                 .child(Vec::<AnyView>::new())
                 .into_any()
         }
-        Node::Table(rows) => render_table(site, rows),
-        Node::BlockTable(table) => render_grid_table(site, table),
-        Node::BlockCell(cell) => view! { <>{render_inline(site, &cell.content)}</> }.into_any(),
+        Node::Table(rows) => render_table(ctx, rows),
+        Node::BlockTable(table) => render_grid_table(ctx, table),
+        Node::BlockCell(cell) => view! { <>{render_inline(ctx, &cell.content)}</> }.into_any(),
         Node::Image {
             align,
             source,
@@ -382,26 +418,27 @@ fn render_node(site: &str, node: &Node) -> AnyView {
             target,
             text,
             class,
-        } => render_link(site, target, text, class.as_deref()),
+        } => render_link(ctx, target, text, class.as_deref()),
         Node::SupSubscript { sup, sub } => view! {
             <>
-                {(!sup.is_empty()).then(|| view! { <sup>{render_inline(site, sup)}</sup> })}
-                {(!sub.is_empty()).then(|| view! { <sub>{render_inline(site, sub)}</sub> })}
+                {(!sup.is_empty()).then(|| view! { <sup>{render_inline(ctx, sup)}</sup> })}
+                {(!sub.is_empty()).then(|| view! { <sub>{render_inline(ctx, sub)}</sub> })}
             </>
         }
         .into_any(),
         Node::HorizontalRule => view! { <hr /> }.into_any(),
         Node::Stylesheet(css) => view! { <style>{css.clone()}</style> }.into_any(),
         Node::Footnote(_) | Node::FootnoteRef(_) => render_footnote_ref(node),
-        Node::FootnoteBlock(bodies) => render_footnote_block(site, bodies),
-        Node::Tabview { id, tabs } => render_tabview(site, *id, tabs),
-        Node::ListPages(lp) => render_block(site, &lp.repeat).into_any(),
+        Node::FootnoteBlock(bodies) => render_footnote_block(ctx, bodies),
+        Node::Tabview { id, tabs } => render_tabview(ctx, *id, tabs),
+        Node::ListPages(lp) => render_block_content(ctx, &lp.repeat).into_any(),
         Node::Include(_) => {
             view! { <span class="include-placeholder">"[include]"</span> }.into_any()
         }
         Node::Date { timestamp, format } => render_date(*timestamp, format.as_deref()),
-        Node::IfExpr { then, .. } => view! { <>{render_inline(site, then)}</> }.into_any(),
-        Node::Collapsible { .. } => render_collapsible(site, node, None),
+        Node::IfExpr { then, .. } => view! { <>{render_inline(ctx, then)}</> }.into_any(),
+        Node::Collapsible { header, body } => render_collapsible(ctx, header, body),
+        Node::CollapsibleHeader { .. } => render_collapsible_header(ctx, node),
         Node::User { name, avatar } => render_user(name, *avatar),
         Node::Clearfloat(side) => {
             let clear = match side {
@@ -416,12 +453,12 @@ fn render_node(site: &str, node: &Node) -> AnyView {
             "newpage" => render_new_page_form(params),
             _ => empty_view(),
         },
-        Node::ModuleBlock { name, params, body } => render_module_block(site, name, params, body),
+        Node::ModuleBlock { name, params, body } => render_module_block(ctx, name, params, body),
         Node::Code(s) => view! {
             <div class="code"><pre><code>{s.clone()}</code></pre></div>
         }
         .into_any(),
-        Node::List(list) => render_list(site, list),
+        Node::List(list) => render_list(ctx, list),
     }
 }
 
@@ -470,24 +507,24 @@ fn render_plain(s: &str) -> AnyView {
     }
 }
 
-fn render_container(site: &str, kind: &ContainerKind, content: &Content) -> AnyView {
+fn render_container(ctx: &RenderCtx, kind: &ContainerKind, content: &Content) -> AnyView {
     match kind {
         ContainerKind::Style(TextStyle::Italic) => {
-            view! { <em>{render_inline(site, content)}</em> }.into_any()
+            view! { <em>{render_inline(ctx, content)}</em> }.into_any()
         }
         ContainerKind::Style(TextStyle::Bold) => {
-            view! { <strong>{render_inline(site, content)}</strong> }.into_any()
+            view! { <strong>{render_inline(ctx, content)}</strong> }.into_any()
         }
         ContainerKind::Style(TextStyle::Underline) => view! {
-            <span style="text-decoration: underline">{render_inline(site, content)}</span>
+            <span style="text-decoration: underline">{render_inline(ctx, content)}</span>
         }
         .into_any(),
         ContainerKind::Style(TextStyle::Strikethrough) => view! {
-            <span style="text-decoration: line-through">{render_inline(site, content)}</span>
+            <span style="text-decoration: line-through">{render_inline(ctx, content)}</span>
         }
         .into_any(),
         ContainerKind::Tt => {
-            let inner = render_inline(site, content);
+            let inner = render_inline(ctx, content);
             custom("tt").child(inner).into_any()
         }
         ContainerKind::Div {
@@ -499,14 +536,14 @@ fn render_container(site: &str, kind: &ContainerKind, content: &Content) -> AnyV
             let id = params_id(params);
             let class = (!class.is_empty()).then_some(class);
             if *block {
-                let inner = render_block(site, content);
+                let inner = render_block_content(ctx, content);
                 return view! { <div id=id class=class style=style>{inner}</div> }.into_any();
             }
             if *inline {
                 // `[[span]]`: inline body. (A span whose body crosses blank
                 // lines is split into one `<p>` per run by [`render_block`] when
                 // it sits in block context.)
-                let inner = render_inline(site, content);
+                let inner = render_inline(ctx, content);
                 return view! { <span id=id class=class style=style>{inner}</span> }.into_any();
             }
             // `[[div_]]`: a block `<div>` that suppresses Wikidot's
@@ -514,16 +551,16 @@ fn render_container(site: &str, kind: &ContainerKind, content: &Content) -> AnyV
             // children always render standalone (never inside a `<p>`), so a
             // sidebar of nested `[[div_]]` / `----` renders as a flat sequence;
             // interior blank-line-separated inline runs still get `<p>`.
-            let inner = render_block_div_(site, content);
+            let inner = render_block_div_(ctx, content);
             view! { <div id=id class=class style=style>{inner}</div> }.into_any()
         }
         ContainerKind::Color(c) => view! {
-            <span style=format!("color: {c}")>{render_inline(site, content)}</span>
+            <span style=format!("color: {c}")>{render_inline(ctx, content)}</span>
         }
         .into_any(),
         ContainerKind::Size(arg) => view! {
             <span style=format!("font-size:{}", normalize_size(arg))>
-                {render_inline(site, content)}
+                {render_inline(ctx, content)}
             </span>
         }
         .into_any(),
@@ -535,20 +572,22 @@ fn render_container(site: &str, kind: &ContainerKind, content: &Content) -> AnyV
                 AlignSide::Justify => "justify",
             };
             view! {
-                <div style=format!("text-align: {align}")>{render_block(site, content)}</div>
+                <div style=format!("text-align: {align}")>{render_block_content(ctx, content)}</div>
             }
             .into_any()
         }
         ContainerKind::Quote => {
-            view! { <blockquote>{render_block(site, content)}</blockquote> }.into_any()
+            view! { <blockquote>{render_block_content(ctx, content)}</blockquote> }.into_any()
         }
         // Tag gating is a server concern; render the body unconditionally.
-        ContainerKind::IfTags { .. } => view! { <>{render_block(site, content)}</> }.into_any(),
+        ContainerKind::IfTags { .. } => {
+            view! { <>{render_block_content(ctx, content)}</> }.into_any()
+        }
     }
 }
 
-fn render_heading(site: &str, level: u32, anchor: Option<&str>, content: &Content) -> AnyView {
-    let inner = view! { <span>{render_inline(site, content)}</span> };
+fn render_heading(ctx: &RenderCtx, level: u32, anchor: Option<&str>, content: &Content) -> AnyView {
+    let inner = view! { <span>{render_inline(ctx, content)}</span> };
     match level.min(6) {
         1 => view! { <h1 id=anchor>{inner}</h1> }.into_any(),
         2 => view! { <h2 id=anchor>{inner}</h2> }.into_any(),
@@ -559,16 +598,16 @@ fn render_heading(site: &str, level: u32, anchor: Option<&str>, content: &Conten
     }
 }
 
-fn render_list(site: &str, list: &List) -> AnyView {
+fn render_list(ctx: &RenderCtx, list: &List) -> AnyView {
     let items: Vec<AnyView> = list
         .items
         .iter()
         .map(|item| {
-            let inner = render_inline(site, &item.content);
+            let inner = render_inline(ctx, &item.content);
             let sub = item
                 .sublist
                 .as_ref()
-                .map(|l| render_list(site, l))
+                .map(|l| render_list(ctx, l))
                 .unwrap_or_else(|| {
                     let _: () = view! { <></> };
                     ().into_any()
@@ -611,14 +650,14 @@ pub fn wrap_topbar_lists(content: &mut Content) {
     }
 }
 
-fn render_table(site: &str, rows: &[Vec<TableCell>]) -> AnyView {
+fn render_table(ctx: &RenderCtx, rows: &[Vec<TableCell>]) -> AnyView {
     let rows_view: Vec<AnyView> = rows
         .iter()
         .map(|row| {
             let cells: Vec<AnyView> = row
                 .iter()
                 .map(|cell| {
-                    let inner = render_inline(site, &cell.content);
+                    let inner = render_inline(ctx, &cell.content);
                     let style = cell
                         .align
                         .map(|a| format!("text-align: {}", side_to_css(a.side)));
@@ -646,7 +685,7 @@ fn render_table(site: &str, rows: &[Vec<TableCell>]) -> AnyView {
 /// use is handled uniformly. Cell content renders inline (no `<p>`). A
 /// `<tbody>` is required: the HTML parser inserts one around bare `<tr>`s
 /// regardless, and SSR output without it cannot hydrate.
-fn render_grid_table(site: &str, table: &BlockTable) -> AnyView {
+fn render_grid_table(ctx: &RenderCtx, table: &BlockTable) -> AnyView {
     let (class, style) = params_to_class_style(&table.params);
     let rows: Vec<AnyView> = table
         .rows
@@ -655,7 +694,7 @@ fn render_grid_table(site: &str, table: &BlockTable) -> AnyView {
             let (rclass, rstyle) = params_to_class_style(&row.params);
             let cells: Vec<AnyView> = collect_grid_cells(&row.content)
                 .iter()
-                .map(|cell| render_grid_cell(site, cell))
+                .map(|cell| render_grid_cell(ctx, cell))
                 .collect();
             view! { <tr class=rclass style=rstyle>{cells}</tr> }.into_any()
         })
@@ -683,9 +722,9 @@ fn collect_grid_cells(content: &Content) -> Vec<&BlockCell> {
     out
 }
 
-fn render_grid_cell(site: &str, cell: &BlockCell) -> AnyView {
+fn render_grid_cell(ctx: &RenderCtx, cell: &BlockCell) -> AnyView {
     let (class, style) = params_to_class_style(&cell.params);
-    let inner = render_inline(site, trim_ws(&cell.content));
+    let inner = render_inline(ctx, trim_ws(&cell.content));
     if cell.header {
         view! { <th class=class style=style>{inner}</th> }.into_any()
     } else {
@@ -752,7 +791,12 @@ fn filename_of(url: &str) -> String {
     url.rsplit('/').next().unwrap_or(url).to_string()
 }
 
-fn render_link(site: &str, target: &LinkTarget, text: &Content, class: Option<&str>) -> AnyView {
+fn render_link(
+    ctx: &RenderCtx,
+    target: &LinkTarget,
+    text: &Content,
+    class: Option<&str>,
+) -> AnyView {
     let href = match target {
         LinkTarget::Url(u) => u.clone(),
         // Still carries unresolved variable slots (no listed page in scope):
@@ -762,13 +806,18 @@ fn render_link(site: &str, target: &LinkTarget, text: &Content, class: Option<&s
         LinkTarget::Page(p) => {
             let rest = p.path.join("/");
             match &p.space {
-                Some(cat) => format!("/{site}/{cat}/{rest}"),
-                None => format!("/{site}/{rest}"),
+                Some(cat) => format!("/{}/{cat}/{rest}", ctx.site),
+                None => format!("/{}/{rest}", ctx.site),
             }
         }
     };
-    let inner = render_inline(site, text);
-    view! { <a class=class href=href>{inner}</a> }.into_any()
+    let inner = render_inline(ctx, text);
+    // `class` omitted entirely when absent — SSR would otherwise emit a
+    // spurious `class=""`.
+    match class {
+        Some(c) => view! { <a class=c href=href>{inner}</a> }.into_any(),
+        None => view! { <a href=href>{inner}</a> }.into_any(),
+    }
 }
 
 /// `[[user name]]` / `[[*user name]]` → Wikidot's `printuser` span. The
@@ -817,7 +866,7 @@ fn render_footnote_ref(node: &Node) -> AnyView {
 }
 
 /// The collected footnote bodies, at `[[footnoteblock]]` (or the page foot).
-fn render_footnote_block(site: &str, bodies: &[Content]) -> AnyView {
+fn render_footnote_block(ctx: &RenderCtx, bodies: &[Content]) -> AnyView {
     if bodies.is_empty() {
         return empty_view();
     }
@@ -829,7 +878,7 @@ fn render_footnote_block(site: &str, bodies: &[Content]) -> AnyView {
             view! {
                 <div class="footnote-footer" id=format!("footnote-{n}")>
                     <a href="javascript:;">{n.to_string()}</a>
-                    {". "}{render_inline(site, body)}
+                    {". "}{render_inline(ctx, body)}
                 </div>
             }
             .into_any()
@@ -846,7 +895,7 @@ fn render_footnote_block(site: &str, bodies: &[Content]) -> AnyView {
 
 /// `[[module NewPage …]]` → Wikidot's new-page form.
 fn render_module_block(
-    site: &str,
+    ctx: &RenderCtx,
     name: &str,
     _params: &std::collections::HashMap<String, Vec<TextObj>>,
     body: &Content,
@@ -864,7 +913,7 @@ fn render_module_block(
         .into_any(),
         // Body-capable modules without data: render nothing rather than a
         // template full of unresolved `%%var%%` slots.
-        _ => view! { <>{render_block(site, body)}</> }.into_any(),
+        _ => view! { <>{render_block_content(ctx, body)}</> }.into_any(),
     }
 }
 
@@ -902,39 +951,97 @@ fn render_new_page_form(params: &std::collections::HashMap<String, Vec<TextObj>>
 }
 
 /// `[[collapsible]]` → Wikidot's folded/unfolded two-part block with a
-/// client-side toggle. `size` is the `[[size …]]` argument of the idiom where
-/// a size span wraps only the show/hide links.
-fn render_collapsible(site: &str, node: &Node, _size: Option<&str>) -> AnyView {
-    let Node::Collapsible {
-        folded,
-        show,
-        hide,
-        content,
-    } = node
-    else {
-        unreachable!()
-    };
-    let open = RwSignal::new(!*folded);
-    let show = nbsp(show);
-    let hide = nbsp(hide);
-    let folded_link = view! {
-        <a class="collapsible-block-link" href="javascript:;"
-            on:click=move |_| open.set(true)>{show.clone()}</a>
-    };
-    let unfolded_link = view! {
-        <a class="collapsible-block-link" href="javascript:;"
-            on:click=move |_| open.set(false)>{hide.clone()}</a>
-    };
+/// client-side toggle. The header subtree — the inline formatting context
+/// around the opener — is walked twice, once per toggle link (the
+/// instruction in [`RenderCtx::link`] telling the
+/// [`Node::CollapsibleHeader`] leaf which label to show and which way to
+/// flip the signal), which is how Wikidot duplicates the active `[[size]]`
+/// / `[[span]]` around both links — the idiom
+/// `[[size 120%]][[collapsible …]][[/size]]` relies on.
+fn render_collapsible(ctx: &RenderCtx, header: &Content, body: &Content) -> AnyView {
+    let unfolded = RwSignal::new(!header_folded(header));
+    let folded_view = render_inline(
+        &ctx.with_link(CollapsibleLinkCtx {
+            unfolded,
+            open: true,
+        }),
+        header,
+    );
+    let unfolded_view = render_inline(
+        &ctx.with_link(CollapsibleLinkCtx {
+            unfolded,
+            open: false,
+        }),
+        header,
+    );
     view! {
         <div class="collapsible-block">
-            <div class="collapsible-block-folded" style=move || open.get().then_some("display:none")>
-                {folded_link}
+            <div class="collapsible-block-folded" style=move || unfolded.get().then_some("display:none")>
+                {folded_view}
             </div>
-            <div class="collapsible-block-unfolded" style=move || (!open.get()).then_some("display:none")>
-                <div class="collapsible-block-unfolded-link">{unfolded_link}</div>
-                <div class="collapsible-block-content">{render_block(site, content)}</div>
+            <div class="collapsible-block-unfolded" style=move || (!unfolded.get()).then_some("display:none")>
+                <div class="collapsible-block-unfolded-link">{unfolded_view}</div>
+                <div class="collapsible-block-content">{render_block_content(ctx, body)}</div>
             </div>
         </div>
+    }
+    .into_any()
+}
+
+/// The header leaf's initial `folded` state (the leaf itself is rendered by
+/// [`render_collapsible_header`]).
+fn header_folded(header: &[Node]) -> bool {
+    header
+        .iter()
+        .find_map(|node| match node {
+            Node::CollapsibleHeader { folded, .. } => Some(*folded),
+            _ => {
+                let mut found = None;
+                node.visit_node(&mut |children| {
+                    found = found.or_else(|| header_folded_search(children))
+                });
+                found
+            }
+        })
+        .unwrap_or(true)
+}
+
+fn header_folded_search(nodes: &[Node]) -> Option<bool> {
+    nodes.iter().find_map(|node| match node {
+        Node::CollapsibleHeader { folded, .. } => Some(*folded),
+        _ => {
+            let mut found = None;
+            node.visit_node(&mut |children| {
+                found = found.or_else(|| header_folded_search(children))
+            });
+            found
+        }
+    })
+}
+
+/// The toggle-link leaf: which label to show (spaces → `&nbsp;`, as
+/// Wikidot keeps the labels from wrapping) and which way to flip the signal
+/// come from [`RenderCtx::link`]. Outside a collapsible it never renders —
+/// the parse pass degrades unpaired headers to raw text.
+fn render_collapsible_header(ctx: &RenderCtx, node: &Node) -> AnyView {
+    let Node::CollapsibleHeader { open, close, .. } = node else {
+        unreachable!()
+    };
+    let Some(CollapsibleLinkCtx {
+        unfolded,
+        open: is_open,
+    }) = ctx.link
+    else {
+        return empty_view();
+    };
+    let (label, unfold) = if is_open {
+        (open, true)
+    } else {
+        (close, false)
+    };
+    view! {
+        <a class="collapsible-block-link" href="javascript:;"
+            on:click=move |_| unfolded.set(unfold)>{nbsp(label)}</a>
     }
     .into_any()
 }
@@ -947,7 +1054,7 @@ fn nbsp(s: &str) -> String {
 
 /// `[[tabview]]` → the YUI DOM skeleton (`.yui-navset`) with a client-side
 /// tab switch; the first tab renders selected.
-fn render_tabview(site: &str, id: u32, tabs: &[kolorinko_wikitext::Tab]) -> AnyView {
+fn render_tabview(ctx: &RenderCtx, id: u32, tabs: &[kolorinko_wikitext::Tab]) -> AnyView {
     if tabs.is_empty() {
         return view! { <div class="yui-navset"></div> }.into_any();
     }
@@ -956,7 +1063,7 @@ fn render_tabview(site: &str, id: u32, tabs: &[kolorinko_wikitext::Tab]) -> AnyV
         .iter()
         .enumerate()
         .map(|(i, tab)| {
-            let name = render_inline(site, &tab.name);
+            let name = render_inline(ctx, &tab.name);
             view! {
                 <li class=move || (selected.get() == i).then_some("selected")>
                     <a href="javascript:;" on:click=move |_| selected.set(i)>
@@ -971,7 +1078,7 @@ fn render_tabview(site: &str, id: u32, tabs: &[kolorinko_wikitext::Tab]) -> AnyV
         .iter()
         .enumerate()
         .map(|(i, tab)| {
-            let body = render_block(site, &tab.content);
+            let body = render_block_content(ctx, &tab.content);
             view! {
                 <div id=format!("wiki-tab-{id}-{i}")
                     style=move || (selected.get() != i).then_some("display:none")>

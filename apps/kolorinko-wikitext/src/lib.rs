@@ -25,6 +25,41 @@ mod traverse;
 
 pub use dates::{civil_from_days, days_from_civil};
 
+/// Degrade every unpaired `[[collapsible]]` opener — a
+/// [`Node::CollapsibleHeader`] whose closer never arrived during parsing —
+/// to its verbatim source text, the same fate the old parser gave an
+/// unclosed container. Headers already inside a [`Node::Collapsible`] are
+/// paired and stay. Called once on every finished parse.
+pub fn degrade_unclosed_collapsibles(content: &mut Content) {
+    for node in content.iter_mut() {
+        degrade_opener_node(node);
+    }
+}
+
+fn degrade_opener_node(node: &mut Node) {
+    match node {
+        Node::CollapsibleHeader { raw, .. } => *node = Node::Raw(std::mem::take(raw)),
+        Node::Collapsible { body, .. } => degrade_unclosed_collapsibles(body),
+        Node::Include(include) => {
+            for (_, value) in &mut include.vars {
+                degrade_unclosed_collapsibles(value);
+            }
+        }
+        Node::Text(TextObj::IncludeVar { default, .. }) => {
+            if let Some(d) = default {
+                degrade_unclosed_collapsibles(d);
+            }
+        }
+        other => {
+            let owned = std::mem::replace(other, Node::Raw(String::new()));
+            *other = owned.map_node(&mut |mut children| {
+                degrade_unclosed_collapsibles(&mut children);
+                children
+            });
+        }
+    }
+}
+
 /// Assign `toc0`, `toc1`, … anchors to every heading in document order,
 /// matching the id scheme Wikidot emits for in-page table-of-contents links.
 /// Headings already carrying an explicit anchor (from `[[# name]]` syntax)
@@ -287,14 +322,30 @@ pub enum Node {
         els: Content,
     },
 
-    /// `[[collapsible show="…" hide="…"]] … [[/collapsible]]`. Renders as the
-    /// two-part folded/unfolded DOM with a client-side toggle; `folded`
-    /// mirrors `folded="no"|"false"` (initially unfolded).
-    Collapsible {
+    /// `[[collapsible show="…" hide="…"]] … [[/collapsible]]` — built by the
+    /// merge pass when the closer arrives, not by balanced pairing (see
+    /// [`Node::CollapsibleHeader`]). `header` is the inline formatting
+    /// context around the opener — ordinary container nodes around a
+    /// [`Node::CollapsibleHeader`] leaf; the renderer walks it once per
+    /// toggle link, which is how Wikidot duplicates the active `[[size]]` /
+    /// `[[span]]` / style marks around both links — the idiom
+    /// `[[size 120%]][[collapsible …]][[/size]]` relies on. `body` is
+    /// everything between the opener and the closer.
+    Collapsible { header: Content, body: Content },
+
+    /// A `[[collapsible]]` toggle-link position, planted by the opener at its
+    /// exact spot. It rides the tree through whatever containers close
+    /// around it, and the closer — wherever it arrives — wraps the inline
+    /// chain around it into the `header` of a [`Node::Collapsible`] (see
+    /// the merge pass's collapsible pairing). Which label a render shows
+    /// (and which way the toggle flips) comes from the render context;
+    /// `folded` is the `folded="no"` initial state, `raw` the opener's
+    /// verbatim source for the unclosed-opener degradation.
+    CollapsibleHeader {
         folded: bool,
-        show: String,
-        hide: String,
-        content: Content,
+        open: String,
+        close: String,
+        raw: String,
     },
 
     /// `[[user name]]` (`avatar == false`) or `[[*user name]]` (`avatar ==

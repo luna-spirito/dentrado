@@ -86,16 +86,9 @@ impl Node {
                 then: f(then),
                 els: f(els),
             },
-            Node::Collapsible {
-                folded,
-                show,
-                hide,
-                content,
-            } => Node::Collapsible {
-                folded,
-                show,
-                hide,
-                content: f(content),
+            Node::Collapsible { header, body } => Node::Collapsible {
+                header: f(header),
+                body: f(body),
             },
             Node::ModuleBlock { name, params, body } => Node::ModuleBlock {
                 name,
@@ -139,10 +132,13 @@ impl Node {
                 f(sub);
             }
             Node::IfExpr { then: content, .. }
-            | Node::Collapsible { content, .. }
             | Node::ModuleBlock { body: content, .. }
             | Node::Footnote(content)
             | Node::Link { text: content, .. } => f(content),
+            Node::Collapsible { header, body } => {
+                f(header);
+                f(body);
+            }
             Node::IfExpr { els, .. } => f(els),
             Node::FootnoteBlock(bodies) => bodies.iter().for_each(f),
             Node::Tabview { tabs, .. } => tabs.iter().for_each(|t| {

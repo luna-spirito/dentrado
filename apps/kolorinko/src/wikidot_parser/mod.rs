@@ -569,21 +569,21 @@ mod tests {
     }
 
     #[test]
-    fn collapsible_is_div_container() {
+    fn collapsible_basic() {
         let c = parse("[[collapsible show=\"+\" hide=\"-\"]]\nbody **bold**\n[[/collapsible]]");
-        let Node::Collapsible {
-            folded,
-            show,
-            hide,
-            content,
-        } = &c[0]
-        else {
+        let Node::Collapsible { header, body } = &c[0] else {
             panic!("expected collapsible, got {c:#?}");
         };
-        assert!(folded);
-        assert_eq!(show, "+");
-        assert_eq!(hide, "-");
-        assert!(content.iter().any(|n| matches!(
+        assert!(matches!(
+            &header[..],
+            [Node::CollapsibleHeader {
+                open,
+                close,
+                folded: true,
+                ..
+            }] if open == "+" && close == "-"
+        ));
+        assert!(body.iter().any(|n| matches!(
             n,
             Node::Container {
                 kind: ContainerKind::Style(TextStyle::Bold),
