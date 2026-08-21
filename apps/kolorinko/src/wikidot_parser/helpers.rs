@@ -153,7 +153,7 @@ fn insert_kv(seg: &str, vars: &mut Vec<(String, Content)>) {
     if key.is_empty() {
         return;
     }
-    vars.push((key.to_string(), merge::parse_sub(unquote(&seg[eq + 1..]))));
+    vars.push((key.to_string(), builder::parse_sub(unquote(&seg[eq + 1..]))));
 }
 
 /// Track `[[`/`]]` depth (and skip over `"..."` quotes) across `s`; return
@@ -299,7 +299,7 @@ fn parse_space_vars(remainder: &str) -> Vec<(String, Content)> {
         };
         let key = remainder[key_start..key_end].trim();
         if !key.is_empty() {
-            vars.push((key.to_string(), merge::parse_sub(value.trim())));
+            vars.push((key.to_string(), builder::parse_sub(value.trim())));
         }
     }
     vars

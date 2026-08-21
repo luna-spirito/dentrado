@@ -1,12 +1,13 @@
-//! Regression tests for `[[collapsible]]` pairing: the opener plants a
-//! `CollapsibleHeader` leaf, and the closer pairs it by scanning backwards
-//! through the inline containers around it — so the inline formatting
-//! context of the opener (`[[size]]`, `[[span]]`, …) wraps both toggle
-//! links, while the body collected after the leaf stays unformatted.
+//! Regression tests for `[[collapsible]]` pairing: the lexer splits the
+//! opener into an opener token plus a toggle-header leaf, so an inline
+//! pairing may wrap the header (`[[size]] [[collapsible]] [[/size]]` —
+//! the crossed idiom Wikidot honors), while the closer collects whatever
+//! node holds the leaf as the node's header and the body gathered after
+//! it stays unformatted.
 
 use kolorinko::wikidot_parser;
 use kolorinko_render::render_block;
-use kolorinko_wikitext::Node;
+use kolorinko_wikitext::{ContainerKind, Node, TextObj};
 use leptos::prelude::*;
 
 fn html(src: &str) -> String {
@@ -14,35 +15,38 @@ fn html(src: &str) -> String {
     view! { <div>{views}</div> }.to_html().replace("<!>", "")
 }
 
-/// The idiom `[[size 120%]] [[collapsible …]] [[/size]] Body [[/collapsible]]`:
-/// the `[[size]]` closes around the header leaf, so the scan pulls the leaf
-/// out through it and both toggle links inherit the 120% wrap — the body
-/// never does.
+/// The crossed idiom `[[size 120%]] [[collapsible …]] [[/size]] Body [[/collapsible]]`:
+/// the size interval crosses the collapsible interval, and the header leaf
+/// — planted between them — is wrapped by the ordinary inline machinery.
+/// The closer then wraps the whole block around the node holding the leaf,
+/// so both toggle links carry the size while the body stays clean.
 #[test]
-fn size_idiom_wraps_both_links_not_body() {
-    let html = html(
+fn size_idiom_wraps_the_header_not_the_body() {
+    let c = wikidot_parser::parse(
         "[[size 120%]] [[collapsible show=\"+ open\" hide=\"- close\"]] [[/size]] Body Here [[/collapsible]]",
     );
 
-    // Exactly two font-size spans: one per toggle link, none around the body.
-    assert_eq!(html.matches("font-size:120%").count(), 2, "{html}");
-    assert!(html.contains(
-        "<div class=\"collapsible-block-folded\"><span style=\"font-size:120%;\"> <a href=\"javascript:;\" class=\"collapsible-block-link\">+\u{a0}open</a> </span></div>"
-    ), "{html}");
-    assert!(html.contains(
-        "<div class=\"collapsible-block-unfolded-link\"><span style=\"font-size:120%;\"> <a href=\"javascript:;\" class=\"collapsible-block-link\">-\u{a0}close</a> </span></div>"
-    ), "{html}");
+    let [Node::Collapsible { header, body }] = &c[..] else {
+        panic!("expected one collapsible, got {c:#?}")
+    };
+    assert!(matches!(
+        &header[..],
+        [Node::Container { kind: ContainerKind::Size(v), content }]
+            if v == "120%" && matches!(
+                &content[..],
+                [Node::Text(TextObj::Plain(_)), Node::CollapsibleHeader { open, close, folded: true, .. }, Node::Text(TextObj::Plain(_))]
+                    if open == "+ open" && close == "- close"
+            )
+    ));
+    assert!(matches!(&body[..], [Node::Text(TextObj::Plain(t))] if t.contains("Body Here")));
 
-    // The body sits in the content div, free of any wrap.
-    let content = html
-        .split("<div class=\"collapsible-block-content\">")
-        .nth(1)
-        .unwrap()
-        .split("</div>")
-        .next()
-        .unwrap();
-    assert!(content.contains("Body Here"), "{html}");
-    assert!(!content.contains("font-size"), "{html}");
+    let h = html(
+        "[[size 120%]] [[collapsible show=\"+ open\" hide=\"- close\"]] [[/size]] Body Here [[/collapsible]]",
+    );
+    let sized = h.matches("font-size:120%").count();
+    let in_link = h.matches("font-size:120%;\"> <a").count();
+    assert_eq!((sized, in_link), (2, 2), "html = {h}");
+    assert!(h.contains("<p>Body Here</p>"), "html = {h}");
 }
 
 /// Wikidot keeps a quoted-space label verbatim: `hide=" "` renders as a

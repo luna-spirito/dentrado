@@ -30,6 +30,9 @@ type E<'a> = extra::Err<Rich<'a, u8>>;
 #[derive(Clone)]
 enum TokenOut<'a> {
     One(Tok<'a>, usize, usize),
+    /// Two tokens over one span: a `[[collapsible …]]` opener and the
+    /// toggle-header leaf planted after it.
+    Two(Tok<'a>, Tok<'a>, usize, usize),
     /// One [`Tok::QuoteMark`] per `>` of the run, at `start + k`.
     Quote {
         start: usize,
@@ -107,6 +110,12 @@ pub(crate) enum Tok<'src> {
     },
     Open(OpenTag<'src>),
     Close(ClosedTag),
+    /// The toggle-header leaf planted right after a `[[collapsible …]]`
+    /// opener (same span): an inline pairing may wrap it —
+    /// `[[size]] [[collapsible]] [[/size]]` — while the opener pairs with
+    /// the distant `[[/collapsible]]` and the builder wraps the whole block
+    /// around whatever node holds this leaf.
+    CollapsibleHdr(Params),
     /// `[!--`
     CommentOpen,
     /// `--]` — only meaningful inside a comment; the merge degrades a stray
@@ -256,7 +265,15 @@ fn token_run<'a>() -> impl Parser<'a, In<'a>, TokenOut<'a>, E<'a>> + Clone + 'a 
         pipe2_prefix(),
         single().map_with(|tok, e| {
             let span: SimpleSpan = e.span();
-            TokenOut::One(tok, span.start, span.end)
+            match &tok {
+                Tok::Open(OpenTag::Collapsible { params }) => TokenOut::Two(
+                    tok.clone(),
+                    Tok::CollapsibleHdr(params.clone()),
+                    span.start,
+                    span.end,
+                ),
+                _ => TokenOut::One(tok, span.start, span.end),
+            }
         }),
     ))
 }
@@ -268,6 +285,10 @@ fn fold_tokens(items: Vec<TokenOut<'_>>) -> Vec<Token<'_>> {
     for out in items {
         match out {
             TokenOut::One(tok, start, end) => toks.push(Token { tok, start, end }),
+            TokenOut::Two(a, b, start, end) => {
+                toks.push(Token { tok: a, start, end });
+                toks.push(Token { tok: b, start, end });
+            }
             TokenOut::Quote { start, count } => toks.extend((0..count).map(|k| Token {
                 tok: Tok::QuoteMark,
                 start: start + k,

@@ -1,5 +1,5 @@
-//! Wikidot markup parser: a chumsky lexer over raw bytes plus a plain merge
-//! pass.
+//! Wikidot markup parser: a chumsky lexer over raw bytes, a pairing pass
+//! over the token stream, and a facts-guided tree builder.
 //!
 //! The grammar follows the reference at
 //! <https://www.wikidot.com/doc-wiki-syntax:inline-formatting> and is a port of
@@ -8,13 +8,18 @@
 //! ## Architecture
 //!
 //! [`lex`] turns the page into a flat, total [`Token`] stream — rich tokens
-//! carrying pre-split openers/closers, parsed attributes and byte spans — and
-//! [`merge::Merger`] pairs them into [`Node`]s in one non-backtracking walk.
-//! Every container (`[[div]]`, `[[span]]`, `[!--`, …) merges its body until
-//! its own closer; on a mismatch or EOF it *flattens*: the verbatim opener
-//! becomes a [`Node::Raw`] followed by the body it already merged, and the
-//! foreign stop propagates to the ancestor that owns the consumed closer.
-//! Malformed input therefore degrades gracefully and merging stays linear.
+//! carrying pre-split openers/closers, parsed attributes and byte spans.
+//! [`pairer::pair`] then answers exactly one question per token — which
+//! opener owns which closer — reporting intervals (and crossings) as plain
+//! facts. [`builder`] folds those facts into [`Node`]s under one structural
+//! rule: block frames sit at the bottom of the stack, inline frames on top,
+//! and every block boundary splits the inline frames above it — which is
+//! exactly Wikidot's interval semantics. Wrapping constructs live on the
+//! builder's explicit frame stack (never the Rust call stack, so hostile
+//! nesting is heap-bounded). Malformed input degrades gracefully: a stray
+//! closer or an opener whose closer never came renders as [`Node::Raw`],
+//! and a strikethrough nobody claimed is an em-dash. Both passes stay
+//! linear.
 //!
 //! ## Graceful degradation
 //!
@@ -28,9 +33,16 @@ pub mod types;
 pub(crate) use crate::wikidot_parser::types::*;
 pub(crate) use std::collections::HashMap;
 
+/// The facts-guided tree builder: folds [`pairer`] intervals into nodes.
+pub(crate) mod builder;
 pub mod helpers;
 pub(crate) mod lexer;
+/// The pre-redesign single-pass merger; kept as the diff oracle until the
+/// corpus finalises the open tables, then to be dissolved.
+#[allow(dead_code)]
 pub(crate) mod merge;
+/// The pairing pass: opener↔closer intervals as plain facts.
+pub(crate) mod pairer;
 
 pub(crate) use helpers::*;
 
@@ -111,12 +123,66 @@ impl ClosedTag {
 /// [`merge_text`]. Total: any input parses to something.
 pub fn parse(input: &str) -> Content {
     let toks = lexer::lex(input);
-    merge::parse_toks(input, &toks)
+    builder::parse_toks(input, &toks)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Crossed containers split, not flatten: the span closes inside the
+    /// div where `[[/div]]` cut it, then re-opens for the tail — Wikidot's
+    /// `<div>hi1 <span>hi2</span></div><span>hi3</span>`.
+    #[test]
+    fn crossed_span_splits_across_div() {
+        let c = parse("[[div]]\nhi1\n[[span]]\nhi2\n[[/div]]\nhi3\n[[/span]]\n");
+        let span = |content: Content| Node::Container {
+            kind: ContainerKind::Div {
+                inline: true,
+                block: false,
+                params: Params::new(),
+            },
+            content,
+        };
+        assert_eq!(
+            c,
+            vec![
+                Node::Container {
+                    kind: ContainerKind::Div {
+                        inline: false,
+                        block: true,
+                        params: Params::new(),
+                    },
+                    content: vec![txt("\nhi1\n"), span(vec![txt("\nhi2\n")])],
+                },
+                span(vec![txt("\nhi3\n")]),
+                txt("\n"),
+            ]
+        );
+    }
+
+    /// Marks split the same way: `**hi--hello**hey--` closes the strike
+    /// inside the bold, then re-opens it for the tail.
+    #[test]
+    fn crossed_strike_splits_across_bold() {
+        let c = parse("**hi--hello**hey--");
+        let style = |style: TextStyle, content: Content| Node::Container {
+            kind: ContainerKind::Style(style),
+            content,
+        };
+        assert_eq!(
+            c,
+            vec![
+                style(
+                    TextStyle::Bold,
+                    vec![
+                        txt("hi"),
+                        style(TextStyle::Strikethrough, vec![txt("hello")])
+                    ]
+                ),
+                style(TextStyle::Strikethrough, vec![txt("hey")]),
+            ]
+        );
+    }
 
     fn txt(s: &str) -> Node {
         Node::Text(TextObj::Plain(s.to_string()))
@@ -417,13 +483,13 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
-            c[1],
+        assert!(c.iter().any(|n| matches!(
+            n,
             Node::Container {
                 kind: ContainerKind::Color(_),
                 ..
             }
-        ));
+        )));
     }
 
     #[test]
@@ -714,12 +780,11 @@ mod tests {
     }
 
     /// A foreign closer (`[[/span]]`) must be claimed by its matching open
-    /// container, with the intervening mismatched container (`[[div]]`)
-    /// flattened inside it — not left to leak as stray text.
+    /// container. The unmatched `[[div]]` opener renders as `Node::Raw` and
+    /// its would-be body stays in flow — nothing leaks as stray text.
     #[test]
     fn mismatched_closer_claimed_by_ancestor() {
         let c = parse("[[span]] outer [[div]] inner [[/span]] tail");
-        // The span matches and wraps the broken div.
         let span = c
             .iter()
             .find_map(|n| match n {
@@ -733,18 +798,18 @@ mod tests {
         assert!(
             span.iter()
                 .any(|n| matches!(n, Node::Raw(s) if s == "[[div]]")),
-            "div should flatten inside span: {span:#?}"
+            "unpaired div opener should render raw: {span:#?}"
         );
         assert!(
             span.iter()
-                .any(|n| matches!(n, Node::Text(TextObj::Plain(s)) if s.contains("inner")))
+                .any(|n| matches!(n, Node::Text(TextObj::Plain(s)) if s.contains("inner"))),
+            "the div body stays in flow inside the span: {span:#?}"
         );
-        // The `[[/span]]` closer is consumed by the span, so `tail` is free text.
         assert!(
             c.iter()
-                .any(|n| matches!(n, Node::Text(TextObj::Plain(s)) if s.contains("tail")))
+                .any(|n| matches!(n, Node::Text(TextObj::Plain(s)) if s.contains("tail"))),
+            "tail lost: {c:#?}"
         );
-        // No stray raw closer leaks.
         assert!(
             c.iter()
                 .all(|n| !matches!(n, Node::Raw(s) if s.contains("/span")))
