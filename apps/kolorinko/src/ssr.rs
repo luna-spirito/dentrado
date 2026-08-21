@@ -15,16 +15,19 @@ use crate::wikidot_page::RepoMeta;
 /// Resolve and render the full SSR document for `(site, slug)`, or `None` when
 /// the frontend template can't host SSR output (no app placeholder — unbuilt
 /// frontend); the caller then falls back to serving plain `index.html`.
+/// `host` — the request's `host[:port]` — absolutizes the OpenGraph card's
+/// URLs.
 pub(crate) async fn document(
     assets: &Arc<HashMap<String, Body>>,
     repo_meta: RepoMeta,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     site: SafePathComponent,
     slug: Slug,
+    host: Option<&str>,
 ) -> Option<String> {
     let state = resolve(repo_meta, core, site.clone(), slug).await;
     let index = index_template(assets)?;
-    kolorinko_render::render_ssr_document(&index, &site, &state)
+    kolorinko_render::render_ssr_document(&index, &site, &state, host)
 }
 
 /// Resolve the page and shell for one route. Subscribes both before reading

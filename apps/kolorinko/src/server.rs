@@ -267,7 +267,19 @@ async fn handle_conn(
                 .get(http::header::ACCEPT_ENCODING)
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("zstd"));
-            let reply = respond::resolve(&full, accept_zstd, &assets, repo_meta, &core).await;
+            // HTTP/3 carries the origin as `:authority` (h3 folds any `Host`
+            // header into the URI's authority); the SSR document absolutizes
+            // its OpenGraph URLs with it.
+            let host = req.uri().authority().map(|a| a.as_str().to_owned());
+            let reply = respond::resolve(
+                &full,
+                accept_zstd,
+                &assets,
+                repo_meta,
+                &core,
+                host.as_deref(),
+            )
+            .await;
             let mut b = http::Response::builder()
                 .status(reply.status)
                 .header("content-type", reply.mime)

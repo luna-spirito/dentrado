@@ -166,7 +166,15 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(());
     }
 
-    let reply = respond::resolve(path, accepts_zstd(&head), assets, repo_meta.clone(), core).await;
+    let reply = respond::resolve(
+        path,
+        accepts_zstd(&head),
+        assets,
+        repo_meta.clone(),
+        core,
+        host_of(&head),
+    )
+    .await;
     write_http(
         stream,
         reply.status,
@@ -189,6 +197,19 @@ fn accepts_zstd(head: &str) -> bool {
         let mut parts = l.splitn(2, ':');
         matches!(parts.next().map(str::trim), Some(name) if name.eq_ignore_ascii_case("accept-encoding"))
             && parts.next().is_some_and(|v| v.contains("zstd"))
+    })
+}
+
+/// The request's `Host` header value — the page's own origin, with which the
+/// SSR document absolutizes its OpenGraph URLs. Same raw-head scan as
+/// [`accepts_zstd`].
+fn host_of(head: &str) -> Option<&str> {
+    head.lines().find_map(|l| {
+        let mut parts = l.splitn(2, ':');
+        match parts.next().map(str::trim) {
+            Some(name) if name.eq_ignore_ascii_case("host") => parts.next().map(str::trim),
+            _ => None,
+        }
     })
 }
 

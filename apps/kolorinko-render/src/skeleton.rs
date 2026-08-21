@@ -7,6 +7,7 @@ use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
 
 use crate::layout::{document_title, html_escape, layout, theme_link};
+use crate::opengraph;
 
 /// Render `state` (page + shell) for `site` through the shared [`layout`] into
 /// HTML — exactly the tree the client renders from the same state, which is
@@ -33,9 +34,15 @@ const APP_PLACEHOLDER: &str = r#"<div id="container"></div>"#;
 /// Seal an SSR'd page into the built frontend's `index.html` template: the
 /// rendered layout + embedded [`SsrState`] replace the app placeholder (so the
 /// client hydrates positionally from `<body>`'s first child), the `<title>`
-/// carries the page title, and the site theme `<link>` joins `<head>`. `None`
-/// when the template has no placeholder (unbuilt frontend).
-pub fn render_ssr_document(index: &str, site: &str, state: &SsrState) -> Option<String> {
+/// carries the page title, the site theme `<link>` and the OpenGraph card join
+/// `<head>`. `host` — the request's `host[:port]` — absolutizes the card's
+/// URLs. `None` when the template has no placeholder (unbuilt frontend).
+pub fn render_ssr_document(
+    index: &str,
+    site: &str,
+    state: &SsrState,
+    host: Option<&str>,
+) -> Option<String> {
     let app = render_app(site, state);
     let embedded = format!(
         r#"<script type="application/json" id="{SSR_STATE_ID}">{}</script>"#,
@@ -46,10 +53,14 @@ pub fn render_ssr_document(index: &str, site: &str, state: &SsrState) -> Option<
         &doc,
         &document_title(site, &state.shell.title, &state.page.meta.title),
     );
-    Some(match state.shell.theme_root.as_deref() {
-        Some(href) => inject_before_head_end(&doc, &theme_link(href)),
-        None => doc,
-    })
+    let og = opengraph::meta(site, &state.shell, &state.page, host);
+    let theme = state
+        .shell
+        .theme_root
+        .as_deref()
+        .map(&theme_link)
+        .unwrap_or_default();
+    Some(inject_before_head_end(&doc, &format!("{og}{theme}")))
 }
 
 /// Replace the placeholder — plus whatever whitespace the template wraps
@@ -110,6 +121,7 @@ pub fn render_page_document(
     );
 
     let title = html_escape(&document_title(site, &shell.title, &page.meta.title));
+    let og = opengraph::meta(site, shell, page, None);
     let style = base_css
         .map(|css| format!("<style>\n{css}\n</style>\n"))
         .unwrap_or_default();
@@ -125,6 +137,7 @@ pub fn render_page_document(
          <meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <title>{title}</title>\n\
+         {og}\
          {style}\
          {theme}\
          </head>\n\

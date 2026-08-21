@@ -17,6 +17,8 @@ pub use layout::{THEME_LINK_ID, document_title, html_escape, layout, theme_link}
 pub use render::{render_block, wrap_topbar_lists};
 
 #[cfg(feature = "ssr")]
+mod opengraph;
+#[cfg(feature = "ssr")]
 mod skeleton;
 
 #[cfg(feature = "ssr")]

@@ -36,13 +36,15 @@ pub(crate) struct Reply {
 }
 
 /// Resolve a GET `full` request path (query string included, if any) into a
-/// [`Reply`]. `accept_zstd` picks the wire form of storable bodies.
+/// [`Reply`]. `accept_zstd` picks the wire form of storable bodies; `host` —
+/// the request's `host[:port]` — absolutizes SSR pages' OpenGraph URLs.
 pub(crate) async fn resolve(
     full: &str,
     accept_zstd: bool,
     assets: &Arc<HashMap<String, Body>>,
     repo_meta: RepoMeta,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    host: Option<&str>,
 ) -> Reply {
     let path = full.split('?').next().unwrap_or(full);
     let key: &str = if path == "/" { "/index.html" } else { path };
@@ -58,7 +60,7 @@ pub(crate) async fn resolve(
             }
             None if !looks_like_asset(key) => match parse_route(path) {
                 Some((site, slug)) => {
-                    match crate::ssr::document(assets, repo_meta, core, site, slug).await {
+                    match crate::ssr::document(assets, repo_meta, core, site, slug, host).await {
                         Some(html) => Reply::ok(
                             "text/html; charset=utf-8",
                             serve_body(&compress(html.into_bytes()), accept_zstd),
