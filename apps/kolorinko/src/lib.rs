@@ -75,10 +75,23 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Command {
+    /// One-shot SSR render, no servers. `<site>/<page>` renders that page to
+    /// stdout; a bare `<site>` mass-renders every page of the site into a
+    /// directory of standalone `.html` files (default
+    /// `.kolorinko/render/<site>`).
     Render {
         #[arg(long)]
         inject: bool,
-        page: String,
+        /// Whole-site render only: output directory
+        /// (default `.kolorinko/render/<site>`).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Whole-site render only: replace the output directory if it exists.
+        #[arg(long)]
+        force: bool,
+        /// `<site>/<page>`/`<site>/<category>/<page>` for one page, bare
+        /// `<site>` for the whole site.
+        target: String,
     },
 }
 
@@ -88,9 +101,12 @@ pub fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.commands {
         None => run_server(load_config(&cli.config_path)?),
-        Some(Command::Render { inject, page }) => {
-            render_cli::run_cli(cli.config_path, page, inject)
-        }
+        Some(Command::Render {
+            inject,
+            out,
+            force,
+            target,
+        }) => render_cli::run_cli(cli.config_path, &target, inject, out, force),
     }
 }
 
@@ -101,17 +117,7 @@ fn load_config(config_path: &Path) -> anyhow::Result<Config> {
 
 /// `kolorinko <config.toml>` — run the H3 + WebTransport server.
 fn run_server(config: Config) -> anyhow::Result<()> {
-    let cores = NonZero::new(
-        std::env::var("NUM_CORES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                available_parallelism()
-                    .map(|x| u32::try_from(x.get()).unwrap())
-                    .unwrap_or(4)
-            }),
-    )
-    .unwrap();
+    let cores = core_count();
 
     let repo_meta = make_repo_meta(&config.repo);
     let bind = config.server.bind.clone();
@@ -171,6 +177,23 @@ fn run_server(config: Config) -> anyhow::Result<()> {
     loop {
         std::thread::park();
     }
+}
+
+/// Core count for multi-core runs: the `NUM_CORES` env override if set (and
+/// parseable), else OS-reported parallelism (fallback 4). Shared by the
+/// server ([`run_server`]) and the whole-site render ([`render_cli`]).
+pub(crate) fn core_count() -> NonZero<u32> {
+    NonZero::new(
+        std::env::var("NUM_CORES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                available_parallelism()
+                    .map(|x| u32::try_from(x.get()).unwrap())
+                    .unwrap_or(4)
+            }),
+    )
+    .unwrap()
 }
 
 /// Build a single-node [`DbConfig`] for `cores` cores. Shared by the server

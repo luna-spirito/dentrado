@@ -360,6 +360,17 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
         self.core_id
     }
 
+    /// Does this core own `gear`? Placement is deterministic — the gear's group
+    /// hash through the jump-consistent hash, the same computation on every
+    /// core — so workers can shard work by ownership without a round trip.
+    #[must_use]
+    pub fn owns(&self, gear: &R::GearId) -> bool {
+        R::meta(gear)
+            .group()
+            .global_hash(&self.storage)
+            .is_ok_and(|h| GlobalCoreId::from_hash(h).route(self.num_cores) == self.core_id)
+    }
+
     #[must_use]
     pub(crate) fn node_id(&self) -> NodeId {
         self.node_id
