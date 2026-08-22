@@ -19,13 +19,12 @@ pub(crate) struct ParsedCache {
 /// `[[include]]` directives. Depends only on the [`repo_l_article_latest`] lens
 /// (never on another parse gear), so the parse layer is acyclic.
 pub(crate) async fn article_latest_parsed<S: Storage<KolorinkoRT>>(
-    meta: &RepoMeta,
     site: &SafePathComponent,
     slug: &Slug,
     ctx: &mut GearCtx<KolorinkoRT, S>,
     cache: &mut ParsedCache,
 ) -> ArticleView {
-    let latest = crate::runtime::repo_l_article_latest(meta.clone(), site.clone(), slug.clone())
+    let latest = crate::runtime::repo_l_article_latest(site.clone(), slug.clone())
         .secondary_get(ctx)
         .await;
     if cache.body.as_deref() == Some(latest.body.as_str())
@@ -63,7 +62,6 @@ pub(crate) struct LatestCache;
 /// transclusion cone re-runs this gear. The tree of every page fetched along
 /// the way rides along as the view's `deps`.
 pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
-    meta: &RepoMeta,
     site: SafePathComponent,
     slug: Slug,
     parsed: &ArticleView,
@@ -82,7 +80,7 @@ pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
         tags: page_meta.tags.clone(),
     };
     let mut state = ResolveState::new(site.clone());
-    let (mut content, deps) = resolve_full(content, slug, host, &mut state, meta, ctx).await;
+    let (mut content, deps) = resolve_full(content, slug, host, &mut state, ctx).await;
     kolorinko_wikitext::assign_toc_anchors(&mut content);
     ArticleView {
         meta: page_meta,
@@ -132,17 +130,16 @@ pub(super) async fn resolve_full<S: Storage<KolorinkoRT>>(
     slug: Slug,
     host: HostCtx,
     state: &mut ResolveState,
-    meta: &RepoMeta,
     ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> (Content, Vec<PageDep>) {
     Box::pin(async move {
         let origin = (state.site.clone(), slug.0, slug.1);
         state.resolved.insert(origin.clone());
-        let (content, mut deps) = resolve_include(content, &origin, state, meta, ctx).await;
-        let (content, listed) = resolve_listpages(content, state, meta, &host, ctx).await;
+        let (content, mut deps) = resolve_include(content, &origin, state, ctx).await;
+        let (content, listed) = resolve_listpages(content, state, &host, ctx).await;
         deps.extend(listed);
         let content = evaluate_iftags(content, &host.tags);
-        let content = resolve_resources(content, &state.site, meta, ctx).await;
+        let content = resolve_resources(content, &state.site, ctx).await;
         (content, deps)
     })
     .await
@@ -163,7 +160,6 @@ pub(super) async fn resolve_include<S: Storage<KolorinkoRT>>(
     content: Content,
     origin: &Key,
     state: &mut ResolveState,
-    meta: &RepoMeta,
     ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> (Content, Vec<PageDep>) {
     let mut edges: Vec<(Key, Key)> = Vec::new();
@@ -175,11 +171,7 @@ pub(super) async fn resolve_include<S: Storage<KolorinkoRT>>(
             if key == *origin {
                 continue;
             }
-            let parsed = crate::runtime::article_latest_parsed(
-                meta.clone(),
-                inc_site.clone(),
-                inc_slug.clone(),
-            )
+            let parsed = crate::runtime::article_latest_parsed(inc_site.clone(), inc_slug.clone())
             .secondary_get(ctx)
             .await;
             edges.push((includer.clone(), key.clone()));

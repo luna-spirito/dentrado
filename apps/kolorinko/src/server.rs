@@ -65,10 +65,9 @@ use kolorinko_rt::{
 
 use crate::respond;
 use crate::runtime::{
-    GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, asset,
-    repo_l_article_latest, repo_l_list_pages, repo_resource, shell,
+    GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, asset, legacy_page_id,
+    page_addr, repo_l_article_latest, repo_l_list_pages, repo_resource, shell,
 };
-use crate::wikidot_page::RepoMeta;
 
 /// Max concurrent WebTransport sessions advertised per HTTP/3 connection
 /// (`SETTINGS_H3_WEBTRANSPORT_MAX_SESSIONS`). Default-0 means "none", which
@@ -81,7 +80,6 @@ pub(crate) async fn serve(
     core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     bind: &str,
     assets: Arc<HashMap<String, Body>>,
-    repo_meta: RepoMeta,
     inject_wt_hash: bool,
 ) -> io::Result<()> {
     let endpoint = build_endpoint(bind, inject_wt_hash)?;
@@ -99,9 +97,8 @@ pub(crate) async fn serve(
             Some(incoming) => {
                 let core = core.clone();
                 let assets = assets.clone();
-                let repo_meta = repo_meta.clone();
                 runtime::spawn(async move {
-                    if let Err(e) = handle_conn(incoming, &core, &assets, &repo_meta).await {
+                    if let Err(e) = handle_conn(incoming, &core, &assets).await {
                         warn!("conn closed: {e}");
                     }
                 })
@@ -191,7 +188,6 @@ async fn handle_conn(
     incoming: compio_quic::Incoming,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     assets: &Arc<HashMap<String, Body>>,
-    repo_meta: &RepoMeta,
 ) -> io::Result<()> {
     let conn = incoming
         .await
@@ -242,9 +238,8 @@ async fn handle_conn(
                     .map_err(|e| io::Error::other(format!("wt accept: {e}")))?;
             info!("wt session established from {remote}");
             let core = core.clone();
-            let repo_meta = repo_meta.clone();
             runtime::spawn(async move {
-                run_session(session, &core, &repo_meta).await;
+                run_session(session, &core).await;
             })
             .detach();
             return Ok(()); // h3_conn consumed by the session
@@ -254,7 +249,6 @@ async fn handle_conn(
         // open for further multiplexed requests.
         let assets = assets.clone();
         let core = core.clone();
-        let repo_meta = repo_meta.clone();
         runtime::spawn(async move {
             let mut stream = stream;
             let full = req
@@ -271,21 +265,16 @@ async fn handle_conn(
             // header into the URI's authority); the SSR document absolutizes
             // its OpenGraph URLs with it.
             let host = req.uri().authority().map(|a| a.as_str().to_owned());
-            let reply = respond::resolve(
-                &full,
-                accept_zstd,
-                &assets,
-                repo_meta,
-                &core,
-                host.as_deref(),
-            )
-            .await;
+            let reply = respond::resolve(&full, accept_zstd, &assets, &core, host.as_deref()).await;
             let mut b = http::Response::builder()
                 .status(reply.status)
                 .header("content-type", reply.mime)
                 .header("content-length", reply.served.bytes.len().to_string())
                 .header("cache-control", reply.cache_control)
                 .header("vary", "Accept-Encoding");
+            if let Some(loc) = reply.location {
+                b = b.header("location", loc);
+            }
             if let Some(enc) = reply.served.encoding {
                 b = b.header("content-encoding", enc);
             }
@@ -321,13 +310,11 @@ async fn handle_conn(
 async fn run_session(
     session: h3_webtransport::server::WebTransportSession<compio_quic::Connection, Bytes>,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
-    repo_meta: &RepoMeta,
 ) {
     while let Ok(Some(accepted)) = session.accept_bi().await {
         match accepted {
             h3_webtransport::server::AcceptedBi::BidiStream(_id, stream) => {
-                runtime::spawn(subscription_stream(stream, core.clone(), repo_meta.clone()))
-                    .detach();
+                runtime::spawn(subscription_stream(stream, core.clone())).detach();
             }
             // Plain HTTP/3 requests can still arrive through an established
             // session; we serve none after the connect.
@@ -344,7 +331,6 @@ async fn run_session(
 async fn subscription_stream<S>(
     bidi: h3_webtransport::stream::BidiStream<S, Bytes>,
     core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
-    repo_meta: RepoMeta,
 ) where
     h3_webtransport::stream::BidiStream<S, Bytes>: AsyncRead + AsyncWrite + Unpin,
 {
@@ -354,7 +340,7 @@ async fn subscription_stream<S>(
         Ok(Some(msg)) => msg,
         _ => return,
     };
-    let s = subscribe_wire(id, repo_meta, &core).await;
+    let s = subscribe_wire(id, &core).await;
     let mut last = hash;
     if let Some(out) = to_wire_out(s.current())
         && push_if_changed(&mut writer, &out, &mut last).await.is_err()
@@ -383,46 +369,43 @@ async fn subscription_stream<S>(
 
 // ---- wire dispatch ----------------------------------------------------------
 //
-// Wire `GearId` (no `repo_meta`) → runtime `GearId` (with the server's
-// configured `repo_meta`) → `Subscription`. The runtime builders construct the
-// full runtime `GearId` internally; the server only injects `repo_meta` and
-// forwards the client-supplied id fields. Runtime `GearOut` → wire `GearOut` is
-// a plain variant-by-variant relabel (same payloads, same variant names).
+// Wire `GearId` → runtime `Subscription`. Since the globals refactor the wire
+// and runtime ids are the same shape (no injected server-config fields): the
+// builder forwards the client-supplied id fields as-is. Runtime `GearOut` →
+// wire `GearOut` is a plain variant-by-variant relabel (same payloads, same
+// variant names).
 
 async fn subscribe_wire(
     id: wire::GearId,
-    repo_meta: RepoMeta,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
 ) -> Subscription<KolorinkoRT, InMemoryStorage<KolorinkoRT>> {
     match id {
+        wire::GearId::PageAddr { space, local } => {
+            page_addr(space, local).subscribe(core).await
+        }
+        wire::GearId::LegacyPageId { site, slug } => {
+            legacy_page_id(site, slug).subscribe(core).await
+        }
         wire::GearId::ArticleLatest { site, slug } => {
-            article_latest(repo_meta, site, slug).subscribe(core).await
+            article_latest(site, slug).subscribe(core).await
         }
         wire::GearId::ArticleLatestParsed { site, slug } => {
-            article_latest_parsed(repo_meta, site, slug)
-                .subscribe(core)
-                .await
+            article_latest_parsed(site, slug).subscribe(core).await
         }
         wire::GearId::RepoLArticleLatest { site, slug } => {
-            repo_l_article_latest(repo_meta, site, slug)
-                .subscribe(core)
-                .await
+            repo_l_article_latest(site, slug).subscribe(core).await
         }
         wire::GearId::RepoLListPages { site, query } => {
-            repo_l_list_pages(repo_meta, site, query)
-                .subscribe(core)
-                .await
+            repo_l_list_pages(site, query).subscribe(core).await
         }
-        wire::GearId::Shell(site) => shell(repo_meta, site).subscribe(core).await,
+        wire::GearId::Shell(site) => shell(site).subscribe(core).await,
         // Assets are HTTP-only — never shipped over WebTransport. The match is
         // exhaustive on the generated wire enum, but `to_wire_out` drops these.
-        wire::GearId::Asset { site, hash, ext } => {
-            asset(repo_meta, site, hash, ext).subscribe(core).await
-        }
+        wire::GearId::Asset { site, hash, ext } => asset(site, hash, ext).subscribe(core).await,
         // Server-internal resolution dependency of `article_latest`; the client
         // never subscribes to it, but the match must be exhaustive.
         wire::GearId::RepoResource { site, path } => {
-            repo_resource(repo_meta, site, path).subscribe(core).await
+            repo_resource(site, path).subscribe(core).await
         }
     }
 }
@@ -435,6 +418,10 @@ fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
         // Shared gears are shared *across cores* by reference; to the client
         // they serialize the same way, so clone the payload out of the handle.
         GearResult::Shared(s) => match &*s {
+            GearOutShared::PageAddrOut(a) => Some(wire::GearOut::PageAddrOut(a.clone())),
+            GearOutShared::LegacyPageIdOut(a) => {
+                Some(wire::GearOut::LegacyPageIdOut(*a))
+            }
             GearOutShared::ShellOut(a) => Some(wire::GearOut::ShellOut(a.clone())),
             GearOutShared::ArticleLatestOut(a) => Some(wire::GearOut::ArticleLatestOut(a.clone())),
             GearOutShared::ArticleLatestParsedOut(a) => {

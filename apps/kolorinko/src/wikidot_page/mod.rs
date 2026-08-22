@@ -72,8 +72,8 @@ use git2::{ObjectType, Oid, Repository, Tree, TreeWalkMode};
 use imbl::HashMap as ImHashMap;
 use kolorinko_render::{http_refs, http_tail, rewrite_with};
 use kolorinko_rt::{
-    Body, CaRef, ListPagesQuery, ListPagesResult, ListedPage, RepoAssetPath, SafePathComponent,
-    SiteShell,
+    Body, CaRef, ListPagesQuery, ListPagesResult, ListedPage, LocalId, PageAddr, RepoAssetPath,
+    SafePathComponent, SiteShell, SpaceId,
 };
 use kolorinko_wikitext::{
     ArticleLatest, ArticleMeta, ArticleView, BlockCell, BlockRow, BlockTable, ContainerKind,
@@ -96,6 +96,7 @@ use crate::runtime::{GearOutShared, KolorinkoRT};
 // `pub(super)`; the private globs below share the ones used across siblings
 // (and, under test, the include-resolution helpers), while only the genuine
 // `crate::wikidot_page::…` API is re-exported `pub(crate)`.
+mod addr;
 mod article_latest;
 mod assets_gear;
 mod config;
@@ -125,6 +126,9 @@ use resources::*;
 use tree_walk::*;
 use vars::*;
 
+pub(crate) use addr::{
+    LegacyPageIdCache, PageAddrCache, legacy_page_id, page_addr,
+};
 pub(crate) use article_latest::{LatestCache, ParsedCache, article_latest, article_latest_parsed};
 pub(crate) use assets_gear::{AssetCache, RepoResourceCache, asset, ca_url, repo_resource};
 pub(crate) use config::RepoMeta;

@@ -40,7 +40,6 @@ use kolorinko_rt::Body;
 use crate::respond;
 use crate::runtime::KolorinkoRT;
 use crate::tls::https_server_config;
-use crate::wikidot_page::RepoMeta;
 
 /// Bind `addr` with `SO_REUSEPORT`, wrap each connection in TLS, and serve the
 /// HTTP/1.1 page. (WebTransport is separate — see [`crate::server`].)
@@ -54,7 +53,6 @@ use crate::wikidot_page::RepoMeta;
 pub(crate) async fn serve(
     addr: &str,
     assets: Arc<HashMap<String, Body>>,
-    repo_meta: RepoMeta,
     core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     inject_wt_hash: bool,
 ) -> io::Result<()> {
@@ -83,7 +81,6 @@ pub(crate) async fn serve(
                 let acceptor = acceptor.clone();
                 let alt_svc = alt_svc.clone();
                 let core = core.clone();
-                let repo_meta = repo_meta.clone();
                 runtime::spawn(async move {
                     let mut stream = match acceptor.accept(stream).await {
                         Ok(s) => s,
@@ -92,9 +89,7 @@ pub(crate) async fn serve(
                             return;
                         }
                     };
-                    if let Err(e) =
-                        handle_conn(&mut stream, &assets, &repo_meta, &core, alt_svc.as_deref())
-                            .await
+                    if let Err(e) = handle_conn(&mut stream, &assets, &core, alt_svc.as_deref()).await
                         && !is_disconnect(&e)
                     {
                         warn!("conn {peer}: {e}");
@@ -133,7 +128,6 @@ async fn bind_reuseport(addr: &str) -> io::Result<TcpListener> {
 async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     assets: &Arc<HashMap<String, Body>>,
-    repo_meta: &RepoMeta,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     alt_svc: Option<&str>,
 ) -> io::Result<()> {
@@ -146,6 +140,7 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
             None,
             b"bad request\n",
             "no-store",
+            None,
             alt_svc,
         )
         .await?;
@@ -160,21 +155,14 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
             None,
             b"method not allowed\n",
             "no-store",
+            None,
             alt_svc,
         )
         .await?;
         return Ok(());
     }
 
-    let reply = respond::resolve(
-        path,
-        accepts_zstd(&head),
-        assets,
-        repo_meta.clone(),
-        core,
-        host_of(&head),
-    )
-    .await;
+    let reply = respond::resolve(path, accepts_zstd(&head), assets, core, host_of(&head)).await;
     write_http(
         stream,
         reply.status,
@@ -182,6 +170,7 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         reply.served.encoding,
         &reply.served.bytes,
         reply.cache_control,
+        reply.location.as_deref(),
         alt_svc,
     )
     .await?;
@@ -244,10 +233,12 @@ async fn write_http<S: AsyncWrite + Unpin>(
     encoding: Option<&str>,
     body: &[u8],
     cache_control: &str,
+    location: Option<&str>,
     alt_svc: Option<&str>,
 ) -> io::Result<()> {
     let status_text = match status {
         200 => "OK",
+        301 => "Moved Permanently",
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -260,6 +251,11 @@ async fn write_http<S: AsyncWrite + Unpin>(
     if let Some(enc) = encoding {
         head.push_str("Content-Encoding: ");
         head.push_str(enc);
+        head.push_str("\r\n");
+    }
+    if let Some(loc) = location {
+        head.push_str("Location: ");
+        head.push_str(loc);
         head.push_str("\r\n");
     }
     if let Some(alt) = alt_svc {

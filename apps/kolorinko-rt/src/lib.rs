@@ -10,10 +10,14 @@
 
 use kolorinko_wikitext::{ArticleView, ListPagesParams};
 
+mod ids;
+
 use std::{
     ops::Deref,
     path::{Component, Path},
 };
+
+pub use crate::ids::{parse_canonical, LocalId, PageAddr, SpaceId, SYSTEM_PREFIX};
 
 /// A page slug: `(category, page)` — Wikidot's `category:name` flattened.
 pub type Slug = (Option<SafePathComponent>, SafePathComponent);
@@ -268,12 +272,19 @@ pub struct SiteShell {
 /// The `*_hash` fields are the content hashes (see [`crate::wire`]) of the
 /// corresponding wire outputs: a hydrating client echoes them in `Subscribe`
 /// so the server re-sends nothing that the rendered page already shows.
+///
+/// `addr` is the resolved dataset address (site + slug) — the subscription
+/// keys for `page`/`shell`, so a canonical-URL hydration needs no resolution
+/// round-trip. `route` is the canonical `(space, local)` address when the URL
+/// was canonical (`None` on legacy paths).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SsrState {
     pub page: ArticleView,
     pub page_hash: String,
     pub shell: SiteShell,
     pub shell_hash: String,
+    pub addr: PageAddr,
+    pub route: Option<(SpaceId, LocalId)>,
 }
 
 pub const SSR_STATE_ID: &str = "kolorinko-ssr";
@@ -312,7 +323,8 @@ impl SsrState {
 #[dentrado_macros::gears_schema(file = "gears.def.rs")]
 pub mod wire {
     use crate::{
-        Body, CaRef, ListPagesQuery, ListPagesResult, RepoAssetPath, SafePathComponent, SiteShell,
+        Body, CaRef, ListPagesQuery, ListPagesResult, LocalId, PageAddr, RepoAssetPath,
+        SafePathComponent, SiteShell, SpaceId,
     };
     use kolorinko_wikitext::{ArticleLatest, ArticleView};
 

@@ -10,30 +10,52 @@
 //   `GearQuery`) for the client. It reads only the signatures; the bodies are
 //   dropped.
 //
-// `wire_skip(repo_meta)` marks the server-config id field the client never
-// supplies: it stays a real id field on the server but is absent from the wire
-// `GearId` (the server injects its configured `repo_meta` when dispatching).
+// Gear identity is purely content addressing. The export repo (url, dir,
+// interval) lives in the process-global config ([`crate::globals`]) — the
+// `repo` oracle below is a singleton with no id fields, its timer reads the
+// interval from the globals, and no `wire_skip` injection exists: what the
+// client addresses is exactly what the server addresses (`site`, `slug`,
+// `space`, `local`).
 
-#[dentrado::gear(
-    timer(
-        period = std::num::NonZero::new(u64::from(repo_meta.interval()))
-            .unwrap_or_else(|| std::num::NonZero::new(900).expect("900 != 0")),
-    ),
-    local,
-    name = Repo,
-)]
-pub(crate) async fn repo(repo_meta: RepoMeta, tick: bool, cache: &mut RepoCache) -> Rc<RepoData> {
-    crate::wikidot_page::repo(&repo_meta, tick, cache).await
+#[dentrado::gear(timer(period = crate::globals::interval()), local, name = Repo)]
+pub(crate) async fn repo(tick: bool, cache: &mut RepoCache) -> Rc<RepoData> {
+    crate::wikidot_page::repo(crate::globals::repo(), tick, cache).await
 }
 
 #[dentrado::gear(
-    follow(target = GearId::Repo(_repo_meta)),
+    follow(target = GearId::Repo {}),
+    shared,
+    name = PageAddr,
+)]
+pub(crate) fn page_addr(
+    space: SpaceId,
+    local: LocalId,
+    repo_data: Rc<RepoData>,
+    _cache: &mut PageAddrCache,
+) -> Option<PageAddr> {
+    crate::wikidot_page::page_addr(&repo_data, space, local)
+}
+
+#[dentrado::gear(
+    follow(target = GearId::Repo {}),
+    shared,
+    name = LegacyPageId,
+)]
+pub(crate) fn legacy_page_id(
+    site: SafePathComponent,
+    slug: (Option<SafePathComponent>, SafePathComponent),
+    repo_data: Rc<RepoData>,
+    _cache: &mut LegacyPageIdCache,
+) -> Option<LocalId> {
+    crate::wikidot_page::legacy_page_id(&repo_data, &site, &slug)
+}
+
+#[dentrado::gear(
+    follow(target = GearId::Repo {}),
     shared,
     name = RepoLArticleLatest,
-    wire_skip(_repo_meta),
 )]
 pub(crate) async fn repo_l_article_latest(
-    _repo_meta: RepoMeta,
     site: SafePathComponent,
     slug: (Option<SafePathComponent>, SafePathComponent),
     repo_data: Rc<RepoData>,
@@ -43,13 +65,11 @@ pub(crate) async fn repo_l_article_latest(
 }
 
 #[dentrado::gear(
-    follow(target = GearId::Repo(_repo_meta)),
+    follow(target = GearId::Repo {}),
     shared,
     name = RepoLListPages,
-    wire_skip(_repo_meta),
 )]
 pub(crate) fn repo_l_list_pages(
-    _repo_meta: RepoMeta,
     site: SafePathComponent,
     query: ListPagesQuery,
     repo_data: Rc<RepoData>,
@@ -59,13 +79,11 @@ pub(crate) fn repo_l_list_pages(
 }
 
 #[dentrado::gear(
-    follow(target = GearId::Repo(_repo_meta)),
+    follow(target = GearId::Repo {}),
     shared,
     name = RepoResource,
-    wire_skip(_repo_meta),
 )]
 pub(crate) fn repo_resource(
-    _repo_meta: RepoMeta,
     site: SafePathComponent,
     path: RepoAssetPath,
     repo_data: Rc<RepoData>,
@@ -74,68 +92,52 @@ pub(crate) fn repo_resource(
     crate::wikidot_page::repo_resource(&repo_data, &site, &path)
 }
 
-#[dentrado::gear(
-    event,
-    shared,
-    name = Asset,
-    wire_skip(repo_meta),
-)]
+#[dentrado::gear(event, shared, name = Asset)]
 pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
-    repo_meta: RepoMeta,
     site: SafePathComponent,
     hash: String,
     ext: String,
     ctx: &mut GearCtx<KolorinkoRT, S>,
     _cache: &mut AssetCache,
 ) -> Option<Body> {
-    crate::wikidot_page::asset(&repo_meta, &site, &hash, &ext, ctx).await
+    crate::wikidot_page::asset(&site, &hash, &ext, ctx).await
 }
 
 #[dentrado::gear(
-    follow(target = GearId::Repo(repo_meta)),
+    follow(target = GearId::Repo {}),
     shared,
     name = Shell,
-    wire_skip(repo_meta),
 )]
 pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
-    repo_meta: RepoMeta,
     site: SafePathComponent,
     repo_data: Rc<RepoData>,
     ctx: &mut GearCtx<KolorinkoRT, S>,
     _cache: &mut ShellCache,
 ) -> SiteShell {
-    crate::wikidot_page::shell(repo_meta, &repo_data, site, ctx).await
+    crate::wikidot_page::shell(&repo_data, site, ctx).await
 }
 
-#[dentrado::gear(
-    event,
-    shared,
-    name = ArticleLatestParsed,
-    wire_skip(repo_meta),
-)]
+#[dentrado::gear(event, shared, name = ArticleLatestParsed)]
 pub(crate) async fn article_latest_parsed<S: Storage<KolorinkoRT>>(
-    repo_meta: RepoMeta,
     site: SafePathComponent,
     slug: (Option<SafePathComponent>, SafePathComponent),
     ctx: &mut GearCtx<KolorinkoRT, S>,
     cache: &mut ParsedCache,
 ) -> ArticleView {
-    crate::wikidot_page::article_latest_parsed(&repo_meta, &site, &slug, ctx, cache).await
+    crate::wikidot_page::article_latest_parsed(&site, &slug, ctx, cache).await
 }
 
 #[dentrado::gear(
-    follow(target = GearId::ArticleLatestParsed { repo_meta, site, slug }),
+    follow(target = GearId::ArticleLatestParsed { site, slug }),
     shared,
     name = ArticleLatest,
-    wire_skip(repo_meta),
 )]
 pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
-    repo_meta: RepoMeta,
     site: SafePathComponent,
     slug: (Option<SafePathComponent>, SafePathComponent),
     parsed: &ArticleView,
     ctx: &mut GearCtx<KolorinkoRT, S>,
     cache: &mut LatestCache,
 ) -> ArticleView {
-    crate::wikidot_page::article_latest(&repo_meta, site, slug, parsed, ctx, cache).await
+    crate::wikidot_page::article_latest(site, slug, parsed, ctx, cache).await
 }

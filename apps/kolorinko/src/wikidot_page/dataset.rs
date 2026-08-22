@@ -70,11 +70,16 @@ pub(super) fn find_article<'a>(
 /// `<host>/<path>` tail (percent-decoded) mapped to its [`CaRef`] (read from
 /// the `files/` symlink target, which points into the `_files/<xx>/<yy>/<hash>`
 /// blob store). The index resolves in-article URLs ([`repo_resource`]) and the
-/// theme root ([`shell`]).
+/// theme root ([`shell`]); the `by_page_id` index resolves canonical
+/// `/space/local` routes ([`page_addr`](crate::wikidot_page::page_addr)).
 #[derive(Default, Clone, Debug)]
 pub(crate) struct WDWebsite {
     pub(super) articles:
         ImHashMap<Option<SafePathComponent>, ImHashMap<SafePathComponent, Article>>,
+    /// Wikidot numeric page id → the page's current slug. Page ids are stable
+    /// across renames (the slug is not), so this index stays authoritative
+    /// while `articles` re-keys — [`incremental_update`] maintains both.
+    pub(super) by_page_id: ImHashMap<u64, Slug>,
     pub(super) title: Option<String>,
     pub(super) subtitle: Option<String>,
     /// The theme stylesheet's `<host>/<path>` tail (`files/` prefix stripped);

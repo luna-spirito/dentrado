@@ -85,12 +85,14 @@ pub(crate) struct AssetCache;
 /// `shared` so the compressed bytes are cached + deduplicated across cores;
 /// HTTP-only — never shipped over WebTransport (`to_wire_out` drops it).
 pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
-    meta: &RepoMeta,
     site: &SafePathComponent,
     hash: &str,
     ext: &str,
     ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> Option<Body> {
+    // The blob store lives under the configured repo dir (a process global
+    // since the `RepoMeta` gear-field removal).
+    let meta = crate::globals::repo();
     // A wire-constructed `GearId::Asset` could carry a malformed hash; only the
     // HTTP path (`serve` → `ca_parts`) pre-validates. Guard before slicing.
     if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -129,12 +131,12 @@ pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
 /// blob identity alone (see the PURE-FUNCTION note above). `None` when the URL
 /// is not mirrored (a hotlink).
 pub(super) async fn get_ca<S: Storage<KolorinkoRT>>(
-    meta: &RepoMeta,
+    _meta: &RepoMeta,
     site: &SafePathComponent,
     path: RepoAssetPath,
     ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> Option<CaRef> {
-    let id = crate::runtime::repo_resource(meta.clone(), site.clone(), path).id;
+    let id = crate::runtime::repo_resource(site.clone(), path).id;
     match ctx.core().read_gear_stale(id).await {
         GearResult::Shared(s) => match &*s {
             GearOutShared::RepoResourceOut(ca) => ca.clone(),

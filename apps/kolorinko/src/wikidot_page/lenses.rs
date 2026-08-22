@@ -70,16 +70,15 @@ pub(crate) fn repo_l_list_pages(
 /// client fetches the entire site frame under one subscription that survives
 /// page navigation within the site.
 pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
-    repo_meta: RepoMeta,
     data: &RepoData,
     site: SafePathComponent,
     ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> SiteShell {
-    let nav_top = crate::runtime::article_latest(repo_meta.clone(), site.clone(), nav_slug("top"))
+    let nav_top = crate::runtime::article_latest(site.clone(), nav_slug("top"))
         .secondary_get(ctx)
         .await;
     let nav_side =
-        crate::runtime::article_latest(repo_meta.clone(), site.clone(), nav_slug("side"))
+        crate::runtime::article_latest(site.clone(), nav_slug("side"))
             .secondary_get(ctx)
             .await;
     let (title, subtitle, theme_root) = data

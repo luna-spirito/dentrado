@@ -809,7 +809,14 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
                     quote! { #id_variant { .. } }
                 };
                 let inner_pat = if fields.len() == 1 {
-                    quote! { #id_variant(#( #bound ),*) }
+                    if bound.is_empty() {
+                        // A zero-field target references no id fields; bind none.
+                        quote! { #id_variant(..) }
+                    } else {
+                        quote! { #id_variant(#( #bound ),*) }
+                    }
+                } else if bound.is_empty() {
+                    quote! { #id_variant { .. } }
                 } else {
                     quote! { #id_variant { #( #bound ),*, .. } }
                 };

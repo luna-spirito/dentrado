@@ -26,7 +26,6 @@ pub(super) struct HostCtx {
 pub(super) async fn resolve_listpages<S: Storage<KolorinkoRT>>(
     content: Content,
     state: &mut ResolveState,
-    meta: &RepoMeta,
     host: &HostCtx,
     ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> (Content, Vec<PageDep>) {
@@ -38,14 +37,14 @@ pub(super) async fn resolve_listpages<S: Storage<KolorinkoRT>>(
     let mut results: HashMap<ListPagesQuery, ListPagesResult> = HashMap::new();
     for query in &queries {
         let result =
-            crate::runtime::repo_l_list_pages(meta.clone(), state.site.clone(), query.clone())
+            crate::runtime::repo_l_list_pages(state.site.clone(), query.clone())
                 .secondary_get(ctx)
                 .await;
         results.insert(query.clone(), (*result).clone());
     }
     // A template referencing `%%content%%` embeds each listed page's rendered
     // body, fetched and resolved below.
-    let listed = resolve_content_bodies(&content, meta, host, &results, state, ctx).await;
+    let listed = resolve_content_bodies(&content, host, &results, state, ctx).await;
     (
         substitute_listpages(content, &results, &state.bodies, &state.site, host),
         listed,
@@ -63,7 +62,6 @@ pub(super) async fn resolve_listpages<S: Storage<KolorinkoRT>>(
 /// embedding, transitively, a page already being resolved).
 async fn resolve_content_bodies<S: Storage<KolorinkoRT>>(
     content: &Content,
-    meta: &RepoMeta,
     host: &HostCtx,
     results: &HashMap<ListPagesQuery, ListPagesResult>,
     state: &mut ResolveState,
@@ -76,7 +74,7 @@ async fn resolve_content_bodies<S: Storage<KolorinkoRT>>(
             continue;
         }
         let parsed =
-            crate::runtime::article_latest_parsed(meta.clone(), state.site.clone(), slug.clone())
+            crate::runtime::article_latest_parsed(state.site.clone(), slug.clone())
                 .secondary_get(ctx)
                 .await;
         let host = HostCtx {
@@ -85,7 +83,7 @@ async fn resolve_content_bodies<S: Storage<KolorinkoRT>>(
             tags: page.tags.clone(),
         };
         let (content, page_deps) =
-            resolve_full(parsed.content.clone(), slug, host, state, meta, ctx).await;
+            resolve_full(parsed.content.clone(), slug, host, state, ctx).await;
         state.bodies.insert(page.fullname(), content);
         deps.push(page_dep(&key, page_deps));
     }

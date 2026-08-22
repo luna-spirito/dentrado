@@ -129,9 +129,10 @@ pub(super) fn meta_page_parts(
     Some((site, p1, p2, id))
 }
 
-/// Remove `(site, cat, name)` from the nested map, pruning a now-empty
-/// category or site. Each level is cloned once (`imbl::HashMap` is O(1)), so this
-/// is O(log n) and shares the rest of the structure.
+/// Remove `(site, cat, name)` from the nested map (and its `by_page_id`
+/// entry — the page id is read off the article before it is dropped), pruning
+/// a now-empty category or site. Each level is cloned once (`imbl::HashMap` is
+/// O(1)), so this is O(log n) and shares the rest of the structure.
 pub(super) fn remove_page(
     sites: &mut ImHashMap<SafePathComponent, WDWebsite>,
     (site, cat, name): &Key,
@@ -139,6 +140,13 @@ pub(super) fn remove_page(
     let Some(mut website) = sites.get(site).cloned() else {
         return;
     };
+    // The old article's page id (if the page exists at all) — needed to drop
+    // the canonical-addressing entry together with the slug-keyed one.
+    let old_page_id = website
+        .articles
+        .get(cat)
+        .and_then(|m| m.get(name))
+        .and_then(|a| a.meta.page_id.parse::<u64>().ok());
     if let Some(mut cat_map) = website.articles.get(cat).cloned() {
         cat_map.remove(name);
         if cat_map.is_empty() {
@@ -147,6 +155,9 @@ pub(super) fn remove_page(
             website.articles.insert(cat.clone(), cat_map);
         }
     }
+    if let Some(id) = old_page_id {
+        website.by_page_id.remove(&id);
+    }
     if website.articles.is_empty() {
         sites.remove(site);
     } else {
@@ -154,8 +165,9 @@ pub(super) fn remove_page(
     }
 }
 
-/// Insert an [`Article`] under `(site, cat, name)`, creating the site/category
-/// levels as needed.
+/// Insert an [`Article`] under `(site, cat, name)` (and under its page id in
+/// the canonical-addressing index), creating the site/category levels as
+/// needed.
 pub(super) fn insert_page(
     sites: &mut ImHashMap<SafePathComponent, WDWebsite>,
     site: SafePathComponent,
@@ -165,6 +177,9 @@ pub(super) fn insert_page(
 ) {
     let mut website = sites.get(&site).cloned().unwrap_or_default();
     let mut cat_map = website.articles.get(&cat).cloned().unwrap_or_default();
+    if let Ok(id) = article.meta.page_id.parse::<u64>() {
+        website.by_page_id.insert(id, (cat.clone(), name.clone()));
+    }
     cat_map.insert(name, article);
     website.articles.insert(cat, cat_map);
     sites.insert(site, website);

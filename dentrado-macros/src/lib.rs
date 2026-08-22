@@ -96,6 +96,10 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 let (pat, ctor) = field_parts(&plans);
                 if matches!(v.fields, Fields::Unit) {
                     quote! { Self::#vident => Ok(Self::#vident), }
+                } else if matches!(&v.fields, Fields::Named(n) if n.named.is_empty()) {
+                    // Field-less named (`Repo {}`): no bindings, and the
+                    // constructor needs its (empty) braces to be a value.
+                    quote! { Self::#vident {} => Ok(Self::#vident {}), }
                 } else {
                     quote! { Self::#vident #pat => Ok(Self::#vident #ctor), }
                 }

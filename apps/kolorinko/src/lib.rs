@@ -21,6 +21,7 @@ use std::{
 
 use crate::runtime::KolorinkoRT;
 mod assets;
+mod globals;
 mod render_cli;
 mod repo;
 mod respond;
@@ -39,6 +40,11 @@ pub mod wikidot_parser;
 struct Config {
     repo: RepoCfg,
     server: ServerCfg,
+    /// Registered content spaces: `[[space]]` tables mapping a canonical
+    /// space id to the export site that serves it. Sites without an entry
+    /// keep their legacy `/site/…` paths and gain no canonical URLs.
+    #[serde(default)]
+    space: Vec<SpaceCfg>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +53,14 @@ struct RepoCfg {
     dir: String,
     /// Seconds between forced `git pull`s.
     interval: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpaceCfg {
+    /// 22-char canonical base64url (16 bytes) — see [`kolorinko_rt::SpaceId`].
+    id: String,
+    /// The export dataset site serving this space (e.g. `rpcauthority`).
+    site: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,7 +133,16 @@ fn load_config(config_path: &Path) -> anyhow::Result<Config> {
 fn run_server(config: Config) -> anyhow::Result<()> {
     let cores = core_count();
 
-    let repo_meta = make_repo_meta(&config.repo);
+    globals::init(
+        &config.repo.url,
+        &config.repo.dir,
+        config.repo.interval,
+        &config
+            .space
+            .iter()
+            .map(|s| (s.id.clone(), s.site.clone()))
+            .collect::<Vec<_>>(),
+    )?;
     let bind = config.server.bind.clone();
     let inject_wt_hash = config.server.inject_wt_hash;
     tls::set_cert_paths(
@@ -149,22 +172,18 @@ fn run_server(config: Config) -> anyhow::Result<()> {
 
     let worker = move |core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>| {
         let bind = bind.clone();
-        let meta = repo_meta.clone();
         let assets = assets.clone();
         async move {
             let core_h3 = core.clone();
-            let meta_h3 = meta.clone();
             let bind_h3 = bind.clone();
             let assets_h3 = assets.clone();
             compio::runtime::spawn(async move {
-                if let Err(e) =
-                    server::serve(core_h3, &bind_h3, assets_h3, meta_h3, inject_wt_hash).await
-                {
+                if let Err(e) = server::serve(core_h3, &bind_h3, assets_h3, inject_wt_hash).await {
                     error!("h3 server exited: {e}");
                 }
             })
             .detach();
-            if let Err(e) = web::serve(&bind, assets, meta, core, inject_wt_hash).await {
+            if let Err(e) = web::serve(&bind, assets, core, inject_wt_hash).await {
                 error!("https bootstrap exited: {e}");
             }
         }
@@ -209,13 +228,4 @@ fn db_config(cores: NonZero<u32>) -> DbConfig<KolorinkoRT, InMemoryStorage<Kolor
             .collect(),
         make_storage: std::sync::Arc::new(InMemoryStorage::<KolorinkoRT>::default),
     }
-}
-
-/// Build the [`RepoMeta`] from the config. `RepoMeta` holds `&'static` fields
-/// (it is part of a gear identity), so the runtime-configured strings are leaked
-/// once at startup — they live for the whole process anyway.
-fn make_repo_meta(cfg: &RepoCfg) -> wikidot_page::RepoMeta {
-    let url: &'static str = Box::leak(cfg.url.clone().into_boxed_str());
-    let path: &'static Path = Box::leak(PathBuf::from(&cfg.dir).into_boxed_path());
-    wikidot_page::RepoMeta::new(url, path, cfg.interval)
 }

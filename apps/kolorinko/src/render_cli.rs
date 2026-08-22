@@ -45,8 +45,7 @@ use kolorinko_wikitext::{ArticleView, ListOrder, ListPagesParams};
 use log::info;
 
 use crate::runtime::KolorinkoRT;
-use crate::wikidot_page::RepoMeta;
-use crate::{Config, db_config, make_repo_meta};
+use crate::{Config, db_config, globals};
 
 /// Entry point for `kolorinko render …` (the leading `render` already
 /// consumed). A target with a `/` names one page (stdout render); a bare
@@ -78,7 +77,7 @@ fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
     let (site, slug) = parse_page(page)?;
     // Compute the site string before `site` is moved into the worker closure.
     let site_str = (*site).clone();
-    let repo_meta = make_repo_meta(&config.repo);
+    init_globals(&config);
 
     // One core is enough for a single render; it keeps the `repo` oracle,
     // every lens, and the parse gears co-located, so the follow/secondary_get
@@ -87,8 +86,8 @@ fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
 
     let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<(ArticleView, SiteShell)>>();
     let worker = move |core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>| {
-        let page_q = crate::runtime::article_latest(repo_meta.clone(), site.clone(), slug.clone());
-        let shell_q = crate::runtime::shell(repo_meta.clone(), site.clone());
+        let page_q = crate::runtime::article_latest(site.clone(), slug.clone());
+        let shell_q = crate::runtime::shell(site.clone());
         let tx = tx.clone();
         async move {
             // Subscribe before reading either: holding both keeps the shared
@@ -127,7 +126,6 @@ fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
 /// Everything a mass-render worker task needs, cloned once per core.
 #[derive(Clone)]
 struct Shared {
-    repo_meta: RepoMeta,
     site: SafePathComponent,
     /// `--inject`: the base theme stylesheet to inline into every page.
     base_css: Option<String>,
@@ -167,7 +165,7 @@ fn run_mass(
     let out = out.unwrap_or_else(|| Path::new(".kolorinko").join("render").join(&site_str));
     prepare_out_dir(&out, force)?;
 
-    let repo_meta = make_repo_meta(&config.repo);
+    init_globals(&config);
     let base_css = if inject {
         read_base_css(&config.server.web_dist)
     } else {
@@ -177,7 +175,6 @@ fn run_mass(
 
     let (tx, rx) = mpsc::channel::<Out>();
     let shared = Shared {
-        repo_meta,
         site,
         base_css,
         tx,
@@ -283,7 +280,7 @@ async fn render_owned(
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     shared: &Shared,
 ) -> anyhow::Result<()> {
-    let shell_q = crate::runtime::shell(shared.repo_meta.clone(), shared.site.clone());
+    let shell_q = crate::runtime::shell(shared.site.clone());
     let shell_sub = shell_q.subscribe(core).await;
     let shell: SiteShell = (*(shell_q.getter)(shell_sub.current())).clone();
 
@@ -291,11 +288,7 @@ async fn render_owned(
     // `_`-prefixed system pages included) in one shared `repo_l_list_pages`
     // query; holding both subscriptions for the whole run keeps the shared
     // `repo` oracle active (one git clone total).
-    let list_q = crate::runtime::repo_l_list_pages(
-        shared.repo_meta.clone(),
-        shared.site.clone(),
-        enumerate_query(),
-    );
+    let list_q = crate::runtime::repo_l_list_pages(shared.site.clone(), enumerate_query());
     let list_sub = list_q.subscribe(core).await;
     let listed: ListPagesResult = (*(list_q.getter)(list_sub.current())).clone();
 
@@ -304,8 +297,7 @@ async fn render_owned(
         let Some(slug) = page_slug(&page) else {
             continue;
         };
-        let page_q =
-            crate::runtime::article_latest(shared.repo_meta.clone(), shared.site.clone(), slug);
+        let page_q = crate::runtime::article_latest(shared.site.clone(), slug);
         if !core.owns(&page_q.id) {
             continue; // another core owns this page
         }
@@ -362,6 +354,22 @@ fn parse_page(arg: &str) -> anyhow::Result<(SafePathComponent, Slug)> {
     parse_route(arg).ok_or_else(|| {
         anyhow::anyhow!("expected <site>/<page> or <site>/<category>/<page>, got {arg:?}")
     })
+}
+
+/// Initialize the process-global config (repo + space registry) once for the
+/// render run — the same globals the server initializes from its config.
+fn init_globals(config: &Config) {
+    globals::init(
+        &config.repo.url,
+        &config.repo.dir,
+        config.repo.interval,
+        &config
+            .space
+            .iter()
+            .map(|s| (s.id.clone(), s.site.clone()))
+            .collect::<Vec<_>>(),
+    )
+    .expect("render initializes the global config exactly once");
 }
 
 /// A listed page back into a `(category, name)` slug — the inverse of the

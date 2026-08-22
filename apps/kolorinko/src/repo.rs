@@ -21,7 +21,6 @@ use kolorinko_rt::{Body, RepoAssetPath, SafePathComponent};
 
 use crate::assets::mime_for_ext;
 use crate::runtime::{GearOutShared, KolorinkoRT, asset};
-use crate::wikidot_page::RepoMeta;
 
 const PREFIX: &str = "/repo/";
 
@@ -56,12 +55,11 @@ pub(crate) fn parse_ca_request(full: &str) -> Option<(SafePathComponent, String,
 /// [`Asset`]: kolorinko_rt gear
 pub(crate) async fn serve(
     full: &str,
-    repo_meta: RepoMeta,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
 ) -> Option<RepoResp> {
     let (site, hash, ext) = parse_ca_request(full)?;
     let mime = mime_for_ext(&ext);
-    let q = asset(repo_meta, site, hash, ext);
+    let q = asset(site, hash, ext);
     let GearResult::Shared(s) = core.read_gear(q.id).await else {
         return None;
     };
@@ -104,7 +102,7 @@ fn ca_parts(path: &RepoAssetPath) -> Option<(String, String, String, String)> {
 #[cfg(test)]
 mod tests {
     use super::{ca_parts, parse_ca_request};
-    use kolorinko_rt::{RepoAssetPath, SafePathComponent};
+    use kolorinko_rt::RepoAssetPath;
 
     #[test]
     fn non_ca_requests_are_rejected() {

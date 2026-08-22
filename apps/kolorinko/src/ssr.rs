@@ -6,28 +6,31 @@
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 
 use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
-use kolorinko_rt::{Body, SafePathComponent, SiteShell, Slug, SsrState, wire::GearOut};
+use kolorinko_rt::{
+    Body, LocalId, PageAddr, SafePathComponent, SiteShell, Slug, SpaceId, SsrState, wire::GearOut,
+};
 use kolorinko_wikitext::ArticleView;
 
 use crate::runtime::{KolorinkoRT, article_latest, shell};
-use crate::wikidot_page::RepoMeta;
 
 /// Resolve and render the full SSR document for `(site, slug)`, or `None` when
 /// the frontend template can't host SSR output (no app placeholder — unbuilt
 /// frontend); the caller then falls back to serving plain `index.html`.
-/// `host` — the request's `host[:port]` — absolutizes the OpenGraph card's
-/// URLs.
+/// `route` is the canonical `(space, local)` address when the URL was
+/// canonical (embedded into the state so the hydrating client holds its
+/// subscription keys without a resolution round-trip); `host` — the request's
+/// `host[:port]` — absolutizes the OpenGraph card's URLs.
 pub(crate) async fn document(
     assets: &Arc<HashMap<String, Body>>,
-    repo_meta: RepoMeta,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     site: SafePathComponent,
     slug: Slug,
+    route: Option<(SpaceId, LocalId)>,
     host: Option<&str>,
 ) -> Option<String> {
-    let state = resolve(repo_meta, core, site.clone(), slug).await;
+    let state = resolve(core, route, site, slug).await;
     let index = index_template(assets)?;
-    kolorinko_render::render_ssr_document(&index, &site, &state, host)
+    kolorinko_render::render_ssr_document(&index, &state, host)
 }
 
 /// Resolve the page and shell for one route. Subscribes both before reading
@@ -36,13 +39,13 @@ pub(crate) async fn document(
 /// current outputs: the same resolution a CSR boot blocks on over WebTransport,
 /// just server-side.
 async fn resolve(
-    repo_meta: RepoMeta,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    route: Option<(SpaceId, LocalId)>,
     site: SafePathComponent,
     slug: Slug,
 ) -> SsrState {
-    let page_q = article_latest(repo_meta.clone(), site.clone(), slug);
-    let shell_q = shell(repo_meta, site);
+    let page_q = article_latest(site.clone(), slug.clone());
+    let shell_q = shell(site.clone());
     let page_sub = page_q.subscribe(core).await;
     let shell_sub = shell_q.subscribe(core).await;
     // The getters return `SharedView<…>` (a `!Send` refcount handle); clone the
@@ -56,6 +59,10 @@ async fn resolve(
         page,
         shell_hash: crate::server::out_hash(&GearOut::ShellOut(shell.clone())),
         shell,
+        // The resolved address: what the client needs to re-subscribe `page` /
+        // `shell` without resolving the URL again.
+        addr: PageAddr { site, slug },
+        route,
     }
 }
 

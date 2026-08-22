@@ -19,3 +19,16 @@ inject_wt_hash = false
 #     && mv localhost+2.pem localhost.pem && mv localhost+2-key.pem localhost-key.pem
 cert_file = ".certs/localhost.pem"
 key_file = ".certs/localhost-key.pem"
+
+# Registered content spaces: canonical `/SPACE/LOCAL` routes served from the
+# export site named here (legacy `/site/…` paths 301 to the canonical form).
+# The id is derived from the SOURCE, not from any operator's key — this is a
+# read-only Wikidot export, not owned content, so identity binding would only
+# add false attribution and orphan the id if the key were ever lost.
+# Whoever mirrors the same export derives the same id:
+#   SHA-256("dentrado/space/v1\0wikidot-export\0<site>")[0..16] → base64url.
+# (Owned spaces, when they appear, will derive from an ed25519 pubkey+label
+# instead — see `SpaceId`'s docs in kolorinko-rt.)
+[[space]]
+id = "I5Xee8HsV1zTMRChatxfiw"
+site = "obscurative"

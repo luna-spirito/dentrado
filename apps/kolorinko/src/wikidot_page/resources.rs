@@ -15,7 +15,6 @@ use super::*;
 pub(super) async fn resolve_resources<S: Storage<KolorinkoRT>>(
     content: Content,
     site: &SafePathComponent,
-    meta: &RepoMeta,
     ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> Content {
     let mut tails: Vec<String> = Vec::new();
@@ -28,7 +27,7 @@ pub(super) async fn resolve_resources<S: Storage<KolorinkoRT>>(
         let Some(path) = RepoAssetPath::new(percent_decode(tail)) else {
             continue;
         };
-        let ca = crate::runtime::repo_resource(meta.clone(), site.clone(), path)
+        let ca = crate::runtime::repo_resource(site.clone(), path)
             .secondary_get(ctx)
             .await;
         if let Some(ca_ref) = &*ca {

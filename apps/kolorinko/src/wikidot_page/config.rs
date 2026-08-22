@@ -4,11 +4,13 @@ use super::*;
 // Configuration
 // =========================================================================
 
-/// Configuration for the [`repo`] oracle gear: where to clone and how often to
-/// re-pull. Holds `&'static` fields because it is part of a [`GearId`](crate::runtime::...)
-/// identity (which is `'static`); a runtime path from a config file is leaked
-/// once at startup with `Box::leak`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado::types::Localizable)]
+/// The export-repo source configuration: where to clone and how often to
+/// re-pull. Held `&'static` (process-global via [`crate::globals`], leaked
+/// once at initialization) because the values name the repository the git
+/// worker thread owns for the whole process lifetime. No longer part of any
+/// [`GearId`](crate::runtime::…) identity — gear ids are purely content
+/// addressing since the globals refactor.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RepoMeta {
     pub(super) url: &'static str,
     pub(super) path: &'static Path,

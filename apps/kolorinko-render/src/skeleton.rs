@@ -2,7 +2,7 @@
 //! the `kolorinko render` debug CLI. Gated on `ssr` because it calls
 //! [`RenderHtml::to_html`]; the layout itself is mode-agnostic.
 
-use kolorinko_rt::{SSR_STATE_ID, SiteShell, SsrState};
+use kolorinko_rt::{PageAddr, SafePathComponent, SiteShell, SsrState, SSR_STATE_ID};
 use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
 
@@ -37,12 +37,8 @@ const APP_PLACEHOLDER: &str = r#"<div id="container"></div>"#;
 /// carries the page title, the site theme `<link>` and the OpenGraph card join
 /// `<head>`. `host` — the request's `host[:port]` — absolutizes the card's
 /// URLs. `None` when the template has no placeholder (unbuilt frontend).
-pub fn render_ssr_document(
-    index: &str,
-    site: &str,
-    state: &SsrState,
-    host: Option<&str>,
-) -> Option<String> {
+pub fn render_ssr_document(index: &str, state: &SsrState, host: Option<&str>) -> Option<String> {
+    let site = state.addr.site.as_str();
     let app = render_app(site, state);
     let embedded = format!(
         r#"<script type="application/json" id="{SSR_STATE_ID}">{}</script>"#,
@@ -117,6 +113,15 @@ pub fn render_page_document(
             page_hash: String::new(),
             shell: shell.clone(),
             shell_hash: String::new(),
+            addr: PageAddr {
+                site: SafePathComponent::new(site.to_string())
+                    .unwrap_or_else(|| SafePathComponent::new("_debug".to_string()).expect("safe")),
+                slug: (
+                    None,
+                    SafePathComponent::new("_debug".to_string()).expect("safe"),
+                ),
+            },
+            route: None,
         },
     );
 
