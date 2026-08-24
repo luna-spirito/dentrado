@@ -14,6 +14,11 @@ pub(crate) struct RepoLArticleCache;
 #[derive(Default, Clone, Debug)]
 pub(crate) struct RepoLListPagesCache;
 
+/// Trivial lens cache: a pure projection of `repo`, recomputed on every
+/// `follow` kick.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct RepoLLocalIdCache;
+
 /// Per-instance cache for [`shell`]: a pure aggregation re-derived each run
 /// from its `article_latest` dependencies and the live [`RepoData`], so it
 /// carries no state between runs.
@@ -21,15 +26,21 @@ pub(crate) struct RepoLListPagesCache;
 pub(crate) struct ShellCache;
 
 /// Project one page out of `repo`'s dataset into a shippable [`ArticleLatest`],
-/// materialising the latest body blob via the worker thread (off-core). A
-/// missing page (or an unopenable repository) yields an empty [`ArticleLatest`]
-/// (blank render).
+/// materialising the latest body blob via the worker thread (off-core). The
+/// page is addressed canonically: the lens resolves `(space, local)` to the
+/// page's current slug through the rename-stable page id
+/// ([`super::page_slug`]) — this is the cross-core bridge every off-`repo`
+/// gear reads the dataset through. An unknown address (or an unopenable
+/// repository) yields an empty [`ArticleLatest`] (blank render).
 pub(crate) async fn repo_l_article_latest(
     data: &RepoData,
-    site: &SafePathComponent,
-    slug: &Slug,
+    space: SpaceId,
+    local: LocalId,
 ) -> ArticleLatest {
-    let Some(a) = data.article(site, slug) else {
+    let Some((site, slug)) = super::page_slug(data, space, local) else {
+        return ArticleLatest::default();
+    };
+    let Some(a) = data.article(&site, &slug) else {
         return ArticleLatest::default();
     };
     let meta = a.meta.clone();
@@ -42,6 +53,24 @@ pub(crate) async fn repo_l_article_latest(
         },
         None => ArticleLatest::default(),
     }
+}
+
+/// The slug-family → canonical bridge: the `(local id, title)` of the page a
+/// legacy `(site, slug)` address names — the id off the rename-stable page
+/// id, the title for a redirect's decorative segment. `None` when the site
+/// has no such page. Everything slug-addressed that needs the canonical
+/// identity (HTTP slug redirects, the `/code/N` endpoint, the render CLI,
+/// and the include cone inside [`article_latest`]) crosses here.
+pub(crate) fn repo_l_local_id(
+    data: &RepoData,
+    site: &SafePathComponent,
+    slug: &Slug,
+) -> Option<(LocalId, String)> {
+    let a = data.article(site, slug)?;
+    Some((
+        LocalId::from_page_id(&a.meta.page_id)?,
+        a.meta.title.clone(),
+    ))
 }
 
 /// Project one ListPages selection out of `repo`'s dataset: the site's pages

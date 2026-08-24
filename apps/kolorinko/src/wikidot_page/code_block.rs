@@ -30,7 +30,7 @@ pub(crate) struct CodeBlockCache;
 /// Extract the Nth (1-indexed) `[[code]]` block of the page's latest
 /// revision, straight from the shared parse: the gear is a `follow` lens
 /// over [`article_latest_parsed`](crate::wikidot_page::article_latest_parsed)
-/// — statically bound to the `(site, slug)` record derived from its own id,
+/// — statically bound to the `(space, local)` record derived from its own id,
 /// co-located with it, and handed the parse as a `&ArticleView` borrow
 /// (zero-copy; no cross-core shipping of the whole tree to extract one
 /// block). It re-runs exactly when the parse output changes — which itself
@@ -44,8 +44,8 @@ pub(crate) struct CodeBlockCache;
 /// computed **once here** (the asset pattern), never per request. `None`
 /// when the page or the Nth block is absent.
 pub(crate) fn code_block(
-    _site: &SafePathComponent,
-    _slug: &Slug,
+    _space: SpaceId,
+    _local: LocalId,
     n: u32,
     parsed: &ArticleView,
 ) -> Option<CodeBlock> {

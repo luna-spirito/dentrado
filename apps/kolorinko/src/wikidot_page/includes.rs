@@ -29,7 +29,7 @@ pub(super) fn collect_include_targets(
     content: &Content,
     current_site: &SafePathComponent,
     raws: &HashMap<Key, Content>,
-    out: &mut Vec<(Key, SafePathComponent, Slug)>,
+    out: &mut Vec<(Key, Slug)>,
 ) {
     for node in content {
         match node {
@@ -37,9 +37,9 @@ pub(super) fn collect_include_targets(
                 if let Some((inc_site, inc_slug)) = include_target(&inc.source, current_site)
                     && let key = (inc_site.clone(), inc_slug.0.clone(), inc_slug.1.clone())
                     && !raws.contains_key(&key)
-                    && !out.iter().any(|(k, _, _)| *k == key)
+                    && !out.iter().any(|(k, _)| *k == key)
                 {
-                    out.push((key, inc_site, inc_slug));
+                    out.push((key, inc_slug));
                 }
             }
             other => {

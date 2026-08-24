@@ -66,7 +66,7 @@ use kolorinko_rt::{
 use crate::respond;
 use crate::runtime::{
     GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, asset, code_block,
-    repo_l_article_latest, repo_l_list_pages, repo_resource, shell,
+    repo_l_article_latest, repo_l_list_pages, repo_l_local_id, repo_resource, shell,
 };
 
 /// Max concurrent WebTransport sessions advertised per HTTP/3 connection
@@ -396,12 +396,19 @@ async fn subscribe_wire(
             article_latest(space, local).subscribe_raw(core).await
         }
         wire::GearId::Shell(space) => shell(space).subscribe_raw(core).await,
-        // The slug-keyed resolution cone (server-internal; exhaustive match).
-        wire::GearId::ArticleLatestParsed { site, slug } => {
-            article_latest_parsed(site, slug).subscribe_raw(core).await
+        // The canonical resolution cone (server-internal; exhaustive match).
+        wire::GearId::ArticleLatestParsed { space, local } => {
+            article_latest_parsed(space, local)
+                .subscribe_raw(core)
+                .await
         }
-        wire::GearId::RepoLArticleLatest { site, slug } => {
-            repo_l_article_latest(site, slug).subscribe_raw(core).await
+        wire::GearId::RepoLArticleLatest { space, local } => {
+            repo_l_article_latest(space, local)
+                .subscribe_raw(core)
+                .await
+        }
+        wire::GearId::RepoLLocalId { site, slug } => {
+            repo_l_local_id(site, slug).subscribe_raw(core).await
         }
         wire::GearId::RepoLListPages { site, query } => {
             repo_l_list_pages(site, query).subscribe_raw(core).await
@@ -410,8 +417,8 @@ async fn subscribe_wire(
         // exhaustive on the generated wire enum, but `to_wire_out` drops these.
         wire::GearId::Asset { site, hash, ext } => asset(site, hash, ext).subscribe_raw(core).await,
         // Code blocks likewise: HTTP-only.
-        wire::GearId::CodeBlock { site, slug, n } => {
-            code_block(site, slug, n).subscribe_raw(core).await
+        wire::GearId::CodeBlock { space, local, n } => {
+            code_block(space, local, n).subscribe_raw(core).await
         }
         // Server-internal resolution dependency of `article_latest`; the client
         // never subscribes to it, but the match must be exhaustive.
@@ -437,8 +444,9 @@ fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
             GearOutShared::RepoLArticleLatestOut(a) => {
                 Some(wire::GearOut::RepoLArticleLatestOut(a.clone()))
             }
-            // Server-internal resolution dependency of `article_latest`; the
-            // client never subscribes to it.
+            // Server-internal resolution dependencies; the client never
+            // subscribes to them.
+            GearOutShared::RepoLLocalIdOut(_) => None,
             GearOutShared::RepoLListPagesOut(_) => None,
             // Assets are served over plain HTTP, never the WebTransport wire —
             // the browser fetches them via `<img>`/`<link>`/`url()`. Dropping

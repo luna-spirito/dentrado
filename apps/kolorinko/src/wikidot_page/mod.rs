@@ -39,26 +39,38 @@
 //!   touched — and adopts the worker's new [`RepoData`] snapshot (wrapped in
 //!   [`Rc`]). An unchanged tip yields `None`, so the prior `Rc` is kept and
 //!   dependents aren't re-run for nothing.
-//! - [`repo_l_article_latest`] (`follow` lens over `repo`): projects one page
-//!   into an owned [`ArticleLatest`] (metadata + latest body + revision list),
-//!   reading the latest body blob out of the worker's cache via the
-//!   [`GitMailbox`] carried in [`RepoData`]. Shippable (`Send`: owned `String`s).
+//! - [`repo_l_article_latest`] (`follow` lens over `repo`): projects one
+//!   page — addressed canonically, `(space, local)` resolved to its current
+//!   slug through the rename-stable page id — into an owned [`ArticleLatest`]
+//!   (metadata + latest body + revision list), reading the latest body blob
+//!   out of the worker's cache via the [`GitMailbox`]` carried in
+//!   [`RepoData`]. Shippable (`Send`: owned `String`s). This is the bridge
+//!   every off-`repo`-core gear reads the dataset through.
+//! - [`repo_l_local_id`] (`follow` lens over `repo`): the slug-family →
+//!   canonical bridge — the `(local id, title)` a legacy `(site, slug)`
+//!   address names (HTTP slug redirects, the `/code/N` endpoint, the render
+//!   CLI, and the include cone inside [`article_latest`]).
 //! - [`repo_l_list_pages`] (`follow` lens over `repo`): projects a ListPages
 //!   module's selection into [`ListPagesResult`] — the matching pages of one
 //!   site, ordered and truncated per the module's parameters.
-//! - [`article_latest_parsed`] (`event`): parses the latest body into
+//! - [`article_latest_parsed`] (`event`, keyed canonically, living off the
+//!   `repo` core): parses the latest body — pulled through the
+//!   [`repo_l_article_latest`] lens via
+//!   [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get) — into
 //!   [`ArticleView`] with `[[include]]` directives **left unresolved**. Kept
 //!   separate from [`article_latest`] so the parse gears never depend on one
 //!   another (which would let two pages that include each other form a gear
 //!   cycle).
-//! - [`article_latest`] (`event`): runs the full resolution pipeline —
-//!   `[[include]]` splicing and `[[module ListPages]]` instantiation via
+//! - [`article_latest`] (`follow` over [`article_latest_parsed`], co-located
+//!   with it): runs the full resolution pipeline — `[[include]]` splicing
+//!   and `[[module ListPages]]` instantiation via
 //!   [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get)-ing
-//!   [`article_latest_parsed`] / [`repo_l_list_pages`] (data-level cycles
-//!   broken by a path-based guard) — producing the final [`ArticleView`]
-//!   with the tree of every fetched page as its `deps`. Declaring each fetch
-//!   as a dependency makes the result reactive: an edit to any page in the
-//!   transitive include/transclusion cone re-runs this gear.
+//!   [`article_latest_parsed`] (includes bridged through [`repo_l_local_id`])
+//!   / [`repo_l_list_pages`] (data-level cycles broken by a path-based
+//!   guard) — producing the final [`ArticleView`] with the tree of every
+//!   fetched page as its `deps`. Declaring each fetch as a dependency makes
+//!   the result reactive: an edit to any page in the transitive
+//!   include/transclusion cone re-runs this gear.
 //! - [`shell`] (`follow` over `repo`): the whole site chrome in one shot — the
 //!   resolved `nav:top` / `nav:side` pages (declared as [`article_latest`]
 //!   [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get) deps)
@@ -133,17 +145,17 @@ pub(crate) use config::RepoMeta;
 pub(crate) use dataset::{Article, RepoData, WDWebsite};
 pub(crate) use git_worker::GitMailbox;
 pub(crate) use lenses::{
-    RepoLArticleCache, RepoLListPagesCache, ShellCache, repo_l_article_latest, repo_l_list_pages,
-    shell,
+    RepoLArticleCache, RepoLListPagesCache, RepoLLocalIdCache, ShellCache, repo_l_article_latest,
+    repo_l_list_pages, repo_l_local_id, shell,
 };
 pub(crate) use repo_gear::{RepoCache, repo};
 
 /// Resolve a canonical address `(space, local)` to the dataset location that
 /// serves it: the registered site for the space, plus the page's current slug
 /// from its (rename-stable) page id. `None` when the space is not registered
-/// in the global config, or the site has no page with that id. This is the
-/// single bridge between the URL layer (`space`/`local`) and the slug-keyed
-/// resolution cone below.
+/// in the global config, or the site has no page with that id. This is one
+/// of the two bridges between the URL layer (`space`/`local`) and the
+/// slug-keyed dataset below (the other direction is [`repo_l_local_id`]).
 pub(crate) fn page_slug(
     data: &RepoData,
     space: SpaceId,

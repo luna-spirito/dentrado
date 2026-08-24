@@ -104,6 +104,5 @@ let's talk just about ServiceWorker for now.
 * limit panics...
 * DataId → 16 bytes? Probably not.
 * zstd-over-wire?
-* TODO: SW.JS CAN DEEPFRY THE ENTIRE WEBSITE! (moved /index.html -> /-/index.html, fun began)
-* https://127.0.0.1:4433/SNhwIJuhsyCE-mxtJJE6aWg/ — doesn't load
 * URL substitutions works horribly. Maybe... sw.js substitution?
+* article_latest urgently needs caching... and a good one... it makes way too much queries, by the way, doesn't it?

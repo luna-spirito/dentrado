@@ -95,9 +95,8 @@ fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
             // canonical `(space, local)` identity the gears address, then
             // subscribe page + shell (holding both keeps the shared `repo`
             // oracle active across the queries — one clone total).
-            let latest_q = crate::runtime::repo_l_article_latest(site.clone(), slug.clone());
-            let latest = latest_q.subscribe(&core).await.current();
-            let Some(local) = kolorinko_rt::LocalId::from_page_id(&latest.meta.page_id) else {
+            let id_q = crate::runtime::repo_l_local_id(site.clone(), slug.clone());
+            let Some((local, _title)) = (*id_q.subscribe(&core).await.current()).clone() else {
                 let _ = tx.send(Err(anyhow::anyhow!("page {slug:?} not found in {site:?}")));
                 return;
             };

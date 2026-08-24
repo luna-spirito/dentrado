@@ -51,7 +51,7 @@ use kolorinko_rt::{Body, LocalId, SYSTEM_PREFIX, SafePathComponent, SpaceId, for
 
 use crate::assets::{Served, compress, looks_like_asset, mime_for, serve_body};
 use crate::repo::{self, RepoResp};
-use crate::runtime::{KolorinkoRT, repo_l_article_latest};
+use crate::runtime::{KolorinkoRT, repo_l_local_id};
 use kolorinko_rt::Slug;
 
 /// Cache-Control policies. CA assets (trunk-hashed outputs, `/-/repo/` blobs,
@@ -236,7 +236,14 @@ async fn code_reply(
     let Some(site) = crate::globals::site_of(&space) else {
         return Reply::not_found();
     };
-    let block = crate::runtime::code_block(site.clone(), slug, n)
+    // The slug family bridges to the canonical parse through the repo lens.
+    let id_sub = crate::runtime::repo_l_local_id(site.clone(), slug)
+        .subscribe(core)
+        .await;
+    let Some((local, _)) = (*id_sub.current()).clone() else {
+        return Reply::not_found();
+    };
+    let block = crate::runtime::code_block(space, local, n)
         .subscribe(core)
         .await
         .current();
@@ -285,14 +292,8 @@ async fn page_local(
     slug: &Slug,
 ) -> Option<(LocalId, String)> {
     let site = crate::globals::site_of(space)?.clone();
-    let latest = repo_l_article_latest(site, slug.clone())
-        .subscribe(core)
-        .await
-        .current();
-    // A missing page projects to the empty `ArticleLatest` — an empty
-    // `page_id` never parses, so it fails right here.
-    let local = LocalId::from_page_id(&latest.meta.page_id)?;
-    Some((local, latest.meta.title.clone()))
+    let sub = repo_l_local_id(site, slug.clone()).subscribe(core).await;
+    (*sub.current()).clone()
 }
 
 /// SSR the page at a canonical address. The 404 check is part of the deal: an

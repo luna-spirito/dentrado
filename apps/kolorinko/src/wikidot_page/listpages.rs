@@ -58,7 +58,8 @@ pub(super) async fn resolve_listpages<S: Storage<KolorinkoRT>>(
 /// `secondary_get` dependency (reactive to its edits) and run through
 /// [`resolve_full`] in its own context; `state.resolved` — extended before
 /// each resolution — is what stops a transclusion cycle (a listed page
-/// embedding, transitively, a page already being resolved).
+/// embedding, transitively, a page already being resolved). The listed
+/// page's own id is already the canonical local id — no slug round-trip.
 async fn resolve_content_bodies<S: Storage<KolorinkoRT>>(
     content: &Content,
     host: &HostCtx,
@@ -72,16 +73,20 @@ async fn resolve_content_bodies<S: Storage<KolorinkoRT>>(
         if state.bodies.contains_key(&page.fullname()) || !state.resolved.insert(key.clone()) {
             continue;
         }
-        let parsed = crate::runtime::article_latest_parsed(state.site.clone(), slug.clone())
-            .secondary_get(ctx)
-            .await;
+        let raw = match LocalId::from_page_id(&page.page_id) {
+            Some(local) => crate::runtime::article_latest_parsed(state.space, local)
+                .secondary_get(ctx)
+                .await
+                .content
+                .clone(),
+            None => Vec::new(),
+        };
         let host = HostCtx {
             fullname: page.fullname(),
             category: page.category.clone(),
             tags: page.tags.clone(),
         };
-        let (content, page_deps) =
-            resolve_full(parsed.content.clone(), slug, host, state, ctx).await;
+        let (content, page_deps) = resolve_full(raw, slug, host, state, ctx).await;
         state.bodies.insert(page.fullname(), content);
         deps.push(page_dep(&key, page_deps));
     }

@@ -15,8 +15,25 @@
 // names is exactly what a subscription names. The export repo (url, dir,
 // interval) lives in the process-global config ([`crate::globals`]) — the
 // `repo` oracle below is a singleton with no id fields, its timer reads the
-// interval from the globals. The slug-keyed gears (`repo_l_article_latest`,
-// `article_latest_parsed`, …) are the server-internal resolution cone: they
+// interval from the globals.
+//
+// The page pipeline is split across cores: `repo` is a `local` oracle pinned
+// to its own core, and every gear off that core reads it only through the
+// `follow` lenses (co-located with `repo`, outputs shared across cores by
+// reference). The parse/resolution gears are keyed by the canonical address,
+// so each `follow` target is statically derivable from the follower's own
+// id fields:
+//
+//   repo → repo_l_article_latest (lens over the dataset)
+//        → article_latest_parsed (event; pulls the lens via `secondary_get`,
+//          lives off the `repo` core)
+//        → article_latest (follows `ArticleLatestParsed { space, local }`,
+//          co-located with the parse)
+//        → code_block (follows the same parse: a lens over its output)
+//
+// `repo_l_local_id` is the slug-family → canonical bridge (a legacy
+// `(site, slug)` address to its `local` id), and `repo_l_list_pages` /
+// `repo_resource` / `asset` stay slug/site-keyed. These server-internal gears
 // never appear in a client subscription (the wire schema carries them only
 // because the schema is generated from this one file).
 
@@ -31,12 +48,26 @@ pub(crate) async fn repo(tick: bool, cache: &mut RepoCache) -> Rc<RepoData> {
     name = RepoLArticleLatest,
 )]
 pub(crate) async fn repo_l_article_latest(
-    site: SafePathComponent,
-    slug: (Option<SafePathComponent>, SafePathComponent),
+    space: SpaceId,
+    local: LocalId,
     repo_data: Rc<RepoData>,
     _cache: &mut RepoLArticleCache,
 ) -> ArticleLatest {
-    crate::wikidot_page::repo_l_article_latest(&repo_data, &site, &slug).await
+    crate::wikidot_page::repo_l_article_latest(&repo_data, space, local).await
+}
+
+#[dentrado::gear(
+    follow(target = GearId::Repo {}),
+    shared,
+    name = RepoLLocalId,
+)]
+pub(crate) fn repo_l_local_id(
+    site: SafePathComponent,
+    slug: (Option<SafePathComponent>, SafePathComponent),
+    repo_data: Rc<RepoData>,
+    _cache: &mut RepoLLocalIdCache,
+) -> Option<(LocalId, String)> {
+    crate::wikidot_page::repo_l_local_id(&repo_data, &site, &slug)
 }
 
 #[dentrado::gear(
@@ -78,25 +109,25 @@ pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
     crate::wikidot_page::asset(&site, &hash, &ext, ctx).await
 }
 
-// A lens over the shared parse: statically bound to the `(site, slug)`
+// A lens over the shared parse: statically bound to the `(space, local)`
 // record of `article_latest_parsed` (the target is derived from this gear's
 // own id), co-located with it, and handed its output as a `&ArticleView`
 // borrow — no per-run dep reconciliation, no cross-core shipping of the
 // whole tree just to extract one block. Re-runs exactly when the parse
 // output changes (which itself re-runs only when the page body does).
 #[dentrado::gear(
-    follow(target = GearId::ArticleLatestParsed { site, slug }),
+    follow(target = GearId::ArticleLatestParsed { space, local }),
     shared,
     name = CodeBlock,
 )]
 pub(crate) fn code_block(
-    site: SafePathComponent,
-    slug: (Option<SafePathComponent>, SafePathComponent),
+    space: SpaceId,
+    local: LocalId,
     n: u32,
     parsed: &ArticleView,
     _cache: &mut CodeBlockCache,
 ) -> Option<CodeBlock> {
-    crate::wikidot_page::code_block(&site, &slug, n, parsed)
+    crate::wikidot_page::code_block(space, local, n, parsed)
 }
 
 #[dentrado::gear(
@@ -113,27 +144,31 @@ pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
     crate::wikidot_page::shell(&repo_data, space, ctx).await
 }
 
+// Parses a page's latest body (fetched through the `repo_l_article_latest`
+// lens via `secondary_get`) into an unresolved `ArticleView`. Keyed by the
+// canonical address, so it lives on its own core — off `repo`'s — and its
+// output is what `article_latest` / `code_block` statically follow.
 #[dentrado::gear(event, shared, name = ArticleLatestParsed)]
 pub(crate) async fn article_latest_parsed<S: Storage<KolorinkoRT>>(
-    site: SafePathComponent,
-    slug: (Option<SafePathComponent>, SafePathComponent),
+    space: SpaceId,
+    local: LocalId,
     ctx: &mut GearCtx<KolorinkoRT, S>,
     cache: &mut ParsedCache,
 ) -> ArticleView {
-    crate::wikidot_page::article_latest_parsed(&site, &slug, ctx, cache).await
+    crate::wikidot_page::article_latest_parsed(space, local, ctx, cache).await
 }
 
 #[dentrado::gear(
-    follow(target = GearId::Repo {}),
+    follow(target = GearId::ArticleLatestParsed { space, local }),
     shared,
     name = ArticleLatest,
 )]
 pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
     space: SpaceId,
     local: LocalId,
-    repo_data: Rc<RepoData>,
+    parsed: &ArticleView,
     ctx: &mut GearCtx<KolorinkoRT, S>,
     cache: &mut LatestCache,
 ) -> ArticleView {
-    crate::wikidot_page::article_latest(space, local, &repo_data, ctx, cache).await
+    crate::wikidot_page::article_latest(space, local, parsed, ctx, cache).await
 }

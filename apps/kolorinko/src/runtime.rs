@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use crate::wikidot_page::{
     AssetCache, CodeBlockCache, LatestCache, ParsedCache, RepoCache, RepoData, RepoLArticleCache,
-    RepoLListPagesCache, RepoResourceCache, ShellCache,
+    RepoLListPagesCache, RepoLLocalIdCache, RepoResourceCache, ShellCache,
 };
 use dentrado::core::{core_ctx::GearCtx, storage::Storage};
 use kolorinko_rt::{
@@ -33,5 +33,5 @@ mod gears {
 // the server's subscription/dispatch code.
 pub(crate) use gears::{
     GearOutShared, article_latest, article_latest_parsed, asset, code_block, repo_l_article_latest,
-    repo_l_list_pages, repo_resource, shell,
+    repo_l_list_pages, repo_l_local_id, repo_resource, shell,
 };
