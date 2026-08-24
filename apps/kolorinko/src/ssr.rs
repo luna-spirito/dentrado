@@ -74,10 +74,10 @@ pub(crate) async fn state(
     }
 }
 
-/// The built frontend's `/-/index.html` as a string (decompressed), or `None`
+/// The built frontend's `/index.html` as a string (decompressed), or `None`
 /// if absent.
 fn index_template(assets: &Arc<HashMap<String, Body>>) -> Option<String> {
-    let body = assets.get("/-/index.html")?;
+    let body = assets.get("/index.html")?;
     let bytes = crate::assets::serve_body(body, false).bytes;
     String::from_utf8(bytes.into()).ok()
 }

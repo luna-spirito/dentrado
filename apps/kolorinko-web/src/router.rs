@@ -139,9 +139,6 @@ impl Router {
             if !path.starts_with('/') || path.starts_with("//") {
                 return;
             }
-            if path.starts_with("/-/") {
-                return; // system namespace: a real fetch
-            }
             if path.rsplit('/').next().unwrap_or("").contains('.') {
                 return;
             }

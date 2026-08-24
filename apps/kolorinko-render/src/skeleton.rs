@@ -111,7 +111,7 @@ fn inject_before_head_end(doc: &str, element: &str) -> String {
 /// debug CLI's output). `base_css` — the Wikidot base theme stylesheet, read by
 /// the caller from the frontend dist — is inlined into `<head>` when given, so
 /// the output is a single self-contained file (no external
-/// `/-/wikidot-base-theme/…` link that only resolves when served).
+/// `/wikidot-base-theme/…` link that only resolves when served).
 pub fn render_page_document(
     shell: &SiteShell,
     page: &ArticleView,

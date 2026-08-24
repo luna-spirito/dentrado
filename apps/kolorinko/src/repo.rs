@@ -7,8 +7,9 @@
 //!   `url()`/`@import` to CA URLs, and compresses. Immutable key, so the
 //!   client caches it forever.
 //!
-//! Everything under `/-/` is system namespace: static files, these mirrored
-//! blobs, future platform endpoints.
+//! Everything under `/-/` is system namespace (these mirrored blobs, future
+//! platform endpoints): blob-or-404, never content routing, never the SPA
+//! fallback.
 //!
 //! Every resource a page or stylesheet references is resolved to a CA URL at
 //! render time (mirrored) or left as its original absolute URL (a hotlink the
@@ -109,7 +110,7 @@ mod tests {
         assert!(parse_ca_request("/-/repo/rpcauthority/bogus/x").is_none()); // not `files`
         assert!(parse_ca_request("/-/repo/rpcauthority/files/d8/4a/deadbeef.png").is_none()); // short hash
         assert!(parse_ca_request("/-/notrepo/x").is_none()); // outside namespace
-        assert!(parse_ca_request("/repo/rpcauthority/files/d8/4a/x").is_none()); // old prefix gone
+        assert!(parse_ca_request("/repo/rpcauthority/files/d8/4a/x").is_none()); // root-relative asset, not ours
     }
 
     #[test]

@@ -238,6 +238,9 @@ fn main() {
 /// navigations and serves the cached CSR shell stale-while-revalidate, so real
 /// browsers bypass SSR; bots / first load / no-JS fall through to SSR. Dev
 /// builds skip registration so `trunk` edits aren't shadowed by a cached shell.
+/// `/sw.js` is a permanent URL: the browser byte-checks it to update installed
+/// workers, so moving it bricks every deployed client — contents change, the
+/// address never does.
 #[cfg(not(debug_assertions))]
 fn register_service_worker() {
     let Some(window) = web_sys::window() else {
@@ -250,7 +253,7 @@ fn register_service_worker() {
         return;
     }
     let container: web_sys::ServiceWorkerContainer = sw.into();
-    let promise = container.register("/-/sw.js");
+    let promise = container.register("/sw.js");
     wasm_bindgen_futures::spawn_local(async move {
         if let Err(e) = wasm_bindgen_futures::JsFuture::from(promise).await {
             leptos::logging::warn!("sw register: {e:?}");

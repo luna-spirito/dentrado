@@ -1,29 +1,32 @@
 // App-shell service worker: serve the cached CSR shell for canonical page
 // navigations (stale-while-revalidate), so real browsers bypass SSR — the
-// wasm app boots from the cached `/-/index.html` and fetches page data over
+// wasm app boots from the cached `/index.html` and fetches page data over
 // WebTransport. Bots, the first load (before the SW controls the page), and
 // no-JS clients fall through to the server's SSR.
 //
 // Only canonical `/{space}/{local}[/title]` paths get the shell. Everything
 // else — slug-form paths (`/{space}/cat:name`, which the client can't
-// resolve) and `/-/…` system paths — goes to the network, so the server's
-// 301s and SSR still answer. The two-id shapes are checked the same way the
-// server does it: exact length, strict base64url alphabet, and the marker
-// bit (first bit 1 ⇒ the leading char sits in the upper half of the
-// alphabet, i.e. matches /[g-z0-9_-]/).
+// resolve), assets, `/-/repo/` blobs — passes through untouched: the server's
+// 301s, SSR, and Cache-Control policies answer directly.
 //
-// Everything else (hashed trunk assets, `/-/repo/` blobs) is left to the
-// HTTP cache, which holds them forever (`immutable`).
+// Update contract: this script is served at `/sw.js` and the shell at
+// `/index.html`, both `no-cache` — and neither URL may ever move. A moved
+// script URL bricks every installed SW (the browser byte-checks the old
+// address forever), and a moved shell URL turns the SWR below stale forever.
+// Contents change; URLs don't. To keep a bad shell from wedging, a 404 on
+// the shell revalidation evicts the cache, and a failed first fetch falls
+// back to a plain network navigation (the server's SSR), so the site keeps
+// working and heals on the next load.
 //
 // Release builds only — `main.rs` skips registration in debug so `trunk`
 // edits aren't shadowed by a cached shell. The shell refreshes itself via
 // stale-while-revalidate on every navigation, so content updates (including
-// a rotated WebTransport cert hash baked into `/-/index.html`) propagate
+// a rotated WebTransport cert hash baked into `/index.html`) propagate
 // without a bump; bump `SHELL` only when the caching contract itself
 // changes.
 
 const SHELL = "shell-v1";
-const SHELL_URL = "/-/index.html";
+const SHELL_URL = "/index.html";
 
 // 23-char space id / 12-char local id, 'S'/'L' marker char first.
 // Canonical id shapes — mirrors kolorinko-rt ids.rs ('S'/'L' marker char +
@@ -69,20 +72,25 @@ function canonical(path) {
 }
 
 // Stale-while-revalidate against the fixed shell URL (never the request URL —
-// that would cache an SSR'd page as the shell). The first SW-served navigation
-// has no cache yet, so it fetches the shell from the network and seeds the
-// cache; later navigations return the cached shell instantly and refresh it in
-// the background.
+// that would cache an SSR'd page as the shell). With a cached shell: serve it
+// instantly, refresh in the background — and evict on a 404 (the shell
+// address must exist; serving a dead shell forever is the one unrecoverable
+// failure). Without one: the fetched shell answers directly, and if even
+// that fetch fails, the navigation itself is re-fetched from the network so
+// the server's SSR answers instead of a network error.
 async function swr(e) {
 	const cache = await caches.open(SHELL);
-	const cached = cache.match(SHELL_URL);
+	const cached = await cache.match(SHELL_URL);
 	const network = freshShell();
 	e.waitUntil(
 		network
-			.then((r) => (r.ok ? cache.put(SHELL_URL, r.clone()) : undefined))
+			.then((r) => {
+				if (r.ok) return cache.put(SHELL_URL, r.clone());
+				if (r.status === 404) return cache.delete(SHELL_URL);
+			})
 			.catch(() => {}),
 	);
-	return cached || network;
+	return cached || network.then((r) => (r.ok ? r : fetch(e.request)));
 }
 
 // Fetch the shell bypassing the HTTP cache and rebuild the Response without

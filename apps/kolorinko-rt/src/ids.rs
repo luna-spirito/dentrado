@@ -51,9 +51,9 @@
 
 use std::fmt;
 
-/// Paths under `/-…` are the system namespace (static assets, mirrored
-/// content-addressed blobs, future platform APIs — the GitLab `/-/`
-/// convention). Content ids start with `S`/`L` and can never collide with it.
+/// Paths under `/-…` are the system namespace (mirrored content-addressed
+/// blobs, future platform APIs — the GitLab `/-/` convention). Content ids
+/// start with `S`/`L` and can never collide with it.
 pub const SYSTEM_PREFIX: &str = "/-";
 
 // ── base64url (no padding, strict) ──────────────────────────────────────────
@@ -462,6 +462,7 @@ mod tests {
         assert!(LocalId::parse(&l.to_string()[..11]).is_none());
         assert!(LocalId::parse("lAAAAADrF7w0").is_none()); // marker char missing
         assert!(LocalId::parse("LAAAAAAAAAB").is_none()); // spare bits set
+
         // Word-shaped names never parse — the whole point of the marker char:
         // a marker *bit* would let exactly ¼ of 11-char strings through
         // (`wonderments` among them); an uppercase prefix lets none.

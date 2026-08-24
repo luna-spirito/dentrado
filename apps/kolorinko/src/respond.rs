@@ -1,31 +1,39 @@
 //! Shared GET-response resolution for the HTTP/1.1 bootstrap ([`crate::web`])
 //! and the HTTP/3 server ([`crate::server`]): one place that maps a request
 //! path to a status/mime/body. Precedence:
-//! 1. the system namespace `/-…` — the built frontend's static files and the
-//!    mirrored content-addressed blobs under `/-/repo/…`
-//!    ([`crate::repo`]); an unknown system path is a plain 404 (no content,
-//!    no SPA fallback — future platform endpoints live here too). Served
+//! 1. the built frontend's static files — an exact map hit at any path
+//!    (root-relative `/index.html`, `/sw.js`, `/wikidot-base-theme/…`, the
+//!    hashed trunk outputs); an unknown path is never answered here. Served
 //!    identically on every origin: asset URLs are root-relative and
 //!    content-addressed, so a page's own origin serves its assets.
-//! 2. `/SPACE/LOCAL[/TITLE]` — the canonical page route, SSR'd from the
+//! 2. the system namespace `/-…` — the mirrored content-addressed blobs
+//!    under `/-/repo/…` ([`crate::repo`]); an unknown system path is a
+//!    plain 404 (no content, no SPA fallback — future platform endpoints
+//!    live here too).
+//! 3. `/SPACE/LOCAL[/TITLE]` — the canonical page route, SSR'd from the
 //!    `article_latest(space, local)` + `shell(space)` cone (valid on any
 //!    origin — the canonical address carries its own space),
-//! 3. `/SPACE/[cat:]slug…` and a bare `/SPACE` — a page named by its slug:
+//! 4. `/SPACE/[cat:]slug…` and a bare `/SPACE` — a page named by its slug:
 //!    resolved and permanently redirected to the titled canonical form
 //!    `/SPACE/LOCAL/TITLE` (the title regenerated from the page's own
 //!    title),
-//! 4. a configured custom domain (`Host` names a space — the wiki's own
+//! 5. a configured custom domain (`Host` names a space — the wiki's own
 //!    domain): the same page family without the space segment —
 //!    `LOCAL[/TITLE]` canonical, `[cat:]slug…` redirected — and `/`
 //!    SSR'ing the wiki's landing page as its homepage. No SPA shell on a
 //!    wiki domain: the platform's client app is not this origin's face, an
 //!    unknown page is a plain 404,
-//! 5. `/` — SSR'd in place with the first registered space's landing page,
-//! 6. anything else non-asset — the `/-/index.html` SPA shell (the client's
+//! 6. `/` — SSR'd in place with the first registered space's landing page,
+//! 7. anything else non-asset — the `/index.html` SPA shell (the client's
 //!    not-found view),
-//! 7. asset-like paths that don't exist — 404.
+//! 8. asset-like paths that don't exist — 404.
 //!
-//! The slug family of 3–4 also carries Wikidot's code-block endpoint:
+//! Static assets, system paths, and content routes can't collide: ids start
+//! with 'S'/'L' and slugs are lowercase, while asset paths are known dist
+//! filenames (never a leading `-`) — a first segment that parses as a space
+//! id is never an asset key or system path, and vice versa.
+//!
+//! The slug family of 4–5 also carries Wikidot's code-block endpoint:
 //! `[cat:]slug…/code/N` serves the page's Nth `[[code]]` block in place
 //! (never redirected, and never on the canonical `L…` address — a block has
 //! no permanent URL). CSS `@import`s are rewritten to this shape at render
@@ -81,18 +89,19 @@ pub(crate) async fn resolve(
     host: Option<&str>,
 ) -> Reply {
     let path = full.split('?').next().unwrap_or(full);
-    // The system namespace: static files first (a plain map hit), then the
-    // mirrored CA blobs, then 404 — never content routing, never the SPA
-    // fallback. Content ids start with 'S'/'L', never '-', so the whole
-    // `/-…` prefix is safely reserved.
+    // Static assets first: an exact map hit answers at any path (the map is
+    // exactly the dist tree — known filenames, never a leading `-`, so it
+    // can't shadow the `/-…` system namespace or a content route). Then the
+    // system namespace: CA blobs, 404 on a miss — never content routing,
+    // never the SPA fallback.
+    if let Some(b) = assets.get(path) {
+        return Reply::ok(
+            mime_for(path),
+            serve_body(b, accept_zstd),
+            static_policy(path),
+        );
+    }
     if path.starts_with(SYSTEM_PREFIX) {
-        if let Some(b) = assets.get(path) {
-            return Reply::ok(
-                mime_for(path),
-                serve_body(b, accept_zstd),
-                static_policy(path),
-            );
-        }
         if let Some(RepoResp::Ok { mime, body }) = repo::serve(full, core).await {
             return Reply::ok(mime, serve_body(&body, accept_zstd), IMMUTABLE);
         }
@@ -322,10 +331,12 @@ fn segments(path: &str) -> Vec<&str> {
 }
 
 /// `no-cache` for the HTML shell and the SW script (both revalidated every
-/// load); `immutable` for every other static asset (CA / path-versioned).
+/// load — the ServiceWorker's update check byte-compares `/sw.js` on every
+/// navigation, so it must never come from a stale cache); `immutable` for
+/// every other static asset (CA / path-versioned).
 fn static_policy(key: &str) -> &'static str {
     match key {
-        "/-/index.html" | "/-/sw.js" => NOCACHE,
+        "/index.html" | "/sw.js" => NOCACHE,
         _ => IMMUTABLE,
     }
 }
@@ -334,9 +345,7 @@ fn index_fallback(assets: &Arc<HashMap<String, Body>>, accept_zstd: bool) -> Rep
     Reply::ok(
         "text/html; charset=utf-8",
         serve_body(
-            assets
-                .get("/-/index.html")
-                .expect("index.html always loaded"),
+            assets.get("/index.html").expect("index.html always loaded"),
             accept_zstd,
         ),
         NOCACHE,
