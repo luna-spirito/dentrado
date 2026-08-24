@@ -38,8 +38,15 @@ const APP_PLACEHOLDER: &str = r#"<div id="container"></div>"#;
 /// client hydrates positionally from `<body>`'s first child), the `<title>`
 /// carries the page title, the site theme `<link>` and the OpenGraph card join
 /// `<head>`. `host` — the request's `host[:port]` — absolutizes the card's
-/// URLs. `None` when the template has no placeholder (unbuilt frontend).
-pub fn render_ssr_document(index: &str, state: &SsrState, host: Option<&str>) -> Option<String> {
+/// URLs; `canonical` — the page's canonical absolute URL — is its `og:url`
+/// (both `None` in the debug CLI). `None` when the template has no
+/// placeholder (unbuilt frontend).
+pub fn render_ssr_document(
+    index: &str,
+    state: &SsrState,
+    host: Option<&str>,
+    canonical: Option<&str>,
+) -> Option<String> {
     // The display name falls back to the space id spelling when the export
     // carries no site title.
     let site = state
@@ -57,7 +64,7 @@ pub fn render_ssr_document(index: &str, state: &SsrState, host: Option<&str>) ->
         &doc,
         &document_title(&site, &state.shell.title, &state.page.meta.title),
     );
-    let og = opengraph::meta(&site, &state.shell, &state.page, host);
+    let og = opengraph::meta(&site, &state.shell, &state.page, host, canonical);
     let theme = state
         .shell
         .theme_root
@@ -126,7 +133,7 @@ pub fn render_page_document(
 
     let site = "kolorinko";
     let title = html_escape(&document_title(site, &shell.title, &page.meta.title));
-    let og = opengraph::meta(site, shell, page, None);
+    let og = opengraph::meta(site, shell, page, None, None);
     let style = base_css
         .map(|css| format!("<style>\n{css}\n</style>\n"))
         .unwrap_or_default();

@@ -18,7 +18,8 @@ use std::{
 };
 
 pub use crate::ids::{
-    LocalId, SYSTEM_PREFIX, SpaceId, encode_path_segment, parse_page_route, title_slug,
+    LocalId, SYSTEM_PREFIX, SpaceId, encode_path_segment, format_page_route, parse_page_route,
+    title_slug,
 };
 
 /// A page slug: `(category, page)` — Wikidot's `category:name` flattened.

@@ -16,9 +16,9 @@
 #   obscurative names it `main`, not Wikidot's default.
 # - `domains`: the source site's custom domains. URLs on these hosts (e.g.
 #   `www.obscurative.ru/local--files/…` in CSS `url()`) resolve to the site's
-#   mirrored attachments like `<site>.wikidot.com` ones do; later the server
-#   will also route `Host: <domain>` requests to the space without a
-#   `SPACE_ID` segment.
+#   mirrored attachments like `<site>.wikidot.com` ones do, and `Host:`
+#   requests on them address the space without a `SPACE_ID` URL segment —
+#   the wiki's own domain.
 [ensure-evakuilo-sites]
 "obscurative" = { landing = "main", domains = ["www.obscurative.ru"] }
 "rpcauthority" = { domains = ["rpc-wiki.net"] }

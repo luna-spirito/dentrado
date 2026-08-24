@@ -60,8 +60,9 @@ pub(crate) struct SpaceReg {
     pub landing: SafePathComponent,
     /// The source site's custom domains: URLs on these hosts (CSS `url()`,
     /// images, links) resolve to the site's mirrored attachments exactly like
-    /// `<site>.wikidot.com` ones do, and — later — `Host: <domain>` requests
-    /// will address the space without a `SPACE_ID` segment.
+    /// `<site>.wikidot.com` ones do, and `Host: <domain>` requests address
+    /// the space without a `SPACE_ID` segment
+    /// ([`space_of_domain`]).
     pub domains: Box<[String]>,
 }
 
@@ -188,6 +189,20 @@ pub(crate) fn site_of(space: &SpaceId) -> Option<&'static SafePathComponent> {
 /// has no canonical addressing — only the render CLI names sites directly).
 pub(crate) fn space_of(site: &SafePathComponent) -> Option<SpaceId> {
     g().by_site.get(site).copied()
+}
+
+/// The space a configured custom domain names, with its registry entry
+/// (`None`: not a configured domain — the main origin, where every URL
+/// carries its own space). This is how a wiki served on its own domain
+/// addresses pages without the `SPACE_ID` segment. Hosts are DNS names:
+/// compared case-insensitively, any `:port` tail ignored (the configured
+/// charset excludes `:`, so an IPv6 literal never matches).
+pub(crate) fn space_of_domain(host: &str) -> Option<(SpaceId, &'static SpaceReg)> {
+    let host = host.split(':').next().unwrap_or(host);
+    g().spaces
+        .iter()
+        .find(|(_, r)| r.domains.iter().any(|d| d.eq_ignore_ascii_case(host)))
+        .map(|(s, r)| (*s, r))
 }
 
 /// The configured alias domains of a registered space (`None`: unregistered

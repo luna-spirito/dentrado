@@ -324,6 +324,20 @@ pub fn parse_page_route(path: &str) -> Option<(SpaceId, LocalId)> {
     }
 }
 
+/// The inverse of [`parse_page_route`] where it matters: the canonical
+/// page URL `/[/SPACE]/LOCAL/TITLE` with the title slug-shaped and
+/// percent-encoded — the form a slug redirect lands on and `og:url` names.
+/// Omit the space segment when the origin already names the space (a wiki
+/// served on its own configured domain, where paths carry no `S…` segment).
+#[must_use]
+pub fn format_page_route(space: Option<SpaceId>, local: LocalId, title: &str) -> String {
+    let title = encode_path_segment(&title_slug(title));
+    match space {
+        Some(s) => format!("/{s}/{local}/{title}"),
+        None => format!("/{local}/{title}"),
+    }
+}
+
 // ── title shaping ───────────────────────────────────────────────────────────
 
 /// Shape a page title into the decorative third URL segment: whitespace →
@@ -389,6 +403,23 @@ mod tests {
     /// `"obscurative"` key.
     fn space() -> SpaceId {
         SpaceId::parse("S70P6lbBZxbc-kcpGOCYmZA").unwrap()
+    }
+
+    #[test]
+    fn format_page_route_roundtrips() {
+        // `LAAAAADXVfyo` is a-109's local id — a real spelling, not
+        // `LocalId::new`, so the expected strings below are wire forms,
+        // not this test's own formatting echoed back.
+        let local = LocalId::parse("LAAAAADXVfyo").unwrap();
+        let url = format_page_route(Some(space()), local, "A-109/108");
+        assert_eq!(url, "/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADXVfyo/a-109108");
+        assert_eq!(parse_page_route(&url), Some((space(), local)));
+        // The space-less form (a wiki's own domain) carries no segment to
+        // parse back — only the titled shape is shared.
+        assert_eq!(
+            format_page_route(None, local, "Затерянные"),
+            "/LAAAAADXVfyo/%D0%B7%D0%B0%D1%82%D0%B5%D1%80%D1%8F%D0%BD%D0%BD%D1%8B%D0%B5"
+        );
     }
 
     #[test]

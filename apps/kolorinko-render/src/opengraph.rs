@@ -12,10 +12,17 @@ use crate::layout::html_escape;
 const DESC_LIMIT: usize = 200;
 
 /// The `og:…` `<meta>` tags describing `page` under `shell`. `host` — the
-/// request's `host[:port]`, always TLS-served — forms `og:url` and
-/// absolutizes the (relative, `/repo/…`) first-image URL; without it (the
-/// debug CLI) the image stays relative and `og:url` is omitted.
-pub fn meta(site: &str, shell: &SiteShell, page: &ArticleView, host: Option<&str>) -> String {
+/// request's `host[:port]`, always TLS-served — absolutizes the (relative,
+/// `/repo/…`) first-image URL; `canonical` — the page's canonical absolute
+/// URL — is `og:url`. Both `None` in the debug CLI: no `og:url`, the image
+/// stays relative.
+pub fn meta(
+    site: &str,
+    shell: &SiteShell,
+    page: &ArticleView,
+    host: Option<&str>,
+    canonical: Option<&str>,
+) -> String {
     let site_name = shell.title.clone().unwrap_or_else(|| site.to_string());
     let title = if page.meta.title.is_empty() {
         site_name.clone()
@@ -24,9 +31,8 @@ pub fn meta(site: &str, shell: &SiteShell, page: &ArticleView, host: Option<&str
     };
     let mut tags =
         tag("og:title", &title) + &tag("og:site_name", &site_name) + &tag("og:type", "article");
-    if let Some(h) = host {
-        let route = page.meta.slug.replace(':', "/");
-        tags += &tag("og:url", &format!("https://{h}/{site}/{route}"));
+    if let Some(u) = canonical {
+        tags += &tag("og:url", u);
     }
     let desc = truncate(&lead_text(&page.content));
     if !desc.is_empty() {
@@ -162,10 +168,16 @@ mod tests {
             txt("of the guide."),
         ]);
         p.meta.slug = "start".into();
-        let m = meta("kolorinko", &shell(), &p, Some("wiki.example:4433"));
+        let m = meta(
+            "kolorinko",
+            &shell(),
+            &p,
+            Some("wiki.example:4433"),
+            Some("https://wiki.example:4433/Sxx/Lyy/a-page"),
+        );
         assert!(m.contains(r#"<meta property="og:title" content="A Page">"#));
         assert!(m.contains(r#"<meta property="og:site_name" content="Site Title">"#));
-        assert!(m.contains(r##"og:url" content="https://wiki.example:4433/kolorinko/start""##));
+        assert!(m.contains(r##"og:url" content="https://wiki.example:4433/Sxx/Lyy/a-page""##));
         assert!(m.contains(
             r#"<meta property="og:description" content="First paragraph of the guide.">"#
         ));
@@ -182,7 +194,13 @@ mod tests {
                 params: Default::default(),
             }],
         }]);
-        let m = meta("kolorinko", &shell(), &p, Some("wiki.example"));
+        let m = meta(
+            "kolorinko",
+            &shell(),
+            &p,
+            Some("wiki.example"),
+            Some("https://wiki.example/kolorinko/docs/guide"),
+        );
         assert!(
             m.contains(r##"og:image" content="https://wiki.example/repo/x/files/ab/cd/hash.png""##)
         );
@@ -193,7 +211,7 @@ mod tests {
     fn description_truncates_on_word_boundary() {
         let long = "word ".repeat(60);
         let p = page(vec![txt(&long)]);
-        let m = meta("kolorinko", &shell(), &p, None);
+        let m = meta("kolorinko", &shell(), &p, None, None);
         let at =
             m.find(r#"og:description" content=""#).unwrap() + r#"og:description" content=""#.len();
         let desc = &m[at..at + m[at..].find('"').unwrap()];
@@ -212,7 +230,7 @@ mod tests {
             Node::Raw("[[module junk".into()),
             txt("Only this."),
         ]);
-        let m = meta("kolorinko", &shell(), &p, None);
+        let m = meta("kolorinko", &shell(), &p, None, None);
         assert!(m.contains(r#"<meta property="og:description" content="Only this.">"#));
     }
 
@@ -220,7 +238,7 @@ mod tests {
     fn empty_title_falls_back_to_site() {
         let mut p = page(vec![txt("hello")]);
         p.meta.title.clear();
-        let m = meta("kolorinko", &shell(), &p, None);
+        let m = meta("kolorinko", &shell(), &p, None, None);
         assert!(m.contains(r#"<meta property="og:title" content="Site Title">"#));
     }
 }

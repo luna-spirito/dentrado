@@ -6,7 +6,7 @@
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 
 use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
-use kolorinko_rt::{Body, LocalId, SiteShell, SpaceId, SsrState, wire::GearOut};
+use kolorinko_rt::{Body, LocalId, SiteShell, SpaceId, SsrState, format_page_route, wire::GearOut};
 use kolorinko_wikitext::ArticleView;
 
 use crate::runtime::{KolorinkoRT, article_latest, shell};
@@ -15,7 +15,9 @@ use crate::runtime::{KolorinkoRT, article_latest, shell};
 /// `(space, local)`, or `None` when the frontend template can't host SSR
 /// output (no app placeholder — unbuilt frontend); the caller then falls back
 /// to serving the plain shell. `host` — the request's `host[:port]` —
-/// absolutizes the OpenGraph card's URLs.
+/// absolutizes the OpenGraph card's URLs and names the page's canonical
+/// address (`og:url`): without the space segment when the host is the
+/// space's own configured domain, with it elsewhere.
 pub(crate) async fn document(
     assets: &Arc<HashMap<String, Body>>,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
@@ -25,7 +27,21 @@ pub(crate) async fn document(
 ) -> Option<String> {
     let state = state(core, space, local).await;
     let index = index_template(assets)?;
-    kolorinko_render::render_ssr_document(&index, &state, host)
+    // The page's canonical URL — `og:url`. The space segment is dropped when
+    // the request's host is the space's own domain: there the space-less
+    // path is the canonical address.
+    let own_domain = |h: &str| crate::globals::space_of_domain(h).is_some_and(|(s, _)| s == space);
+    let canonical = host.map(|h| {
+        format!(
+            "https://{h}{}",
+            format_page_route(
+                (!own_domain(h)).then_some(space),
+                local,
+                &state.page.meta.title
+            )
+        )
+    });
+    kolorinko_render::render_ssr_document(&index, &state, host, canonical.as_deref())
 }
 
 /// Resolve the page and shell for one canonical address. Subscribes both

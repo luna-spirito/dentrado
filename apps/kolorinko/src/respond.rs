@@ -4,27 +4,36 @@
 //! 1. the system namespace `/-…` — the built frontend's static files and the
 //!    mirrored content-addressed blobs under `/-/repo/…`
 //!    ([`crate::repo`]); an unknown system path is a plain 404 (no content,
-//!    no SPA fallback — future platform endpoints live here too),
+//!    no SPA fallback — future platform endpoints live here too). Served
+//!    identically on every origin: asset URLs are root-relative and
+//!    content-addressed, so a page's own origin serves its assets.
 //! 2. `/SPACE/LOCAL[/TITLE]` — the canonical page route, SSR'd from the
-//!    `article_latest(space, local)` + `shell(space)` cone,
+//!    `article_latest(space, local)` + `shell(space)` cone (valid on any
+//!    origin — the canonical address carries its own space),
 //! 3. `/SPACE/[cat:]slug…` and a bare `/SPACE` — a page named by its slug:
 //!    resolved and permanently redirected to the titled canonical form
-//!    `/SPACE/LOCAL/TITLE` (the title regenerated from the page's own title),
-//! 4. `/` — SSR'd in place with the first registered space's landing page,
-//! 5. anything else non-asset — the `/-/index.html` SPA shell (the client's
+//!    `/SPACE/LOCAL/TITLE` (the title regenerated from the page's own
+//!    title),
+//! 4. a configured custom domain (`Host` names a space — the wiki's own
+//!    domain): the same page family without the space segment —
+//!    `LOCAL[/TITLE]` canonical, `[cat:]slug…` redirected — and `/`
+//!    SSR'ing the wiki's landing page as its homepage. No SPA shell on a
+//!    wiki domain: the platform's client app is not this origin's face, an
+//!    unknown page is a plain 404,
+//! 5. `/` — SSR'd in place with the first registered space's landing page,
+//! 6. anything else non-asset — the `/-/index.html` SPA shell (the client's
 //!    not-found view),
-//! 6. asset-like paths that don't exist — 404.
+//! 7. asset-like paths that don't exist — 404.
 //!
-//! Legacy `/site/cat/page` URLs are not served: a first segment that doesn't
-//! parse as a space id is just an unknown path (rule 5).
+//! Legacy `/site/cat/page` URLs are not served on the main origin: a first
+//! segment that doesn't parse as a space id is just an unknown path (rule 6);
+//! on a custom domain that same shape is the wiki's slug family (rule 4).
 
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 
 use bytes::Bytes;
 use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
-use kolorinko_rt::{
-    Body, LocalId, SYSTEM_PREFIX, SafePathComponent, SpaceId, encode_path_segment, title_slug,
-};
+use kolorinko_rt::{Body, LocalId, SYSTEM_PREFIX, SafePathComponent, SpaceId, format_page_route};
 
 use crate::assets::{Served, compress, looks_like_asset, mime_for, serve_body};
 use crate::repo::{self, RepoResp};
@@ -81,7 +90,7 @@ pub(crate) async fn resolve(
     route(path, accept_zstd, assets, core, host).await
 }
 
-/// Content routing: canonical spaces, slug redirects, then the SSR/SPA
+/// Content routing: canonical spaces, custom domains, then the SSR/SPA
 /// fallbacks.
 async fn route(
     path: &str,
@@ -95,7 +104,20 @@ async fn route(
     // makes this purely syntactic: no slug can imitate it — slugs are
     // lowercase, ids start with 'S').
     if let Some(space) = segs.first().and_then(|s| SpaceId::parse(s)) {
-        return space_route(&segs, space, accept_zstd, assets, core, host).await;
+        return tail_route(&segs[1..], space, true, accept_zstd, assets, core, host).await;
+    }
+    // A wiki's own domain (`Host` names a registered space): the same page
+    // family addressed without the space segment, and `/` — the wiki's
+    // homepage — its landing page SSR'd in place.
+    if let Some((space, reg)) = host.and_then(crate::globals::space_of_domain) {
+        if segs.as_slice() == [""] {
+            let slug = (None, reg.landing.clone());
+            return match page_local(core, &space, &slug).await {
+                Some((local, _title)) => ssr(accept_zstd, assets, core, host, space, local).await,
+                None => Reply::not_found(),
+            };
+        }
+        return tail_route(&segs, space, false, accept_zstd, assets, core, host).await;
     }
     // `/` — the first registered space's landing page, SSR'd in place.
     if segs.as_slice() == [""] {
@@ -119,56 +141,57 @@ async fn route(
     Reply::not_found()
 }
 
-/// `/SPACE/…`: the canonical page family and the slug redirects.
-async fn space_route(
-    segs: &[&str],
+/// The page family of one space, addressed by the segments after the space
+/// segment: `LOCAL[/TITLE]` — the canonical route, SSR'd (the title is
+/// decorative, never inspected); `[cat:]slug…` — a page named by its slug:
+/// resolved and permanently redirected to its titled canonical form; a bare
+/// tail — the space's landing page, same redirect. `explicit` — whether
+/// redirect targets carry the space segment (the main origin) or rely on the
+/// host already naming the space (the wiki's own domain).
+async fn tail_route(
+    tail: &[&str],
     space: SpaceId,
+    explicit: bool,
     accept_zstd: bool,
     assets: &Arc<HashMap<String, Body>>,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     host: Option<&str>,
 ) -> Reply {
-    // `/SPACE/LOCAL[/TITLE]` — canonical (the title is decorative, never
-    // inspected).
-    if let Some(local) = segs.get(1).and_then(|s| LocalId::parse(s)) {
-        if segs.len() > 3 {
+    if let Some(local) = tail.first().and_then(|s| LocalId::parse(s)) {
+        if tail.len() > 2 {
             return Reply::not_found();
         }
         return ssr(accept_zstd, assets, core, host, space, local).await;
     }
-    // `/SPACE/[cat:]slug…` or a bare `/SPACE`: resolve the named page — the
-    // bare form means the space's landing page — and redirect to its titled
-    // canonical URL.
-    let slug = match slug_segments(segs, &space) {
+    let slug = match slug_of(tail, &space) {
         Some(slug) => slug,
         None => return Reply::not_found(),
     };
     match page_local(core, &space, &slug).await {
         // The title segment is regenerated from the page's own title, so a
         // rename never leaves a stale pretty URL behind.
-        Some((local, title)) => Reply::moved(&format!(
-            "/{space}/{local}/{}",
-            encode_path_segment(&title_slug(&title))
-        )),
+        Some((local, title)) => {
+            Reply::moved(&format_page_route(explicit.then_some(space), local, &title))
+        }
         None => Reply::not_found(),
     }
 }
 
 /// The `(category, name)` slug named by the segments after the space id:
-/// `cat:name`, `name`, or the old flattened `cat/name`; a bare `/SPACE` names
-/// the landing page.
-fn slug_segments(segs: &[&str], space: &SpaceId) -> Option<Slug> {
+/// `cat:name`, `name`, or the old flattened `cat/name`; no segments at all
+/// names the space's landing page.
+fn slug_of(tail: &[&str], space: &SpaceId) -> Option<Slug> {
     let spc = |s: &str| SafePathComponent::new(s.to_string());
-    match segs.len() {
-        1 => {
+    match tail {
+        [] => {
             let reg = crate::globals::reg_of(space)?;
             Some((None, reg.landing.clone()))
         }
-        2 => match segs[1].split_once(':') {
+        [x] => match x.split_once(':') {
             Some((cat, name)) => Some((Some(spc(cat)?), spc(name)?)),
-            None => Some((None, spc(segs[1])?)),
+            None => Some((None, spc(x)?)),
         },
-        3 => Some((Some(spc(segs[1])?), spc(segs[2])?)),
+        [a, b] => Some((Some(spc(a)?), spc(b)?)),
         _ => None,
     }
 }
@@ -288,7 +311,8 @@ impl Reply {
 
 #[cfg(test)]
 mod tests {
-    use super::segments;
+    use super::{Slug, segments, slug_of};
+    use kolorinko_rt::SpaceId;
 
     #[test]
     fn segments_split() {
@@ -296,5 +320,31 @@ mod tests {
         assert_eq!(segments("/a/"), ["a", ""]);
         assert_eq!(segments("/"), [""]);
         assert_eq!(segments("/a//b"), ["a", "", "b"]);
+    }
+
+    /// `slug_of` as `(Option<category>, name)` strings, for plain asserts.
+    fn strs(s: Option<Slug>) -> Option<(Option<String>, String)> {
+        s.map(|(cat, name)| (cat.map(|c| c.to_string()), name.to_string()))
+    }
+
+    #[test]
+    fn slug_of_shapes() {
+        let space = SpaceId::parse("S70P6lbBZxbc-kcpGOCYmZA").unwrap();
+        let slug = |tail: &[&str]| strs(slug_of(tail, &space));
+        // `name`, `cat:name`, and the old flattened `cat/name`.
+        assert_eq!(slug(&["name"]), Some((None, "name".into())));
+        assert_eq!(
+            slug(&["cat:name"]),
+            Some((Some("cat".into()), "name".into()))
+        );
+        assert_eq!(
+            slug(&["cat", "name"]),
+            Some((Some("cat".into()), "name".into()))
+        );
+        // Deeper than any legacy form, or an empty name — never a slug.
+        assert_eq!(slug(&["a", "b", "c"]), None);
+        assert_eq!(slug(&[""]), None);
+        assert_eq!(slug(&["cat:"]), None);
+        assert_eq!(slug(&[":name"]), None);
     }
 }
