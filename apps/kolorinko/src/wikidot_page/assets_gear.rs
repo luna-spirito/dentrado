@@ -17,29 +17,44 @@ pub(crate) struct RepoResourceCache;
 /// URL is not mirrored (a hotlink) — the caller then leaves the original URL.
 ///
 /// `.wdfiles.com` is Wikidot's file-serving CDN alias for the canonical
-/// `.wikidot.com` host: pages reference the alias, but the mirror indexes
-/// attachments under the canonical host. So a `.wdfiles.com` tail that misses
-/// is retried under `.wikidot.com` before concluding it is a hotlink.
+/// `.wikidot.com` host, and a site's configured alias domains are its custom
+/// domains: pages reference either, but the mirror indexes attachments under
+/// the canonical host. So a tail whose host is an alias is retried there
+/// before concluding it is a hotlink.
 pub(crate) fn repo_resource(
     data: &RepoData,
     site: &SafePathComponent,
     path: &RepoAssetPath,
 ) -> Option<CaRef> {
     let files = &data.sites.get(site)?.files;
-    files
-        .get(path)
-        .cloned()
-        .or_else(|| repo_alias(path).and_then(|alt| files.get(&alt).cloned()))
+    files.get(path).cloned().or_else(|| {
+        crate::globals::space_of(site)
+            .and_then(|space| crate::globals::domains_of(&space))
+            .and_then(|domains| repo_alias(site, domains, path))
+            .and_then(|alt| files.get(&alt).cloned())
+    })
 }
 
-/// The canonical-host form of a `.wdfiles.com` [`RepoAssetPath`]: replace the
-/// `<sub>.wdfiles.com` host segment with `<sub>.wikidot.com`, keeping the rest
-/// of the path. `None` when the host is not a `.wdfiles.com` alias.
-fn repo_alias(path: &RepoAssetPath) -> Option<RepoAssetPath> {
+/// The canonical-host form of a [`RepoAssetPath`] whose host is an alias of
+/// `site`: `<sub>.wdfiles.com` (Wikidot's file CDN) rewrites to
+/// `<sub>.wikidot.com`, and any of the site's configured alias domains
+/// (case-insensitively — hosts are) rewrites to `<site>.wikidot.com`.
+/// `None` when the host is neither — including another site's alias domain.
+fn repo_alias(
+    site: &SafePathComponent,
+    domains: &[String],
+    path: &RepoAssetPath,
+) -> Option<RepoAssetPath> {
     let s = path.as_str();
     let (host, rest) = s.split_once('/')?;
-    let sub = host.strip_suffix(".wdfiles.com")?;
-    RepoAssetPath::new(format!("{sub}.wikidot.com/{rest}"))
+    let canonical = match host.strip_suffix(".wdfiles.com") {
+        Some(sub) => format!("{sub}.wikidot.com"),
+        None if domains.iter().any(|d| d.eq_ignore_ascii_case(host)) => {
+            format!("{}.wikidot.com", **site)
+        }
+        None => return None,
+    };
+    RepoAssetPath::new(format!("{canonical}/{rest}"))
 }
 
 /// Serialize a [`CaRef`] to its served URL:
@@ -154,19 +169,37 @@ mod tests {
 
     #[test]
     fn repo_alias_maps_wdfiles_to_wikidot() {
+        let site = SafePathComponent::new("rpcauthority".into()).unwrap();
         let p = RepoAssetPath::new("rpcauthority.wdfiles.com/local--files/x/y.png".into()).unwrap();
         assert_eq!(
-            repo_alias(&p).map(|a| a.as_str().to_owned()),
+            repo_alias(&site, &[], &p).map(|a| a.as_str().to_owned()),
             Some("rpcauthority.wikidot.com/local--files/x/y.png".to_owned()),
         );
     }
 
     #[test]
-    fn repo_alias_skips_non_wdfiles_hosts() {
+    fn repo_alias_maps_configured_domains_case_insensitively() {
+        let site = SafePathComponent::new("obscurative".into()).unwrap();
+        let domains = ["www.obscurative.ru".to_owned()];
+        let p = RepoAssetPath::new("WWW.OBSCURATIVE.RU/local--files/x/y.png".into()).unwrap();
+        assert_eq!(
+            repo_alias(&site, &domains, &p).map(|a| a.as_str().to_owned()),
+            Some("obscurative.wikidot.com/local--files/x/y.png".to_owned()),
+        );
+    }
+
+    #[test]
+    fn repo_alias_skips_non_alias_hosts() {
+        let site = SafePathComponent::new("rpcauthority".into()).unwrap();
+        let domains = ["rpc-wiki.net".to_owned()];
         let canonical =
             RepoAssetPath::new("rpcauthority.wikidot.com/local--files/x/y.png".into()).unwrap();
         let foreign = RepoAssetPath::new("i.imgur.com/x.jpg".into()).unwrap();
-        assert_eq!(repo_alias(&canonical), None);
-        assert_eq!(repo_alias(&foreign), None);
+        let other_site =
+            RepoAssetPath::new("www.obscurative.ru/local--files/x/y.png".into()).unwrap();
+        assert_eq!(repo_alias(&site, &domains, &canonical), None);
+        assert_eq!(repo_alias(&site, &domains, &foreign), None);
+        // A domain of *another* site is not this site's alias.
+        assert_eq!(repo_alias(&site, &domains, &other_site), None);
     }
 }

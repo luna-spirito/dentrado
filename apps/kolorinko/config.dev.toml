@@ -2,17 +2,26 @@
 # the workspace root (cargo's CWD). For a real deploy, copy config.example.toml
 # and edit it.
 
-# Wikidot-export sites to register as content spaces. Each entry is
-# `"<site>"` (landing page defaults to `start`) or `"<site>:<landing>"`; the
-# canonical space id is derived from the SOURCE, not from any operator's key
-# — a read-only export, so identity binding would only add false attribution
-# and orphan the id if the key were ever lost. Whoever mirrors the same
-# export derives the same id (fork navigation = URL segment swap):
+# Wikidot-export sites to register as content spaces, in serving order: the
+# first entry's landing page is what the bare `/` serves. The canonical space
+# id is derived from the KEY, not from any operator's choice — a read-only
+# export, so identity binding would only add false attribution and orphan the
+# id if the key were ever lost. Whoever mirrors the same export derives the
+# same id (fork navigation = URL segment swap):
 #   SHA-256("wikidot-evakuilo/v1/<site>")[0..16] → 'S' + base64url.
 # (Owned spaces, when they appear, will derive from an ed25519 pubkey+label
 # instead — see `SpaceId`'s docs in kolorinko-rt.)
-# obscurative's landing page is `main`, not Wikidot's default `start`.
-ensure-evakuilo-sites = ["obscurative:main", "rpcauthority"]
+# Per site:
+# - `landing` (default `start`): the page its bare `/SPACE` resolves to.
+#   obscurative names it `main`, not Wikidot's default.
+# - `domains`: the source site's custom domains. URLs on these hosts (e.g.
+#   `www.obscurative.ru/local--files/…` in CSS `url()`) resolve to the site's
+#   mirrored attachments like `<site>.wikidot.com` ones do; later the server
+#   will also route `Host: <domain>` requests to the space without a
+#   `SPACE_ID` segment.
+[ensure-evakuilo-sites]
+"obscurative" = { landing = "main", domains = ["www.obscurative.ru"] }
+"rpcauthority" = { domains = ["rpc-wiki.net"] }
 
 [repo]
 url = "https://github.com/luna-spirito/wikidot-kolorinko-export.git"

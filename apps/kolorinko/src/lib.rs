@@ -7,6 +7,7 @@ use dentrado::{
     },
     types::NodeId,
 };
+use indexmap::IndexMap;
 use log::{error, info};
 use serde::Deserialize;
 use std::{
@@ -40,14 +41,14 @@ pub mod wikidot_parser;
 struct Config {
     repo: RepoCfg,
     server: ServerCfg,
-    /// Wikidot-export sites to register as content spaces. Each entry is
-    /// `"<site>"` (landing page defaults to `start`) or `"<site>:<landing>"`;
-    /// the canonical space id is derived as
-    /// `SHA-256("wikidot-evakuilo/v1/<site>")[0..16]` — see
-    /// [`globals::evakuilo_space_id`]. The first entry's landing page is what
-    /// the bare `/` serves.
+    /// Wikidot-export sites to register as content spaces, in serving order
+    /// (the first entry's landing page is what the bare `/` serves): site →
+    /// [`globals::SiteCfg`] (`landing`, `domains`). The canonical space id is
+    /// derived as `SHA-256("wikidot-evakuilo/v1/<site>")[0..16]` — see
+    /// [`globals::evakuilo_space_id`]. An `IndexMap` keeps the TOML document
+    /// order, which defines `/`'s serving space.
     #[serde(rename = "ensure-evakuilo-sites", default)]
-    ensure_evakuilo_sites: Vec<String>,
+    ensure_evakuilo_sites: IndexMap<String, globals::SiteCfg>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -385,8 +385,8 @@ mod tests {
     use super::*;
 
     /// SHA-256("wikidot-evakuilo/v1/obscurative")[0..16], S-prefixed —
-    /// the id the dev config's `ensure-evakuilo-sites = ["obscurative"]`
-    /// derives.
+    /// the id the dev config's `ensure-evakuilo-sites` derives for its
+    /// `"obscurative"` key.
     fn space() -> SpaceId {
         SpaceId::parse("S70P6lbBZxbc-kcpGOCYmZA").unwrap()
     }

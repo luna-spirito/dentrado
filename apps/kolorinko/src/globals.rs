@@ -10,7 +10,7 @@
 //! `site`, `slug`) and the servers take no config at all.
 //!
 //! Spaces are *derived*, never hand-picked: each `ensure-evakuilo-sites`
-//! entry names a Wikidot-export site, and its canonical space id is
+//! key names a Wikidot-export site, and its canonical space id is
 //! `SHA-256("wikidot-evakuilo/v1/<site>")[0..16]`, marker-prefixed
 //! (see [`kolorinko_rt::SpaceId`]). Independent operators mirroring the same
 //! export therefore converge on the same address with zero coordination —
@@ -21,19 +21,48 @@
 //! `space_of` lookups), so call sites built against this module survive the
 //! swap.
 
-use std::{collections::HashMap, num::NonZero, sync::OnceLock};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZero,
+    sync::OnceLock,
+};
 
+use indexmap::IndexMap;
 use kolorinko_rt::{SafePathComponent, SpaceId};
 use ring::digest::{SHA256, digest};
+use serde::Deserialize;
 
 use crate::wikidot_page::RepoMeta;
 
-/// One registered content space: the export dataset site that serves it and
-/// the slug its bare `/SPACE` (and `/`) resolve to (the site's landing page —
-/// Wikidot's default is `start`, but many wikis name it `main`).
+/// One `ensure-evakuilo-sites` table entry: the site's landing page (`start`,
+/// Wikidot's default, unless named otherwise — e.g. obscurative's `main`) and
+/// its alias domains.
+#[derive(Debug, Deserialize)]
+pub(crate) struct SiteCfg {
+    #[serde(default = "default_landing")]
+    pub landing: String,
+    /// The source site's custom domains (`www.obscurative.ru`, …). See
+    /// [`SpaceReg::domains`].
+    #[serde(default)]
+    pub domains: Vec<String>,
+}
+
+fn default_landing() -> String {
+    kolorinko_rt::START_PAGE.to_owned()
+}
+
+/// One registered content space: the export dataset site that serves it, the
+/// slug its bare `/SPACE` (and `/`) resolve to (the site's landing page —
+/// Wikidot's default is `start`, but many wikis name it `main`), and the
+/// source site's alias domains.
 pub(crate) struct SpaceReg {
     pub site: SafePathComponent,
     pub landing: SafePathComponent,
+    /// The source site's custom domains: URLs on these hosts (CSS `url()`,
+    /// images, links) resolve to the site's mirrored attachments exactly like
+    /// `<site>.wikidot.com` ones do, and — later — `Host: <domain>` requests
+    /// will address the space without a `SPACE_ID` segment.
+    pub domains: Box<[String]>,
 }
 
 /// Everything configured once at startup. Leaked into a `OnceLock` — the
@@ -66,32 +95,15 @@ pub(crate) fn evakuilo_space_id(site: &str) -> SpaceId {
     SpaceId::from_bytes(bytes)
 }
 
-/// Parse one `ensure-evakuilo-sites` entry: `"<site>"` (landing defaults to
-/// [`kolorinko_rt::START_PAGE`]) or `"<site>:<landing>"`. The colon cannot
-/// occur in a site name, so the two forms are unambiguous.
-fn parse_entry(entry: &str) -> anyhow::Result<(SafePathComponent, SafePathComponent)> {
-    let spc = |s: &str| {
-        SafePathComponent::new(s.to_owned())
-            .ok_or_else(|| anyhow::anyhow!("invalid space site name {s:?}"))
-    };
-    match entry.split_once(':') {
-        Some((site, landing)) => Ok((spc(site)?, spc(landing)?)),
-        None => Ok((
-            spc(entry)?,
-            SafePathComponent::new(kolorinko_rt::START_PAGE.to_owned())
-                .expect("start is a safe name"),
-        )),
-    }
-}
-
 /// Initialize once from the parsed config. Fails (before anything starts) on
-/// an invalid site/landing name, a duplicate space id, or a second
-/// initialization.
+/// an invalid site/landing/domain name, a domain claimed by two sites, or a
+/// second initialization. A TOML table cannot repeat a key, so duplicate
+/// sites and duplicate space ids are unrepresentable by construction.
 pub(crate) fn init(
     repo_url: &str,
     repo_dir: &str,
     interval: u32,
-    evakuilo_sites: &[String],
+    sites: &IndexMap<String, SiteCfg>,
 ) -> anyhow::Result<()> {
     // `RepoMeta` fields are `&'static` by design (they name the repo the
     // worker thread owns for the process lifetime); the config's strings
@@ -105,18 +117,38 @@ pub(crate) fn init(
             interval
         },
     );
-    let mut spaces = Vec::new();
-    let mut by_site = HashMap::new();
-    for entry in evakuilo_sites {
-        let (site, landing) = parse_entry(entry)?;
-        let space = evakuilo_space_id(&site);
-        if !by_site.contains_key(&site) {
-            by_site.insert(site.clone(), space);
+    let spc = |s: &str, what: &str| {
+        SafePathComponent::new(s.to_owned())
+            .ok_or_else(|| anyhow::anyhow!("invalid {what} name {s:?}"))
+    };
+    let mut spaces = Vec::with_capacity(sites.len());
+    let mut by_site = HashMap::with_capacity(sites.len());
+    let mut seen_domains: HashSet<String> = HashSet::new();
+    for (site_name, cfg) in sites {
+        let site = spc(site_name, "space site")?;
+        let landing = spc(&cfg.landing, "landing page")?;
+        for d in &cfg.domains {
+            if d.is_empty()
+                || !d
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+            {
+                anyhow::bail!("invalid alias domain {d:?} of site {site_name:?}");
+            }
+            if !seen_domains.insert(d.to_ascii_lowercase()) {
+                anyhow::bail!("alias domain {d:?} claimed by more than one site");
+            }
         }
-        if spaces.iter().any(|(s, _)| *s == space) {
-            anyhow::bail!("duplicate space id for {entry:?}");
-        }
-        spaces.push((space, SpaceReg { site, landing }));
+        let space = evakuilo_space_id(site_name);
+        by_site.insert(site.clone(), space);
+        spaces.push((
+            space,
+            SpaceReg {
+                site,
+                landing,
+                domains: cfg.domains.clone().into_boxed_slice(),
+            },
+        ));
     }
     GLOBALS
         .set(Globals {
@@ -156,6 +188,14 @@ pub(crate) fn site_of(space: &SpaceId) -> Option<&'static SafePathComponent> {
 /// has no canonical addressing — only the render CLI names sites directly).
 pub(crate) fn space_of(site: &SafePathComponent) -> Option<SpaceId> {
     g().by_site.get(site).copied()
+}
+
+/// The configured alias domains of a registered space (`None`: unregistered
+/// id). The resource resolver retries a missed lookup under the canonical
+/// `<site>.wikidot.com` host for each of them
+/// ([`crate::wikidot_page::repo_resource`]).
+pub(crate) fn domains_of(space: &SpaceId) -> Option<&'static [String]> {
+    reg_of(space).map(|r| &r.domains[..])
 }
 
 /// The first registered space and its registry entry — whose landing page the
