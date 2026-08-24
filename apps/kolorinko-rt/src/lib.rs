@@ -235,6 +235,30 @@ pub struct CodeBlock {
 #[serde(transparent)]
 pub struct ListPagesQuery(#[localizable(skip)] pub ListPagesParams);
 
+/// A batched slug → canonical query: the set of a page's internal link
+/// targets, resolved to their `(local id, title)` pairs by one lens read.
+/// Sorted and deduplicated by the resolver before it becomes a gear id, so
+/// the id is a pure function of the *set* (edit-order churn never
+/// re-instantiates the gear). Plain data with no local ids, so localization
+/// is the identity.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    dentrado_types::Localizable,
+)]
+#[serde(transparent)]
+pub struct PageQuery(#[localizable(skip)] pub Vec<Slug>);
+
+/// The [`PageQuery`] answer: positional — entry `i` is the `(local id,
+/// title)` of `query[i]`, `None` when the site has no such page (the
+/// referrer renders that link as a `newpage`).
+pub type PageQueryResult = Vec<Option<(LocalId, String)>>;
+
 /// One page selected by a ListPages module: everything a template body can
 /// reference through `%%…%%` variables.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -352,8 +376,8 @@ impl SsrState {
 #[dentrado_macros::gears_schema(file = "gears.def.rs")]
 pub mod wire {
     use crate::{
-        Body, CaRef, CodeBlock, ListPagesQuery, ListPagesResult, LocalId, RepoAssetPath,
-        SafePathComponent, SiteShell, SpaceId,
+        Body, CaRef, CodeBlock, ListPagesQuery, ListPagesResult, LocalId, PageQuery,
+        PageQueryResult, RepoAssetPath, SafePathComponent, SiteShell, SpaceId,
     };
     use kolorinko_wikitext::{ArticleLatest, ArticleView};
 

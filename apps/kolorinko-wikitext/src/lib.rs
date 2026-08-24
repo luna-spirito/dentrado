@@ -468,8 +468,21 @@ pub struct BlockCell {
 pub enum LinkTarget {
     /// External `http://` / `https://` URL (or a same-page `#fragment`).
     Url(String),
-    /// Internal wiki page reference (`database:vika-owl`, `science`, …).
+    /// Internal wiki reference that link resolution never classified as a
+    /// page slug — a site-root link (`[/ label]`, empty path) or a
+    /// multi-segment route (`forum/t-1`). Renders as the slug-family route
+    /// (the server 301s it); never colored.
     Page(PageRef),
+    /// Internal wiki reference that resolution classified as a page slug
+    /// and the site has no such page: Wikidot's red `newpage` link (same
+    /// slug-family href, plus the `newpage` class).
+    Missing(PageRef),
+    /// A same-site page reference that resolution looked up and found: the
+    /// target's canonical identity (the exporter's numeric page id —
+    /// `LocalId::from_page_id` payload — plus its current title), from which
+    /// the renderer builds the titled canonical route directly. Renaming the
+    /// target page re-resolves the referrer, so the route stays valid.
+    Canonical { page_id: String, title: String },
     /// A target from any link kind (`[[a href=…]]`, `[[[…]]]`, `[…]`) that
     /// still carries variable slots (`{$x}` / `%%x%%`): not classifiable as
     /// URL or page until the variables resolve. Substitution re-classifies

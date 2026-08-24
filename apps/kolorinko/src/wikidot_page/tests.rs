@@ -650,3 +650,179 @@ fn code_endpoint_imports_fall_back_to_local_routes() {
         &format!("@import url(\"/{sp}/component:theme/code/1\");")
     );
 }
+
+#[test]
+fn page_refs_are_collected_and_query_canonicalized() {
+    let page = |space: Option<&str>, path: &[&str]| {
+        LinkTarget::Page(PageRef {
+            space: space.map(str::to_string),
+            path: path.iter().map(|s| (*s).to_string()).collect(),
+        })
+    };
+    let content: Content = vec![
+        Node::Link {
+            target: page(None, &["index"]),
+            text: vec![],
+            class: None,
+        },
+        // Nested inside a container — the walk reaches it.
+        Node::Container {
+            kind: ContainerKind::Div {
+                inline: false,
+                block: true,
+                params: HashMap::new(),
+            },
+            content: vec![Node::Link {
+                target: page(Some("database"), &["vika-owl"]),
+                text: vec![],
+                class: None,
+            }],
+        },
+        // Duplicate: deduplicated.
+        Node::Link {
+            target: page(None, &["index"]),
+            text: vec![],
+            class: None,
+        },
+        // Empty ref and a `/`-bearing name: not slugs, never queried.
+        Node::Link {
+            target: page(None, &[]),
+            text: vec![],
+            class: None,
+        },
+        Node::Link {
+            target: page(None, &["forum/t-1"]),
+            text: vec![],
+            class: None,
+        },
+        // External URL: untouched by this pass.
+        Node::Link {
+            target: LinkTarget::Url("https://x.example".into()),
+            text: vec![],
+            class: None,
+        },
+    ];
+    let mut slugs = Vec::new();
+    super::collect_page_refs(&content, &mut slugs);
+    assert_eq!(
+        slugs,
+        vec![
+            root_slug("index"),
+            (Some(site("database")), site("vika-owl")),
+        ]
+    );
+    // The id form is the sorted, deduplicated set…
+    let query = super::canonical_query(slugs);
+    assert_eq!(
+        query.0,
+        vec![
+            root_slug("index"),
+            (Some(site("database")), site("vika-owl")),
+        ]
+    );
+    // …so any reshuffling of the same set is the same id.
+    let reshuffled = vec![
+        root_slug("index"),
+        (Some(site("database")), site("vika-owl")),
+        root_slug("index"),
+    ];
+    assert_eq!(super::canonical_query(reshuffled), query);
+}
+
+#[test]
+fn link_substitution_rewrites_hits_and_keeps_misses() {
+    let page = |space: Option<&str>, name: &str| {
+        LinkTarget::Page(PageRef {
+            space: space.map(str::to_string),
+            path: vec![name.to_string()],
+        })
+    };
+    let content: Content = vec![
+        Node::Link {
+            target: page(None, "index"),
+            text: vec![],
+            class: None,
+        },
+        Node::Link {
+            target: page(None, "missing"),
+            text: vec![],
+            class: None,
+        },
+        // A site-root ref: unclassifiable, never touched (never a red link).
+        Node::Link {
+            target: LinkTarget::Page(PageRef {
+                space: None,
+                path: vec![],
+            }),
+            text: vec![],
+            class: None,
+        },
+        Node::Container {
+            kind: ContainerKind::Div {
+                inline: false,
+                block: true,
+                params: HashMap::new(),
+            },
+            content: vec![Node::Link {
+                target: page(Some("database"), "vika-owl"),
+                text: vec![],
+                class: None,
+            }],
+        },
+    ];
+    let resolved = HashMap::from([
+        (
+            root_slug("index"),
+            (LocalId::new(986050317), "Index".to_string()),
+        ),
+        (
+            (Some(site("database")), site("vika-owl")),
+            (LocalId::new(1305054470), "Вика-Сова".to_string()),
+        ),
+    ]);
+    let out = super::substitute_links(content, &resolved);
+    // Hits become canonical refs carrying the rename-stable page id + title.
+    let Node::Link {
+        target: LinkTarget::Canonical { page_id, title },
+        ..
+    } = &out[0]
+    else {
+        panic!("expected a canonical link")
+    };
+    assert_eq!((page_id.as_str(), title.as_str()), ("986050317", "Index"));
+    let Node::Container {
+        content: nested, ..
+    } = &out[3]
+    else {
+        panic!("expected the container")
+    };
+    let Node::Link {
+        target: LinkTarget::Canonical { page_id, title },
+        ..
+    } = &nested[0]
+    else {
+        panic!("expected the nested hit")
+    };
+    assert_eq!(
+        (page_id.as_str(), title.as_str()),
+        ("1305054470", "Вика-Сова")
+    );
+    // The miss becomes `Missing` — the renderer's red `newpage` link.
+    let Node::Link {
+        target: LinkTarget::Missing(p),
+        ..
+    } = &out[1]
+    else {
+        panic!("expected the miss to become a red link")
+    };
+    assert_eq!(p.path, vec!["missing".to_string()]);
+    // The unclassifiable root ref stays `Page` verbatim.
+    let Node::Link {
+        target: LinkTarget::Page(p),
+        ..
+    } = &out[2]
+    else {
+        panic!("expected the root ref to stay a page ref")
+    };
+    assert!(p.path.is_empty());
+}

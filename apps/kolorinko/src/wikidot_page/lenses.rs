@@ -19,6 +19,11 @@ pub(crate) struct RepoLListPagesCache;
 #[derive(Default, Clone, Debug)]
 pub(crate) struct RepoLLocalIdCache;
 
+/// Trivial lens cache for [`repo_l_query_pages`]: a pure projection of
+/// `repo`, recomputed on every `follow` kick.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct RepoLQueryPagesCache;
+
 /// Per-instance cache for [`shell`]: a pure aggregation re-derived each run
 /// from its `article_latest` dependencies and the live [`RepoData`], so it
 /// carries no state between runs.
@@ -71,6 +76,23 @@ pub(crate) fn repo_l_local_id(
         LocalId::from_page_id(&a.meta.page_id)?,
         a.meta.title.clone(),
     ))
+}
+
+/// The batched [`repo_l_local_id`]: the `(local id, title)` answer for a
+/// whole (sorted, deduplicated) slug set in one positional read — one gear
+/// instance and one dependency per page, instead of one per link, which is
+/// what keeps thousand-link index pages viable. An unknown site answers
+/// `None` for every slug (every link renders `newpage`).
+pub(crate) fn repo_l_query_pages(
+    data: &RepoData,
+    site: &SafePathComponent,
+    query: &PageQuery,
+) -> PageQueryResult {
+    query
+        .0
+        .iter()
+        .map(|slug| repo_l_local_id(data, site, slug))
+        .collect()
 }
 
 /// Project one ListPages selection out of `repo`'s dataset: the site's pages

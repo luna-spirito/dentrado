@@ -32,8 +32,11 @@
 //        → code_block (follows the same parse: a lens over its output)
 //
 // `repo_l_local_id` is the slug-family → canonical bridge (a legacy
-// `(site, slug)` address to its `local` id), and `repo_l_list_pages` /
-// `repo_resource` / `asset` stay slug/site-keyed. These server-internal gears
+// `(site, slug)` address to its `local` id), `repo_l_query_pages` its batched
+// form — the whole (sorted, deduplicated) link set of one page resolved in a
+// single lens read, so a thousand-link index page declares one dependency
+// instead of a thousand — and `repo_l_list_pages` / `repo_resource` / `asset`
+// stay slug/site-keyed. These server-internal gears
 // never appear in a client subscription (the wire schema carries them only
 // because the schema is generated from this one file).
 
@@ -68,6 +71,20 @@ pub(crate) fn repo_l_local_id(
     _cache: &mut RepoLLocalIdCache,
 ) -> Option<(LocalId, String)> {
     crate::wikidot_page::repo_l_local_id(&repo_data, &site, &slug)
+}
+
+#[dentrado::gear(
+    follow(target = GearId::Repo {}),
+    shared,
+    name = RepoLQueryPages,
+)]
+pub(crate) fn repo_l_query_pages(
+    site: SafePathComponent,
+    query: PageQuery,
+    repo_data: Rc<RepoData>,
+    _cache: &mut RepoLQueryPagesCache,
+) -> PageQueryResult {
+    crate::wikidot_page::repo_l_query_pages(&repo_data, &site, &query)
 }
 
 #[dentrado::gear(

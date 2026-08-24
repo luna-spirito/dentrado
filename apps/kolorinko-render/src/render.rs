@@ -6,6 +6,7 @@
 //! `/<site>/<category?>/<page>` — the path-prefix scheme this mirror uses
 //! instead of Wikidot's per-site subdomains.
 
+use kolorinko_rt::{LocalId, format_page_route};
 use kolorinko_wikitext::{
     Align, AlignSide, BlockCell, BlockTable, ClearSide, ContainerKind, Content, LinkTarget, List,
     Node, TableCell, TextObj, TextStyle, civil_from_days, days_from_civil,
@@ -804,11 +805,20 @@ fn render_link(
         // flatten with the same default / verbatim `%%name%%` fallback as any
         // other text run and use it as the href.
         LinkTarget::Unresolved(objs) => text_objs_to_string(objs),
-        // A wiki-internal reference: the canonical slug form `cat:name` (the
-        // colon can't collide with a base64url local id, so the server routes
-        // these by slug and 301s to the titled canonical address). Without a
-        // space (a context-less render) the href falls back to root-relative.
-        LinkTarget::Page(p) => {
+        // A link resolution looked this up and found it: build the titled
+        // canonical route straight from the target's rename-stable identity —
+        // the form the client router intercepts, so navigation stays in the
+        // app.
+        LinkTarget::Canonical { page_id, title } => LocalId::from_page_id(page_id).map_or_else(
+            || "/".to_string(),
+            |l| format_page_route(ctx.space, l, title),
+        ),
+        // A page ref, resolved or not, renders the slug-family route — the
+        // canonical `cat:name` form (the colon can't collide with a base64url
+        // local id, so the server routes these by slug and 301s to the titled
+        // canonical address). Without a space (a context-less render) the
+        // href falls back to root-relative.
+        LinkTarget::Page(p) | LinkTarget::Missing(p) => {
             let rest = p.path.join("/");
             match ctx.space {
                 Some(space) => match &p.space {
@@ -824,7 +834,16 @@ fn render_link(
     };
     let inner = render_inline(ctx, text);
     // `class` omitted entirely when absent — SSR would otherwise emit a
-    // spurious `class=""`.
+    // spurious `class=""`. A `Missing` target is a page the site doesn't
+    // have, so it always carries `newpage` (appended to any author-supplied
+    // class): `a.newpage` is the red-link style the base theme already ships.
+    let class = match target {
+        LinkTarget::Missing(_) => match class {
+            Some(c) => Some(format!("{c} newpage")),
+            None => Some("newpage".to_string()),
+        },
+        _ => class.map(str::to_string),
+    };
     match class {
         Some(c) => view! { <a class=c href=href>{inner}</a> }.into_any(),
         None => view! { <a href=href>{inner}</a> }.into_any(),

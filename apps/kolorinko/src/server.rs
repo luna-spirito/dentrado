@@ -66,7 +66,8 @@ use kolorinko_rt::{
 use crate::respond;
 use crate::runtime::{
     GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, asset, code_block,
-    repo_l_article_latest, repo_l_list_pages, repo_l_local_id, repo_resource, shell,
+    repo_l_article_latest, repo_l_list_pages, repo_l_local_id, repo_l_query_pages, repo_resource,
+    shell,
 };
 
 /// Max concurrent WebTransport sessions advertised per HTTP/3 connection
@@ -410,6 +411,9 @@ async fn subscribe_wire(
         wire::GearId::RepoLLocalId { site, slug } => {
             repo_l_local_id(site, slug).subscribe_raw(core).await
         }
+        wire::GearId::RepoLQueryPages { site, query } => {
+            repo_l_query_pages(site, query).subscribe_raw(core).await
+        }
         wire::GearId::RepoLListPages { site, query } => {
             repo_l_list_pages(site, query).subscribe_raw(core).await
         }
@@ -447,6 +451,7 @@ fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
             // Server-internal resolution dependencies; the client never
             // subscribes to them.
             GearOutShared::RepoLLocalIdOut(_) => None,
+            GearOutShared::RepoLQueryPagesOut(_) => None,
             GearOutShared::RepoLListPagesOut(_) => None,
             // Assets are served over plain HTTP, never the WebTransport wire —
             // the browser fetches them via `<img>`/`<link>`/`url()`. Dropping

@@ -58,8 +58,8 @@ pub(crate) async fn article_latest_parsed<S: Storage<KolorinkoRT>>(
 pub(crate) struct LatestCache;
 
 /// Render a page's final [`ArticleView`] by running [`resolve_full`] — the
-/// `[[include]]` / `[[module ListPages]]` / `[[iftags]]` / resource resolution
-/// pipeline. The gear is keyed by the canonical address `(space, local)` —
+/// `[[include]]` / `[[module ListPages]]` / `[[iftags]]` / link / resource
+/// resolution The gear is keyed by the canonical address `(space, local)` —
 /// exactly what the URL and the client subscription name — and follows the
 /// page's own parse ([`article_latest_parsed`], co-located off the `repo`
 /// core): the parse's `meta` carries the current slug, so the site/slug
@@ -134,7 +134,8 @@ impl ResolveState {
 }
 
 /// The full resolution pipeline — `[[include]]`, `[[module ListPages]]`,
-/// `[[iftags]]`, mirrored resources — run on `content` in the context of
+/// `[[iftags]]`, internal links, mirrored resources — run on `content` in
+/// the context of
 /// page (`site`, `slug`, `host`), returning the resolved content together
 /// with its dependency tree: the include cone plus every listed page fetched
 /// for a `%%content%%` transclusion. Shared between the gear's own resolution
@@ -158,6 +159,7 @@ pub(super) async fn resolve_full<S: Storage<KolorinkoRT>>(
         let (content, listed) = resolve_listpages(content, state, &host, ctx).await;
         deps.extend(listed);
         let content = evaluate_iftags(content, &host.tags);
+        let content = resolve_links(content, &state.site, ctx).await;
         let content = resolve_resources(content, &state.site, ctx).await;
         (content, deps)
     })

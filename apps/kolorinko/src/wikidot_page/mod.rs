@@ -50,6 +50,10 @@
 //!   canonical bridge — the `(local id, title)` a legacy `(site, slug)`
 //!   address names (HTTP slug redirects, the `/code/N` endpoint, the render
 //!   CLI, and the include cone inside [`article_latest`]).
+//! - [`repo_l_query_pages`] (`follow` lens over `repo`): the batched
+//!   [`repo_l_local_id`] — a page's whole (sorted, deduplicated) link set
+//!   answered in one read, so link resolution inside [`article_latest`]
+//!   declares one dependency per page instead of one per link.
 //! - [`repo_l_list_pages`] (`follow` lens over `repo`): projects a ListPages
 //!   module's selection into [`ListPagesResult`] — the matching pages of one
 //!   site, ordered and truncated per the module's parameters.
@@ -67,7 +71,8 @@
 //!   [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get)-ing
 //!   [`article_latest_parsed`] (includes bridged through [`repo_l_local_id`])
 //!   / [`repo_l_list_pages`] (data-level cycles broken by a path-based
-//!   guard) — producing the final [`ArticleView`] with the tree of every
+//!   guard), then internal links through [`repo_l_query_pages`] — producing
+//!   the final [`ArticleView`] with the tree of every
 //!   fetched page as its `deps`. Declaring each fetch as a dependency makes
 //!   the result reactive: an edit to any page in the transitive
 //!   include/transclusion cone re-runs this gear.
@@ -84,8 +89,8 @@ use git2::{ObjectType, Oid, Repository, Tree, TreeWalkMode};
 use imbl::HashMap as ImHashMap;
 use kolorinko_render::{http_refs, http_tail, rewrite_with};
 use kolorinko_rt::{
-    Body, CaRef, CodeBlock, ListPagesQuery, ListPagesResult, ListedPage, LocalId, RepoAssetPath,
-    SafePathComponent, SiteShell, SpaceId,
+    Body, CaRef, CodeBlock, ListPagesQuery, ListPagesResult, ListedPage, LocalId, PageQuery,
+    PageQueryResult, RepoAssetPath, SafePathComponent, SiteShell, SpaceId,
 };
 use kolorinko_wikitext::{
     ArticleLatest, ArticleMeta, ArticleView, BlockCell, BlockRow, BlockTable, ContainerKind,
@@ -118,6 +123,7 @@ mod iftags;
 mod includes;
 mod incremental;
 mod lenses;
+mod links;
 mod listpages;
 mod repo_gear;
 mod resources;
@@ -132,6 +138,7 @@ use git_worker::*;
 use iftags::*;
 use includes::*;
 use incremental::*;
+use links::*;
 use listpages::*;
 use repo_gear::*;
 use resources::*;
@@ -145,8 +152,8 @@ pub(crate) use config::RepoMeta;
 pub(crate) use dataset::{Article, RepoData, WDWebsite};
 pub(crate) use git_worker::GitMailbox;
 pub(crate) use lenses::{
-    RepoLArticleCache, RepoLListPagesCache, RepoLLocalIdCache, ShellCache, repo_l_article_latest,
-    repo_l_list_pages, repo_l_local_id, shell,
+    RepoLArticleCache, RepoLListPagesCache, RepoLLocalIdCache, RepoLQueryPagesCache, ShellCache,
+    repo_l_article_latest, repo_l_list_pages, repo_l_local_id, repo_l_query_pages, shell,
 };
 pub(crate) use repo_gear::{RepoCache, repo};
 
