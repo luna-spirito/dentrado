@@ -133,6 +133,11 @@ pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
                 && let Some(ca) = get_ca(site, path, ctx).await
             {
                 map.insert(tail.clone(), ca_url(site, &ca));
+            } else if let Some(url) = code_url_for_tail(tail) {
+                // Not mirrored: Wikidot's `/code/N` endpoint still serves
+                // locally — the same fallback [`resolve_resources`] applies
+                // to page-embedded stylesheets.
+                map.insert(tail.clone(), url);
             }
         }
         crate::assets::compress(rewrite_with(&text, None, |t| map.get(t).cloned()).into_bytes())

@@ -200,7 +200,10 @@ pub(crate) enum OpenTag<'src> {
         name: &'src str,
     },
     Tabview,
-    Code,
+    /// `[[code …]]` — the `type` attribute (`type="css"`) rides along.
+    Code {
+        params: Params,
+    },
     /// `[[module css …]]`
     Css,
     ListPages {
@@ -1291,8 +1294,12 @@ fn iftags_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
 }
 
 fn code_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
-    let end = read_to(b, j, b"]]")?;
-    Some((end + 2, OpenTag::Code))
+    let mut params = Params::new();
+    let k = lex_params(b, j, &mut params);
+    let k = skip_spaces(b, k);
+    b.get(k..)
+        .is_some_and(|r| r.starts_with(b"]]"))
+        .then(|| (k + 2, OpenTag::Code { params }))
 }
 
 fn head_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {

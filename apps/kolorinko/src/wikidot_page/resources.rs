@@ -6,12 +6,14 @@ use super::*;
 
 /// Resolve every mirrored external resource — `[[image source]]`, `[[[url]]]`
 /// link targets, and `url()`/`@import` references inside `[[module css]]` — to
-/// its content-addressed `/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` URL and
+/// its content-addressed `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` URL and
 /// substitute. Each resource is declared as a [`repo_resource`]
 /// `secondary_get` dependency, so the result is reactive to an attachment
 /// being re-mirrored (new hash) anywhere in the (already include-resolved)
-/// tree. URLs that aren't mirrored (hotlinks) are left untouched so the client
-/// loads them straight from the origin.
+/// tree. A URL that isn't mirrored is retried as Wikidot's `/code/N`
+/// endpoint ([`code_url_for_tail`]) and pointed at the local slug-family
+/// code route; anything else is left as its original absolute URL (a hotlink
+/// the client loads straight from the origin).
 pub(super) async fn resolve_resources<S: Storage<KolorinkoRT>>(
     content: Content,
     site: &SafePathComponent,
@@ -23,6 +25,7 @@ pub(super) async fn resolve_resources<S: Storage<KolorinkoRT>>(
         return content;
     }
     let mut resolved: HashMap<String, CaRef> = HashMap::new();
+    let mut code: HashMap<String, String> = HashMap::new();
     for tail in &tails {
         let Some(path) = RepoAssetPath::new(percent_decode(tail)) else {
             continue;
@@ -30,11 +33,18 @@ pub(super) async fn resolve_resources<S: Storage<KolorinkoRT>>(
         let ca = crate::runtime::repo_resource(site.clone(), path)
             .secondary_get(ctx)
             .await;
-        if let Some(ca_ref) = &*ca {
-            resolved.insert(tail.clone(), ca_ref.clone());
+        match &*ca {
+            Some(ca_ref) => {
+                resolved.insert(tail.clone(), ca_ref.clone());
+            }
+            None => {
+                if let Some(url) = code_url_for_tail(tail) {
+                    code.insert(tail.clone(), url);
+                }
+            }
         }
     }
-    substitute_resources(content, site, &resolved)
+    substitute_resources(content, site, &resolved, &code)
 }
 
 /// Walk `content` and collect every mirrored-attachment `host/path` tail
@@ -79,16 +89,23 @@ fn ref_tail_of(source: &[TextObj]) -> Option<String> {
 }
 
 /// Replace every mirrored-attachment reference in `content` with its
-/// content-addressed URL from `resolved` (`host/path` tail → [`CaRef`]).
-/// References absent from `resolved` (un-mirrored hotlinks) pass through
-/// unchanged.
+/// content-addressed URL from `resolved` (`host/path` tail → [`CaRef`]), or
+/// its local code route from `code` (`host/path` tail → `/S…/<slug>/code/N`,
+/// the `/code/N` fallback of [`resolve_resources`]). References absent from
+/// both (un-mirrored hotlinks) pass through unchanged.
 pub(super) fn substitute_resources(
     content: Content,
     site: &SafePathComponent,
     resolved: &HashMap<String, CaRef>,
+    code: &HashMap<String, String>,
 ) -> Content {
-    let ca_for = |tail: &str| resolved.get(tail).map(|ca| ca_url(site, ca));
-    let mut walk = |c: Content| substitute_resources(c, site, resolved);
+    let url_for = |tail: &str| {
+        resolved
+            .get(tail)
+            .map(|ca| ca_url(site, ca))
+            .or_else(|| code.get(tail).cloned())
+    };
+    let mut walk = |c: Content| substitute_resources(c, site, resolved, code);
     content
         .into_iter()
         .map(|node| match node {
@@ -98,7 +115,7 @@ pub(super) fn substitute_resources(
                 params,
             } => Node::Image {
                 align,
-                source: subst_source(source, ca_for),
+                source: subst_source(source, url_for),
                 params,
             },
             Node::Link {
@@ -107,8 +124,8 @@ pub(super) fn substitute_resources(
                 class,
             } => Node::Link {
                 target: match target {
-                    LinkTarget::Url(u) => match http_tail(&u, None).and_then(|t| ca_for(&t)) {
-                        Some(ca) => LinkTarget::Url(ca),
+                    LinkTarget::Url(u) => match http_tail(&u, None).and_then(|t| url_for(&t)) {
+                        Some(url) => LinkTarget::Url(url),
                         None => LinkTarget::Url(u),
                     },
                     other => other,
@@ -116,20 +133,92 @@ pub(super) fn substitute_resources(
                 text: walk(text),
                 class,
             },
-            Node::Stylesheet(css) => Node::Stylesheet(rewrite_with(&css, None, ca_for)),
+            Node::Stylesheet(css) => Node::Stylesheet(rewrite_with(&css, None, url_for)),
             other => other.map_node(&mut walk),
         })
         .collect()
 }
 
-/// Rewrite a purely-literal image `source` (`[Plain(url)]`) to its CA URL when
-/// `ca_for` resolves it; leave sources with variables or non-http URLs as-is.
-fn subst_source<F: Fn(&str) -> Option<String>>(source: Vec<TextObj>, ca_for: F) -> Vec<TextObj> {
+/// Rewrite a purely-literal image `source` (`[Plain(url)]`) to its resolved
+/// URL when `url_for` matches it; leave sources with variables or non-http
+/// URLs as-is.
+fn subst_source<F: Fn(&str) -> Option<String>>(source: Vec<TextObj>, url_for: F) -> Vec<TextObj> {
     if let Some(url) = TextObj::plain_concat(&source)
         && let Some(tail) = http_tail(&url, None)
-        && let Some(ca) = ca_for(&tail)
+        && let Some(resolved) = url_for(&tail)
     {
-        return vec![TextObj::Plain(ca)];
+        return vec![TextObj::Plain(resolved)];
     }
     source
+}
+
+// =========================================================================
+// Wikidot `/code/N` endpoints → local slug-family code routes
+// =========================================================================
+
+/// Rewrite an external reference of Wikidot's `/code/N` endpoint shape to
+/// the local route that serves it — `/<space>/<slug>/code/N`, the slug
+/// family's code tail (see [`crate::respond`]) — so theme-component
+/// `@import`s load from the mirror instead of the origin (which, beyond
+/// archive purity, also stops them being blocked as mixed content:
+/// `http://` subresources of the HTTPS mirror). Recognized tails, covering
+/// every form in the corpus:
+/// - `<host>/<page>/code/<N>` — `<sub>.wikidot.com` hosts (± `www.`) and
+///   configured alias domains (± `www.`);
+/// - `<host>/local--code/<page>/<N>` — the `.wdfiles.com` alias the wikidot
+///   form 302s to (page percent-encoded).
+///
+/// `None` for anything else — including sites no registered space serves
+/// (an un-mirrored wiki keeps its hotlink rather than a guaranteed-404
+/// local route) and multi-segment pages (`forum/t-123/code/1`, which no
+/// code endpoint ever answered).
+pub(super) fn code_url_for_tail(tail: &str) -> Option<String> {
+    let (host, rest) = tail.split_once('/')?;
+    let space = code_space(host)?;
+    let segs: Vec<&str> = rest.split('/').collect();
+    let (page_raw, n) = match segs.as_slice() {
+        [page, "code", n] | ["local--code", page, n] => (*page, *n),
+        _ => return None,
+    };
+    let n: u32 = n.parse().ok()?;
+    let page = percent_decode(page_raw);
+    if page.contains('/') {
+        return None; // a decoded `%2F` never makes a second segment
+    }
+    let slug = match page.split_once(':') {
+        Some((cat, name)) => (
+            Some(SafePathComponent::new(cat.to_owned())?),
+            SafePathComponent::new(name.to_owned())?,
+        ),
+        None => (None, SafePathComponent::new(page)?),
+    };
+    let cat = slug
+        .0
+        .as_ref()
+        .map_or(String::new(), |c| format!("{}:", **c));
+    Some(format!("/{space}/{cat}{}/code/{n}", *slug.1))
+}
+
+/// The registered space a code-endpoint host belongs to: a
+/// `<sub>.wikidot.com` / `<sub>.wdfiles.com` host (± `www.`) names `sub` —
+/// either a registered site directly, or (the `.wdfiles.com` form of) a
+/// configured alias domain; any other host must be a configured alias
+/// domain itself (± `www.` — the corpus references `www.rpc-wiki.net`
+/// while configs list the bare form). `None` for hosts no registered space
+/// claims (the reference stays a hotlink).
+fn code_space(host: &str) -> Option<SpaceId> {
+    let base = host
+        .strip_suffix(".wikidot.com")
+        .or_else(|| host.strip_suffix(".wdfiles.com"))
+        .map_or(host, |sub| sub.strip_prefix("www.").unwrap_or(sub));
+    let by_name =
+        SafePathComponent::new(base.to_owned()).and_then(|s| crate::globals::space_of(&s));
+    by_name.or_else(|| {
+        crate::globals::space_of_domain(base)
+            .or_else(|| {
+                base.strip_prefix("www.")
+                    .and_then(crate::globals::space_of_domain)
+            })
+            .map(|(space, _)| space)
+    })
 }

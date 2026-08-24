@@ -78,6 +78,27 @@ pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
     crate::wikidot_page::asset(&site, &hash, &ext, ctx).await
 }
 
+// A lens over the shared parse: statically bound to the `(site, slug)`
+// record of `article_latest_parsed` (the target is derived from this gear's
+// own id), co-located with it, and handed its output as a `&ArticleView`
+// borrow — no per-run dep reconciliation, no cross-core shipping of the
+// whole tree just to extract one block. Re-runs exactly when the parse
+// output changes (which itself re-runs only when the page body does).
+#[dentrado::gear(
+    follow(target = GearId::ArticleLatestParsed { site, slug }),
+    shared,
+    name = CodeBlock,
+)]
+pub(crate) fn code_block(
+    site: SafePathComponent,
+    slug: (Option<SafePathComponent>, SafePathComponent),
+    n: u32,
+    parsed: &ArticleView,
+    _cache: &mut CodeBlockCache,
+) -> Option<CodeBlock> {
+    crate::wikidot_page::code_block(&site, &slug, n, parsed)
+}
+
 #[dentrado::gear(
     follow(target = GearId::Repo {}),
     shared,

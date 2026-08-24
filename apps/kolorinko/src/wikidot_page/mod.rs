@@ -72,7 +72,7 @@ use git2::{ObjectType, Oid, Repository, Tree, TreeWalkMode};
 use imbl::HashMap as ImHashMap;
 use kolorinko_render::{http_refs, http_tail, rewrite_with};
 use kolorinko_rt::{
-    Body, CaRef, ListPagesQuery, ListPagesResult, ListedPage, LocalId, RepoAssetPath,
+    Body, CaRef, CodeBlock, ListPagesQuery, ListPagesResult, ListedPage, LocalId, RepoAssetPath,
     SafePathComponent, SiteShell, SpaceId,
 };
 use kolorinko_wikitext::{
@@ -98,6 +98,7 @@ use crate::runtime::{GearOutShared, KolorinkoRT};
 // `crate::wikidot_page::…` API is re-exported `pub(crate)`.
 mod article_latest;
 mod assets_gear;
+mod code_block;
 mod config;
 mod dataset;
 mod git_worker;
@@ -127,6 +128,7 @@ use vars::*;
 
 pub(crate) use article_latest::{LatestCache, ParsedCache, article_latest, article_latest_parsed};
 pub(crate) use assets_gear::{AssetCache, RepoResourceCache, asset, ca_url, repo_resource};
+pub(crate) use code_block::{CodeBlockCache, code_block};
 pub(crate) use config::RepoMeta;
 pub(crate) use dataset::{Article, RepoData, WDWebsite};
 pub(crate) use git_worker::GitMailbox;

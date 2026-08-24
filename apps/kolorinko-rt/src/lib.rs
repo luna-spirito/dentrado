@@ -195,6 +195,29 @@ pub struct CaRef {
     pub ext: String,
 }
 
+/// One `[[code]]` block served through Wikidot's `/code/N` endpoint shape —
+/// the legacy slug family's `/<cat:><name>/code/<N>` tail (on the space-\
+///segmented main origin or a wiki's own domain). The opener's
+/// `type="css"`-ness picks the MIME (`text/css` vs `text/plain`), which is
+/// what makes `@import`ing the block work as a stylesheet. Like any other
+/// asset the body is zstd-compressed **once in the gear** (never per
+/// request) and carries its strong ETag alongside, so the HTTP layer's hot
+/// path is a refcount bump. HTTP-only output: never shipped over
+/// WebTransport.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CodeBlock {
+    /// The opener carried `type="css"` (any case) → serve `text/css`.
+    pub css: bool,
+    /// The block's interior, verbatim from the page source (no entity
+    /// re-escaping — a deliberate divergence from Wikidot's one-extra-`&amp;`
+    /// behaviour), compressed like every other asset.
+    pub body: Body,
+    /// Strong quoted ETag over the *decoded* interior (stable across
+    /// encodings, so a zstd-capable and a plain client revalidate
+    /// identically).
+    pub etag: String,
+}
+
 /// A `[[module ListPages]]` selection as a gear-id payload: the module's
 /// parsed parameters, context selectors (`category="."`, `tags="="`, …)
 /// already resolved against the rendering page. Plain data with no local
@@ -329,8 +352,8 @@ impl SsrState {
 #[dentrado_macros::gears_schema(file = "gears.def.rs")]
 pub mod wire {
     use crate::{
-        Body, CaRef, ListPagesQuery, ListPagesResult, LocalId, RepoAssetPath, SafePathComponent,
-        SiteShell, SpaceId,
+        Body, CaRef, CodeBlock, ListPagesQuery, ListPagesResult, LocalId, RepoAssetPath,
+        SafePathComponent, SiteShell, SpaceId,
     };
     use kolorinko_wikitext::{ArticleLatest, ArticleView};
 

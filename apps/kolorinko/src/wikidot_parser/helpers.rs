@@ -313,6 +313,15 @@ fn parse_space_vars(remainder: &str) -> Vec<(String, Content)> {
 /// arguments (`rss`, `urlAttrPrefix`, …) are ignored. An `@URL|default`
 /// reference keeps only its default — URL-passed arguments have no meaning in
 /// a static render.
+/// A `[[code …]]` opener's `type` attribute as written — `type="css"` marks
+/// the block a stylesheet (Wikidot's `/code/N` endpoint compares
+/// case-insensitively at serve time). `None` when absent or non-literal
+/// (a `%%var%%` value can never name a type here — the endpoint serves
+/// templates un-substituted too).
+pub(crate) fn code_type(attrs: &HashMap<String, Vec<TextObj>>) -> Option<String> {
+    TextObj::plain_concat(attrs.get("type")?)
+}
+
 pub(crate) fn listpages_params(attrs: &HashMap<String, Vec<TextObj>>) -> ListPagesParams {
     let sel = |key: &str| attr_value(attrs, key);
     ListPagesParams {

@@ -629,9 +629,16 @@ mod tests {
     #[test]
     fn code_block_is_raw() {
         // `[[code]]` body is verbatim (not parsed as wikitext): the `>` stays
-        // literal rather than becoming a blockquote, and the body is trimmed.
+        // literal rather than becoming a blockquote. The interior is kept
+        // byte-faithful (`/code/N` serves it as stored); render trims it.
         let c = parse("[[code]]\n> line one\n**not bold**\n[[/code]]");
-        assert_eq!(c, vec![Node::Code("> line one\n**not bold**".to_string())]);
+        assert_eq!(
+            c,
+            vec![Node::Code {
+                ty: None,
+                raw: "\n> line one\n**not bold**\n".to_string(),
+            }]
+        );
     }
 
     #[test]

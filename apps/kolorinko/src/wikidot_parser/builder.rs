@@ -24,9 +24,9 @@ use super::pairer::{Event, Pairing, pair};
 use super::*;
 
 /// Which verbatim region a frame holds.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Verb {
-    Code,
+    Code(Option<String>),
     Css,
     Comment,
 }
@@ -366,7 +366,9 @@ impl<'src> Builder<'src, '_> {
             Tok::SupMark => FrameKind::Sup(true),
             Tok::SubMark => FrameKind::Sup(false),
             Tok::CommentOpen => FrameKind::Verbatim(Verb::Comment),
-            Tok::Open(OpenTag::Code) => FrameKind::Verbatim(Verb::Code),
+            Tok::Open(OpenTag::Code { params }) => {
+                FrameKind::Verbatim(Verb::Code(code_type(params)))
+            }
             Tok::Open(OpenTag::Css) => FrameKind::Verbatim(Verb::Css),
             Tok::Open(tag) => FrameKind::Tag(tag.clone()),
             _ => unreachable!("open_of only marks pairable openers"),
@@ -652,7 +654,7 @@ impl<'src> Builder<'src, '_> {
             FrameKind::Verbatim(verb) => {
                 let body = self.src[self.toks[open].end..self.toks[close].start].to_string();
                 match verb {
-                    Verb::Code => vec![Node::Code(body.trim().to_string())],
+                    Verb::Code(ty) => vec![Node::Code { ty, raw: body }],
                     Verb::Css => vec![Node::Stylesheet(body.trim().to_string())],
                     // A comment discards everything it spanned.
                     Verb::Comment => Vec::new(),
@@ -1068,7 +1070,14 @@ mod tests {
     fn code_region_is_opaque() {
         assert_eq!(
             parse("a [[code]] [[div]] [[/code]] b"),
-            vec![txt("a "), Node::Code("[[div]]".into()), txt(" b")]
+            vec![
+                txt("a "),
+                Node::Code {
+                    ty: None,
+                    raw: " [[div]] ".into(),
+                },
+                txt(" b"),
+            ]
         );
     }
 

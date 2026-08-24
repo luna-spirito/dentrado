@@ -65,7 +65,7 @@ use kolorinko_rt::{
 
 use crate::respond;
 use crate::runtime::{
-    GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, asset,
+    GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, asset, code_block,
     repo_l_article_latest, repo_l_list_pages, repo_resource, shell,
 };
 
@@ -265,13 +265,23 @@ async fn handle_conn(
             // header into the URI's authority); the SSR document absolutizes
             // its OpenGraph URLs with it.
             let host = req.uri().authority().map(|a| a.as_str().to_owned());
-            let reply = respond::resolve(&full, accept_zstd, &assets, &core, host.as_deref()).await;
+            let inm = req
+                .headers()
+                .get(http::header::IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let reply = respond::resolve(&full, accept_zstd, &assets, &core, host.as_deref())
+                .await
+                .revalidated(inm.as_deref());
             let mut b = http::Response::builder()
                 .status(reply.status)
                 .header("content-type", reply.mime)
                 .header("content-length", reply.served.bytes.len().to_string())
                 .header("cache-control", reply.cache_control)
                 .header("vary", "Accept-Encoding");
+            if let Some(etag) = &reply.etag {
+                b = b.header("etag", etag);
+            }
             if let Some(loc) = reply.location {
                 b = b.header("location", loc);
             }
@@ -399,6 +409,10 @@ async fn subscribe_wire(
         // Assets are HTTP-only — never shipped over WebTransport. The match is
         // exhaustive on the generated wire enum, but `to_wire_out` drops these.
         wire::GearId::Asset { site, hash, ext } => asset(site, hash, ext).subscribe_raw(core).await,
+        // Code blocks likewise: HTTP-only.
+        wire::GearId::CodeBlock { site, slug, n } => {
+            code_block(site, slug, n).subscribe_raw(core).await
+        }
         // Server-internal resolution dependency of `article_latest`; the client
         // never subscribes to it, but the match must be exhaustive.
         wire::GearId::RepoResource { site, path } => {
@@ -430,6 +444,8 @@ fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
             // the browser fetches them via `<img>`/`<link>`/`url()`. Dropping
             // here keeps their bytes out of the subscription channel.
             GearOutShared::AssetOut(_) => None,
+            // Code blocks: same HTTP-only treatment as assets.
+            GearOutShared::CodeBlockOut(_) => None,
             // Server-internal: never shipped to the client.
             GearOutShared::RepoResourceOut(_) => None,
         },

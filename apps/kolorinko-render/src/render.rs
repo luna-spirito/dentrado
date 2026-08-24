@@ -382,7 +382,7 @@ fn is_block(node: &Node) -> bool {
             | Node::Stylesheet(_)
             | Node::Include(_)
             | Node::Raw(_)
-            | Node::Code(_)
+            | Node::Code { .. }
             | Node::ModuleBlock { .. }
             | Node::Module { .. }
             | Node::List(_)
@@ -455,8 +455,8 @@ fn render_node(ctx: &RenderCtx, node: &Node) -> AnyView {
             _ => empty_view(),
         },
         Node::ModuleBlock { name, params, body } => render_module_block(ctx, name, params, body),
-        Node::Code(s) => view! {
-            <div class="code"><pre><code>{s.clone()}</code></pre></div>
+        Node::Code { raw, .. } => view! {
+            <div class="code"><pre><code>{raw.trim()}</code></pre></div>
         }
         .into_any(),
         Node::List(list) => render_list(ctx, list),

@@ -142,6 +142,7 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
             b"bad request\n",
             "no-store",
             None,
+            None,
             alt_svc,
         )
         .await?;
@@ -157,13 +158,16 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
             b"method not allowed\n",
             "no-store",
             None,
+            None,
             alt_svc,
         )
         .await?;
         return Ok(());
     }
 
-    let reply = respond::resolve(path, accepts_zstd(&head), assets, core, host_of(&head)).await;
+    let reply = respond::resolve(path, accepts_zstd(&head), assets, core, host_of(&head))
+        .await
+        .revalidated(if_none_match(&head));
     write_http(
         stream,
         reply.status,
@@ -171,6 +175,7 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         reply.served.encoding,
         &reply.served.bytes,
         reply.cache_control,
+        reply.etag.as_deref(),
         reply.location.as_deref(),
         alt_svc,
     )
@@ -203,6 +208,18 @@ fn host_of(head: &str) -> Option<&str> {
     })
 }
 
+/// The request's `If-None-Match` header value, for ETag revalidation
+/// ([`Reply::revalidated`]). Same raw-head scan as [`accepts_zstd`].
+fn if_none_match(head: &str) -> Option<&str> {
+    head.lines().find_map(|l| {
+        let mut parts = l.splitn(2, ':');
+        match parts.next().map(str::trim) {
+            Some(name) if name.eq_ignore_ascii_case("if-none-match") => parts.next().map(str::trim),
+            _ => None,
+        }
+    })
+}
+
 /// Read bytes until the end of the HTTP request head (`\r\n\r\n`).
 async fn read_request_head<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<String> {
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
@@ -225,8 +242,10 @@ async fn read_request_head<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<S
 }
 
 /// Write a complete HTTP/1.1 response (head + body) and flush. `encoding`, when
-/// present, is sent as `Content-Encoding` (zstd for a compressed [`Body`]).
-/// `alt_svc`, when present, advertises the HTTP/3 upgrade.
+/// present, is sent as `Content-Encoding` (zstd for a compressed [`Body`]);
+/// `etag`, likewise, as `ETag` (revalidatable replies). `alt_svc`, when
+/// present, advertises the HTTP/3 upgrade.
+#[allow(clippy::too_many_arguments)]
 async fn write_http<S: AsyncWrite + Unpin>(
     stream: &mut S,
     status: u16,
@@ -234,12 +253,14 @@ async fn write_http<S: AsyncWrite + Unpin>(
     encoding: Option<&str>,
     body: &[u8],
     cache_control: &str,
+    etag: Option<&str>,
     location: Option<&str>,
     alt_svc: Option<&str>,
 ) -> io::Result<()> {
     let status_text = match status {
         200 => "OK",
         301 => "Moved Permanently",
+        304 => "Not Modified",
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -249,6 +270,11 @@ async fn write_http<S: AsyncWrite + Unpin>(
         "HTTP/1.1 {status} {status_text}\r\nContent-Type: {mime}\r\nContent-Length: {len}\r\nConnection: close\r\nCache-Control: {cache_control}\r\nVary: Accept-Encoding\r\n",
         len = body.len(),
     );
+    if let Some(etag) = etag {
+        head.push_str("ETag: ");
+        head.push_str(etag);
+        head.push_str("\r\n");
+    }
     if let Some(enc) = encoding {
         head.push_str("Content-Encoding: ");
         head.push_str(enc);

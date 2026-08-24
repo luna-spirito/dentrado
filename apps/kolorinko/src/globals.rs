@@ -141,6 +141,7 @@ pub(crate) fn init(
             }
         }
         let space = evakuilo_space_id(site_name);
+        println!("Registering: {site_name} -> {}", space.as_str()); // tmp
         by_site.insert(site.clone(), space);
         spaces.push((
             space,

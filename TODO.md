@@ -105,3 +105,5 @@ let's talk just about ServiceWorker for now.
 * limit panics...
 * DataId → 16 bytes?
 * zstd-over-wire?
+* TODO: SW.JS CAN DEEPFRY THE ENTIRE WEBSITE! (moved /index.html -> /-/index.html, fun began)
+* https://127.0.0.1:4433/SNhwIJuhsyCE-mxtJJE6aWg/ — doesn't load

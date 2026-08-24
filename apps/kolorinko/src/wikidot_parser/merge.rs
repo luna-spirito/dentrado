@@ -1189,7 +1189,7 @@ impl<'src> Merger<'src> {
             OpenTag::Collapsible { .. } => Self::collapsible_arm,
             OpenTag::User { .. } => Self::user_arm,
             OpenTag::Footnoteblock => Self::footnoteblock_arm,
-            OpenTag::Code => Self::code_arm,
+            OpenTag::Code { .. } => Self::code_arm,
             OpenTag::Css => Self::css_arm,
             OpenTag::ListPages { .. } => Self::listpages_arm,
             OpenTag::Module { .. } => Self::module_arm,
@@ -1300,10 +1300,15 @@ impl<'src> Merger<'src> {
     fn code_arm(
         &mut self,
         opener: (usize, usize),
-        _tag: OpenTag<'src>,
+        tag: OpenTag<'src>,
     ) -> (Content, Option<Stop<'src>>) {
-        self.raw_body(opener, ClosedTag::Code, |body| {
-            Node::Code(body.trim().to_string())
+        let ty = match tag {
+            OpenTag::Code { params } => code_type(&params),
+            _ => None,
+        };
+        self.raw_body(opener, ClosedTag::Code, move |body| Node::Code {
+            ty: ty.clone(),
+            raw: body.to_string(),
         })
     }
 

@@ -25,6 +25,12 @@
 //!    not-found view),
 //! 7. asset-like paths that don't exist — 404.
 //!
+//! The slug family of 3–4 also carries Wikidot's code-block endpoint:
+//! `[cat:]slug…/code/N` serves the page's Nth `[[code]]` block in place
+//! (never redirected, and never on the canonical `L…` address — a block has
+//! no permanent URL). CSS `@import`s are rewritten to this shape at render
+//! time ([`crate::wikidot_page::resources`]).
+//!
 //! Legacy `/site/cat/page` URLs are not served on the main origin: a first
 //! segment that doesn't parse as a space id is just an unknown path (rule 6);
 //! on a custom domain that same shape is the wiki's slug family (rule 4).
@@ -44,9 +50,10 @@ use kolorinko_rt::Slug;
 /// the base-theme tree — path-versioned on the rare change → safe under
 /// `immutable`) are cached forever; HTML (the shell, SSR pages, the SPA
 /// fallback) is `no-cache` since the ServiceWorker owns client-side
-/// stale-while-revalidate; errors are `no-store`.
+/// stale-while-revalidate; code blocks track the page's latest revision, so
+/// they revalidate via their ETag; errors are `no-store`.
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
-const HTML: &str = "no-cache";
+const NOCACHE: &str = "no-cache";
 const NOSTORE: &str = "no-store";
 
 /// A resolved response: what to write, regardless of transport.
@@ -57,6 +64,10 @@ pub(crate) struct Reply {
     pub cache_control: &'static str,
     /// `Location` for redirect replies (301); absent otherwise.
     pub location: Option<String>,
+    /// Strong ETag of `served`'s decoded body; set iff the reply is
+    /// revalidatable (a code block). A matching `If-None-Match` collapses
+    /// the reply to a 304 ([`Reply::revalidated`]).
+    pub etag: Option<String>,
 }
 
 /// Resolve a GET `full` request path (query string included, if any) into a
@@ -163,6 +174,15 @@ async fn tail_route(
         }
         return ssr(accept_zstd, assets, core, host, space, local).await;
     }
+    // `…/code/N` — Wikidot's code-block endpoint rides the slug family (on
+    // either origin): the Nth `[[code]]` block served in place, never
+    // redirected. Not on the canonical `L…` address above — a block has no
+    // permanent URL of its own.
+    if let Some((slug_tail, n)) = code_tail(tail)
+        && let Some(slug) = slug_of(slug_tail, &space)
+    {
+        return code_reply(space, slug, n, accept_zstd, core).await;
+    }
     let slug = match slug_of(tail, &space) {
         Some(slug) => slug,
         None => return Reply::not_found(),
@@ -174,6 +194,57 @@ async fn tail_route(
             Reply::moved(&format_page_route(explicit.then_some(space), local, &title))
         }
         None => Reply::not_found(),
+    }
+}
+
+/// The slug-family tail of a `…/code/N` request: the segments naming the
+/// page (empty = the space's landing page, like Wikidot's site-root
+/// `/code/N`) plus the 1-indexed block number. `None` unless the tail
+/// literally ends in `/code/<u32>` — anything else flows on to the plain
+/// slug routing.
+fn code_tail<'a>(tail: &'a [&'a str]) -> Option<(&'a [&'a str], u32)> {
+    match tail {
+        [prefix @ .., "code", n] => Some((prefix, n.parse().ok()?)),
+        _ => None,
+    }
+}
+
+/// Serve one `…/code/N` request through the [`CodeBlock`] gear: the block's
+/// interior, `text/css; charset=utf-8` for a `type="css"` block and
+/// `text/plain` otherwise, under `no-cache` + the block's strong ETag (the
+/// bytes track the page's latest revision, so clients revalidate instead of
+/// caching forever). A missing page or block is a plain 404 — Wikidot's odd
+/// `200 text/plain` "No valid codeblock found." serves no client better.
+///
+/// [`CodeBlock`]: kolorinko_rt gear
+async fn code_reply(
+    space: SpaceId,
+    slug: Slug,
+    n: u32,
+    accept_zstd: bool,
+    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+) -> Reply {
+    let Some(site) = crate::globals::site_of(&space) else {
+        return Reply::not_found();
+    };
+    let block = crate::runtime::code_block(site.clone(), slug, n)
+        .subscribe(core)
+        .await
+        .current();
+    let Some(block) = &*block else {
+        return Reply::not_found();
+    };
+    Reply {
+        status: 200,
+        mime: if block.css {
+            "text/css; charset=utf-8"
+        } else {
+            "text/plain; charset=utf-8"
+        },
+        served: serve_body(&block.body, accept_zstd),
+        cache_control: NOCACHE,
+        location: None,
+        etag: Some(block.etag.clone()),
     }
 }
 
@@ -235,7 +306,7 @@ async fn ssr(
         Some(html) => Reply::ok(
             "text/html; charset=utf-8",
             serve_body(&compress(html.into_bytes()), accept_zstd),
-            HTML,
+            NOCACHE,
         ),
         None => index_fallback(assets, accept_zstd),
     }
@@ -252,7 +323,7 @@ fn segments(path: &str) -> Vec<&str> {
 /// load); `immutable` for every other static asset (CA / path-versioned).
 fn static_policy(key: &str) -> &'static str {
     match key {
-        "/-/index.html" | "/-/sw.js" => HTML,
+        "/-/index.html" | "/-/sw.js" => NOCACHE,
         _ => IMMUTABLE,
     }
 }
@@ -266,7 +337,7 @@ fn index_fallback(assets: &Arc<HashMap<String, Body>>, accept_zstd: bool) -> Rep
                 .expect("index.html always loaded"),
             accept_zstd,
         ),
-        HTML,
+        NOCACHE,
     )
 }
 
@@ -278,6 +349,7 @@ impl Reply {
             served,
             cache_control,
             location: None,
+            etag: None,
         }
     }
 
@@ -290,8 +362,9 @@ impl Reply {
                 bytes: Bytes::from_static(b"moved\n"),
                 encoding: None,
             },
-            cache_control: HTML,
+            cache_control: NOCACHE,
             location: Some(location.to_string()),
+            etag: None,
         }
     }
 
@@ -305,8 +378,43 @@ impl Reply {
             },
             cache_control: NOSTORE,
             location: None,
+            etag: None,
         }
     }
+
+    /// Collapse to a 304 when the request's `If-None-Match` matches this
+    /// reply's ETag; the caller passes the raw header value (`None`: no
+    /// header). The 304 keeps the `ETag` and `Cache-Control` headers (what a
+    /// revalidation is for) and drops the body.
+    pub(crate) fn revalidated(self, if_none_match: Option<&str>) -> Self {
+        let Some(etag) = self.etag.clone() else {
+            return self;
+        };
+        if if_none_match.is_some_and(|h| matches_etag(h, &etag)) {
+            return Self {
+                status: 304,
+                mime: "text/plain",
+                served: Served {
+                    bytes: Bytes::new(),
+                    encoding: None,
+                },
+                cache_control: self.cache_control,
+                location: None,
+                etag: Some(etag),
+            };
+        }
+        self
+    }
+}
+
+/// RFC 9110 `If-None-Match` vs a strong ETag: `*` matches anything, and a
+/// weak `W/"…"` entry compares by opaque value after stripping the prefix
+/// (a 304 answer is always a weak comparison).
+fn matches_etag(header: &str, etag: &str) -> bool {
+    header.split(',').any(|t| {
+        let t = t.trim();
+        t == "*" || t.strip_prefix("W/").unwrap_or(t) == etag
+    })
 }
 
 #[cfg(test)]
@@ -346,5 +454,21 @@ mod tests {
         assert_eq!(slug(&[""]), None);
         assert_eq!(slug(&["cat:"]), None);
         assert_eq!(slug(&[":name"]), None);
+    }
+
+    #[test]
+    fn code_tail_shapes() {
+        // The page-naming segments' count plus the parsed block number.
+        let t = |tail: &[&str]| super::code_tail(tail).map(|(p, n)| (p.len(), n));
+        assert_eq!(t(&["component:theme", "code", "1"]), Some((1, 1)));
+        assert_eq!(t(&["cat", "name", "code", "40"]), Some((2, 40)));
+        // No page segments: the landing page's block, like Wikidot's
+        // site-root `/code/N`.
+        assert_eq!(t(&["code", "1"]), Some((0, 1)));
+        // Not the endpoint shape: a flattened `x/code` slug, a non-numeric N,
+        // too few segments.
+        assert_eq!(t(&["x", "code"]), None);
+        assert_eq!(t(&["x", "code", "a"]), None);
+        assert_eq!(t(&["x"]), None);
     }
 }

@@ -118,40 +118,37 @@ impl Node {
         }
     }
 
-    /// Call `f` for every [`Content`] nested inside the node.
-    pub fn visit_node(&self, f: &mut impl FnMut(&Content)) {
+    /// The [`Content`]s nested directly inside this node, in document
+    /// order — the single source of truth for where content can live: both
+    /// [`Node::visit_node`] and borrowing tree walks (finding the Nth code
+    /// block, say) recurse through here.
+    pub fn sub_contents(&self) -> Vec<&Content> {
         match self {
-            Node::Container { content, .. } | Node::Heading { content, .. } => f(content),
-            Node::Table(rows) => rows.iter().for_each(|row| {
-                row.iter().for_each(|cell| f(&cell.content));
-            }),
-            Node::BlockTable(t) => t.rows.iter().for_each(|r| f(&r.content)),
-            Node::BlockCell(c) => f(&c.content),
-            Node::SupSubscript { sup, sub } => {
-                f(sup);
-                f(sub);
-            }
-            Node::IfExpr { then: content, .. }
-            | Node::ModuleBlock { body: content, .. }
-            | Node::Footnote(content)
-            | Node::Link { text: content, .. } => f(content),
-            Node::Collapsible { header, body } => {
-                f(header);
-                f(body);
-            }
-            Node::IfExpr { els, .. } => f(els),
-            Node::FootnoteBlock(bodies) => bodies.iter().for_each(f),
-            Node::Tabview { tabs, .. } => tabs.iter().for_each(|t| {
-                f(&t.name);
-                f(&t.content);
-            }),
-            Node::ListPages(lp) => {
-                f(&lp.prepend);
-                f(&lp.repeat);
-                f(&lp.append);
-            }
-            Node::List(list) => visit_list(list, f),
-            _ => {}
+            Node::Container { content, .. } | Node::Heading { content, .. } => vec![content],
+            Node::Table(rows) => rows
+                .iter()
+                .flat_map(|row| row.iter().map(|cell| &cell.content))
+                .collect(),
+            Node::BlockTable(t) => t.rows.iter().map(|r| &r.content).collect(),
+            Node::BlockCell(c) => vec![&c.content],
+            Node::SupSubscript { sup, sub } => vec![sup, sub],
+            Node::IfExpr { then, els, .. } => vec![then, els],
+            Node::ModuleBlock { body, .. } => vec![body],
+            Node::Footnote(content) => vec![content],
+            Node::Link { text, .. } => vec![text],
+            Node::Collapsible { header, body } => vec![header, body],
+            Node::FootnoteBlock(bodies) => bodies.iter().collect(),
+            Node::Tabview { tabs, .. } => tabs.iter().flat_map(|t| [&t.name, &t.content]).collect(),
+            Node::ListPages(lp) => vec![&lp.prepend, &lp.repeat, &lp.append],
+            Node::List(list) => list_contents(list),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Call `f` for every [`Content`] nested directly inside the node.
+    pub fn visit_node(&self, f: &mut impl FnMut(&Content)) {
+        for content in self.sub_contents() {
+            f(content);
         }
     }
 }
@@ -170,13 +167,15 @@ fn map_list(list: List, f: &mut impl FnMut(Content) -> Content) -> List {
     }
 }
 
-fn visit_list(list: &List, f: &mut impl FnMut(&Content)) {
+fn list_contents(list: &List) -> Vec<&Content> {
+    let mut out = Vec::new();
     for item in &list.items {
-        f(&item.content);
+        out.push(&item.content);
         if let Some(sub) = &item.sublist {
-            visit_list(sub, f);
+            out.extend(list_contents(sub));
         }
     }
+    out
 }
 
 #[cfg(test)]

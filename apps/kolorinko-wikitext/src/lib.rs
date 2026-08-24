@@ -396,8 +396,11 @@ pub enum Node {
     },
 
     /// `[[code]] … [[/code]]` — verbatim preformatted source (not parsed as
-    /// wikitext). Rendered as Wikidot's `<div class="code"><pre><code>…` block.
-    Code(String),
+    /// wikitext). `raw` is the exact interior as stored — byte-faithful for
+    /// Wikidot's `/code/N` endpoint, which serves it verbatim; rendering
+    /// trims it. `ty` is the opener's `type` attribute as written
+    /// (`type="css"` blocks are served as stylesheets).
+    Code { ty: Option<String>, raw: String },
 
     /// `* item` / `# item` bullet list, nestable by indentation. PureScript
     /// `Listo`.

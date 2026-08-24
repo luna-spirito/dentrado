@@ -463,7 +463,7 @@ fn external_refs_are_collected_and_content_addressed() {
     .iter()
     .map(|t| (t.to_string(), ca.clone()))
     .collect();
-    let out = super::substitute_resources(content, &site, &resolved);
+    let out = super::substitute_resources(content, &site, &resolved, &HashMap::new());
     // Image source → CA url.
     let Node::Image { source, .. } = &out[0] else {
         panic!("expected image")
@@ -569,4 +569,84 @@ fn real_repo_indexes_sharded_files_and_shell() {
         "url {url} should start with {prefix}"
     );
     assert!(url.ends_with(".css"));
+}
+
+/// Globals for host-matching tests: the dev config's two sites. `init` is
+/// first-write-wins (`OnceLock`), so a second call is a no-op — every test
+/// must tolerate this one registry.
+fn init_test_globals() {
+    let mut sites = indexmap::IndexMap::new();
+    sites.insert(
+        "obscurative".to_string(),
+        crate::globals::SiteCfg {
+            landing: "main".into(),
+            domains: vec!["www.obscurative.ru".into()],
+        },
+    );
+    sites.insert(
+        "rpcauthority".to_string(),
+        crate::globals::SiteCfg {
+            landing: kolorinko_rt::START_PAGE.into(),
+            domains: vec!["rpc-wiki.net".into()],
+        },
+    );
+    let _ = crate::globals::init("", ".", 0, &sites);
+}
+
+#[test]
+fn code_urls_rewrite_to_slug_family_routes() {
+    init_test_globals();
+    let sp = crate::globals::evakuilo_space_id("rpcauthority");
+    let f = |t: &str| super::code_url_for_tail(t);
+    // The wikidot.com form, the configured alias domain (the corpus's www
+    // variant of a bare config entry), and the wdfiles `local--code` 302
+    // target with its percent-encoded page — all one local code route.
+    assert_eq!(
+        f("rpcauthority.wikidot.com/component:research-style/code/1"),
+        Some(format!("/{sp}/component:research-style/code/1"))
+    );
+    assert_eq!(
+        f("www.rpc-wiki.net/component:research-style/code/1"),
+        Some(format!("/{sp}/component:research-style/code/1"))
+    );
+    assert_eq!(
+        f("rpc-wiki.net.wdfiles.com/local--code/component%3Aresearch-style/1"),
+        Some(format!("/{sp}/component:research-style/code/1"))
+    );
+    // A bare-name page and a block number other than 1.
+    assert_eq!(
+        f("rpc-wiki.net/foo/code/2"),
+        Some(format!("/{sp}/foo/code/2"))
+    );
+    // Unregistered site, multi-segment page, bad N, non-code shape: all stay
+    // hotlinks.
+    assert_eq!(f("rpcsandbox.wikidot.com/foo/code/1"), None);
+    assert_eq!(f("rpcauthority.wikidot.com/forum/t-123/code/1"), None);
+    assert_eq!(f("rpcauthority.wikidot.com/component:theme/code/x"), None);
+    assert_eq!(f("i.imgur.com/x.jpg"), None);
+}
+
+#[test]
+fn code_endpoint_imports_fall_back_to_local_routes() {
+    init_test_globals();
+    let sp = crate::globals::evakuilo_space_id("rpcauthority");
+    let site = SafePathComponent::new("rpcauthority".into()).unwrap();
+    let tail = "www.rpc-wiki.net/component:theme/code/1";
+    let content: Content = vec![Node::Stylesheet(
+        format!("@import url(http://{tail});").into(),
+    )];
+    let code = HashMap::from([(
+        tail.to_string(),
+        super::code_url_for_tail(tail).expect("code url"),
+    )]);
+    let out = super::substitute_resources(content, &site, &HashMap::new(), &code);
+    let Node::Stylesheet(rewritten) = &out[0] else {
+        panic!("expected stylesheet")
+    };
+    // `rewrite_with` re-emits a `url()` whose replacement contains `:` as a
+    // quoted string (valid CSS; CA URLs never carry one, code routes do).
+    assert_eq!(
+        rewritten,
+        &format!("@import url(\"/{sp}/component:theme/code/1\");")
+    );
 }
