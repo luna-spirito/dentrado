@@ -96,14 +96,14 @@ let's talk just about ServiceWorker for now.
 * Разобраться с subscribe_wire & to_wire_out наконец
 * incremental diff_changes
 * `/repo` -- страшный endpoint.
-* Механизм обхода дерева необходимо генерализовать.
 * alt≠hash
 * Assume append-only for git?
 * Timer shouldn't resend on nothing-changed?
 * Client keep-alive? No keep-alive right now, he connection probably gets dropped after idle.
 * compression over WebTransport? Well, that's problematic...
 * limit panics...
-* DataId → 16 bytes?
+* DataId → 16 bytes? Probably not.
 * zstd-over-wire?
 * TODO: SW.JS CAN DEEPFRY THE ENTIRE WEBSITE! (moved /index.html -> /-/index.html, fun began)
 * https://127.0.0.1:4433/SNhwIJuhsyCE-mxtJJE6aWg/ — doesn't load
+* URL substitutions works horribly. Maybe... sw.js substitution?

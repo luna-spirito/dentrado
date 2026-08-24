@@ -312,10 +312,12 @@ async fn ssr(
     }
 }
 
-/// Non-empty path segments, leading slash dropped (so `/a/b` and `a/b` agree;
-/// interior empties like `/a//b` are kept as-is and simply never parse).
+/// Non-empty path segments, leading slash dropped and trailing slashes
+/// trimmed (so `/a/b`, `/a/b/`, and `a/b` agree; interior empties like
+/// `/a//b` are kept as-is and simply never parse).
 fn segments(path: &str) -> Vec<&str> {
-    let s = path.strip_prefix('/').unwrap_or(path).split('/');
+    let p = path.trim_end_matches('/');
+    let s = p.strip_prefix('/').unwrap_or(p).split('/');
     Vec::from_iter(s)
 }
 
@@ -425,8 +427,11 @@ mod tests {
     #[test]
     fn segments_split() {
         assert_eq!(segments("/a/b"), ["a", "b"]);
-        assert_eq!(segments("/a/"), ["a", ""]);
+        // Trailing slashes are insignificant on content routes.
+        assert_eq!(segments("/a/"), ["a"]);
+        assert_eq!(segments("/a//"), ["a"]);
         assert_eq!(segments("/"), [""]);
+        assert_eq!(segments("//"), [""]);
         assert_eq!(segments("/a//b"), ["a", "", "b"]);
     }
 
