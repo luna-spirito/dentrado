@@ -2,21 +2,23 @@
 //! the `kolorinko render` debug CLI. Gated on `ssr` because it calls
 //! [`RenderHtml::to_html`]; the layout itself is mode-agnostic.
 
-use kolorinko_rt::{PageAddr, SafePathComponent, SiteShell, SsrState, SSR_STATE_ID};
+use kolorinko_rt::{LocalId, SSR_STATE_ID, SiteShell, SpaceId, SsrState};
 use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
 
 use crate::layout::{document_title, html_escape, layout, theme_link};
 use crate::opengraph;
 
-/// Render `state` (page + shell) for `site` through the shared [`layout`] into
-/// HTML — exactly the tree the client renders from the same state, which is
-/// what positional hydration matches against.
-fn render_app(site: &str, state: &SsrState) -> String {
-    let (site, shell, page) = (site.to_string(), state.shell.clone(), state.page.clone());
+/// Render `state` (page + shell) through the shared [`layout`] into HTML —
+/// exactly the tree the client renders from the same state, which is what
+/// positional hydration matches against.
+fn render_app(state: &SsrState) -> String {
+    let (space, shell, page) = (state.space, state.shell.clone(), state.page.clone());
+    let name = shell.title.clone().unwrap_or_else(|| space.as_str());
     let title = page.meta.title.clone();
     layout(
-        move || site.clone(),
+        move || Some(space),
+        move || name.clone(),
         move || shell.title.clone(),
         move || shell.subtitle.clone(),
         move || Some(shell.nav_top.clone()),
@@ -38,8 +40,14 @@ const APP_PLACEHOLDER: &str = r#"<div id="container"></div>"#;
 /// `<head>`. `host` — the request's `host[:port]` — absolutizes the card's
 /// URLs. `None` when the template has no placeholder (unbuilt frontend).
 pub fn render_ssr_document(index: &str, state: &SsrState, host: Option<&str>) -> Option<String> {
-    let site = state.addr.site.as_str();
-    let app = render_app(site, state);
+    // The display name falls back to the space id spelling when the export
+    // carries no site title.
+    let site = state
+        .shell
+        .title
+        .clone()
+        .unwrap_or_else(|| state.space.as_str());
+    let app = render_app(state);
     let embedded = format!(
         r#"<script type="application/json" id="{SSR_STATE_ID}">{}</script>"#,
         state.to_embedded_json()
@@ -47,9 +55,9 @@ pub fn render_ssr_document(index: &str, state: &SsrState, host: Option<&str>) ->
     let doc = replace_placeholder(index, &format!("{app}{embedded}"))?;
     let doc = set_title(
         &doc,
-        &document_title(site, &state.shell.title, &state.page.meta.title),
+        &document_title(&site, &state.shell.title, &state.page.meta.title),
     );
-    let og = opengraph::meta(site, &state.shell, &state.page, host);
+    let og = opengraph::meta(&site, &state.shell, &state.page, host);
     let theme = state
         .shell
         .theme_root
@@ -96,35 +104,27 @@ fn inject_before_head_end(doc: &str, element: &str) -> String {
 /// debug CLI's output). `base_css` — the Wikidot base theme stylesheet, read by
 /// the caller from the frontend dist — is inlined into `<head>` when given, so
 /// the output is a single self-contained file (no external
-/// `/wikidot-base-theme/…` link that only resolves when served).
+/// `/-/wikidot-base-theme/…` link that only resolves when served).
 pub fn render_page_document(
-    site: &str,
     shell: &SiteShell,
     page: &ArticleView,
     base_css: Option<&str>,
 ) -> String {
-    let body = render_app(
-        site,
-        &SsrState {
-            page: page.clone(),
-            // No content hashes: this is a static debug document, never a
-            // hydration source; an empty hash matches nothing, so a live
-            // client (if one ever loaded it) would simply get a full push.
-            page_hash: String::new(),
-            shell: shell.clone(),
-            shell_hash: String::new(),
-            addr: PageAddr {
-                site: SafePathComponent::new(site.to_string())
-                    .unwrap_or_else(|| SafePathComponent::new("_debug".to_string()).expect("safe")),
-                slug: (
-                    None,
-                    SafePathComponent::new("_debug".to_string()).expect("safe"),
-                ),
-            },
-            route: None,
-        },
-    );
+    let body = render_app(&SsrState {
+        page: page.clone(),
+        // No content hashes: this is a static debug document, never a
+        // hydration source; an empty hash matches nothing, so a live
+        // client (if one ever loaded it) would simply get a full push.
+        page_hash: String::new(),
+        shell: shell.clone(),
+        shell_hash: String::new(),
+        // Context-less debug render: no canonical address (the ids are
+        // zero placeholders, purely to satisfy the type).
+        space: SpaceId::from_bytes([0; 16]),
+        local: LocalId::new(0),
+    });
 
+    let site = "kolorinko";
     let title = html_escape(&document_title(site, &shell.title, &page.meta.title));
     let og = opengraph::meta(site, shell, page, None);
     let style = base_css

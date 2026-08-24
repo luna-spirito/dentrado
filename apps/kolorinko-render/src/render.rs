@@ -18,8 +18,8 @@ use leptos::tachys::html::element::custom;
 /// subtree, which toggle link is being produced. The header subtree is
 /// walked once per link — see [`render_collapsible`].
 #[derive(Clone, Copy)]
-pub(crate) struct RenderCtx<'a> {
-    site: &'a str,
+pub(crate) struct RenderCtx {
+    space: Option<kolorinko_rt::SpaceId>,
     link: Option<CollapsibleLinkCtx>,
 }
 
@@ -32,9 +32,9 @@ pub(crate) struct CollapsibleLinkCtx {
     open: bool,
 }
 
-impl<'a> RenderCtx<'a> {
-    fn new(site: &'a str) -> Self {
-        Self { site, link: None }
+impl RenderCtx {
+    fn new(space: Option<kolorinko_rt::SpaceId>) -> Self {
+        Self { space, link: None }
     }
 
     fn with_link(&self, link: CollapsibleLinkCtx) -> Self {
@@ -73,9 +73,10 @@ fn trim_ws(content: &Content) -> &[Node] {
 /// Render `#page-content`: top-level inline runs are grouped into `<p>`,
 /// block nodes render standalone — exactly as Wikidot's renderer does. A run of
 /// blank lines inside a text node is a paragraph break; single newlines stay
-/// inside their paragraph as soft breaks (`<br>`).
-pub fn render_block(site: &str, content: &Content) -> Vec<AnyView> {
-    render_block_content(&RenderCtx::new(site), content)
+/// inside their paragraph as soft breaks (`<br>`). `space` is the canonical
+/// space the page renders under — the prefix internal page links point at.
+pub fn render_block(space: Option<kolorinko_rt::SpaceId>, content: &Content) -> Vec<AnyView> {
+    render_block_content(&RenderCtx::new(space), content)
 }
 
 fn render_block_content(ctx: &RenderCtx, content: &Content) -> Vec<AnyView> {
@@ -803,11 +804,21 @@ fn render_link(
         // flatten with the same default / verbatim `%%name%%` fallback as any
         // other text run and use it as the href.
         LinkTarget::Unresolved(objs) => text_objs_to_string(objs),
+        // A wiki-internal reference: the canonical slug form `cat:name` (the
+        // colon can't collide with a base64url local id, so the server routes
+        // these by slug and 301s to the titled canonical address). Without a
+        // space (a context-less render) the href falls back to root-relative.
         LinkTarget::Page(p) => {
             let rest = p.path.join("/");
-            match &p.space {
-                Some(cat) => format!("/{}/{cat}/{rest}", ctx.site),
-                None => format!("/{}/{rest}", ctx.site),
+            match ctx.space {
+                Some(space) => match &p.space {
+                    Some(cat) => format!("/{space}/{cat}:{rest}"),
+                    None => format!("/{space}/{rest}"),
+                },
+                None => match &p.space {
+                    Some(cat) => format!("/{cat}/{rest}"),
+                    None => format!("/{rest}"),
+                },
             }
         }
     };

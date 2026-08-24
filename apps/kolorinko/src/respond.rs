@@ -1,37 +1,40 @@
 //! Shared GET-response resolution for the HTTP/1.1 bootstrap ([`crate::web`])
 //! and the HTTP/3 server ([`crate::server`]): one place that maps a request
 //! path to a status/mime/body. Precedence:
-//! 1. static assets (the built frontend, loaded at startup),
-//! 2. `/repo/` mirrored content-addressed assets ([`crate::repo`]),
-//! 3. the system namespace `/-…` — reserved (404 for now; future platform
-//!    APIs and static files live here),
-//! 4. canonical page routes `/SPACE/LOCAL[/slug]` — SSR'd from the resolved
-//!    page + shell; a decorative slug 301s to the canonical two-segment form,
-//!    a bare space 301s to its start page,
-//! 5. legacy `/site[/cat/page]` routes — 301 to the canonical form when the
-//!    site is registered as a space, else SSR'd in place (unregistered sites
-//!    keep working),
-//! 6. anything else non-asset — the `index.html` CSR fallback,
-//! 7. asset-like paths that don't exist — 404.
+//! 1. the system namespace `/-…` — the built frontend's static files and the
+//!    mirrored content-addressed blobs under `/-/repo/…`
+//!    ([`crate::repo`]); an unknown system path is a plain 404 (no content,
+//!    no SPA fallback — future platform endpoints live here too),
+//! 2. `/SPACE/LOCAL[/TITLE]` — the canonical page route, SSR'd from the
+//!    `article_latest(space, local)` + `shell(space)` cone,
+//! 3. `/SPACE/[cat:]slug…` and a bare `/SPACE` — a page named by its slug:
+//!    resolved and permanently redirected to the titled canonical form
+//!    `/SPACE/LOCAL/TITLE` (the title regenerated from the page's own title),
+//! 4. `/` — SSR'd in place with the first registered space's landing page,
+//! 5. anything else non-asset — the `/-/index.html` SPA shell (the client's
+//!    not-found view),
+//! 6. asset-like paths that don't exist — 404.
+//!
+//! Legacy `/site/cat/page` URLs are not served: a first segment that doesn't
+//! parse as a space id is just an unknown path (rule 5).
 
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 
 use bytes::Bytes;
-use dentrado::core::{core_ctx::Core, gear::GearResult, storage::InMemoryStorage};
+use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
 use kolorinko_rt::{
-    Body, LocalId, PageAddr, SafePathComponent, Slug, SpaceId, SYSTEM_PREFIX, parse_canonical,
-    parse_route,
+    Body, LocalId, SYSTEM_PREFIX, SafePathComponent, SpaceId, encode_path_segment, title_slug,
 };
 
 use crate::assets::{Served, compress, looks_like_asset, mime_for, serve_body};
 use crate::repo::{self, RepoResp};
-use crate::runtime::{GearOutShared, KolorinkoRT, legacy_page_id, page_addr};
-use kolorinko_rt::START_PAGE;
+use crate::runtime::{KolorinkoRT, repo_l_article_latest};
+use kolorinko_rt::Slug;
 
-/// Cache-Control policies. CA assets (trunk-hashed outputs, `/repo/` blobs,
-/// the legacy `wikidot-base-theme/**` tree — path-versioned on the rare change
-/// → safe under `immutable`) are cached forever; HTML (the shell, SSR pages,
-/// the SPA fallback) is `no-cache` since the ServiceWorker owns client-side
+/// Cache-Control policies. CA assets (trunk-hashed outputs, `/-/repo/` blobs,
+/// the base-theme tree — path-versioned on the rare change → safe under
+/// `immutable`) are cached forever; HTML (the shell, SSR pages, the SPA
+/// fallback) is `no-cache` since the ServiceWorker owns client-side
 /// stale-while-revalidate; errors are `no-store`.
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const HTML: &str = "no-cache";
@@ -58,25 +61,28 @@ pub(crate) async fn resolve(
     host: Option<&str>,
 ) -> Reply {
     let path = full.split('?').next().unwrap_or(full);
-    let key: &str = if path == "/" { "/index.html" } else { path };
-    match assets.get(key) {
-        Some(b) => Reply::ok(
-            mime_for(key),
-            serve_body(b, accept_zstd),
-            static_policy(key),
-        ),
-        None => match repo::serve(full, core).await {
-            Some(RepoResp::Ok { mime, body }) => {
-                Reply::ok(mime, serve_body(&body, accept_zstd), IMMUTABLE)
-            }
-            None if !looks_like_asset(key) => route(path, accept_zstd, assets, core, host).await,
-            None => Reply::not_found(),
-        },
+    // The system namespace: static files first (a plain map hit), then the
+    // mirrored CA blobs, then 404 — never content routing, never the SPA
+    // fallback. Content ids start with 'S'/'L', never '-', so the whole
+    // `/-…` prefix is safely reserved.
+    if path.starts_with(SYSTEM_PREFIX) {
+        if let Some(b) = assets.get(path) {
+            return Reply::ok(
+                mime_for(path),
+                serve_body(b, accept_zstd),
+                static_policy(path),
+            );
+        }
+        if let Some(RepoResp::Ok { mime, body }) = repo::serve(full, core).await {
+            return Reply::ok(mime, serve_body(&body, accept_zstd), IMMUTABLE);
+        }
+        return Reply::not_found();
     }
+    route(path, accept_zstd, assets, core, host).await
 }
 
-/// Content routing after assets and `/repo/`: system namespace, canonical
-/// spaces, legacy site paths, then the CSR fallback.
+/// Content routing: canonical spaces, slug redirects, then the SSR/SPA
+/// fallbacks.
 async fn route(
     path: &str,
     accept_zstd: bool,
@@ -84,33 +90,37 @@ async fn route(
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     host: Option<&str>,
 ) -> Reply {
-    // The system namespace (`/-/api`, `/-/static`, …) is reserved: never a
-    // content id, never the SPA fallback. Nothing is served under it yet.
-    if path.starts_with(SYSTEM_PREFIX) {
-        return Reply::not_found();
-    }
-
     let segs = segments(path);
-    // Canonical: the first segment parses as a space id (exactly 22 base64url
-    // chars — syntactically distinct from any legacy site name).
+    // `/SPACE/…` — the first segment parses as a space id (the marker char
+    // makes this purely syntactic: no slug can imitate it — slugs are
+    // lowercase, ids start with 'S').
     if let Some(space) = segs.first().and_then(|s| SpaceId::parse(s)) {
-        return canonical(&segs, space, accept_zstd, assets, core, host).await;
+        return space_route(&segs, space, accept_zstd, assets, core, host).await;
     }
-
-    // Legacy `/site[/cat/page]`.
-    if let Some((site, slug)) = parse_route(path) {
-        // Registered site → its pages have canonical addresses; redirect.
-        if let Some(target) = legacy_target(core, &site, &slug).await {
-            return Reply::moved(&target);
-        }
-        return ssr(accept_zstd, assets, core, host, site, slug, None).await;
+    // `/` — the first registered space's landing page, SSR'd in place.
+    if segs.as_slice() == [""] {
+        return match crate::globals::first_space() {
+            Some((space, reg)) => {
+                let slug = (None, reg.landing.clone());
+                match page_local(core, &space, &slug).await {
+                    Some((local, _title)) => {
+                        ssr(accept_zstd, assets, core, host, space, local).await
+                    }
+                    None => index_fallback(assets, accept_zstd),
+                }
+            }
+            None => index_fallback(assets, accept_zstd),
+        };
     }
-
-    index_fallback(assets, accept_zstd)
+    // Anything else: the SPA shell for routes, a 404 for asset-like paths.
+    if !looks_like_asset(path) {
+        return index_fallback(assets, accept_zstd);
+    }
+    Reply::not_found()
 }
 
-/// `/SPACE/LOCAL[/slug…]` — the canonical page route family.
-async fn canonical(
+/// `/SPACE/…`: the canonical page family and the slug redirects.
+async fn space_route(
     segs: &[&str],
     space: SpaceId,
     accept_zstd: bool,
@@ -118,100 +128,87 @@ async fn canonical(
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     host: Option<&str>,
 ) -> Reply {
-    // A decorative slug (or anything beyond the local id) is not canonical:
-    // 301 to the two-segment form. The slug is never inspected — it exists
-    // only so human-readable links work.
-    if segs.len() >= 3 {
-        let Some(local) = segs.get(1).and_then(|s| LocalId::parse(s)) else {
+    // `/SPACE/LOCAL[/TITLE]` — canonical (the title is decorative, never
+    // inspected).
+    if let Some(local) = segs.get(1).and_then(|s| LocalId::parse(s)) {
+        if segs.len() > 3 {
             return Reply::not_found();
-        };
-        return Reply::moved(&format!("/{space}/{local}"));
-    }
-    match parse_canonical(&format!("/{space}/{}", segs.get(1).copied().unwrap_or_default())) {
-        Some((space, local)) => match resolve_page_addr(core, space, local).await {
-            Some(addr) => {
-                let route = Some((space, local));
-                ssr(
-                    accept_zstd,
-                    assets,
-                    core,
-                    host,
-                    addr.site.clone(),
-                    addr.slug.clone(),
-                    route,
-                )
-                .await
-            }
-            // A well-formed canonical route for an unknown space/page is a
-            // plain 404 — it looked like a page, not a SPA route.
-            None => Reply::not_found(),
-        },
-        // Bare `/SPACE` (or a malformed local segment): redirect to the
-        // space's start page when one exists.
-        None => {
-            let Some(site) = crate::globals::site_of(&space) else {
-                return Reply::not_found();
-            };
-            let start = (
-                None,
-                SafePathComponent::new(START_PAGE.to_string()).expect("start is a safe name"),
-            );
-            match legacy_target(core, site, &start).await {
-                Some(target) => Reply::moved(&target),
-                None => Reply::not_found(),
-            }
         }
+        return ssr(accept_zstd, assets, core, host, space, local).await;
+    }
+    // `/SPACE/[cat:]slug…` or a bare `/SPACE`: resolve the named page — the
+    // bare form means the space's landing page — and redirect to its titled
+    // canonical URL.
+    let slug = match slug_segments(segs, &space) {
+        Some(slug) => slug,
+        None => return Reply::not_found(),
+    };
+    match page_local(core, &space, &slug).await {
+        // The title segment is regenerated from the page's own title, so a
+        // rename never leaves a stale pretty URL behind.
+        Some((local, title)) => Reply::moved(&format!(
+            "/{space}/{local}/{}",
+            encode_path_segment(&title_slug(&title))
+        )),
+        None => Reply::not_found(),
     }
 }
 
-/// Resolve `(space, local)` through the [`PageAddr`](crate::runtime::page_addr)
-/// gear: the dataset site + current slug serving that canonical address.
-async fn resolve_page_addr(
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
-    space: SpaceId,
-    local: LocalId,
-) -> Option<PageAddr> {
-    let q = page_addr(space, local);
-    let GearResult::Shared(s) = core.read_gear(q.id).await else {
-        return None;
-    };
-    match &*s {
-        GearOutShared::PageAddrOut(addr) => addr.clone(),
+/// The `(category, name)` slug named by the segments after the space id:
+/// `cat:name`, `name`, or the old flattened `cat/name`; a bare `/SPACE` names
+/// the landing page.
+fn slug_segments(segs: &[&str], space: &SpaceId) -> Option<Slug> {
+    let spc = |s: &str| SafePathComponent::new(s.to_string());
+    match segs.len() {
+        1 => {
+            let reg = crate::globals::reg_of(space)?;
+            Some((None, reg.landing.clone()))
+        }
+        2 => match segs[1].split_once(':') {
+            Some((cat, name)) => Some((Some(spc(cat)?), spc(name)?)),
+            None => Some((None, spc(segs[1])?)),
+        },
+        3 => Some((Some(spc(segs[1])?), spc(segs[2])?)),
         _ => None,
     }
 }
 
-/// The canonical target for a legacy address: `/{space}/{local}` when the site
-/// is registered and the page exists, else `None`.
-async fn legacy_target(
+/// Resolve a slug within a registered space to its canonical address plus the
+/// page's title (for the redirect's title segment). `None` when the space is
+/// unregistered or the site has no such page.
+async fn page_local(
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
-    site: &SafePathComponent,
+    space: &SpaceId,
     slug: &Slug,
-) -> Option<String> {
-    let space = crate::globals::space_of(site)?;
-    let q = legacy_page_id(site.clone(), slug.clone());
-    let GearResult::Shared(s) = core.read_gear(q.id).await else {
-        return None;
-    };
-    let GearOutShared::LegacyPageIdOut(Some(local)) = &*s else {
-        return None;
-    };
-    Some(format!("/{space}/{local}"))
+) -> Option<(LocalId, String)> {
+    let site = crate::globals::site_of(space)?.clone();
+    let latest = repo_l_article_latest(site, slug.clone())
+        .subscribe(core)
+        .await
+        .current();
+    // A missing page projects to the empty `ArticleLatest` — an empty
+    // `page_id` never parses, so it fails right here.
+    let local = LocalId::from_page_id(&latest.meta.page_id)?;
+    Some((local, latest.meta.title.clone()))
 }
 
-/// SSR the page at `(site, slug)`. `route` is the canonical address the URL
-/// was served under (embedded into the SSR state so the client hydrates with
-/// its subscription keys, no resolution round-trip).
+/// SSR the page at a canonical address. The 404 check is part of the deal: an
+/// address that parses canonically but names nothing (unknown space, or a
+/// local id the site has no page for) looked like a page, not a SPA route —
+/// it answers as one.
 async fn ssr(
     accept_zstd: bool,
     assets: &Arc<HashMap<String, Body>>,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     host: Option<&str>,
-    site: SafePathComponent,
-    slug: Slug,
-    route: Option<(SpaceId, LocalId)>,
+    space: SpaceId,
+    local: LocalId,
 ) -> Reply {
-    match crate::ssr::document(assets, core, site, slug, route, host).await {
+    let state = crate::ssr::state(core, space, local).await;
+    if state.page.meta.page_id.is_empty() {
+        return Reply::not_found();
+    }
+    match crate::ssr::document(assets, core, space, local, host).await {
         Some(html) => Reply::ok(
             "text/html; charset=utf-8",
             serve_body(&compress(html.into_bytes()), accept_zstd),
@@ -224,16 +221,15 @@ async fn ssr(
 /// Non-empty path segments, leading slash dropped (so `/a/b` and `a/b` agree;
 /// interior empties like `/a//b` are kept as-is and simply never parse).
 fn segments(path: &str) -> Vec<&str> {
-    let mut s = path.strip_prefix('/').unwrap_or(path).split('/');
-    
-    Vec::from_iter(s.by_ref())
+    let s = path.strip_prefix('/').unwrap_or(path).split('/');
+    Vec::from_iter(s)
 }
 
 /// `no-cache` for the HTML shell and the SW script (both revalidated every
 /// load); `immutable` for every other static asset (CA / path-versioned).
 fn static_policy(key: &str) -> &'static str {
     match key {
-        "/index.html" | "/sw.js" => HTML,
+        "/-/index.html" | "/-/sw.js" => HTML,
         _ => IMMUTABLE,
     }
 }
@@ -242,7 +238,9 @@ fn index_fallback(assets: &Arc<HashMap<String, Body>>, accept_zstd: bool) -> Rep
     Reply::ok(
         "text/html; charset=utf-8",
         serve_body(
-            assets.get("/index.html").expect("index.html always loaded"),
+            assets
+                .get("/-/index.html")
+                .expect("index.html always loaded"),
             accept_zstd,
         ),
         HTML,

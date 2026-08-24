@@ -40,11 +40,14 @@ pub mod wikidot_parser;
 struct Config {
     repo: RepoCfg,
     server: ServerCfg,
-    /// Registered content spaces: `[[space]]` tables mapping a canonical
-    /// space id to the export site that serves it. Sites without an entry
-    /// keep their legacy `/site/…` paths and gain no canonical URLs.
-    #[serde(default)]
-    space: Vec<SpaceCfg>,
+    /// Wikidot-export sites to register as content spaces. Each entry is
+    /// `"<site>"` (landing page defaults to `start`) or `"<site>:<landing>"`;
+    /// the canonical space id is derived as
+    /// `SHA-256("wikidot-evakuilo/v1/<site>")[0..16]` — see
+    /// [`globals::evakuilo_space_id`]. The first entry's landing page is what
+    /// the bare `/` serves.
+    #[serde(rename = "ensure-evakuilo-sites", default)]
+    ensure_evakuilo_sites: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,14 +56,6 @@ struct RepoCfg {
     dir: String,
     /// Seconds between forced `git pull`s.
     interval: u32,
-}
-
-#[derive(Debug, Deserialize)]
-struct SpaceCfg {
-    /// 22-char canonical base64url (16 bytes) — see [`kolorinko_rt::SpaceId`].
-    id: String,
-    /// The export dataset site serving this space (e.g. `rpcauthority`).
-    site: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,20 +124,23 @@ fn load_config(config_path: &Path) -> anyhow::Result<Config> {
         .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", config_path.display()))
 }
 
-/// `kolorinko <config.toml>` — run the H3 + WebTransport server.
-fn run_server(config: Config) -> anyhow::Result<()> {
-    let cores = core_count();
-
+/// Initialize the process-global config from the parsed file — the single
+/// entry point shared by the server ([`run_server`]) and the render CLI
+/// ([`render_cli`]), so both derive the same space registry.
+fn init_globals(config: &Config) -> anyhow::Result<()> {
     globals::init(
         &config.repo.url,
         &config.repo.dir,
         config.repo.interval,
-        &config
-            .space
-            .iter()
-            .map(|s| (s.id.clone(), s.site.clone()))
-            .collect::<Vec<_>>(),
-    )?;
+        &config.ensure_evakuilo_sites,
+    )
+}
+
+/// `kolorinko <config.toml>` — run the H3 + WebTransport server.
+fn run_server(config: Config) -> anyhow::Result<()> {
+    let cores = core_count();
+
+    init_globals(&config)?;
     let bind = config.server.bind.clone();
     let inject_wt_hash = config.server.inject_wt_hash;
     tls::set_cert_paths(

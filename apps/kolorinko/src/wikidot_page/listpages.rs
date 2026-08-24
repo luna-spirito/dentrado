@@ -36,10 +36,9 @@ pub(super) async fn resolve_listpages<S: Storage<KolorinkoRT>>(
     }
     let mut results: HashMap<ListPagesQuery, ListPagesResult> = HashMap::new();
     for query in &queries {
-        let result =
-            crate::runtime::repo_l_list_pages(state.site.clone(), query.clone())
-                .secondary_get(ctx)
-                .await;
+        let result = crate::runtime::repo_l_list_pages(state.site.clone(), query.clone())
+            .secondary_get(ctx)
+            .await;
         results.insert(query.clone(), (*result).clone());
     }
     // A template referencing `%%content%%` embeds each listed page's rendered
@@ -73,10 +72,9 @@ async fn resolve_content_bodies<S: Storage<KolorinkoRT>>(
         if state.bodies.contains_key(&page.fullname()) || !state.resolved.insert(key.clone()) {
             continue;
         }
-        let parsed =
-            crate::runtime::article_latest_parsed(state.site.clone(), slug.clone())
-                .secondary_get(ctx)
-                .await;
+        let parsed = crate::runtime::article_latest_parsed(state.site.clone(), slug.clone())
+            .secondary_get(ctx)
+            .await;
         let host = HostCtx {
             fullname: page.fullname(),
             category: page.category.clone(),
@@ -339,6 +337,7 @@ fn listed_page(
     ListedPage {
         name: (**name).clone(),
         category: cat.as_ref().map(|c| (**c).clone()),
+        page_id: a.meta.page_id.clone(),
         title: a.meta.title.clone(),
         tags: a.meta.tags.clone(),
         created_by: created.map_or_else(String::new, |r| r.author.clone()),

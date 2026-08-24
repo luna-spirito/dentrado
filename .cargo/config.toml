@@ -1,0 +1,8 @@
+# Cargo config for tooling that invokes cargo from the workspace root (e.g.
+# `cargo check --manifest-path apps/kolorinko-web/Cargo.toml`): cargo discovers
+# `.cargo/config.toml` from the *cwd*, not the manifest, so the wasm-only
+# `web_sys_unstable_apis` cfg lives here too — mirrored in
+# `apps/kolorinko-web/.cargo/config.toml` for builds run from inside the crate.
+# Target-scoped, so it is a no-op for the workspace's native builds.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]

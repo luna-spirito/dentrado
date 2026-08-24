@@ -11,6 +11,12 @@ use kolorinko::wikidot_parser;
 use kolorinko_render::render_block;
 use leptos::prelude::*;
 
+/// A fixed space for link-href assertions: byte 0x2a everywhere (the marker
+/// bit is forced by `from_bytes`), rendered via `Display` into expected hrefs.
+fn test_space() -> Option<kolorinko_rt::SpaceId> {
+    Some(kolorinko_rt::SpaceId::from_bytes([0x2a; 16]))
+}
+
 #[test]
 fn grid_table_rows_are_wrapped_in_tbody() {
     let src = concat!(
@@ -20,7 +26,7 @@ fn grid_table_rows_are_wrapped_in_tbody() {
         "[[/row]]\n",
         "[[/table]]",
     );
-    let html = render_block("rpcauthority", &wikidot_parser::parse(src))
+    let html = render_block(test_space(), &wikidot_parser::parse(src))
         .into_iter()
         .map(|v| v.to_html())
         .collect::<String>()

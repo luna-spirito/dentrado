@@ -1,0 +1,7 @@
+# web-sys gates its WebTransport bindings behind this cfg (the crate features
+# alone don't unlock them); every wasm build of this crate needs it. The
+# workspace root `.cargo/config.toml` carries the same flag for tooling that
+# invokes cargo from the root — cargo discovers config from the *cwd*, not the
+# manifest, so both copies are needed.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]

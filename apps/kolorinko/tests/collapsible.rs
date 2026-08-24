@@ -10,8 +10,14 @@ use kolorinko_render::render_block;
 use kolorinko_wikitext::{ContainerKind, Node, TextObj};
 use leptos::prelude::*;
 
+/// A fixed space for link-href assertions: byte 0x2a everywhere (the marker
+/// bit is forced by `from_bytes`), rendered via `Display` into expected hrefs.
+fn test_space() -> Option<kolorinko_rt::SpaceId> {
+    Some(kolorinko_rt::SpaceId::from_bytes([0x2a; 16]))
+}
+
 fn html(src: &str) -> String {
-    let views = render_block("rpcauthority", &wikidot_parser::parse(src));
+    let views = render_block(test_space(), &wikidot_parser::parse(src));
     view! { <div>{views}</div> }.to_html().replace("<!>", "")
 }
 

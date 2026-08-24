@@ -6,13 +6,19 @@ use kolorinko::wikidot_parser;
 use kolorinko_render::render_block;
 use leptos::prelude::*;
 
+/// A fixed space for link-href assertions: byte 0x2a everywhere (the marker
+/// bit is forced by `from_bytes`), rendered via `Display` into expected hrefs.
+fn test_space() -> Option<kolorinko_rt::SpaceId> {
+    Some(kolorinko_rt::SpaceId::from_bytes([0x2a; 16]))
+}
+
 /// Marker sentinels used to slice the SSR output back out of its wrapper.
 const OPEN: &str = "@@__KOLORINKO_OPEN__@@";
 const CLOSE: &str = "@@__KOLORINKO_CLOSE__@@";
 
 /// Parse `src` and render `#page-content` (top-level block flow) to HTML.
 fn render_block_html(src: &str) -> String {
-    let views = render_block("test", &wikidot_parser::parse(src));
+    let views = render_block(test_space(), &wikidot_parser::parse(src));
     let html = view! { <div>{OPEN}{views}{CLOSE}</div> }.to_html();
     let i = html.find(OPEN).unwrap() + OPEN.len();
     let j = html.find(CLOSE).unwrap();

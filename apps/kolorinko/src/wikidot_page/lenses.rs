@@ -61,35 +61,57 @@ pub(crate) fn repo_l_list_pages(
     }
 }
 
-/// The site's whole chrome in one shot: the fully include-resolved `nav:top`
-/// and `nav:side` pages plus the theme-root URLs. Each nav page is declared as
-/// an [`article_latest`](crate::runtime::article_latest)
+/// The space's whole chrome in one shot: the fully include-resolved `nav:top`
+/// and `nav:side` pages plus the theme-root URLs. Keyed on the canonical
+/// `space` (the URL/subscription identity); the dataset site is resolved
+/// through the global registry, and each nav page is fetched by its
+/// `local` id (resolved from the followed [`RepoData`]) via an
+/// [`article_latest`](crate::runtime::article_latest)
 /// [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get) dependency
 /// (so an edit to either re-runs this gear); the theme roots are projected
-/// straight out of the followed [`RepoData`]. Keyed on `site` alone, so the
-/// client fetches the entire site frame under one subscription that survives
-/// page navigation within the site.
+/// straight out of the followed snapshot. The client fetches the entire site
+/// frame under one subscription that survives page navigation within the
+/// space.
 pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
     data: &RepoData,
-    site: SafePathComponent,
+    space: SpaceId,
     ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> SiteShell {
-    let nav_top = crate::runtime::article_latest(site.clone(), nav_slug("top"))
-        .secondary_get(ctx)
-        .await;
-    let nav_side =
-        crate::runtime::article_latest(site.clone(), nav_slug("side"))
-            .secondary_get(ctx)
-            .await;
+    let Some(site) = crate::globals::site_of(&space) else {
+        return SiteShell::default();
+    };
+    let nav = |name: &'static str| {
+        let slug = nav_slug(name);
+        data.article(site, &slug)
+            .and_then(|a| LocalId::from_page_id(&a.meta.page_id))
+    };
+    let nav_top = match nav("top") {
+        Some(local) => {
+            let view = crate::runtime::article_latest(space, local)
+                .secondary_get(ctx)
+                .await;
+            (*view).clone()
+        }
+        None => ArticleView::default(),
+    };
+    let nav_side = match nav("side") {
+        Some(local) => {
+            let view = crate::runtime::article_latest(space, local)
+                .secondary_get(ctx)
+                .await;
+            (*view).clone()
+        }
+        None => ArticleView::default(),
+    };
     let (title, subtitle, theme_root) = data
         .sites
-        .get(&site)
+        .get(site)
         .map(|w| {
             let theme_root = w
                 .theme_root
                 .as_ref()
                 .and_then(|p| w.files.get(p))
-                .map(|ca| ca_url(&site, ca));
+                .map(|ca| ca_url(site, ca));
             (w.title.clone(), w.subtitle.clone(), theme_root)
         })
         .unwrap_or_default();
@@ -97,8 +119,8 @@ pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
         title,
         subtitle,
         theme_root,
-        nav_top: (*nav_top).clone(),
-        nav_side: (*nav_side).clone(),
+        nav_top,
+        nav_side,
     }
 }
 

@@ -21,7 +21,7 @@ mod wt;
 
 use kolorinko_render::{THEME_LINK_ID, document_title, layout};
 use kolorinko_rt::wire;
-use kolorinko_rt::{PageAddr, SSR_STATE_ID, SiteShell, SsrState};
+use kolorinko_rt::{SSR_STATE_ID, SiteShell, SsrState, encode_path_segment, title_slug};
 use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
 use std::{cell::Cell, rc::Rc};
@@ -36,41 +36,23 @@ fn app(initial: Option<SsrState>) -> AnyView {
 
     let space = router.space;
     let local = router.local;
-    let site = router.site;
-    let slug = router.slug;
     let client = Rc::new(wt::connect());
     let page_hash = initial.as_ref().map(|s| s.page_hash.clone());
     let shell_hash = initial.as_ref().map(|s| s.shell_hash.clone());
     let (page, set_page) = signal(initial.as_ref().map(|s| s.page.clone()));
     let (shell, set_shell) = signal(initial.map(|s| s.shell));
 
-    // Canonical-route resolution: `space`/`local` → the serving `site`/`slug`
-    // (a pure registry lookup server-side). Feeds the router's address
-    // signals, which the page/shell queries below key on. A hydration boot
-    // skips the round-trip: the SSR state already seeded the address (and the
-    // equality-dedup in `set_resolved` keeps the seed from re-notifying).
-    follow_opt(
-        &client,
-        None,
-        move || space.get().zip(local.get()).map(|(s, l)| wire::page_addr(s, l)),
-        move |addr: Option<PageAddr>| {
-            if let Some(PageAddr { site, slug }) = addr {
-                router.set_resolved(site, slug);
-            }
-            // `None` (unknown space/page) leaves the address unset — the
-            // page stays empty, the URL's canonical form still shown.
-        },
-        || {},
-    );
-
+    // The page and its shell are addressed by the canonical route itself —
+    // the same identity the URL names — so no resolution round-trip exists:
+    // the queries key straight on `space`/`local`.
     follow_opt(
         &client,
         page_hash,
         move || {
-            let site = site.get();
-            let slug = slug.get();
-            (site.is_some() && slug.is_some())
-                .then(|| wire::article_latest(site.unwrap(), slug.unwrap()))
+            space
+                .get()
+                .zip(local.get())
+                .map(|(s, l)| wire::article_latest(s, l))
         },
         move |v: ArticleView| set_page.set(Some(v)),
         move || set_page.set(None),
@@ -79,14 +61,21 @@ fn app(initial: Option<SsrState>) -> AnyView {
     follow_opt(
         &client,
         shell_hash,
-        move || site.get().map(wire::shell),
+        move || space.get().map(wire::shell),
         move |v: SiteShell| set_shell.set(Some(v)),
         move || set_shell.set(None),
     );
 
     // Field-level getters: each reactive node clones only the field it
-    // renders, never the whole shell/page (see `layout`'s signature).
-    let site_name = move || site.get().map(|s| (*s).clone()).unwrap_or_default();
+    // renders, never the whole shell/page (see `layout`'s signature). The
+    // display name falls back to the space id spelling until the shell
+    // arrives with the site title.
+    let space_str = move || space.get().map(|s| s.to_string()).unwrap_or_default();
+    let site_name = move || {
+        shell
+            .with(|s| s.as_ref().and_then(|x| x.title.clone()))
+            .unwrap_or_else(space_str)
+    };
     let shell_title = move || shell.with(|s| s.as_ref().and_then(|x| x.title.clone()));
     let shell_subtitle = move || shell.with(|s| s.as_ref().and_then(|x| x.subtitle.clone()));
     let nav_top = move || shell.with(|s| s.as_ref().map(|x| x.nav_top.clone()));
@@ -99,10 +88,31 @@ fn app(initial: Option<SsrState>) -> AnyView {
         let Some(doc) = (|| web_sys::window()?.document())() else {
             return;
         };
-        if let Some(title) = page_title()
-            && let Some(site) = site.get()
-        {
-            doc.set_title(&document_title(&site, &shell_title(), &title));
+        if let Some(title) = page_title() {
+            doc.set_title(&document_title(&site_name(), &shell_title(), &title));
+        }
+    });
+
+    // Show the pretty titled form (`/SPACE/LOCAL/TITLE`) in the address bar
+    // once the page's title is known — the same segment the server's slug
+    // redirects land on, re-derived here from the article itself (renames
+    // propagate on the next render).
+    Effect::new(move |_| {
+        let Some((space, local)) = space.get().zip(local.get()) else {
+            return;
+        };
+        let Some(title) = page_title().filter(|t| !t.is_empty()) else {
+            return;
+        };
+        let titled = format!(
+            "/{space}/{local}/{}",
+            encode_path_segment(&title_slug(&title))
+        );
+        let path = window_path();
+        if parse_titled(&path) == Some((space, local)) && path != titled {
+            if let Ok(h) = web_sys::window().expect("no window").history() {
+                let _ = h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&titled));
+            }
         }
     });
 
@@ -139,6 +149,7 @@ fn app(initial: Option<SsrState>) -> AnyView {
     });
 
     layout(
+        move || space.get(),
         site_name,
         shell_title,
         shell_subtitle,
@@ -147,6 +158,22 @@ fn app(initial: Option<SsrState>) -> AnyView {
         page_title,
         page_body,
     )
+}
+
+/// The current pathname (best-effort; `""` outside a window).
+fn window_path() -> String {
+    web_sys::window()
+        .and_then(|w| w.location().pathname().ok())
+        .unwrap_or_default()
+}
+
+/// Parse a path that may carry a decorative title segment (the address-bar
+/// form) — the permissive sibling of [`kolorinko_rt::parse_page_route`].
+fn parse_titled(path: &str) -> Option<(kolorinko_rt::SpaceId, kolorinko_rt::LocalId)> {
+    let mut segs = path.trim_start_matches('/').split('/');
+    let space = kolorinko_rt::SpaceId::parse(segs.next()?)?;
+    let local = kolorinko_rt::LocalId::parse(segs.next()?)?;
+    Some((space, local))
 }
 
 /// One subscription to a gear, keyed on `make_query`, feeding `set`.
@@ -223,7 +250,7 @@ fn register_service_worker() {
         return;
     }
     let container: web_sys::ServiceWorkerContainer = sw.into();
-    let promise = container.register("/sw.js");
+    let promise = container.register("/-/sw.js");
     wasm_bindgen_futures::spawn_local(async move {
         if let Err(e) = wasm_bindgen_futures::JsFuture::from(promise).await {
             leptos::logging::warn!("sw register: {e:?}");

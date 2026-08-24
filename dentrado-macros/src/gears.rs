@@ -1025,10 +1025,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
                             _ => ::core::unreachable!(#msg),
                         }
                     }
-                    ::dentrado::core::gear::GearQuery {
-                        id: #id_construct,
-                        getter: #getter,
-                    }
+                    ::dentrado::core::gear::GearQuery::new(#id_construct, #getter)
                 }
             }
         } else {
@@ -1045,10 +1042,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
                             _ => ::core::unreachable!(#msg),
                         }
                     }
-                    ::dentrado::core::gear::GearQuery {
-                        id: #id_construct,
-                        getter: #getter,
-                    }
+                    ::dentrado::core::gear::GearQuery::new(#id_construct, #getter)
                 }
             }
         }
@@ -1253,7 +1247,7 @@ fn expand_schema(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStr
                         _ => ::core::unreachable!(#msg),
                     }
                 }
-                GearQuery { id: #id_construct, getter: #getter }
+                GearQuery::new(#id_construct, #getter)
             }
         }
     });
@@ -1272,8 +1266,26 @@ fn expand_schema(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStr
 
         #[derive(Clone)]
         pub struct GearQuery<Out> {
-            pub id: GearId,
-            pub getter: fn(GearOut) -> Out,
+            id: GearId,
+            getter: fn(GearOut) -> Out,
+        }
+
+        impl<Out> GearQuery<Out> {
+            /// The queried gear's id (e.g. for a subscription registry keyed
+            /// by gear).
+            pub fn id(&self) -> &GearId {
+                &self.id
+            }
+
+            /// Extract `Out` out of a raw `GearOut` — the per-variant
+            /// projection this query was built to read.
+            pub fn extract(&self, out: GearOut) -> Out {
+                (self.getter)(out)
+            }
+
+            fn new(id: GearId, getter: fn(GearOut) -> Out) -> Self {
+                Self { id, getter }
+            }
         }
 
         #( #builders )*

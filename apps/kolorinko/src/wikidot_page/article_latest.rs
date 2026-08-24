@@ -46,34 +46,46 @@ pub(crate) async fn article_latest_parsed<S: Storage<KolorinkoRT>>(
 }
 
 // =========================================================================
-// `article_latest` gear — the resolution pipeline
+// `article_latest` gear — the canonical-address resolution pipeline
 // =========================================================================
 
-/// No carry-over state: the result is fully re-derived each run from the parse
-/// gears it depends on (which the framework re-runs on any change).
+/// No carry-over state: the result is fully re-derived each run from the
+/// follow target and the parse gears it depends on (which the framework
+/// re-runs on any change).
 #[derive(Default, Clone, Debug)]
 pub(crate) struct LatestCache;
 
 /// Render a page's final [`ArticleView`] by running [`resolve_full`] — the
 /// `[[include]]` / `[[module ListPages]]` / `[[iftags]]` / resource resolution
-/// pipeline. Declaring each fetched page and ListPages selection as a
-/// [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get) dependency
-/// makes the whole result reactive — an edit anywhere in the include or
+/// pipeline. The gear is keyed by the canonical address `(space, local)` —
+/// exactly what the URL and the client subscription name — and follows the
+/// `repo` oracle so the id→slug bridge ([`super::page_slug`], rename-stable)
+/// re-runs whenever the export tip moves. The page's own parse comes from an
+/// [`article_latest_parsed`] [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get)
+/// dependency; declaring each fetched page and ListPages selection the same
+/// way makes the whole result reactive — an edit anywhere in the include or
 /// transclusion cone re-runs this gear. The tree of every page fetched along
-/// the way rides along as the view's `deps`.
+/// the way rides along as the view's `deps`. An unregistered space or unknown
+/// local id yields an empty view (the HTTP layer turns that into a 404).
 pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
-    site: SafePathComponent,
-    slug: Slug,
-    parsed: &ArticleView,
+    space: SpaceId,
+    local: LocalId,
+    data: &RepoData,
     ctx: &mut GearCtx<KolorinkoRT, S>,
     _cache: &mut LatestCache,
 ) -> ArticleView {
+    let Some((site, slug)) = super::page_slug(data, space, local) else {
+        return ArticleView::default();
+    };
+    let parsed = crate::runtime::article_latest_parsed(site.clone(), slug.clone())
+        .secondary_get(ctx)
+        .await;
     let ArticleView {
         meta: page_meta,
         revisions,
         content,
         ..
-    } = parsed.clone();
+    } = (*parsed).clone();
     let host = HostCtx {
         fullname: page_meta.slug.clone(),
         category: slug.0.as_ref().map(|c| (**c).clone()),
@@ -172,8 +184,8 @@ pub(super) async fn resolve_include<S: Storage<KolorinkoRT>>(
                 continue;
             }
             let parsed = crate::runtime::article_latest_parsed(inc_site.clone(), inc_slug.clone())
-            .secondary_get(ctx)
-            .await;
+                .secondary_get(ctx)
+                .await;
             edges.push((includer.clone(), key.clone()));
             state.raws.insert(key.clone(), parsed.content.clone());
             queue.push_back((key, parsed.content.clone()));

@@ -72,7 +72,7 @@ use git2::{ObjectType, Oid, Repository, Tree, TreeWalkMode};
 use imbl::HashMap as ImHashMap;
 use kolorinko_render::{http_refs, http_tail, rewrite_with};
 use kolorinko_rt::{
-    Body, CaRef, ListPagesQuery, ListPagesResult, ListedPage, LocalId, PageAddr, RepoAssetPath,
+    Body, CaRef, ListPagesQuery, ListPagesResult, ListedPage, LocalId, RepoAssetPath,
     SafePathComponent, SiteShell, SpaceId,
 };
 use kolorinko_wikitext::{
@@ -96,7 +96,6 @@ use crate::runtime::{GearOutShared, KolorinkoRT};
 // `pub(super)`; the private globs below share the ones used across siblings
 // (and, under test, the include-resolution helpers), while only the genuine
 // `crate::wikidot_page::…` API is re-exported `pub(crate)`.
-mod addr;
 mod article_latest;
 mod assets_gear;
 mod config;
@@ -126,9 +125,6 @@ use resources::*;
 use tree_walk::*;
 use vars::*;
 
-pub(crate) use addr::{
-    LegacyPageIdCache, PageAddrCache, legacy_page_id, page_addr,
-};
 pub(crate) use article_latest::{LatestCache, ParsedCache, article_latest, article_latest_parsed};
 pub(crate) use assets_gear::{AssetCache, RepoResourceCache, asset, ca_url, repo_resource};
 pub(crate) use config::RepoMeta;
@@ -139,3 +135,27 @@ pub(crate) use lenses::{
     shell,
 };
 pub(crate) use repo_gear::{RepoCache, repo};
+
+/// Resolve a canonical address `(space, local)` to the dataset location that
+/// serves it: the registered site for the space, plus the page's current slug
+/// from its (rename-stable) page id. `None` when the space is not registered
+/// in the global config, or the site has no page with that id. This is the
+/// single bridge between the URL layer (`space`/`local`) and the slug-keyed
+/// resolution cone below.
+pub(crate) fn page_slug(
+    data: &RepoData,
+    space: SpaceId,
+    local: LocalId,
+) -> Option<(
+    SafePathComponent,
+    (Option<SafePathComponent>, SafePathComponent),
+)> {
+    let site = crate::globals::site_of(&space)?;
+    let slug = data
+        .sites
+        .get(site)?
+        .by_page_id
+        .get(&local.page_id())?
+        .clone();
+    Some((site.clone(), slug))
+}

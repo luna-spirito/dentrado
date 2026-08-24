@@ -44,10 +44,12 @@ const PROBE_LEVEL: i32 = 1;
 /// is worthwhile. `0.98` ≈ "the sample shrank by more than 2 %".
 const PROBE_MIN_RATIO: f64 = 0.98;
 
-/// Load the built frontend into a `path → Body` map, keyed by request path
-/// (e.g. `/index.html`, `/pkg/kolorinko_web.js`). Each file is zstd-compressed
-/// when that helps; `/index.html` gets the WT cert hash injected **before**
-/// compression in hash-pinning mode.
+/// Load the built frontend into a `path → Body` map, keyed by the served
+/// request path under the system namespace (`/-/index.html`,
+/// `/-/pkg/kolorinko_web.js`, … — the files sit at the same relative paths
+/// under `dist/`). Each file is zstd-compressed when that helps;
+/// `/-/index.html` gets the WT cert hash injected **before** compression in
+/// hash-pinning mode.
 pub(crate) fn load_assets(dir: &Path, wt_hash: Option<&[u8]>) -> HashMap<String, Body> {
     let mut map = HashMap::new();
     if dir.is_dir() {
@@ -58,7 +60,7 @@ pub(crate) fn load_assets(dir: &Path, wt_hash: Option<&[u8]>) -> HashMap<String,
             dir.display()
         );
     }
-    map.entry("/index.html".to_string())
+    map.entry("/-/index.html".to_string())
         .or_insert_with(|| compress(PLACEHOLDER_INDEX.as_bytes().to_vec()));
     map
 }
@@ -141,8 +143,8 @@ fn walk(root: &Path, dir: &Path, wt_hash: Option<&[u8]>, map: &mut HashMap<Strin
         } else if let Ok(rel) = path.strip_prefix(root)
             && let Ok(bytes) = std::fs::read(&path)
         {
-            let key = format!("/{}", rel.to_string_lossy().replace('\\', "/"));
-            let bytes = if key == "/index.html"
+            let key = format!("/-/{}", rel.to_string_lossy().replace('\\', "/"));
+            let bytes = if key == "/-/index.html"
                 && let Some(hash) = wt_hash
             {
                 inject_wt_hash(&bytes, hash)

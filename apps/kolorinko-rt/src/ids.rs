@@ -1,44 +1,59 @@
 //! The canonical addressing layer: opaque content-space and page-local
-//! identifiers, plus canonical-route parsing.
+//! identifiers, page-route parsing, and title-segment shaping.
 //!
 //! # The URL model
 //! ```text
-//! https://<host>/{space}/{local}[/decorative-slug]
-//!                        │       └─ 11 chars base64url (8 bytes)
-//!                        └─ 22 chars base64url (16 bytes)
+//! https://<host>/{space}/{local}[/title]
+//!                │       └─ 'L' + 11 chars base64url (64 bits)
+//!                └─ 'S' + 22 chars base64url (128 bits)
 //! ```
-//! - **space** ([`SpaceId`]): 16 random-or-derived bytes identifying one
+//! - **space** ([`SpaceId`]): 16 derived-or-random bytes identifying one
 //!   content space (today: one Wikidot-export site; tomorrow: any gear-owned
-//!   namespace). Registered in the server config; globally collision-safe
-//!   (128-bit) so the identifier travels across a future federation without a
-//!   coordinating registry.
+//!   namespace). Registered in the server config; collision-safe (all 128
+//!   payload bits) so the identifier travels across a future federation
+//!   without a coordinating registry.
 //! - **local** ([`LocalId`]): 8 bytes identifying one page *within* its space.
 //!   For Wikidot imports this is the exporter's numeric `page_id` — the one
 //!   stable key Wikidot ever assigned (fullnames change on rename). Native
 //!   spaces will use CSPRNG-64. Only birthday-safe, not attack-safe: each
 //!   space has a server authority that rejects duplicates at insert.
-//! - The optional third segment is a decorative slug: accepted for
-//!   human-readable sharing, never parsed, and 301-redirected away to the
-//!   canonical `/space/local` form.
+//! - The optional third segment is a human-readable **title** derived from the
+//!   page's title ([`title_slug`]): accepted for sharing, never parsed, and
+//!   regenerated on redirects.
 //!
-//! Both encodings are **canonical base64url without padding** with the
-//! spare trailing bits required to be zero, and parse is strict (exact
-//! length, exact alphabet, round-trip), so one identifier has exactly one
-//! spelling — a URL either is canonical or does not parse.
+//! # The marker char
+//! Every id's canonical form is `'S'/'L' ‖ base64url(payload)`: one literal
+//! uppercase prefix character, then the raw payload at its full width. The
+//! prefix is chosen from **outside the slug alphabet**: slugs are lowercase
+//! by construction (Wikidot normalizes imported page names to lowercase,
+//! [`title_slug`] lowercases, and native spaces mint lowercase), and URL
+//! path matching is case-sensitive — so a segment starting with an
+//! uppercase letter can *never* be a slug, and a slug can *never* parse as
+//! an id. This is what makes URL dispatch purely syntactic: no page name —
+//! however word-like or adversarial — can shadow a canonical route, and no
+//! id can swallow a page's slug URL. (`adventurous`, `wonderments`, any
+//! 11-char name: all unambiguously slugs.)
 //!
-//! Reserved namespace: any path whose first segment starts with `-` (in
-//! particular `/-/…`) is system space, never content (see [`SYSTEM_PREFIX`]).
+//! A marker *bit* cannot do this job: any bit-layout inside the shared
+//! base64url alphabet leaves exactly ¼ of 11-char strings parseable as ids
+//! (upper-half first char × zero spare bit), and real words live in that
+//! quarter — the prefix char spends one character instead and gets
+//! certainty.
+//!
+//! The prefix also keeps ids out of every other reserved corner: an id
+//! never starts with `-` (so the whole `/-…` namespace is free for the
+//! system) and always eyeball-distinct from names. Base64url without
+//! padding is canonical (spare trailing bits required zero, parse strict on
+//! length/alphabet/round-trip), so one identifier has exactly one spelling.
+//!
+//! Reserved namespace: paths under `/-…` are system space, never content
+//! (see [`SYSTEM_PREFIX`]); ids start with `S`/`L`, never `-`.
 
 use std::fmt;
 
-use crate::{SafePathComponent, Slug};
-
-/// Paths under `/-…` are the system namespace (assets served by the platform,
-/// future APIs, static files — the GitLab `/-/` convention). Content
-/// identifiers can never collide with it: a base64url segment never starts
-/// with `-`… well, `-` *is* in the alphabet — but a canonical id segment has a
-/// fixed length (22/11), so the check is done after canonical parse fails;
-/// this constant marks the *reservation* in one place.
+/// Paths under `/-…` are the system namespace (static assets, mirrored
+/// content-addressed blobs, future platform APIs — the GitLab `/-/`
+/// convention). Content ids start with `S`/`L` and can never collide with it.
 pub const SYSTEM_PREFIX: &str = "/-";
 
 // ── base64url (no padding, strict) ──────────────────────────────────────────
@@ -57,7 +72,7 @@ fn sym_val(c: u8) -> Option<u8> {
 }
 
 /// Encode `bytes` as unpadded base64url.
-pub(crate) fn b64u_encode(bytes: &[u8]) -> String {
+fn b64u_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = u32::from(chunk[0]);
@@ -83,7 +98,7 @@ pub(crate) fn b64u_encode(bytes: &[u8]) -> String {
 /// Strict unpadded base64url decode: rejects non-alphabet bytes, impossible
 /// lengths (`len % 4 == 1`), and non-zero spare bits in the final partial
 /// group (so a fixed-size id has exactly one valid spelling).
-pub(crate) fn b64u_decode(s: &str) -> Option<Vec<u8>> {
+fn b64u_decode(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     if bytes.len() % 4 == 1 {
         return None;
@@ -91,8 +106,7 @@ pub(crate) fn b64u_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(bytes.len() * 3 / 4 + 1);
     for chunk in bytes.chunks(4) {
         // A group of `l` chars packs `6*l` bits, most-significant char first;
-        // only the leading `8*l - 2*(4-l) - …` — in short: chars shift by
-        // `6*(l-1-i)`, unlike a full group's `6*(3-i)`.
+        // chars shift by `6*(l-1-i)`, unlike a full group's `6*(3-i)`.
         let l = chunk.len();
         let mut n: u32 = 0;
         for (i, &c) in chunk.iter().enumerate() {
@@ -126,10 +140,13 @@ pub(crate) fn b64u_decode(s: &str) -> Option<Vec<u8>> {
 
 // ── SpaceId ─────────────────────────────────────────────────────────────────
 
-/// A content-space identifier: 16 opaque bytes, canonically 22 base64url
-/// chars. Collision-safe against the whole internet (128 bits), so it needs
-/// no global registry to stay unique — a future p2p/federated deployment
-/// replicates the mapping, never mints it.
+/// A content-space identifier: 16 opaque payload bytes, canonically
+/// `'S' ‖ base64url(payload)` — 23 chars (see the module's
+/// [marker char](self#the-marker-char) section; the marker lives only in
+/// the string form — the bytes are raw). Collision-safe against the whole
+/// internet (128 payload bits), so it needs no global registry to stay
+/// unique — a future p2p/federated deployment replicates the mapping, never
+/// mints it.
 ///
 /// # Derivation (recommendations, not enforced — the id is opaque)
 /// The id should be **deterministically derived**, so independent operators
@@ -137,23 +154,29 @@ pub(crate) fn b64u_decode(s: &str) -> Option<Vec<u8>> {
 /// from depends on who owns the content:
 /// - **imported / read-only spaces** (Wikidot exports): derive from the
 ///   source, not from any operator's key —
-///   `SHA-256("dentrado/space/v1" ‖ "wikidot-export" ‖ site)[0..16]`.
-///   Whoever mirrors the export gets the same id (fork navigation = segment
-///   swap), and no key compromise or loss can orphan the id.
+///   `SHA-256("wikidot-evakuilo/v1" ‖ site)[0..16]`, wrapped raw. Whoever
+///   mirrors the export gets the same id (fork navigation =
+///   segment swap), and no key compromise or loss can orphan the id.
 /// - **owned spaces** (original content, future writes): derive from the
 ///   owner's signing key so future signatures can prove authority —
-///   `SHA-256("dentrado/space/v1" ‖ pubkey ‖ label)[0..16]` (ed25519).
-///   The `label` is mandatory: without it every space of one key collapses
-///   into the same id. The private key never participates in derivation and
-///   never leaves the owner; only the 32-byte public key is published.
+///   `SHA-256("dentrado/space/v1" ‖ pubkey ‖ label)[0..16]` (ed25519),
+///   wrapped raw. The `label` is mandatory: without it every space of one key
+///   collapses into the same id. The private key never participates in
+///   derivation and never leaves the owner; only the 32-byte public key is
+///   published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, dentrado_types::Localizable)]
 #[localizable(skip)]
 pub struct SpaceId([u8; 16]);
 
 impl SpaceId {
-    /// The canonical encoding length in characters.
-    pub const LEN: usize = 22;
+    /// The marker char every canonical spelling starts with.
+    pub const PREFIX: char = 'S';
 
+    /// The canonical encoding length in characters (prefix + 22).
+    pub const LEN: usize = 23;
+
+    /// Wrap raw payload bytes as-is (the marker is a property of the string
+    /// encoding, not of the value).
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
@@ -164,20 +187,23 @@ impl SpaceId {
         &self.0
     }
 
-    /// Parse the canonical 22-char form. Strict: wrong length, wrong alphabet,
-    /// or non-zero padding bits all fail (so re-encoding any parsed value
-    /// reproduces the input byte-for-byte).
+    /// Parse the canonical 23-char form (`'S'` + 22). Strict: wrong prefix,
+    /// wrong length, wrong alphabet, or non-zero padding bits all fail (so
+    /// re-encoding any parsed value reproduces the input byte-for-byte).
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
-        let bytes = b64u_decode(s)?;
-        let bytes: [u8; 16] = bytes.try_into().ok()?;
-        (s.len() == Self::LEN).then_some(Self(bytes))
+        let rest = s.strip_prefix(Self::PREFIX)?;
+        if s.len() != Self::LEN {
+            return None;
+        }
+        let bytes: [u8; 16] = b64u_decode(rest)?.try_into().ok()?;
+        Some(Self(bytes))
     }
 
-    /// The canonical 22-char spelling.
+    /// The canonical 23-char spelling.
     #[must_use]
     pub fn as_str(&self) -> String {
-        b64u_encode(&self.0)
+        format!("{}{}", Self::PREFIX, b64u_encode(&self.0))
     }
 }
 
@@ -198,54 +224,68 @@ impl serde::Serialize for SpaceId {
 
 impl<'de> serde::Deserialize<'de> for SpaceId {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Self::parse(&String::deserialize(d)?)
-            .ok_or_else(|| serde::de::Error::custom("invalid space id (want 22-char base64url)"))
+        Self::parse(&String::deserialize(d)?).ok_or_else(|| {
+            serde::de::Error::custom("invalid space id (want S + 22-char base64url)")
+        })
     }
 }
 
 // ── LocalId ─────────────────────────────────────────────────────────────────
 
-/// A page identifier *within* one space: 8 bytes, canonically 11 base64url
-/// chars. Wikidot imports carry the exporter's numeric `page_id` here (stable
-/// across renames — the fullname is not); native spaces will mint CSPRNG-64.
-/// Uniqueness is per-space and birthday-safe only: each space's authority
-/// rejects duplicates at insert, so targeted collisions are out of scope.
+/// A page identifier *within* one space: 8 raw payload bytes, canonically
+/// `'L' ‖ base64url(payload)` — 12 chars (see the module's
+/// [marker char](self#the-marker-char) section; the marker lives only in
+/// the string form). Wikidot imports carry the exporter's numeric `page_id`
+/// here (stable across renames — the fullname is not); native spaces will
+/// mint CSPRNG-64. Uniqueness is per-space and birthday-safe only: each
+/// space's authority rejects duplicates at insert, so targeted collisions
+/// are out of scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, dentrado_types::Localizable)]
 #[localizable(skip)]
 pub struct LocalId(u64);
 
 impl LocalId {
-    /// The canonical encoding length in characters.
-    pub const LEN: usize = 11;
+    /// The marker char every canonical spelling starts with.
+    pub const PREFIX: char = 'L';
 
+    /// The canonical encoding length in characters (prefix + 11).
+    pub const LEN: usize = 12;
+
+    /// Wrap a page number as-is (the marker is added by the string encoding;
+    /// the payload keeps all 64 bits).
     #[must_use]
     pub const fn new(id: u64) -> Self {
         Self(id)
     }
 
+    /// The wrapped page number — the wikidot `page_id` for imported spaces.
     #[must_use]
-    pub const fn as_u64(&self) -> u64 {
+    pub const fn page_id(&self) -> u64 {
         self.0
     }
 
     /// Parse a wikidot-export `page_id` string (decimal) into a local id.
     #[must_use]
     pub fn from_page_id(s: &str) -> Option<Self> {
-        s.parse::<u64>().ok().map(Self)
+        s.parse::<u64>().ok().map(Self::new)
     }
 
-    /// Parse the canonical 11-char form (strict, like [`SpaceId::parse`]).
+    /// Parse the canonical 12-char form (`'L'` + 11; strict, like
+    /// [`SpaceId::parse`]).
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
-        let bytes = b64u_decode(s)?;
-        let bytes: [u8; 8] = bytes.try_into().ok()?;
-        (s.len() == Self::LEN).then_some(Self(u64::from_be_bytes(bytes)))
+        let rest = s.strip_prefix(Self::PREFIX)?;
+        if s.len() != Self::LEN {
+            return None;
+        }
+        let bytes: [u8; 8] = b64u_decode(rest)?.try_into().ok()?;
+        Some(Self(u64::from_be_bytes(bytes)))
     }
 }
 
 impl fmt::Display for LocalId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&b64u_encode(&self.0.to_be_bytes()))
+        write!(f, "{}{}", Self::PREFIX, b64u_encode(&self.0.to_be_bytes()))
     }
 }
 
@@ -257,49 +297,102 @@ impl serde::Serialize for LocalId {
 
 impl<'de> serde::Deserialize<'de> for LocalId {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Self::parse(&String::deserialize(d)?)
-            .ok_or_else(|| serde::de::Error::custom("invalid local id (want 11-char base64url)"))
+        Self::parse(&String::deserialize(d)?).ok_or_else(|| {
+            serde::de::Error::custom("invalid local id (want L + 11-char base64url)")
+        })
     }
 }
 
 // ── route parsing ───────────────────────────────────────────────────────────
 
-/// A resolved content address: which dataset site serves the space, and the
-/// page's slug within it. The bridge between the canonical URL layer and the
-/// slug-keyed gears (`article_latest`, `shell`, …).
-#[derive(
-    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, dentrado_types::Localizable,
-)]
-pub struct PageAddr {
-    pub site: SafePathComponent,
-    pub slug: Slug,
-}
-
-/// `/{space}/{local}` (exactly two segments) → the canonical page address.
-/// `None` for anything else — a trailing slash, a third decorative-slug
-/// segment (the server answers those with a 301; no client should ever
-/// subscribe under one), a bare space, or a legacy site path. Shared by the
+/// `/{space}/{local}[/title]` → the canonical page address. The optional
+/// third segment is a decorative title: accepted (so shared pretty URLs keep
+/// working) but never inspected. Anything else — a trailing slash, a fourth
+/// segment, a bare space, a legacy site path — is `None`. Shared by the
 /// server's SSR dispatch and the web client's router, so both agree on what
 /// a canonical route is.
 #[must_use]
-pub fn parse_canonical(path: &str) -> Option<(SpaceId, LocalId)> {
+pub fn parse_page_route(path: &str) -> Option<(SpaceId, LocalId)> {
     let mut segs = path.trim_start_matches('/').split('/');
     let space = SpaceId::parse(segs.next()?)?;
     let local = LocalId::parse(segs.next()?)?;
-    segs.next().is_none().then_some((space, local))
+    // At most one non-empty decorative title segment may follow.
+    match segs.next() {
+        None => Some((space, local)),
+        Some(title) if !title.is_empty() && segs.next().is_none() => Some((space, local)),
+        Some(_) => None,
+    }
+}
+
+// ── title shaping ───────────────────────────────────────────────────────────
+
+/// Shape a page title into the decorative third URL segment: whitespace →
+/// `-`, alphanumeric characters kept (lowercased, Unicode-aware), `-`/`_`
+/// kept, everything else dropped, leading/trailing `-` trimmed. Empty results
+/// (an untitled page) fall back to `page`. Never parses back into anything —
+/// the segment exists for humans, redirects regenerate it.
+#[must_use]
+pub fn title_slug(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    // Collapse runs: each whitespace char is one '-', but adjacent ones (or
+    // one next to a literal dash) don't stack — "a  -  b" is "a-b".
+    let mut prev_dash = false;
+    for ch in title.chars() {
+        if ch.is_whitespace() {
+            if !prev_dash {
+                out.push('-');
+                prev_dash = true;
+            }
+        } else if ch.is_alphanumeric() {
+            out.extend(ch.to_lowercase());
+            prev_dash = false;
+        } else if (ch == '-' || ch == '_') && !prev_dash {
+            out.push(ch);
+            prev_dash = ch == '-';
+        }
+    }
+    while out.starts_with('-') {
+        out.remove(0);
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push_str("page");
+    }
+    out
+}
+
+/// Percent-encode a path segment (RFC 3986 unreserved characters kept as-is).
+/// The redirect `Location` and the client's `pushState` both go through this,
+/// so a title segment has exactly one spelling everywhere.
+#[must_use]
+pub fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(b));
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// SHA-256("wikidot-evakuilo/v1/obscurative")[0..16], S-prefixed —
+    /// the id the dev config's `ensure-evakuilo-sites = ["obscurative"]`
+    /// derives.
     fn space() -> SpaceId {
-        // SHA-256("dentrado/space/v1\0wikidot-export\0obscurative")[0..16]
-        SpaceId::parse("I5Xee8HsV1zTMRChatxfiw").unwrap()
+        SpaceId::parse("S70P6lbBZxbc-kcpGOCYmZA").unwrap()
     }
 
     #[test]
-    fn codec_round_trips() {
+    fn b64u_codec_round_trips() {
         for len in 0..=32 {
             let bytes: Vec<u8> = (0..len as u8).map(|i| i.wrapping_mul(37)).collect();
             let enc = b64u_encode(&bytes);
@@ -310,52 +403,70 @@ mod tests {
     #[test]
     fn space_id_is_strict() {
         let s = space();
-        assert_eq!(s.as_str().len(), 22);
+        assert_eq!(s.as_str().len(), 23);
         assert_eq!(SpaceId::parse(&s.as_str()), Some(s));
+        // The marker char shows: every id starts with its uppercase prefix.
+        assert!(s.as_str().starts_with('S'));
+        // The bytes are the raw payload — no marker inside, from_bytes is a
+        // plain wrap.
+        assert_eq!(SpaceId::from_bytes(*s.as_bytes()), s);
         // Wrong length.
-        assert!(SpaceId::parse(&s.as_str()[..21]).is_none());
+        assert!(SpaceId::parse(&s.as_str()[..22]).is_none());
         assert!(SpaceId::parse(&format!("{}x", s.as_str())).is_none());
+        // Missing marker char rejected (lowercase prefix is a slug's shape).
+        assert!(SpaceId::parse(&format!("s{}", &s.as_str()[1..])).is_none());
         // Standard base64 (+, /, =) rejected.
-        assert!(SpaceId::parse("AAAAAAAAAAAAAAAAAAAAAA=").is_none());
-        assert!(SpaceId::parse("AAAAAAAAAAAAAAAAAAAAA+AA").is_none());
-        // Non-zero spare bits in the final char rejected (…AB carries bits).
-        assert!(SpaceId::parse("AAAAAAAAAAAAAAAAAAAAAB").is_none());
+        assert!(SpaceId::parse("SAAAAAAAAAAAAAAAAAAAAA=").is_none());
+        assert!(SpaceId::parse("SAAAAAAAAAAAAAAAAAAAA+AA").is_none());
+        // Non-zero spare bits in the final char rejected (…AB carries a bit).
+        assert!(SpaceId::parse("SAAAAAAAAAAAAAAAAAAAAAB").is_none());
     }
 
     #[test]
     fn local_id_is_strict_and_carries_page_ids() {
-        let l = LocalId::from_page_id("1305054470").unwrap();
-        assert_eq!(l.as_u64(), 1_305_054_470);
-        let enc = l.to_string();
-        assert_eq!(enc.len(), 11);
-        assert_eq!(LocalId::parse(&enc), Some(l));
-        assert!(LocalId::parse(&enc[..10]).is_none());
-        assert!(LocalId::parse("AAAAAAAAAAA").is_some()); // page id 0
-        assert!(LocalId::parse("AAAAAAAAAAB").is_none()); // spare bits set
+        let l = LocalId::from_page_id("986050317").unwrap();
+        assert_eq!(l.page_id(), 986_050_317);
+        assert_eq!(l.to_string(), "LAAAAADrF7w0");
+        assert!(LocalId::parse("LAAAAADrF7w0").is_some());
+        assert!(LocalId::parse(&l.to_string()[..11]).is_none());
+        assert!(LocalId::parse("lAAAAADrF7w0").is_none()); // marker char missing
+        assert!(LocalId::parse("LAAAAAAAAAB").is_none()); // spare bits set
+        // Word-shaped names never parse — the whole point of the marker char:
+        // a marker *bit* would let exactly ¼ of 11-char strings through
+        // (`wonderments` among them); an uppercase prefix lets none.
+        assert!(LocalId::parse("wonderments").is_none());
+        assert!(LocalId::parse("adventurous").is_none());
         assert!(LocalId::from_page_id("not-a-number").is_none());
     }
 
     #[test]
-    fn canonical_routes_parse() {
-        let (sp, lo) = parse_canonical("/I5Xee8HsV1zTMRChatxfiw/AAAAAE3JjQY").unwrap();
+    fn page_routes_parse() {
+        let (sp, lo) = parse_page_route("/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0").unwrap();
         assert_eq!(sp, space());
-        assert_eq!(lo.as_u64(), 1_305_054_470);
-        // Strict: trailing slash, slug segment, bare space, legacy paths.
-        assert!(parse_canonical("/I5Xee8HsV1zTMRChatxfiw/AAAAAE3JjQY/").is_none());
-        assert!(parse_canonical("/I5Xee8HsV1zTMRChatxfiw/AAAAAE3JjQY/slag").is_none());
-        assert!(parse_canonical("/I5Xee8HsV1zTMRChatxfiw").is_none());
-        assert!(parse_canonical("/").is_none());
-        // Legacy site paths do not parse as canonical.
-        assert!(parse_canonical("/obscurative/syntax").is_none());
+        assert_eq!(lo.page_id(), 986_050_317);
+        // The decorative title rides along unparsed.
+        let (sp2, lo2) =
+            parse_page_route("/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0/%D1%82%D0%B5%D0%BD%D1%8C")
+                .unwrap();
+        assert_eq!((sp2, lo2), (sp, lo));
+        // Strict: trailing slash, a fourth segment, bare space, junk, legacy.
+        assert!(parse_page_route("/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0/").is_none());
+        assert!(parse_page_route("/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0/a/b").is_none());
+        assert!(parse_page_route("/S70P6lbBZxbc-kcpGOCYmZA").is_none());
+        assert!(parse_page_route("/").is_none());
+        assert!(parse_page_route("/obscurative/syntax").is_none());
     }
 
     #[test]
-    fn page_addr_serializes() {
-        let addr = PageAddr {
-            site: SafePathComponent::new("obscurative".into()).unwrap(),
-            slug: (None, SafePathComponent::new("syntax".into()).unwrap()),
-        };
-        let json = serde_json::to_string(&addr).unwrap();
-        assert_eq!(serde_json::from_str::<PageAddr>(&json).unwrap(), addr);
+    fn titles_shape_into_segments() {
+        assert_eq!(title_slug("Тень подъезда"), "тень-подъезда");
+        assert_eq!(title_slug("Hello, World!"), "hello-world");
+        assert_eq!(title_slug("  spaced  out  "), "spaced-out");
+        assert_eq!(title_slug("???"), "page");
+        assert_eq!(
+            encode_path_segment("тень-подъезда"),
+            "%D1%82%D0%B5%D0%BD%D1%8C-%D0%BF%D0%BE%D0%B4%D1%8A%D0%B5%D0%B7%D0%B4%D0%B0"
+        );
+        assert_eq!(encode_path_segment("plain-1.2_~"), "plain-1.2_~");
     }
 }

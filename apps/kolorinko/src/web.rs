@@ -89,7 +89,8 @@ pub(crate) async fn serve(
                             return;
                         }
                     };
-                    if let Err(e) = handle_conn(&mut stream, &assets, &core, alt_svc.as_deref()).await
+                    if let Err(e) =
+                        handle_conn(&mut stream, &assets, &core, alt_svc.as_deref()).await
                         && !is_disconnect(&e)
                     {
                         warn!("conn {peer}: {e}");

@@ -1,132 +1,58 @@
 //! Path-based client router: the single source of truth for which page the
-//! app shows. Two URL families address a page:
+//! app shows. There is exactly one URL family — the canonical
+//! `/{space}/{local}[/title]` (the 'S'/'L' marker char in both ids makes recognition
+//! purely syntactic; the optional title segment is decorative). The server
+//! SSRs canonical routes and 301s slug-form paths to them; the client never
+//! resolves slugs, so a slug link is simply a full browser navigation.
 //!
-//! - **canonical** `/<space>/<local>` (a 22-char space id, an 11-char local
-//!   id) — the route the server SSRs; the client resolves it to the serving
-//!   `site`/`slug` through the `page_addr` gear over WebTransport, so a
-//!   hydration boot seeds the resolution from the embedded SSR state (no
-//!   round-trip), while a CSR boot (ServiceWorker shell) resolves live;
-//! - **legacy** `/<site>/<category?>/<page>` (Wikidot's `category:name`
-//!   flattened to `/`) — what in-content links still carry; rendered in
-//!   place, no canonical identity needed client-side.
-//!
-//! `space`/`local` and `site`/`slug` live as reactive signals so
-//! subscriptions re-subscribe on navigation. Two global listeners keep them in
-//! sync with the URL:
+//! `space`/`local` live as reactive signals so subscriptions re-subscribe on
+//! navigation. Two global listeners keep them in sync with the URL:
 //! - a `popstate` listener (back / forward), and
-//! - a delegated `click` listener that turns left-clicks on internal `<a>`
-//!   into client-side navigation (pushState) instead of a full reload — so the
-//!   WebTransport session and its subscriptions stay live across page changes.
+//! - a delegated `click` listener that turns left-clicks on internal
+//!   `<a href="/SPACE/LOCAL…">` links into client-side navigation
+//!   (pushState) instead of a full reload — so the WebTransport session and
+//!   its subscriptions stay live across page changes.
 
-use kolorinko_rt::{LocalId, SafePathComponent, SpaceId, SsrState, parse_route};
+use kolorinko_rt::{LocalId, SpaceId, SsrState, parse_page_route};
 use leptos::prelude::*;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{Element, Event, MouseEvent};
 
-pub(crate) type Slug = kolorinko_rt::Slug;
+/// The CSR-boot fallback (Trunk dev, or a stale ServiceWorker shell on an
+/// unparseable path): the dev config's space (`obscurative`) landing page
+/// (`main`, page id 986050317). The URL is rewritten to it, so a reload is
+/// stable. Production boots always carry the SSR state and never land here.
+const FALLBACK_PATH: &str = "/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0";
 
-const FALLBACK_SITE: &str = "obscurative";
-const FALLBACK_PAGE: &str = "syntax";
-
-/// The demo default route for a bare or unparseable path: rewritten
-/// (replaceState) so a refresh is stable.
 fn window() -> web_sys::Window {
     web_sys::window().expect("no window")
 }
 
-fn fallback() -> ClientRoute {
-    let href = format!("/{FALLBACK_SITE}/{FALLBACK_PAGE}");
-    if let Ok(h) = window().history() {
-        let _ = h.replace_state_with_url(&JsValue::NULL, "", Some(&href));
-    }
-    ClientRoute::Legacy {
-        site: SafePathComponent::new(FALLBACK_SITE.into()).unwrap(),
-        slug: (None, SafePathComponent::new(FALLBACK_PAGE.into()).unwrap()),
-    }
-}
-
-/// What a path names. Canonical routes with a decorative third segment
-/// (`/space/local/slug`) normalize to the two-segment form (the server 301s
-/// them; the client just never pushes the slug).
-#[derive(Clone, PartialEq)]
-enum ClientRoute {
-    Canonical { space: SpaceId, local: LocalId },
-    Legacy { site: SafePathComponent, slug: Slug },
-}
-
-/// Parse an internal path into a route: canonical first (a 22-char
-/// base64url first segment is syntactically distinct from any legacy site
-/// name), then the legacy `/site[/cat/page]` form.
-fn route_for(path: &str) -> Option<ClientRoute> {
-    let mut segs = path.trim_start_matches('/').split('/');
-    let first = segs.next()?;
-    if let Some(space) = SpaceId::parse(first)
-        && let Some(local) = segs.next().and_then(LocalId::parse)
-    {
-        return Some(ClientRoute::Canonical { space, local });
-    }
-    parse_route(path).map(|(site, slug)| ClientRoute::Legacy { site, slug })
-}
-
 #[derive(Clone)]
 pub(crate) struct Router {
-    /// The canonical route, when the URL is `/SPACE/LOCAL` (`None` on legacy
-    /// paths): the `page_addr` subscription's keys.
+    /// The canonical route: the `article_latest` / `shell` subscription keys.
     pub space: RwSignal<Option<SpaceId>>,
     pub local: RwSignal<Option<LocalId>>,
-    /// The resolved dataset address, once known (`None` while a canonical
-    /// route is still resolving). Legacy routes set it directly.
-    pub site: RwSignal<Option<SafePathComponent>>,
-    pub slug: RwSignal<Option<Slug>>,
 }
 
 impl Router {
     /// Read the route from the current URL — or, on a hydration boot, from
-    /// the embedded SSR state (whose `addr`/`route` are exactly the resolved
-    /// route the server rendered with). A bare or unparseable path is
-    /// rewritten (replaceState) to the demo default so a refresh is stable.
+    /// the embedded SSR state (which carries exactly the canonical address
+    /// the server rendered with). An unparseable path is rewritten
+    /// (replaceState) to the demo default so a refresh is stable.
     pub(crate) fn bootstrap(initial: Option<&SsrState>) -> Self {
-        // On a hydration boot the embedded state carries the exact route the
-        // server rendered with (canonical space/local, or just the resolved
-        // address for a legacy URL); on a CSR boot parse the location.
-        let (route, addr) = match initial {
-            Some(s) => match s.route {
-                Some((space, local)) => (
-                    ClientRoute::Canonical { space, local },
-                    Some((s.addr.site.clone(), s.addr.slug.clone())),
-                ),
-                None => (
-                    ClientRoute::Legacy {
-                        site: s.addr.site.clone(),
-                        slug: s.addr.slug.clone(),
-                    },
-                    None,
-                ),
-            },
-            None => (
-                route_for(&window().location().pathname().unwrap_or_default())
-                    .unwrap_or_else(fallback),
-                None,
-            ),
-        };
-        // The SSR `addr` seeds the page/shell subscriptions for a canonical
-        // hydration boot (hash-checked, no resolution round-trip); a resolving
-        // CSR boot starts with the address unknown.
-        let (space, local, site, slug) = match route {
-            ClientRoute::Canonical { space, local } => {
-                let (site, slug) = match addr {
-                    Some((site, slug)) => (Some(site), Some(slug)),
-                    None => (None, None),
-                };
-                (Some(space), Some(local), site, slug)
-            }
-            ClientRoute::Legacy { site, slug } => (None, None, Some(site), Some(slug)),
-        };
+        let route = initial
+            .map(|s| (s.space, s.local))
+            .or_else(|| parse_page_route(&window().location().pathname().unwrap_or_default()))
+            .unwrap_or_else(|| {
+                if let Ok(h) = window().history() {
+                    let _ = h.replace_state_with_url(&JsValue::NULL, "", Some(FALLBACK_PATH));
+                }
+                parse_page_route(FALLBACK_PATH).expect("fallback parses")
+            });
         Self {
-            space: RwSignal::new(space),
-            local: RwSignal::new(local),
-            site: RwSignal::new(site),
-            slug: RwSignal::new(slug),
+            space: RwSignal::new(Some(route.0)),
+            local: RwSignal::new(Some(route.1)),
         }
     }
 
@@ -140,80 +66,37 @@ impl Router {
     /// Client-side navigate to an internal path: pushState + update signals,
     /// so subscriptions re-subscribe without a full reload.
     pub(crate) fn navigate(&self, path: String) {
-        let Some(route) = route_for(&path) else {
+        let Some((space, local)) = parse_page_route(&path) else {
             return;
-        };
-        let path = match &route {
-            // Never carry the decorative slug: the address bar shows the
-            // canonical two-segment form (mirroring the server's 301).
-            ClientRoute::Canonical { space, local } => format!("/{space}/{local}"),
-            ClientRoute::Legacy { .. } => path,
         };
         if let Ok(h) = window().history() {
             let _ = h.push_state_with_url(&JsValue::NULL, "", Some(&path));
         }
-        self.apply(route);
+        self.set_space(Some(space));
+        self.set_local(Some(local));
     }
 
     fn sync_from_location(&self) {
-        if let Some(route) = route_for(&window().location().pathname().unwrap_or_default()) {
-            self.apply(route);
+        if let Some((space, local)) =
+            parse_page_route(&window().location().pathname().unwrap_or_default())
+        {
+            self.set_space(Some(space));
+            self.set_local(Some(local));
         }
     }
 
-    /// Apply a route to the signals, each only when it actually changes
-    /// (`RwSignal::set` notifies unconditionally — a plain `set` would tear
-    /// down and re-subscribe every signal-keyed subscription, notably the
-    /// `shell` gear, on same-site navigations).
-    ///
-    /// A canonical route clears the resolved address: the `page_addr`
-    /// subscription re-fills it, and until then the page/shell queries are
-    /// `None` (nothing stale renders under the new URL).
-    fn apply(&self, route: ClientRoute) {
-        match route {
-            ClientRoute::Canonical { space, local } => {
-                self.set_opt_space(Some(space));
-                self.set_opt_local(Some(local));
-                self.set_site(None);
-                self.set_slug(None);
-            }
-            ClientRoute::Legacy { site, slug } => {
-                self.set_opt_space(None);
-                self.set_opt_local(None);
-                self.set_site(Some(site));
-                self.set_slug(Some(slug));
-            }
-        }
-    }
-
-    /// The `page_addr` resolution landed: set the serving address for the
-    /// current canonical route (does not touch `space`/`local`).
-    pub(crate) fn set_resolved(&self, site: SafePathComponent, slug: Slug) {
-        self.set_site(Some(site));
-        self.set_slug(Some(slug));
-    }
-
-    fn set_opt_space(&self, v: Option<SpaceId>) {
+    /// Set a signal only when it actually changes (`RwSignal::set` notifies
+    /// unconditionally — a plain `set` would tear down and re-subscribe every
+    /// signal-keyed subscription on same-page navigations).
+    fn set_space(&self, v: Option<SpaceId>) {
         if self.space.with_untracked(|s| *s != v) {
             self.space.set(v);
         }
     }
 
-    fn set_opt_local(&self, v: Option<LocalId>) {
+    fn set_local(&self, v: Option<LocalId>) {
         if self.local.with_untracked(|s| *s != v) {
             self.local.set(v);
-        }
-    }
-
-    fn set_site(&self, v: Option<SafePathComponent>) {
-        if self.site.with_untracked(|s| *s != v) {
-            self.site.set(v);
-        }
-    }
-
-    fn set_slug(&self, v: Option<Slug>) {
-        if self.slug.with_untracked(|s| *s != v) {
-            self.slug.set(v);
         }
     }
 
@@ -227,9 +110,11 @@ impl Router {
     }
 
     /// Intercept plain left-clicks on internal `<a href="/…">` links and turn
-    /// them into client-side navigation. Asset-like hrefs (a `.` in the last
-    /// segment, e.g. `/pkg/x.js`) and modified clicks fall through to the
-    /// browser so new-tab / open-in-background keep working.
+    /// them into client-side navigation when the href parses as a canonical
+    /// route. Slug-form links (`/SPACE/cat:slug`) and asset-like hrefs (a `.`
+    /// in the last segment) fall through to the browser — the server 301s the
+    /// former to the canonical form, so a full navigation is correct, just
+    /// slower.
     fn install_clicks(self) {
         let cb = Closure::<dyn Fn(Event)>::new(move |ev: Event| {
             if let Some(me) = ev.dyn_ref::<MouseEvent>()
@@ -254,10 +139,13 @@ impl Router {
             if !path.starts_with('/') || path.starts_with("//") {
                 return;
             }
+            if path.starts_with("/-/") {
+                return; // system namespace: a real fetch
+            }
             if path.rsplit('/').next().unwrap_or("").contains('.') {
                 return;
             }
-            if route_for(path).is_some() {
+            if parse_page_route(path).is_some() {
                 ev.prevent_default();
                 self.navigate(path.to_string());
             }

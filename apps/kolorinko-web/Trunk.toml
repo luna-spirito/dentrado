@@ -1,3 +1,7 @@
 [build]
 target = "index.html"
 dist = "dist"
+# The kolorinko server serves the built frontend from its system namespace
+# (`/-/…`); the prefix makes trunk point the generated wasm/js loader tags at
+# `/-/kolorinko-web-….js` & co, matching the paths the HTTP layer answers.
+public_url = "/-/"

@@ -10,9 +10,14 @@ use kolorinko::wikidot_parser;
 use kolorinko_render::render_block;
 use leptos::prelude::*;
 
+/// A fixed space for link-href assertions (raw bytes; Display adds the 'S' marker).
+fn test_space() -> Option<kolorinko_rt::SpaceId> {
+    Some(kolorinko_rt::SpaceId::from_bytes([0x2a; 16]))
+}
+
 /// Parse `src`, render top-level block flow, and return the SSR HTML.
-fn render_html(site: &str, src: &str) -> String {
-    let views = render_block(site, &wikidot_parser::parse(src));
+fn render_html(space: Option<kolorinko_rt::SpaceId>, src: &str) -> String {
+    let views = render_block(space, &wikidot_parser::parse(src));
     view! { <div>{views}</div> }.to_html()
 }
 
@@ -48,7 +53,7 @@ fn side_block_inner(norm: &str) -> &str {
 #[test]
 fn div_sidebar_renders_blocks_without_p() {
     let norm = normalize(&render_html(
-        "rpcauthority",
+        test_space(),
         include_str!("div_sidebar_input.txt"),
     ));
     let inner = side_block_inner(&norm);
@@ -67,7 +72,10 @@ fn div_sidebar_renders_blocks_without_p() {
     assert!(inner.starts_with(r#"<div class="menu-item">"#));
     assert!(inner.contains(r#"<hr><div class="heading">RPC Database</div>"#));
     // Each menu-item holds its inline content directly (no `<p>` around it).
-    assert!(inner.contains(r#"<div class="menu-item"><a href="/rpcauthority/">Main</a></div>"#));
+    assert!(inner.contains(&format!(
+        r#"<div class="menu-item"><a href="/{s}/">Main</a></div>"#,
+        s = test_space().unwrap()
+    )));
     // Section dividers (`----`) survive as `<hr>` between the heading groups.
     assert_eq!(inner.matches("<hr>").count(), 7);
 }

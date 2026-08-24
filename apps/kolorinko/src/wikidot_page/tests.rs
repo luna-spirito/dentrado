@@ -471,7 +471,7 @@ fn external_refs_are_collected_and_content_addressed() {
     assert_eq!(
             source,
             &vec![TextObj::Plain(
-                "/repo/scp/files/d8/4a/d84a29109fe0e70c7a5c22c39bda120fdbc56bd192f5927af95b9af8d0f87c27.png".into()
+                "/-/repo/scp/files/d8/4a/d84a29109fe0e70c7a5c22c39bda120fdbc56bd192f5927af95b9af8d0f87c27.png".into()
             )]
         );
     // Hotlink left untouched.
@@ -487,7 +487,7 @@ fn external_refs_are_collected_and_content_addressed() {
     let Node::Stylesheet(css) = &out[2] else {
         panic!("expected stylesheet")
     };
-    assert!(css.contains("/repo/scp/files/d8/4a/"));
+    assert!(css.contains("/-/repo/scp/files/d8/4a/"));
     assert!(!css.contains("https://scp.wikidot.com"));
 }
 
@@ -560,7 +560,7 @@ fn real_repo_indexes_sharded_files_and_shell() {
     // And ca_url embeds the full hash under the matching shards.
     let url = super::ca_url(&site("rpcauthority"), ca);
     let prefix = format!(
-        "/repo/rpcauthority/files/{}/{}",
+        "/-/repo/rpcauthority/files/{}/{}",
         &ca.hash[..2],
         &ca.hash[2..4]
     );

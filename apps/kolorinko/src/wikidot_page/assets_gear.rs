@@ -42,13 +42,14 @@ fn repo_alias(path: &RepoAssetPath) -> Option<RepoAssetPath> {
     RepoAssetPath::new(format!("{sub}.wikidot.com/{rest}"))
 }
 
-/// Serialize a [`CaRef`] to its served URL: `/repo/<site>/files/<xx>/<yy>/<hash>.<ext>`,
-/// embedding the sha256 (xx=key[0:2], yy=key[2:4], leaf=full hash) so the URL
-/// is self-describing and collision-free with real `files/<host>/<path>` paths
-/// (a 64-hex leaf never occurs naturally). The extension rides along so the
-/// server derives the MIME without a side table; an empty extension yields a
-/// bare `<hash>` leaf. The on-disk `_files/` layout (sharded rest-leaf) is
-/// reconstructed at read time.
+/// Serialize a [`CaRef`] to its served URL:
+/// `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>`, embedding the sha256
+/// (xx=key[0:2], yy=key[2:4], leaf=full hash) so the URL is self-describing
+/// and collision-free with real `files/<host>/<path>` paths (a 64-hex leaf
+/// never occurs naturally). The extension rides along so the server derives
+/// the MIME without a side table; an empty extension yields a bare `<hash>`
+/// leaf. The on-disk `_files/` layout (sharded rest-leaf) is reconstructed at
+/// read time.
 pub(crate) fn ca_url(site: &SafePathComponent, ca: &CaRef) -> String {
     let site = &**site;
     let h = &ca.hash;
@@ -57,7 +58,7 @@ pub(crate) fn ca_url(site: &SafePathComponent, ca: &CaRef) -> String {
     } else {
         format!(".{}", ca.ext)
     };
-    format!("/repo/{site}/files/{}/{}/{}{}", &h[..2], &h[2..4], h, ext)
+    format!("/-/repo/{site}/files/{}/{}/{}{}", &h[..2], &h[2..4], h, ext)
 }
 
 // =========================================================================
@@ -114,7 +115,7 @@ pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
         let mut map: HashMap<String, String> = HashMap::new();
         for tail in &refs {
             if let Some(path) = RepoAssetPath::new(percent_decode(tail))
-                && let Some(ca) = get_ca(meta, site, path, ctx).await
+                && let Some(ca) = get_ca(site, path, ctx).await
             {
                 map.insert(tail.clone(), ca_url(site, &ca));
             }
@@ -131,12 +132,13 @@ pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
 /// blob identity alone (see the PURE-FUNCTION note above). `None` when the URL
 /// is not mirrored (a hotlink).
 pub(super) async fn get_ca<S: Storage<KolorinkoRT>>(
-    _meta: &RepoMeta,
     site: &SafePathComponent,
     path: RepoAssetPath,
     ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> Option<CaRef> {
-    let id = crate::runtime::repo_resource(site.clone(), path).id;
+    let id = crate::runtime::repo_resource(site.clone(), path)
+        .id()
+        .clone();
     match ctx.core().read_gear_stale(id).await {
         GearResult::Shared(s) => match &*s {
             GearOutShared::RepoResourceOut(ca) => ca.clone(),

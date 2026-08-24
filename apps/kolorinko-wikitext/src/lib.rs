@@ -659,7 +659,7 @@ pub struct PageDep {
 /// A fully rendered page: metadata, edit-history summary, the resolved
 /// [`Content`] (all `[[include]]` directives expanded), and the tree of pages
 /// fetched while resolving those includes (empty before resolution).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ArticleView {
     pub meta: ArticleMeta,
     pub revisions: Vec<RevMeta>,

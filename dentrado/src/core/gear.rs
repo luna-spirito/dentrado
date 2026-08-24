@@ -228,27 +228,31 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
 /// the raw [`GearCtx::secondary_get`] (which returns an untyped [`GearResult`]).
 ///
 /// `id` names the gear (with its id fields); `getter` extracts `Out` out of the
-/// stored [`GearResult`]. The `#[gears]` macro pairs them per gear, so by
-/// construction `getter` is always fed the family it matches — the
-/// `unreachable!` arm in it is a defensive invariant, not an expected path.
+/// stored [`GearResult`]. Both are **private by design**: a `GearQuery` is an
+/// opaque handle — callers address gears through the generated builders and
+/// read results through [`GearQuery::secondary_get`] / [`GearQuery::subscribe`]
+/// (whose [`GearSubscription::current`] yields the extracted `Out`). If a new
+/// use needs direct access, add a method here rather than reopening the fields.
+/// The `#[gears]` macro pairs them per gear, so by construction `getter` is
+/// always fed the family it matches — the `unreachable!` arm in it is a
+/// defensive invariant, not an expected path.
 /// For a shippable gear `Out` is an owned value (peeled out of the `Ship` arm);
 /// for a `#[gear(shared)]` gear `Out` is [`SharedView<R, T>`] (built from the
 /// `Shared` arm). Local (`#[gear(local)]`) outputs are deliberately outside
 /// this layer: they have no builder and are read only through `follow` gears.
 ///
 /// Built by the `#[gears]` macro as one fn per gear, e.g.
-/// `pub fn repo(repo_meta: RepoMeta) -> GearQuery<R, Arc<RepoData>>`; methods
-/// like [`GearQuery::secondary_get`] are the composable surface.
+/// `pub fn repo() -> GearQuery<R, Rc<RepoData>>`.
 pub struct GearQuery<R: IsRuntime, Out> {
     /// Queried gear.
-    pub id: R::GearId,
+    id: R::GearId,
     /// Extracts `Out` out of the gear's **stored** result ([`GearResult`]).
     /// For a shippable gear `Out` is owned, peeled from the `Ship` arm; for a
     /// shared gear `Out` is [`SharedView<R, T>`], built from the `Shared` arm.
     /// A `Local` result is never fed here — a `Local` output is pinned to its
     /// core and reachable only through `follow`; the getter's defensive arm
     /// panics if one somehow arrives.
-    pub getter: fn(GearResult<R>) -> Out,
+    getter: fn(GearResult<R>) -> Out,
 }
 
 // Manual (not derived) so we don't add `Out: Clone` / `R: Clone` bounds: the
@@ -264,6 +268,18 @@ impl<R: IsRuntime, Out> Clone for GearQuery<R, Out> {
 }
 
 impl<R: IsRuntime, Out> GearQuery<R, Out> {
+    /// The queried gear's id. Prefer the methods below over inspecting it.
+    pub fn id(&self) -> &R::GearId {
+        &self.id
+    }
+
+    /// Extract `Out` out of a raw stored [`GearResult`] — the per-family
+    /// projection this query was built to read (e.g. peeling a subscription
+    /// push or a `read_gear` result).
+    pub fn extract(&self, out: GearResult<R>) -> Out {
+        (self.getter)(out)
+    }
+
     /// Declare a dependency on this gear's output and pull its current value
     /// (awaiting it if not yet computed) — the raw [`GearCtx::secondary_get`]
     /// followed by the getter's per-family extraction. A `Local` result never
@@ -277,10 +293,68 @@ impl<R: IsRuntime, Out> GearQuery<R, Out> {
 
     /// Subscribe to this gear's output (worker-facing push mode). The id is
     /// owned internally, so the caller never names the concrete `R::GearId`
-    /// type. The returned [`Subscription`] yields raw [`GearResult`]s; the
-    /// per-variant extraction is up to the caller (e.g. via [`GearOut`]).
-    pub async fn subscribe<S: Storage<R>>(&self, core: &Rc<Core<R, S>>) -> Subscription<R, S> {
+    /// type. The returned [`GearSubscription`] is the query's typed lens over
+    /// the raw stream: `current`/`next` yield the extracted `Out`, so callers
+    /// never match [`GearResult`] variants by hand (the raw form is reachable
+    /// through `Deref` if a wire layer needs it).
+    pub async fn subscribe<S: Storage<R>>(
+        &self,
+        core: &Rc<Core<R, S>>,
+    ) -> GearSubscription<R, S, Out> {
+        GearSubscription {
+            sub: core.subscribe_gear(self.id.clone()).await,
+            getter: self.getter,
+        }
+    }
+
+    /// The raw-subscription escape hatch: the same subscription without the
+    /// getter projection, for wire bridges that re-encode pushes in the
+    /// unprojected [`GearResult`] form (everything else should prefer
+    /// [`GearQuery::subscribe`]).
+    pub async fn subscribe_raw<S: Storage<R>>(&self, core: &Rc<Core<R, S>>) -> Subscription<R, S> {
         core.subscribe_gear(self.id.clone()).await
+    }
+
+    /// The macro-facing constructor: pairs an id with its getter. Not for
+    /// hand-written code — build queries through the generated per-gear
+    /// builders.
+    #[doc(hidden)]
+    pub fn new(id: R::GearId, getter: fn(GearResult<R>) -> Out) -> Self {
+        Self { id, getter }
+    }
+}
+
+/// A [`Subscription`] projected through a [`GearQuery`]'s getter — the typed
+/// read side of the query layer. [`GearSubscription::current`] and
+/// [`GearSubscription::next`] return the extracted `Out` (an owned value for a
+/// shippable gear, a [`SharedView`] for a shared one) instead of the raw
+/// stored [`GearResult`], so callers never re-implement the per-family
+/// projection the macro already paired with the gear. `Deref`s to the raw
+/// [`Subscription`] for the rare consumer that needs the unprojected form
+/// (e.g. a wire bridge re-encoding pushes).
+#[must_use]
+pub struct GearSubscription<R: IsRuntime, S: Storage<R>, Out> {
+    sub: Subscription<R, S>,
+    getter: fn(GearResult<R>) -> Out,
+}
+
+impl<R: IsRuntime, S: Storage<R>, Out> GearSubscription<R, S, Out> {
+    /// The gear's currently-cached output, extracted.
+    #[must_use]
+    pub fn current(&self) -> Out {
+        (self.getter)(self.sub.current())
+    }
+
+    /// Wait for the next output update and return the new value, extracted.
+    pub async fn next(&self) -> Out {
+        (self.getter)(self.sub.next().await)
+    }
+}
+
+impl<R: IsRuntime, S: Storage<R>, Out> Deref for GearSubscription<R, S, Out> {
+    type Target = Subscription<R, S>;
+    fn deref(&self) -> &Subscription<R, S> {
+        &self.sub
     }
 }
 

@@ -411,6 +411,7 @@ mod tests {
         ListedPage {
             name: name.into(),
             category: cat.map(str::to_string),
+            page_id: "1".into(),
             title: title.into(),
             tags: tags.iter().map(|s| (*s).to_string()).collect(),
             created_by: "user".into(),

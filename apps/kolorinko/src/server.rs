@@ -65,8 +65,8 @@ use kolorinko_rt::{
 
 use crate::respond;
 use crate::runtime::{
-    GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, asset, legacy_page_id,
-    page_addr, repo_l_article_latest, repo_l_list_pages, repo_resource, shell,
+    GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, asset,
+    repo_l_article_latest, repo_l_list_pages, repo_resource, shell,
 };
 
 /// Max concurrent WebTransport sessions advertised per HTTP/3 connection
@@ -380,32 +380,29 @@ async fn subscribe_wire(
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
 ) -> Subscription<KolorinkoRT, InMemoryStorage<KolorinkoRT>> {
     match id {
-        wire::GearId::PageAddr { space, local } => {
-            page_addr(space, local).subscribe(core).await
+        // The client-facing gears are keyed by the canonical URL identity
+        // (`space`/`local`): what a URL names is what a subscription names.
+        wire::GearId::ArticleLatest { space, local } => {
+            article_latest(space, local).subscribe_raw(core).await
         }
-        wire::GearId::LegacyPageId { site, slug } => {
-            legacy_page_id(site, slug).subscribe(core).await
-        }
-        wire::GearId::ArticleLatest { site, slug } => {
-            article_latest(site, slug).subscribe(core).await
-        }
+        wire::GearId::Shell(space) => shell(space).subscribe_raw(core).await,
+        // The slug-keyed resolution cone (server-internal; exhaustive match).
         wire::GearId::ArticleLatestParsed { site, slug } => {
-            article_latest_parsed(site, slug).subscribe(core).await
+            article_latest_parsed(site, slug).subscribe_raw(core).await
         }
         wire::GearId::RepoLArticleLatest { site, slug } => {
-            repo_l_article_latest(site, slug).subscribe(core).await
+            repo_l_article_latest(site, slug).subscribe_raw(core).await
         }
         wire::GearId::RepoLListPages { site, query } => {
-            repo_l_list_pages(site, query).subscribe(core).await
+            repo_l_list_pages(site, query).subscribe_raw(core).await
         }
-        wire::GearId::Shell(site) => shell(site).subscribe(core).await,
         // Assets are HTTP-only — never shipped over WebTransport. The match is
         // exhaustive on the generated wire enum, but `to_wire_out` drops these.
-        wire::GearId::Asset { site, hash, ext } => asset(site, hash, ext).subscribe(core).await,
+        wire::GearId::Asset { site, hash, ext } => asset(site, hash, ext).subscribe_raw(core).await,
         // Server-internal resolution dependency of `article_latest`; the client
         // never subscribes to it, but the match must be exhaustive.
         wire::GearId::RepoResource { site, path } => {
-            repo_resource(site, path).subscribe(core).await
+            repo_resource(site, path).subscribe_raw(core).await
         }
     }
 }
@@ -418,10 +415,6 @@ fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
         // Shared gears are shared *across cores* by reference; to the client
         // they serialize the same way, so clone the payload out of the handle.
         GearResult::Shared(s) => match &*s {
-            GearOutShared::PageAddrOut(a) => Some(wire::GearOut::PageAddrOut(a.clone())),
-            GearOutShared::LegacyPageIdOut(a) => {
-                Some(wire::GearOut::LegacyPageIdOut(*a))
-            }
             GearOutShared::ShellOut(a) => Some(wire::GearOut::ShellOut(a.clone())),
             GearOutShared::ArticleLatestOut(a) => Some(wire::GearOut::ArticleLatestOut(a.clone())),
             GearOutShared::ArticleLatestParsedOut(a) => {

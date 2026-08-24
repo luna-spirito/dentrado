@@ -2,10 +2,13 @@
 //!
 //! One shape, one gear (both `shared` — cached + deduplicated across cores —
 //! and HTTP-only: never shipped over WebTransport):
-//! - **Content-addressed** `/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` — the
-//!   [`Asset`] gear reads the `_files/…/<hash>` blob, rewrites CSS
-//!   `url()`/`@import` to CA URLs, and compresses. Immutable key, so the client
-//!   caches it forever.
+//! - **Content-addressed** `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` —
+//!   the [`Asset`] gear reads the `_files/…/<hash>` blob, rewrites CSS
+//!   `url()`/`@import` to CA URLs, and compresses. Immutable key, so the
+//!   client caches it forever.
+//!
+//! Everything under `/-/` is system namespace: static files, these mirrored
+//! blobs, future platform endpoints.
 //!
 //! Every resource a page or stylesheet references is resolved to a CA URL at
 //! render time (mirrored) or left as its original absolute URL (a hotlink the
@@ -16,21 +19,21 @@
 
 use std::rc::Rc;
 
-use dentrado::core::{core_ctx::Core, gear::GearResult, storage::InMemoryStorage};
+use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
 use kolorinko_rt::{Body, RepoAssetPath, SafePathComponent};
 
 use crate::assets::mime_for_ext;
-use crate::runtime::{GearOutShared, KolorinkoRT, asset};
+use crate::runtime::{KolorinkoRT, asset};
 
-const PREFIX: &str = "/repo/";
+const PREFIX: &str = "/-/repo/";
 
 /// Result of a repo-asset request.
 pub(crate) enum RepoResp {
     Ok { mime: &'static str, body: Body },
 }
 
-/// The validated pieces of a `/repo/<site>/files/<xx>/<yy>/<hash>[.<ext>]`
-/// request: `(site, hash, ext)`, or `None` for anything outside the `/repo/`
+/// The validated pieces of a `/-/repo/<site>/files/<xx>/<yy>/<hash>[.<ext>]`
+/// request: `(site, hash, ext)`, or `None` for anything outside the `/-/repo/`
 /// namespace, not under `files/`, with an unsafe path, or not the CA shape.
 /// Pure (no disk, no core) so the SPA-fallback and traversal guards are
 /// testable without a runtime.
@@ -49,7 +52,7 @@ pub(crate) fn parse_ca_request(full: &str) -> Option<(SafePathComponent, String,
 }
 
 /// Resolve one CA request via the [`Asset`] gear, or `None` for anything
-/// outside the `/repo/` namespace or a missing blob (404). `full` is the raw
+/// outside the `/-/repo/` namespace or a missing blob (404). `full` is the raw
 /// request path (with query, if any).
 ///
 /// [`Asset`]: kolorinko_rt gear
@@ -59,17 +62,11 @@ pub(crate) async fn serve(
 ) -> Option<RepoResp> {
     let (site, hash, ext) = parse_ca_request(full)?;
     let mime = mime_for_ext(&ext);
-    let q = asset(site, hash, ext);
-    let GearResult::Shared(s) = core.read_gear(q.id).await else {
-        return None;
-    };
-    match &*s {
-        GearOutShared::AssetOut(Some(body)) => Some(RepoResp::Ok {
-            mime,
-            body: body.clone(),
-        }),
-        _ => None,
-    }
+    let body = asset(site, hash, ext).subscribe(core).await.current();
+    (*body).as_ref().map(|body| RepoResp::Ok {
+        mime,
+        body: body.clone(),
+    })
 }
 
 /// Split a CA request path `<xx>/<yy>/<hash>.<ext>` into its shards, or `None`
@@ -106,19 +103,20 @@ mod tests {
 
     #[test]
     fn non_ca_requests_are_rejected() {
-        assert!(parse_ca_request("/repo/rpcauthority/theme/../etc/passwd").is_none());
-        assert!(parse_ca_request("/repo/rpcauthority//files/x").is_none());
-        assert!(parse_ca_request("/repo/rpcauthority/files/../secret").is_none());
-        assert!(parse_ca_request("/repo/rpcauthority/bogus/x").is_none()); // not `files`
-        assert!(parse_ca_request("/repo/rpcauthority/files/d8/4a/deadbeef.png").is_none()); // short hash
-        assert!(parse_ca_request("/notrepo/x").is_none()); // outside namespace
+        assert!(parse_ca_request("/-/repo/rpcauthority/theme/../etc/passwd").is_none());
+        assert!(parse_ca_request("/-/repo/rpcauthority//files/x").is_none());
+        assert!(parse_ca_request("/-/repo/rpcauthority/files/../secret").is_none());
+        assert!(parse_ca_request("/-/repo/rpcauthority/bogus/x").is_none()); // not `files`
+        assert!(parse_ca_request("/-/repo/rpcauthority/files/d8/4a/deadbeef.png").is_none()); // short hash
+        assert!(parse_ca_request("/-/notrepo/x").is_none()); // outside namespace
+        assert!(parse_ca_request("/repo/rpcauthority/files/d8/4a/x").is_none()); // old prefix gone
     }
 
     #[test]
     fn parses_ca_request() {
         let h = "d84a29109fe0e70c7a5c22c39bda120fdbc56bd192f5927af95b9af8d0f87c27";
         let (site, hash, ext) =
-            parse_ca_request(&format!("/repo/rpcauthority/files/d8/4a/{h}.jpg"))
+            parse_ca_request(&format!("/-/repo/rpcauthority/files/d8/4a/{h}.jpg"))
                 .expect("CA request");
         assert_eq!((*site).clone(), "rpcauthority");
         assert_eq!(hash, h);

@@ -75,9 +75,8 @@ pub(crate) fn run_cli(
 
 fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
     let (site, slug) = parse_page(page)?;
-    // Compute the site string before `site` is moved into the worker closure.
-    let site_str = (*site).clone();
-    init_globals(&config);
+    crate::init_globals(&config)?;
+    let space = space_of_site(&site)?;
 
     // One core is enough for a single render; it keeps the `repo` oracle,
     // every lens, and the parse gears co-located, so the follow/secondary_get
@@ -86,19 +85,32 @@ fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
 
     let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<(ArticleView, SiteShell)>>();
     let worker = move |core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>| {
-        let page_q = crate::runtime::article_latest(site.clone(), slug.clone());
-        let shell_q = crate::runtime::shell(site.clone());
         let tx = tx.clone();
+        // Clone the captures into fresh locals here (not inside the async
+        // block) so the worker closure itself stays `Fn`.
+        let site = site.clone();
+        let slug = slug.clone();
         async move {
-            // Subscribe before reading either: holding both keeps the shared
-            // `repo` oracle active across the two queries (one clone total).
+            // The page is named by its slug on the CLI: bridge to the
+            // canonical `(space, local)` identity the gears address, then
+            // subscribe page + shell (holding both keeps the shared `repo`
+            // oracle active across the queries — one clone total).
+            let latest_q = crate::runtime::repo_l_article_latest(site.clone(), slug.clone());
+            let latest = latest_q.subscribe(&core).await.current();
+            let Some(local) = kolorinko_rt::LocalId::from_page_id(&latest.meta.page_id) else {
+                let _ = tx.send(Err(anyhow::anyhow!("page {slug:?} not found in {site:?}")));
+                return;
+            };
+            let page_q = crate::runtime::article_latest(space, local);
+            let shell_q = crate::runtime::shell(space);
             let page_sub = page_q.subscribe(&core).await;
             let shell_sub = shell_q.subscribe(&core).await;
-            let page = (page_q.getter)(page_sub.current());
-            let shell = (shell_q.getter)(shell_sub.current());
-            // The getters return `SharedView<…>` (a `!Send` refcount handle);
+            // `current()` yields `SharedView<…>` (a `!Send` refcount handle);
             // clone the payload out so owned values cross the channel.
-            let _ = tx.send(Ok(((*page).clone(), (*shell).clone())));
+            let _ = tx.send(Ok((
+                (*page_sub.current()).clone(),
+                (*shell_sub.current()).clone(),
+            )));
         }
     };
 
@@ -114,7 +126,7 @@ fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
     } else {
         None
     };
-    let html = render_page_document(&site_str, &shell, &page_view, base_css.as_deref());
+    let html = render_page_document(&shell, &page_view, base_css.as_deref());
     print!("{html}");
     Ok(())
 }
@@ -126,6 +138,9 @@ fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
 /// Everything a mass-render worker task needs, cloned once per core.
 #[derive(Clone)]
 struct Shared {
+    /// The site's registered canonical space (gear identity).
+    space: kolorinko_rt::SpaceId,
+    /// The dataset site (slug-keyed enumeration identity).
     site: SafePathComponent,
     /// `--inject`: the base theme stylesheet to inline into every page.
     base_css: Option<String>,
@@ -165,7 +180,8 @@ fn run_mass(
     let out = out.unwrap_or_else(|| Path::new(".kolorinko").join("render").join(&site_str));
     prepare_out_dir(&out, force)?;
 
-    init_globals(&config);
+    crate::init_globals(&config)?;
+    let space = space_of_site(&site)?;
     let base_css = if inject {
         read_base_css(&config.server.web_dist)
     } else {
@@ -175,6 +191,7 @@ fn run_mass(
 
     let (tx, rx) = mpsc::channel::<Out>();
     let shared = Shared {
+        space,
         site,
         base_css,
         tx,
@@ -280,31 +297,31 @@ async fn render_owned(
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     shared: &Shared,
 ) -> anyhow::Result<()> {
-    let shell_q = crate::runtime::shell(shared.site.clone());
-    let shell_sub = shell_q.subscribe(core).await;
-    let shell: SiteShell = (*(shell_q.getter)(shell_sub.current())).clone();
+    let shell_q = crate::runtime::shell(shared.space);
+    let shell: SiteShell = (*shell_q.subscribe(core).await.current()).clone();
 
     // The wide-open selection enumerating every page of the site (hidden
     // `_`-prefixed system pages included) in one shared `repo_l_list_pages`
     // query; holding both subscriptions for the whole run keeps the shared
     // `repo` oracle active (one git clone total).
     let list_q = crate::runtime::repo_l_list_pages(shared.site.clone(), enumerate_query());
-    let list_sub = list_q.subscribe(core).await;
-    let listed: ListPagesResult = (*(list_q.getter)(list_sub.current())).clone();
+    let listed: ListPagesResult = (*list_q.subscribe(core).await.current()).clone();
 
     let mut rendered = 0usize;
     for page in listed.pages {
-        let Some(slug) = page_slug(&page) else {
+        // The listed page id is the canonical local id — no slug round-trip
+        // needed.
+        let Some(local) = kolorinko_rt::LocalId::from_page_id(&page.page_id) else {
             continue;
         };
-        let page_q = crate::runtime::article_latest(shared.site.clone(), slug);
-        if !core.owns(&page_q.id) {
+        let page_q = crate::runtime::article_latest(shared.space, local);
+        if !core.owns(page_q.id()) {
             continue; // another core owns this page
         }
         let sub = page_q.subscribe(core).await;
-        let view: ArticleView = (*(page_q.getter)(sub.current())).clone();
+        let view: ArticleView = (*sub.current()).clone();
         drop(sub);
-        let html = render_page_document(&shared.site, &shell, &view, shared.base_css.as_deref());
+        let html = render_page_document(&shell, &view, shared.base_css.as_deref());
         shared
             .tx
             .send(Out::Page { page, html })
@@ -356,33 +373,15 @@ fn parse_page(arg: &str) -> anyhow::Result<(SafePathComponent, Slug)> {
     })
 }
 
-/// Initialize the process-global config (repo + space registry) once for the
-/// render run — the same globals the server initializes from its config.
-fn init_globals(config: &Config) {
-    globals::init(
-        &config.repo.url,
-        &config.repo.dir,
-        config.repo.interval,
-        &config
-            .space
-            .iter()
-            .map(|s| (s.id.clone(), s.site.clone()))
-            .collect::<Vec<_>>(),
-    )
-    .expect("render initializes the global config exactly once");
-}
-
-/// A listed page back into a `(category, name)` slug — the inverse of the
-/// dataset projection (`slug_of` in `listpages.rs`): `None` only for
-/// malformed names that cannot be safe path components (shouldn't happen for
-/// pages that came out of the repo).
-fn page_slug(page: &ListedPage) -> Option<Slug> {
-    Some((
-        page.category
-            .as_ref()
-            .and_then(|c| SafePathComponent::new(c.clone())),
-        SafePathComponent::new(page.name.clone())?,
-    ))
+/// The registered space for a site named on the CLI — the render gears
+/// address pages canonically, so the site must appear in
+/// `ensure-evakuilo-sites`.
+fn space_of_site(site: &SafePathComponent) -> anyhow::Result<kolorinko_rt::SpaceId> {
+    globals::space_of(site).ok_or_else(|| {
+        anyhow::anyhow!(
+            "site {site:?} is not registered; add it to `ensure-evakuilo-sites` in the config"
+        )
+    })
 }
 
 /// The page's output path relative to the render root, laid out like the
@@ -489,13 +488,14 @@ fn read_base_css(web_dist: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ListedPage, page_rel_path, page_slug, prepare_out_dir};
+    use super::{ListedPage, page_rel_path, prepare_out_dir};
     use std::path::{Path, PathBuf};
 
     fn listed(category: Option<&str>, name: &str) -> ListedPage {
         ListedPage {
             name: name.to_string(),
             category: category.map(str::to_string),
+            page_id: "1".to_string(),
             title: String::new(),
             tags: Vec::new(),
             created_by: String::new(),
@@ -516,22 +516,6 @@ mod tests {
             page_rel_path(&listed(Some("rpc"), "rpc-205")),
             Path::new("rpc").join("rpc-205.html")
         );
-    }
-
-    #[test]
-    fn page_slug_round_trips() {
-        assert_eq!(
-            page_slug(&listed(Some("rpc"), "rpc-205"))
-                .map(|(c, n)| { (c.map(|c| (*c).clone()), (*n).clone()) }),
-            Some((Some("rpc".to_string()), "rpc-205".to_string()))
-        );
-        assert_eq!(
-            page_slug(&listed(None, "start")).map(|(c, n)| (c, (*n).clone())),
-            Some((None, "start".to_string()))
-        );
-        // Unsafe names can't become slugs (defensive: repo data is validated
-        // at the same boundary on the way in).
-        assert!(page_slug(&listed(None, "../etc")).is_none());
     }
 
     #[test]

@@ -17,7 +17,9 @@ use std::{
     path::{Component, Path},
 };
 
-pub use crate::ids::{parse_canonical, LocalId, PageAddr, SpaceId, SYSTEM_PREFIX};
+pub use crate::ids::{
+    LocalId, SYSTEM_PREFIX, SpaceId, encode_path_segment, parse_page_route, title_slug,
+};
 
 /// A page slug: `(category, page)` — Wikidot's `category:name` flattened.
 pub type Slug = (Option<SafePathComponent>, SafePathComponent);
@@ -183,7 +185,7 @@ pub enum Body {
 /// MIME is derivable without a side table — [`crate::wire`] never needs the
 /// blob's type, only this pair.
 ///
-/// Serialized onto `/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` by the resolver.
+/// Serialized onto `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` by the resolver.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CaRef {
     /// 64-char lowercase hex SHA-256.
@@ -217,6 +219,9 @@ pub struct ListedPage {
     pub name: String,
     /// Page category, `None` for a root (`_default`) page.
     pub category: Option<String>,
+    /// The exporter's numeric page id — the canonical `LocalId` payload
+    /// (`LocalId::from_page_id`).
+    pub page_id: String,
     pub title: String,
     pub tags: Vec<String>,
     pub created_by: String,
@@ -252,11 +257,11 @@ pub struct ListPagesResult {
 /// content-addressed URL, and the fully include-resolved `nav:top` / `nav:side`
 /// pages. Bundled so the client requests the whole site frame once and keeps it
 /// live across page navigation within the site.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SiteShell {
     pub title: Option<String>,
     pub subtitle: Option<String>,
-    /// CA URL `/repo/<site>/files/<xx>/<yy>/<hash>.css`, or `None` if the site
+    /// CA URL `/-/repo/<site>/files/<xx>/<yy>/<hash>.css`, or `None` if the site
     /// has no theme root mirrored into `files/`.
     pub theme_root: Option<String>,
     pub nav_top: ArticleView,
@@ -272,19 +277,19 @@ pub struct SiteShell {
 /// The `*_hash` fields are the content hashes (see [`crate::wire`]) of the
 /// corresponding wire outputs: a hydrating client echoes them in `Subscribe`
 /// so the server re-sends nothing that the rendered page already shows.
-///
-/// `addr` is the resolved dataset address (site + slug) — the subscription
-/// keys for `page`/`shell`, so a canonical-URL hydration needs no resolution
-/// round-trip. `route` is the canonical `(space, local)` address when the URL
-/// was canonical (`None` on legacy paths).
+/// `addr`/`route` are gone with the legacy routes: the canonical
+/// `(space, local)` address below is both what the URL names and the
+/// subscription keys for `page`/`shell`, so hydration needs no resolution
+/// round-trip — and the decorative title segment, when wanted, is re-derived
+/// from the page's own title ([`title_slug`]).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SsrState {
     pub page: ArticleView,
     pub page_hash: String,
     pub shell: SiteShell,
     pub shell_hash: String,
-    pub addr: PageAddr,
-    pub route: Option<(SpaceId, LocalId)>,
+    pub space: SpaceId,
+    pub local: LocalId,
 }
 
 pub const SSR_STATE_ID: &str = "kolorinko-ssr";
@@ -323,8 +328,8 @@ impl SsrState {
 #[dentrado_macros::gears_schema(file = "gears.def.rs")]
 pub mod wire {
     use crate::{
-        Body, CaRef, ListPagesQuery, ListPagesResult, LocalId, PageAddr, RepoAssetPath,
-        SafePathComponent, SiteShell, SpaceId,
+        Body, CaRef, ListPagesQuery, ListPagesResult, LocalId, RepoAssetPath, SafePathComponent,
+        SiteShell, SpaceId,
     };
     use kolorinko_wikitext::{ArticleLatest, ArticleView};
 

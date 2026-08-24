@@ -117,10 +117,11 @@ impl WtClient {
     ) -> u64 {
         let sub = self.inner.next_sub.get();
         self.inner.next_sub.set(sub.wrapping_add(1));
-        let getter = query.getter;
-        let cb: UpdateCb = Rc::new(move |out| on_update(getter(out)));
+        let id = query.id().clone();
+        let extract = move |out| query.extract(out);
+        let cb: UpdateCb = Rc::new(move |out| on_update(extract(out)));
         let reg = Rc::new(Registration {
-            id: query.id,
+            id,
             cb,
             hash: RefCell::new(known.map(str::to_owned)),
             writer: RefCell::new(None),

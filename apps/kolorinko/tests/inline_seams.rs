@@ -8,8 +8,13 @@ use kolorinko_render::render_block;
 use kolorinko_wikitext::{ContainerKind, Node, TextObj, TextStyle};
 use leptos::prelude::*;
 
+/// A fixed space for link-href assertions (raw bytes; Display adds the 'S' marker).
+fn test_space() -> Option<kolorinko_rt::SpaceId> {
+    Some(kolorinko_rt::SpaceId::from_bytes([0x2a; 16]))
+}
+
 fn render_nodes(content: &[Node]) -> String {
-    let views = render_block("rpcauthority", &content.to_vec());
+    let views = render_block(test_space(), &content.to_vec());
     view! { <div>{views}</div> }.to_html().replace("<!>", "")
 }
 
@@ -59,9 +64,12 @@ fn rim_trim_stops_at_content() {
 fn seam_space_before_inline_container_survives() {
     assert_eq!(
         html("intro\n\nThe RPC Authority Wiki **[[[component:theme|Black Supremacy]]]**"),
-        r#"<div><p>intro</p><p>The RPC Authority Wiki <strong>\
-<a href="/rpcauthority/component/theme">Black Supremacy</a></strong></p></div>"#
-            .replace("\\\n", "")
+        format!(
+            r#"<div><p>intro</p><p>The RPC Authority Wiki <strong>\
+<a href="/{s}/component:theme">Black Supremacy</a></strong></p></div>"#,
+            s = test_space().unwrap()
+        )
+        .replace("\\\n", "")
     );
 }
 
@@ -78,9 +86,12 @@ fn single_newlines_between_inline_nodes_render_as_br() {
 ";
     assert_eq!(
         html(toc),
-        "<div><div class=\"content-panel content-toc\">\
+        format!(
+            "<div><div class=\"content-panel content-toc\">\
 <p><strong>Table of Contents</strong><br>\
-<a href=\"/rpcauthority/rpc-archive#operational\">Operational Information</a><br>\
-<a href=\"/rpcauthority/rpc-archive#list\">List of RPCs</a></p></div></div>"
+<a href=\"/{s}/rpc-archive#operational\">Operational Information</a><br>\
+<a href=\"/{s}/rpc-archive#list\">List of RPCs</a></p></div></div>",
+            s = test_space().unwrap()
+        )
     );
 }

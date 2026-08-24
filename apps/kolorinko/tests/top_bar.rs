@@ -7,17 +7,22 @@ use kolorinko::wikidot_parser;
 use kolorinko_render::{render_block, wrap_topbar_lists};
 use leptos::prelude::*;
 
-fn render_topbar_html(site: &str, src: &str) -> String {
+/// A fixed space for link-href assertions (raw bytes; Display adds the 'S' marker).
+fn test_space() -> Option<kolorinko_rt::SpaceId> {
+    Some(kolorinko_rt::SpaceId::from_bytes([0x2a; 16]))
+}
+
+fn render_topbar_html(space: Option<kolorinko_rt::SpaceId>, src: &str) -> String {
     let mut content = wikidot_parser::parse(src);
     wrap_topbar_lists(&mut content);
-    let views = render_block(site, &content);
+    let views = render_block(space, &content);
     view! { <div>{views}</div> }.to_html().replace("<!>", "")
 }
 
 #[test]
 fn topbar_wraps_submenu_triggers() {
     let html = render_topbar_html(
-        "test",
+        test_space(),
         concat!(
             "[[div class=\"top-bar\"]]\n",
             "* RPC Archive\n",
@@ -36,16 +41,28 @@ fn topbar_wraps_submenu_triggers() {
     );
     // Nested leaf entries keep their real links.
     assert!(
-        html.contains(r#"<a href="/test/rpc-archive">001</a>"#),
+        html.contains(&format!(
+            r#"<a href="/{s}/rpc-archive">001</a>"#,
+            s = test_space().unwrap()
+        )),
         "{html}"
     );
     assert!(
-        html.contains(r#"<a href="/test/non-canon-hub">Joke</a>"#),
+        html.contains(&format!(
+            r#"<a href="/{s}/non-canon-hub">Joke</a>"#,
+            s = test_space().unwrap()
+        )),
         "{html}"
     );
     // A top-level item with no submenu keeps its real link — it is not turned
     // into a dead `javascript:;` anchor (and never nests anchors).
-    assert!(html.contains(r#"<a href="/test/home">Home</a>"#), "{html}");
+    assert!(
+        html.contains(&format!(
+            r#"<a href="/{s}/home">Home</a>"#,
+            s = test_space().unwrap()
+        )),
+        "{html}"
+    );
     assert!(
         !html.contains("<a href=\"javascript:\"><a"),
         "nested anchors: {html}"
@@ -58,7 +75,7 @@ fn topbar_leaves_nested_levels_unwrapped() {
     // wrapped. The middle level (itself a submenu of the top, with its own
     // children) must NOT get a `javascript:;` anchor.
     let html = render_topbar_html(
-        "test",
+        test_space(),
         concat!(
             "[[div class=\"top-bar\"]]\n",
             "* Top\n",
@@ -73,12 +90,18 @@ fn topbar_leaves_nested_levels_unwrapped() {
         !html.contains(r#"<a href="javascript:;">Mid</a>"#),
         "middle level wrongly wrapped: {html}"
     );
-    assert!(html.contains(r#"<a href="/test/leaf">Leaf</a>"#), "{html}");
+    assert!(
+        html.contains(&format!(
+            r#"<a href="/{s}/leaf">Leaf</a>"#,
+            s = test_space().unwrap()
+        )),
+        "{html}"
+    );
 }
 
 #[test]
 fn topbar_transform_is_idempotent_without_sublists() {
     // A flat list with no submenus is untouched: no `javascript:;` anchors.
-    let html = render_topbar_html("test", "* [[[a|A]]]\n* [[[b|B]]]\n");
+    let html = render_topbar_html(test_space(), "* [[[a|A]]]\n* [[[b|B]]]\n");
     assert!(!html.contains("javascript:"), "{html}");
 }
