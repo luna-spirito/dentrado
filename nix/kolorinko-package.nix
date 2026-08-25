@@ -118,7 +118,7 @@ let
     installPhaseCommand = "cp -r dist $out";
     # `wasm-bindgen-cli` must byte-match the `wasm-bindgen` version in that
     # lockfile.
-    wasm-bindgen-cli = pkgs.wasm-bindgen-cli_0_2_125;
+    wasm-bindgen-cli = pkgs.wasm-bindgen-cli_0_2_126;
     # Deps (leptos, wasm-bindgen, the path crates' deps…) come from the
     # stubbed deps-only build above; Trunk then builds just the web crate.
     cargoArtifacts = webDeps;
