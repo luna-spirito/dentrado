@@ -27,7 +27,15 @@
         git-hooks.flakeModule
       ];
 
-      flake.nixosModules.kolorinko = ./nix/kolorinko-module.nix;
+      # The module requires `services.kolorinko.package`; this wrapper
+      # defaults it to this flake's own crane-built package for the host
+      # system, so consumers only need `services.kolorinko.enable = true`.
+      flake.nixosModules.kolorinko =
+        { pkgs, lib, ... }:
+        {
+          imports = [ ./nix/kolorinko-module.nix ];
+          services.kolorinko.package = lib.mkDefault inputs.self.packages.${pkgs.system}.kolorinko;
+        };
 
       systems = [
         "x86_64-linux"

@@ -30,7 +30,7 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      description = "kolorinko package to run — this flake's `packages.<system>.kolorinko`.";
+      description = "kolorinko package to run. The flake's `nixosModules.kolorinko` wrapper defaults this to its own `packages.<system>.kolorinko`; set it explicitly only when importing the module file directly.";
     };
 
     openFirewall = lib.mkOption {
