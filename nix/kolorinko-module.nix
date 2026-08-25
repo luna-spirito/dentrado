@@ -14,12 +14,16 @@ let
   cfg = config.services.kolorinko;
 
   toml = pkgs.formats.toml { };
+  credentialsDir = "/run/credentials/kolorinko.service";
   configFile =
     let
-      # Paths the module owns: mutable state and the dist inside the package.
+      # Paths the module owns: mutable state, the dist inside the package,
+      # and TLS material exposed as systemd credentials (see LoadCredential).
       managed = {
         repo.dir = "/var/lib/kolorinko/repo";
         server.web_dist = "${cfg.package}/share/web-dist";
+        server.cert_file = "${credentialsDir}/cert";
+        server.key_file = "${credentialsDir}/key";
       };
     in
     toml.generate "kolorinko.toml" (lib.recursiveUpdate cfg.settings managed);
@@ -37,6 +41,27 @@ in
       type = lib.types.bool;
       default = false;
       description = "Open the firewall (TCP + UDP/QUIC) for `settings.server.bind`'s port.";
+    };
+
+    certs = {
+      cert = lib.mkOption {
+        type = lib.types.str;
+        default = "/etc/kolorinko/cert.pem";
+        description = ''
+          TLS certificate file. Read by systemd (as root, so any permission
+          works) and exposed to the service as a credential; the server sees it
+          at `/run/credentials/kolorinko.service/cert` regardless of this path.
+        '';
+      };
+      key = lib.mkOption {
+        type = lib.types.str;
+        default = "/etc/kolorinko/key.pem";
+        description = ''
+          TLS private key file. Read by systemd (as root) and exposed to the
+          service as a credential; the server sees it at
+          `/run/credentials/kolorinko.service/key` regardless of this path.
+        '';
+      };
     };
 
     settings = lib.mkOption {
@@ -59,9 +84,10 @@ in
         };
       };
       description = ''
-        Contents of kolorinko's TOML config. `repo.dir` and
-        `server.web_dist` are derived from `package` and the service's state
-        directory and must not be set here.
+        Contents of kolorinko's TOML config. `repo.dir`, `server.web_dist`,
+        `server.cert_file` and `server.key_file` are derived from `package`,
+        the service's state directory and the loaded credentials; setting
+        them here has no effect.
       '';
     };
   };
@@ -74,7 +100,7 @@ in
 
     systemd.services.kolorinko = {
       description = "kolorinko (HTTP/3 + WebTransport wiki mirror)";
-      documentation = "https://github.com/luna-spirito/dentrado";
+      documentation = [ "https://github.com/luna-spirito/dentrado" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
@@ -83,6 +109,13 @@ in
 
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/kolorinko ${configFile}";
+        # PID 1 (root) reads the sources and republishes them per-start in
+        # /run/credentials, owned by the dynamic user — private keys can keep
+        # root-only permissions on disk and never touch the service's view.
+        LoadCredential = [
+          "cert:${cfg.certs.cert}"
+          "key:${cfg.certs.key}"
+        ];
         StateDirectory = "kolorinko";
         WorkingDirectory = "/var/lib/kolorinko";
         DynamicUser = true;
