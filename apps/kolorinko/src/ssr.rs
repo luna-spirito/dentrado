@@ -15,9 +15,11 @@ use crate::runtime::{KolorinkoRT, article_latest, shell};
 /// `(space, local)`, or `None` when the frontend template can't host SSR
 /// output (no app placeholder — unbuilt frontend); the caller then falls back
 /// to serving the plain shell. `host` — the request's `host[:port]` —
-/// absolutizes the OpenGraph card's URLs and names the page's canonical
-/// address (`og:url`): without the space segment when the host is the
-/// space's own configured domain, with it elsewhere.
+/// absolutizes the OpenGraph card's URLs, names the page's canonical address
+/// (`og:url`: without the space segment when the host is the space's own
+/// configured domain, with it elsewhere), and, on such a domain, rides into
+/// the document as `window.__DEFAULT_SPACE_ID__` (see
+/// [`kolorinko_rt::DEFAULT_SPACE_GLOBAL`]).
 pub(crate) async fn document(
     assets: &Arc<HashMap<String, Body>>,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
@@ -41,7 +43,12 @@ pub(crate) async fn document(
             )
         )
     });
-    kolorinko_render::render_ssr_document(&index, &state, host, canonical.as_deref())
+    // The space the host itself names (whatever page it renders) — the
+    // client collapses `/S<default>/…` hrefs to `/…` against it.
+    let default_space = host
+        .and_then(crate::globals::space_of_domain)
+        .map(|(s, _)| s);
+    kolorinko_render::render_ssr_document(&index, &state, host, canonical.as_deref(), default_space)
 }
 
 /// Resolve the page and shell for one canonical address. Subscribes both

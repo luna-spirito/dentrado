@@ -9,7 +9,7 @@ license = "AGPL-3.0-or-later"
 anyhow = "1.0.102"
 bytes = "1"
 chumsky = "0.13.0"
-compio = { version = "0.19.1", features = [
+compio = { version = "0.19.2", features = [
   "runtime",
   "io-uring",
   "fs",

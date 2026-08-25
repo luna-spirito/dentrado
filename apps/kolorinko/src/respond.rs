@@ -5,7 +5,9 @@
 //!    (root-relative `/index.html`, `/sw.js`, `/wikidot-base-theme/…`, the
 //!    hashed trunk outputs); an unknown path is never answered here. Served
 //!    identically on every origin: asset URLs are root-relative and
-//!    content-addressed, so a page's own origin serves its assets.
+//!    content-addressed, so a page's own origin serves its assets — except
+//!    `/index.html`, which on a wiki's own domain (rule 5) carries the
+//!    default-space script below.
 //! 2. the system namespace `/-…` — the mirrored content-addressed blobs
 //!    under `/-/repo/…` ([`crate::repo`]); an unknown system path is a
 //!    plain 404 (no content, no SPA fallback — future platform endpoints
@@ -22,7 +24,10 @@
 //!    `LOCAL[/TITLE]` canonical, `[cat:]slug…` redirected — and `/`
 //!    SSR'ing the wiki's landing page as its homepage. No SPA shell on a
 //!    wiki domain: the platform's client app is not this origin's face, an
-//!    unknown page is a plain 404,
+//!    unknown page is a plain 404. Every HTML document served here (SSR
+//!    pages, the `/index.html` asset) carries
+//!    `window.__DEFAULT_SPACE_ID__`, so the client reads `/L…` addresses
+//!    the same way — and collapses `/S<default>/L…` ones to `/L…`
 //! 6. `/` — SSR'd in place with the first registered space's landing page,
 //! 7. anything else non-asset — the `/index.html` SPA shell (the client's
 //!    not-found view),
@@ -89,11 +94,20 @@ pub(crate) async fn resolve(
     host: Option<&str>,
 ) -> Reply {
     let path = full.split('?').next().unwrap_or(full);
-    // Static assets first: an exact map hit answers at any path (the map is
+    // The CSR shell answers through [`shell_body`] (never the plain asset
+    // map) so a wiki's own domain gets the default-space script injected.
+    // Then the static map: an exact hit answers at any path (the map is
     // exactly the dist tree — known filenames, never a leading `-`, so it
     // can't shadow the `/-…` system namespace or a content route). Then the
     // system namespace: CA blobs, 404 on a miss — never content routing,
     // never the SPA fallback.
+    if path == "/index.html" {
+        return Reply::ok(
+            "text/html; charset=utf-8",
+            shell_body(assets, accept_zstd, host),
+            static_policy(path),
+        );
+    }
     if let Some(b) = assets.get(path) {
         return Reply::ok(
             mime_for(path),
@@ -148,15 +162,15 @@ async fn route(
                     Some((local, _title)) => {
                         ssr(accept_zstd, assets, core, host, space, local).await
                     }
-                    None => index_fallback(assets, accept_zstd),
+                    None => index_fallback(assets, accept_zstd, host),
                 }
             }
-            None => index_fallback(assets, accept_zstd),
+            None => index_fallback(assets, accept_zstd, host),
         };
     }
     // Anything else: the SPA shell for routes, a 404 for asset-like paths.
     if !looks_like_asset(path) {
-        return index_fallback(assets, accept_zstd);
+        return index_fallback(assets, accept_zstd, host);
     }
     Reply::not_found()
 }
@@ -318,7 +332,7 @@ async fn ssr(
             serve_body(&compress(html.into_bytes()), accept_zstd),
             NOCACHE,
         ),
-        None => index_fallback(assets, accept_zstd),
+        None => index_fallback(assets, accept_zstd, host),
     }
 }
 
@@ -342,15 +356,38 @@ fn static_policy(key: &str) -> &'static str {
     }
 }
 
-fn index_fallback(assets: &Arc<HashMap<String, Body>>, accept_zstd: bool) -> Reply {
+fn index_fallback(
+    assets: &Arc<HashMap<String, Body>>,
+    accept_zstd: bool,
+    host: Option<&str>,
+) -> Reply {
     Reply::ok(
         "text/html; charset=utf-8",
-        serve_body(
-            assets.get("/index.html").expect("index.html always loaded"),
-            accept_zstd,
-        ),
+        shell_body(assets, accept_zstd, host),
         NOCACHE,
     )
+}
+
+/// The SPA shell (`/index.html`) as this host serves it: the stored asset
+/// verbatim, plus — on a wiki's own domain — `window.__DEFAULT_SPACE_ID__`
+/// injected after `<head>` (the same script the SSR document seals in), so a
+/// CSR boot there reads `/L…` paths and collapses `/S<default>/L…` ones
+/// against the space the host already names. Rebuilt per serve like an SSR
+/// page (the shell is small); every other origin shares the stored bytes.
+fn shell_body(
+    assets: &Arc<HashMap<String, Body>>,
+    accept_zstd: bool,
+    host: Option<&str>,
+) -> Served {
+    let stored = assets.get("/index.html").expect("index.html always loaded");
+    let Some((space, _)) = host.and_then(crate::globals::space_of_domain) else {
+        return serve_body(stored, accept_zstd);
+    };
+    let html = crate::assets::inject_head_script(
+        &serve_body(stored, false).bytes,
+        &kolorinko_rt::default_space_script(space),
+    );
+    serve_body(&compress(html), accept_zstd)
 }
 
 impl Reply {

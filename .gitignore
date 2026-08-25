@@ -1,8 +1,10 @@
-target
 .*
 !.cargo
-/thinking
+target
 dist
+*.png
+
+/thinking
 /*.md
 /*.html
 /tools

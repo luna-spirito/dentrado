@@ -209,22 +209,15 @@ pub(crate) fn looks_like_asset(path: &str) -> bool {
     )
 }
 
-// ---- WebTransport cert-hash injection (hash-pinning mode) -------------------
+// ---- HTML `<head>` script injection ----------------------------------------
 //
-// Done once into the raw `index.html` bytes (see [`load_assets`]), before
-// zstd compression — not per request.
+// The WT cert hash rides the raw `index.html` bytes once at [`load_assets`]
+// (every origin alike); the default-space id is per serve, a wiki's own
+// domain only (see `respond::shell_body`).
 
-/// Inject `<script>window.__WT_CERT_HASH__=new Uint8Array([...]);</script>` into
-/// the page right after the opening `<head>`, so the wasm WebTransport client
-/// can pin the server's self-signed cert via `serverCertificateHashes`.
-fn inject_wt_hash(html: &[u8], hash: &[u8]) -> Vec<u8> {
-    let script = format!(
-        "<script>window.__WT_CERT_HASH__=new Uint8Array([{}]);</script>",
-        hash.iter()
-            .map(|b| b.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+/// Inject `<script>…</script>` into the page right after the opening
+/// `<head …>`, so the client carries it before any other `<head>` content.
+pub(crate) fn inject_head_script(html: &[u8], script: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(html.len() + script.len());
     match find_head_open(html) {
         Some(pos) => {
@@ -239,6 +232,20 @@ fn inject_wt_hash(html: &[u8], hash: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Inject `<script>window.__WT_CERT_HASH__=new Uint8Array([...]);</script>`, so
+/// the wasm WebTransport client can pin the server's self-signed cert via
+/// `serverCertificateHashes`.
+fn inject_wt_hash(html: &[u8], hash: &[u8]) -> Vec<u8> {
+    let script = format!(
+        "<script>window.__WT_CERT_HASH__=new Uint8Array([{}]);</script>",
+        hash.iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    inject_head_script(html, &script)
 }
 
 /// Byte offset just past the first `<head ...>` tag (case-insensitive), if any.
@@ -266,6 +273,25 @@ mod tests {
     #[test]
     fn large_incompressible_is_raw() {
         assert!(matches!(compress(random(4 * super::PROBE_SIZE)), Raw(_)));
+    }
+
+    /// The script lands right after the opening `<head>` (case-insensitive,
+    /// attributes tolerated), and a `<head>`-less document prepends it
+    /// defensively.
+    #[test]
+    fn head_script_injects_after_head_open() {
+        use super::inject_head_script;
+        assert_eq!(
+            inject_head_script(
+                b"<html><HEAD lang=\"en\"><title>x</title></HEAD></html>",
+                "<script>s</script>"
+            ),
+            b"<html><HEAD lang=\"en\"><script>s</script><title>x</title></HEAD></html>"
+        );
+        assert_eq!(
+            inject_head_script(b"no head", "<script>s</script>"),
+            b"<script>s</script>no head"
+        );
     }
 
     /// Small files skip the probe and rely on the ratio guard, so a small

@@ -21,7 +21,7 @@
 #   the wiki's own domain.
 [ensure-evakuilo-sites]
 "obscurative" = { landing = "main", domains = ["www.obscurative.ru"] }
-"rpcauthority" = { domains = ["rpc-wiki.net", "www.rpc-wiki.net"] }
+"rpcauthority" = { domains = ["rpc-wiki.net", "www.rpc-wiki.net", "rpc.localhost" ] }
 
 [repo]
 url = "https://github.com/luna-spirito/wikidot-kolorinko-export.git"

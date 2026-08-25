@@ -18,8 +18,8 @@ use std::{
 };
 
 pub use crate::ids::{
-    LocalId, SYSTEM_PREFIX, SpaceId, encode_path_segment, format_page_route, parse_page_route,
-    title_slug,
+    LocalId, SYSTEM_PREFIX, SpaceId, encode_path_segment, format_page_route, parse_local_route,
+    parse_page_route, title_slug,
 };
 
 /// A page slug: `(category, page)` — Wikidot's `category:name` flattened.
@@ -342,6 +342,24 @@ pub struct SsrState {
 
 pub const SSR_STATE_ID: &str = "kolorinko-ssr";
 
+/// The `window` global naming the space a served origin already implies:
+/// injected as [`default_space_script`] into every HTML document the server
+/// sends on a wiki's own configured domain (never on the main origin, where
+/// every URL carries its own space). The client pairs it with
+/// [`parse_local_route`] — `/L…` paths address this space — and collapses
+/// `/{default}/L…` hrefs to `/L…`, so the space segment appears in a URL only
+/// when it differs from the host's own.
+pub const DEFAULT_SPACE_GLOBAL: &str = "__DEFAULT_SPACE_ID__";
+
+/// The `<script>` payload publishing [`DEFAULT_SPACE_GLOBAL`] to the client:
+/// `window.__DEFAULT_SPACE_ID__="<space>"`. The spelling is the contract
+/// between the injecting server and the reading client — like
+/// [`SSR_STATE_ID`], it travels in the document, not the wire.
+#[must_use]
+pub fn default_space_script(space: SpaceId) -> String {
+    format!(r#"<script>window.{DEFAULT_SPACE_GLOBAL}="{space}";</script>"#)
+}
+
 impl SsrState {
     /// Serialize into the body of an `<script type="application/json">`
     /// element. `<` is escaped as `\u003c` so page content can never close the
@@ -400,5 +418,21 @@ pub mod wire {
     #[serde(tag = "t", rename_all = "lowercase")]
     pub enum ServerMsg {
         Push { out: GearOut, hash: String },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The injected script's exact spelling is the server↔client contract:
+    /// the server writes it, the client reads `window.__DEFAULT_SPACE_ID__`.
+    #[test]
+    fn default_space_script_shape() {
+        let space = SpaceId::parse("S70P6lbBZxbc-kcpGOCYmZA").unwrap();
+        assert_eq!(
+            default_space_script(space),
+            r#"<script>window.__DEFAULT_SPACE_ID__="S70P6lbBZxbc-kcpGOCYmZA";</script>"#
+        );
     }
 }

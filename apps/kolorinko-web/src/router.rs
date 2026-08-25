@@ -1,9 +1,16 @@
 //! Path-based client router: the single source of truth for which page the
 //! app shows. There is exactly one URL family — the canonical
 //! `/{space}/{local}[/title]` (the 'S'/'L' marker char in both ids makes recognition
-//! purely syntactic; the optional title segment is decorative). The server
-//! SSRs canonical routes and 301s slug-form paths to them; the client never
-//! resolves slugs, so a slug link is simply a full browser navigation.
+//! purely syntactic; the optional title segment is decorative) — plus its
+//! space-less sibling `/{local}[/title]` on a wiki's own domain, where the
+//! `Host` already names the space: the server injects that space as
+//! `window.__DEFAULT_SPACE_ID__` ([`DEFAULT_SPACE_GLOBAL`]) into every HTML
+//! document it serves there, and this router reads it, addresses `/L…`
+//! paths to it, and collapses `/S<default>/L…` hrefs to `/L…` — so the
+//! space segment appears in a URL only when it differs from the host's own.
+//! The server SSRs canonical routes and 301s slug-form paths to them; the
+//! client never resolves slugs, so a slug link is simply a full browser
+//! navigation.
 //!
 //! `space`/`local` live as reactive signals so subscriptions re-subscribe on
 //! navigation. Two global listeners keep them in sync with the URL:
@@ -13,7 +20,10 @@
 //!   (pushState) instead of a full reload — so the WebTransport session and
 //!   its subscriptions stay live across page changes.
 
-use kolorinko_rt::{LocalId, SpaceId, SsrState, parse_page_route};
+use kolorinko_rt::{
+    DEFAULT_SPACE_GLOBAL, LocalId, SpaceId, SsrState, format_page_route, parse_local_route,
+    parse_page_route,
+};
 use leptos::prelude::*;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{Element, Event, MouseEvent};
@@ -33,6 +43,30 @@ pub(crate) struct Router {
     /// The canonical route: the `article_latest` / `shell` subscription keys.
     pub space: RwSignal<Option<SpaceId>>,
     pub local: RwSignal<Option<LocalId>>,
+    /// The space this origin already names (`window.__DEFAULT_SPACE_ID__`,
+    /// injected by the server on a wiki's own domain; `None` on the main
+    /// origin). `/L…` paths address it ([`parse_route`]), and its own
+    /// canonical hrefs collapse to the space-less form ([`collapse`]).
+    default: Option<SpaceId>,
+}
+
+/// `window.__DEFAULT_SPACE_ID__`, the space the origin itself names — the
+/// script the server injects into every HTML document of a wiki's own
+/// configured domain (absent on the main origin, where every URL carries
+/// its own space).
+fn default_space(window: &web_sys::Window) -> Option<SpaceId> {
+    js_sys::Reflect::get(window.as_ref(), &JsValue::from_str(DEFAULT_SPACE_GLOBAL))
+        .ok()?
+        .as_string()
+        .and_then(|s| SpaceId::parse(&s))
+}
+
+/// The route a path names when `default` is the space the origin already
+/// names: the canonical `/{space}/{local}[/title]`, or — on a wiki's own
+/// domain — the space-less `/{local}[/title]` addressed to the default
+/// space ([`parse_local_route`]).
+fn parse_route(default: Option<SpaceId>, path: &str) -> Option<(SpaceId, LocalId)> {
+    parse_page_route(path).or_else(|| Some((default?, parse_local_route(path)?)))
 }
 
 impl Router {
@@ -41,9 +75,12 @@ impl Router {
     /// the server rendered with). An unparseable path is rewritten
     /// (replaceState) to the demo default so a refresh is stable.
     pub(crate) fn bootstrap(initial: Option<&SsrState>) -> Self {
+        let default = default_space(&window());
         let route = initial
             .map(|s| (s.space, s.local))
-            .or_else(|| parse_page_route(&window().location().pathname().unwrap_or_default()))
+            .or_else(|| {
+                parse_route(default, &window().location().pathname().unwrap_or_default())
+            })
             .unwrap_or_else(|| {
                 if let Ok(h) = window().history() {
                     let _ = h.replace_state_with_url(&JsValue::NULL, "", Some(FALLBACK_PATH));
@@ -53,6 +90,7 @@ impl Router {
         Self {
             space: RwSignal::new(Some(route.0)),
             local: RwSignal::new(Some(route.1)),
+            default,
         }
     }
 
@@ -64,21 +102,45 @@ impl Router {
     }
 
     /// Client-side navigate to an internal path: pushState + update signals,
-    /// so subscriptions re-subscribe without a full reload.
+    /// so subscriptions re-subscribe without a full reload. The pushed
+    /// address is the path's [`collapse`]d form.
     pub(crate) fn navigate(&self, path: String) {
-        let Some((space, local)) = parse_page_route(&path) else {
+        let Some((space, local)) = self.parse(&path) else {
             return;
         };
         if let Ok(h) = window().history() {
-            let _ = h.push_state_with_url(&JsValue::NULL, "", Some(&path));
+            let _ = h.push_state_with_url(&JsValue::NULL, "", Some(&self.collapse(&path)));
         }
         self.set_space(Some(space));
         self.set_local(Some(local));
     }
 
+    /// The route a path names on this origin — [`parse_route`] against the
+    /// origin's default space.
+    pub(crate) fn parse(&self, path: &str) -> Option<(SpaceId, LocalId)> {
+        parse_route(self.default, path)
+    }
+
+    /// The address-bar form of `(space, local)` titled `title` on this
+    /// origin: [`format_page_route`] with the space segment dropped when the
+    /// route names the default space — the host already does.
+    pub(crate) fn address(&self, space: SpaceId, local: LocalId, title: &str) -> String {
+        format_page_route((self.default != Some(space)).then_some(space), local, title)
+    }
+
+    /// An internal href with its `/{default}` prefix dropped — the same
+    /// collapse as [`address`] applied to the href as-is, so its title
+    /// segment stays verbatim (ids are fixed-length, so the prefix never
+    /// bleeds into another space's).
+    fn collapse(&self, path: &str) -> String {
+        self.default
+            .and_then(|d| path.strip_prefix(&format!("/{d}/")).map(str::to_string))
+            .unwrap_or_else(|| path.to_string())
+    }
+
     fn sync_from_location(&self) {
         if let Some((space, local)) =
-            parse_page_route(&window().location().pathname().unwrap_or_default())
+            self.parse(&window().location().pathname().unwrap_or_default())
         {
             self.set_space(Some(space));
             self.set_local(Some(local));
@@ -111,10 +173,11 @@ impl Router {
 
     /// Intercept plain left-clicks on internal `<a href="/…">` links and turn
     /// them into client-side navigation when the href parses as a canonical
-    /// route. Slug-form links (`/SPACE/cat:slug`) and asset-like hrefs (a `.`
-    /// in the last segment) fall through to the browser — the server 301s the
-    /// former to the canonical form, so a full navigation is correct, just
-    /// slower.
+    /// route (the space-less `/L…` family included, on a wiki's own domain).
+    /// Slug-form links (`/SPACE/cat:slug`, `/cat:slug`) and asset-like hrefs
+    /// (a `.` in the last segment) fall through to the browser — the server
+    /// 301s the former to the canonical form, so a full navigation is
+    /// correct, just slower.
     fn install_clicks(self) {
         let cb = Closure::<dyn Fn(Event)>::new(move |ev: Event| {
             if let Some(me) = ev.dyn_ref::<MouseEvent>()
@@ -142,7 +205,7 @@ impl Router {
             if path.rsplit('/').next().unwrap_or("").contains('.') {
                 return;
             }
-            if parse_page_route(path).is_some() {
+            if self.parse(path).is_some() {
                 ev.prevent_default();
                 self.navigate(path.to_string());
             }

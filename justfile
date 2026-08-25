@@ -12,3 +12,6 @@ test:
 clean:
     cargo clean
     rm -rf apps/kolorinko-web/dist
+
+package:
+    nix build .#kolorinko

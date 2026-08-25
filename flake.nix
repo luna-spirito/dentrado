@@ -6,6 +6,7 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    crane.url = "github:ipetkov/crane";
     git-hooks = {
       url = "github:cachix/git-hooks.nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -16,6 +17,7 @@
     inputs@{
       flake-parts,
       rust-overlay,
+      crane,
       nixpkgs,
       git-hooks,
       ...
@@ -24,6 +26,8 @@
       imports = [
         git-hooks.flakeModule
       ];
+
+      flake.nixosModules.kolorinko = ./nix/kolorinko-module.nix;
 
       systems = [
         "x86_64-linux"
@@ -49,6 +53,8 @@
             ];
             targets = [ "wasm32-unknown-unknown" ];
           };
+
+          craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
         in
         {
           pre-commit.settings.hooks = {
@@ -67,6 +73,10 @@
               files = "(Cargo\\.(toml|lock)|deny\\.toml)$";
               pass_filenames = false;
             };
+          };
+
+          packages.kolorinko = pkgs.callPackage ./nix/kolorinko-package.nix {
+            inherit craneLib;
           };
 
           devShells.default = pkgs.mkShell {

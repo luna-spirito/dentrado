@@ -2,7 +2,7 @@
 //! the `kolorinko render` debug CLI. Gated on `ssr` because it calls
 //! [`RenderHtml::to_html`]; the layout itself is mode-agnostic.
 
-use kolorinko_rt::{LocalId, SSR_STATE_ID, SiteShell, SpaceId, SsrState};
+use kolorinko_rt::{LocalId, SSR_STATE_ID, SiteShell, SpaceId, SsrState, default_space_script};
 use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
 
@@ -37,15 +37,19 @@ const APP_PLACEHOLDER: &str = r#"<div id="container"></div>"#;
 /// rendered layout + embedded [`SsrState`] replace the app placeholder (so the
 /// client hydrates positionally from `<body>`'s first child), the `<title>`
 /// carries the page title, the site theme `<link>` and the OpenGraph card join
-/// `<head>`. `host` — the request's `host[:port]` — absolutizes the card's
-/// URLs; `canonical` — the page's canonical absolute URL — is its `og:url`
-/// (both `None` in the debug CLI). `None` when the template has no
-/// placeholder (unbuilt frontend).
+/// `<head>`, and `default_space` — the space the request's host already names,
+/// on a wiki's own domain — rides along as `window.__DEFAULT_SPACE_ID__` so
+/// the client reads `/L…` paths (and collapses `/{default}/L…` hrefs) against
+/// it. `host` — the request's `host[:port]` — absolutizes the card's URLs;
+/// `canonical` — the page's canonical absolute URL — is its `og:url` (both
+/// `None` in the debug CLI). `None` when the template has no placeholder
+/// (unbuilt frontend).
 pub fn render_ssr_document(
     index: &str,
     state: &SsrState,
     host: Option<&str>,
     canonical: Option<&str>,
+    default_space: Option<SpaceId>,
 ) -> Option<String> {
     // The display name falls back to the space id spelling when the export
     // carries no site title.
@@ -71,7 +75,11 @@ pub fn render_ssr_document(
         .as_deref()
         .map(&theme_link)
         .unwrap_or_default();
-    Some(inject_before_head_end(&doc, &format!("{og}{theme}")))
+    let default = default_space.map(default_space_script).unwrap_or_default();
+    Some(inject_before_head_end(
+        &doc,
+        &format!("{og}{theme}{default}"),
+    ))
 }
 
 /// Replace the placeholder — plus whatever whitespace the template wraps

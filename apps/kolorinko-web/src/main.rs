@@ -21,7 +21,7 @@ mod wt;
 
 use kolorinko_render::{THEME_LINK_ID, document_title, layout};
 use kolorinko_rt::wire;
-use kolorinko_rt::{SSR_STATE_ID, SiteShell, SsrState, encode_path_segment, title_slug};
+use kolorinko_rt::{SSR_STATE_ID, SiteShell, SsrState};
 use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
 use std::{cell::Cell, rc::Rc};
@@ -93,10 +93,12 @@ fn app(initial: Option<SsrState>) -> AnyView {
         }
     });
 
-    // Show the pretty titled form (`/SPACE/LOCAL/TITLE`) in the address bar
+    // Show the pretty titled form (`/SPACE/LOCAL/TITLE` — or `/LOCAL/TITLE`
+    // when the page names this origin's default space) in the address bar
     // once the page's title is known — the same segment the server's slug
     // redirects land on, re-derived here from the article itself (renames
     // propagate on the next render).
+    let titled_router = router.clone();
     Effect::new(move |_| {
         let Some((space, local)) = space.get().zip(local.get()) else {
             return;
@@ -104,12 +106,9 @@ fn app(initial: Option<SsrState>) -> AnyView {
         let Some(title) = page_title().filter(|t| !t.is_empty()) else {
             return;
         };
-        let titled = format!(
-            "/{space}/{local}/{}",
-            encode_path_segment(&title_slug(&title))
-        );
+        let titled = titled_router.address(space, local, &title);
         let path = window_path();
-        if parse_titled(&path) == Some((space, local)) && path != titled {
+        if titled_router.parse(&path) == Some((space, local)) && path != titled {
             if let Ok(h) = web_sys::window().expect("no window").history() {
                 let _ = h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&titled));
             }
@@ -165,15 +164,6 @@ fn window_path() -> String {
     web_sys::window()
         .and_then(|w| w.location().pathname().ok())
         .unwrap_or_default()
-}
-
-/// Parse a path that may carry a decorative title segment (the address-bar
-/// form) — the permissive sibling of [`kolorinko_rt::parse_page_route`].
-fn parse_titled(path: &str) -> Option<(kolorinko_rt::SpaceId, kolorinko_rt::LocalId)> {
-    let mut segs = path.trim_start_matches('/').split('/');
-    let space = kolorinko_rt::SpaceId::parse(segs.next()?)?;
-    let local = kolorinko_rt::LocalId::parse(segs.next()?)?;
-    Some((space, local))
 }
 
 /// One subscription to a gear, keyed on `make_query`, feeding `set`.

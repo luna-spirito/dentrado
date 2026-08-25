@@ -316,11 +316,30 @@ pub fn parse_page_route(path: &str) -> Option<(SpaceId, LocalId)> {
     let mut segs = path.trim_start_matches('/').split('/');
     let space = SpaceId::parse(segs.next()?)?;
     let local = LocalId::parse(segs.next()?)?;
-    // At most one non-empty decorative title segment may follow.
+    title_only(segs).then_some((space, local))
+}
+
+/// `/{local}[/title]` → the space-less page address of a wiki served on its
+/// own configured domain: there the `Host` already names the space, so the
+/// path needn't (the server routes it per-host; the client pairs it with
+/// [`crate::DEFAULT_SPACE_GLOBAL`]). The same shape as
+/// [`parse_page_route`] minus the space segment — the 'L' marker keeps it
+/// disjoint from every slug family a wiki domain serves.
+#[must_use]
+pub fn parse_local_route(path: &str) -> Option<LocalId> {
+    let mut segs = path.trim_start_matches('/').split('/');
+    let local = LocalId::parse(segs.next()?)?;
+    title_only(segs).then_some(local)
+}
+
+/// What may follow a route's id segments: at most one non-empty decorative
+/// title segment, nothing more.
+fn title_only(segs: std::str::Split<'_, char>) -> bool {
+    let mut segs = segs;
     match segs.next() {
-        None => Some((space, local)),
-        Some(title) if !title.is_empty() && segs.next().is_none() => Some((space, local)),
-        Some(_) => None,
+        None => true,
+        Some(title) if !title.is_empty() && segs.next().is_none() => true,
+        Some(_) => false,
     }
 }
 
@@ -487,6 +506,26 @@ mod tests {
         assert!(parse_page_route("/S70P6lbBZxbc-kcpGOCYmZA").is_none());
         assert!(parse_page_route("/").is_none());
         assert!(parse_page_route("/obscurative/syntax").is_none());
+    }
+
+    #[test]
+    fn local_routes_parse() {
+        // The wiki's-own-domain family: `/L…[/title]` names the default
+        // space — the same strictness minus the space segment.
+        assert_eq!(
+            parse_local_route("/LAAAAADrF7w0").map(|l| l.page_id()),
+            Some(986_050_317)
+        );
+        assert_eq!(
+            parse_local_route("/LAAAAADrF7w0/title").map(|l| l.page_id()),
+            Some(986_050_317)
+        );
+        // A space segment, a trailing slash, too deep, bare root, a slug.
+        assert!(parse_local_route("/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0").is_none());
+        assert!(parse_local_route("/LAAAAADrF7w0/").is_none());
+        assert!(parse_local_route("/LAAAAADrF7w0/a/b").is_none());
+        assert!(parse_local_route("/").is_none());
+        assert!(parse_local_route("/some-page").is_none());
     }
 
     #[test]
