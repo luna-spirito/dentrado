@@ -169,6 +169,7 @@ pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
     SiteShell {
         title,
         subtitle,
+        site: Some(site.to_string()),
         theme_root,
         nav_top,
         nav_side,

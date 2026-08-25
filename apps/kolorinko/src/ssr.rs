@@ -81,6 +81,18 @@ pub(crate) async fn state(
     }
 }
 
+/// The platform's about screen as a served document — SSR'd into the same
+/// shell template every page uses (see
+/// [`kolorinko_render::render_about_document`]) — or `None` when the
+/// frontend template can't host SSR output; the caller then falls back to
+/// serving the plain shell.
+pub(crate) fn about_document(
+    assets: &Arc<HashMap<String, Body>>,
+    host: Option<&str>,
+) -> Option<String> {
+    kolorinko_render::render_about_document(&index_template(assets)?, host)
+}
+
 /// The built frontend's `/index.html` as a string (decompressed), or `None`
 /// if absent.
 fn index_template(assets: &Arc<HashMap<String, Body>>) -> Option<String> {

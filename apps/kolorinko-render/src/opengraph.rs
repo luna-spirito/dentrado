@@ -44,6 +44,21 @@ pub fn meta(
     tags
 }
 
+/// The platform page's own card: no article behind it, so just the
+/// identity tags — `og:url` absolutized against the request host. No
+/// description: the page's copy is the manifesto's, and inventing a lead
+/// for the card is not this module's business.
+pub fn about_meta(host: Option<&str>) -> String {
+    tag("og:title", "Dentrado")
+        + &tag("og:site_name", "Dentrado")
+        + &tag(
+            "og:description",
+            "Open-source wiki engine and archival initiative",
+        )
+        + &tag("og:type", "website")
+        + &tag("og:url", &absolutize(host, crate::about::ABOUT_PATH))
+}
+
 /// One `<meta property="og:…" content="…">` tag.
 fn tag(prop: &str, content: &str) -> String {
     format!(
@@ -147,6 +162,7 @@ mod tests {
         SiteShell {
             title: Some("Site Title".into()),
             subtitle: None,
+            site: Some("obscurative".into()),
             theme_root: None,
             nav_top: page(Vec::new()),
             nav_side: page(Vec::new()),

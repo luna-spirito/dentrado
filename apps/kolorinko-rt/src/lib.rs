@@ -309,6 +309,11 @@ pub struct ListPagesResult {
 pub struct SiteShell {
     pub title: Option<String>,
     pub subtitle: Option<String>,
+    /// The Wikidot site slug this space mirrors (`<site>.wikidot.com`), named
+    /// by the registry — the read-only banner's "mirroring …" backlink points
+    /// there. `None` only for a space the registry doesn't know (the
+    /// context-less debug render).
+    pub site: Option<String>,
     /// CA URL `/-/repo/<site>/files/<xx>/<yy>/<hash>.css`, or `None` if the site
     /// has no theme root mirrored into `files/`.
     pub theme_root: Option<String>,

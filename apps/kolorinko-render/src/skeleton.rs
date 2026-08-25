@@ -6,6 +6,7 @@ use kolorinko_rt::{LocalId, SSR_STATE_ID, SiteShell, SpaceId, SsrState, default_
 use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
 
+use crate::about::about_page;
 use crate::layout::{document_title, html_escape, layout, theme_link};
 use crate::opengraph;
 
@@ -21,6 +22,7 @@ fn render_app(state: &SsrState) -> String {
         move || name.clone(),
         move || shell.title.clone(),
         move || shell.subtitle.clone(),
+        move || shell.site.clone(),
         move || Some(shell.nav_top.clone()),
         move || Some(shell.nav_side.clone()),
         move || Some(title.clone()),
@@ -80,6 +82,21 @@ pub fn render_ssr_document(
         &doc,
         &format!("{og}{theme}{default}"),
     ))
+}
+
+/// Seal the about screen into the same `index.html` template — an SSR page
+/// like any other, minus the parts it has none of: the rendered
+/// [`about_page`] replaces the app placeholder, the `<title>` is the
+/// platform's, and the OpenGraph card ([`opengraph::about_meta`]) joins
+/// `<head>`. No [`SsrState`] is embedded — the screen carries no data — so
+/// the client boots CSR there: it clears the body (dropping this markup,
+/// identical to what it re-renders) and takes over routing from
+/// [`crate::about::ABOUT_PATH`]. `host` absolutizes the card's `og:url`.
+/// `None` when the template has no placeholder (unbuilt frontend).
+pub fn render_about_document(index: &str, host: Option<&str>) -> Option<String> {
+    let doc = replace_placeholder(index, &about_page().to_html())?;
+    let doc = set_title(&doc, "Dentrado");
+    Some(inject_before_head_end(&doc, &opengraph::about_meta(host)))
 }
 
 /// Replace the placeholder — plus whatever whitespace the template wraps

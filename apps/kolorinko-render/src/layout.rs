@@ -14,6 +14,7 @@
 use kolorinko_wikitext::{ArticleView, PageDep};
 use leptos::prelude::*;
 
+use crate::about::ABOUT_PATH;
 use crate::render::render_block;
 
 /// `<link id>` of the per-site theme stylesheet, injected into `<head>` by the
@@ -23,18 +24,36 @@ pub const THEME_LINK_ID: &str = "kolorinko-site-theme";
 /// Fallback `<title>` when a page has no title of its own.
 pub const TITLE_FALLBACK: &str = "dntrd";
 
+/// The Dentrado read-only banner's stylesheet, rendered by [`layout`] as a
+/// `<style>` element through `inner_html` (raw on both the SSR and CSR
+/// side — no entity escaping, which a raw-text element would take
+/// literally). Kept free of `<`, `>`, `&`, and quotes by construction:
+/// escaped text inside `<style>` is spelled as entities and would break the
+/// rules (asserted by `banner_css_survives_raw`).
+const BANNER_CSS: &str = "\
+#dentrado-banner{display:flex;flex-wrap:wrap;gap:.25em 1.5em;align-items:baseline;justify-content:space-between;padding:.55em 1.25em;background:#0e1116;color:#a7b0bf;font:500 12.5px/1.45 ui-sans-serif,system-ui,sans-serif;text-align:left}\
+#dentrado-banner a{color:#e6965a;text-decoration:none;border-bottom:1px solid rgba(230,150,90,.35)}\
+#dentrado-banner a:hover{border-bottom-color:#e6965a}\
+#dentrado-banner .dentrado-brand{color:#f4f6f9;font-weight:700;letter-spacing:.02em}\
+#dentrado-banner .dentrado-about{white-space:nowrap}\
+";
+
 /// Render the full page layout. `space` is the canonical space the page
 /// renders under (the header link and internal-link prefix; `None` in a
 /// context-less render); `site_name` is the human-readable site name (the
 /// header's fallback text). The shell getters expose one chrome field each
 /// — `None` while the shell loads — so each reactive node clones only the
 /// field it renders, never the whole [`SiteShell`]; `page` likewise for the
-/// current page (or `None` while it loads).
+/// current page (or `None` while it loads). `shell_site` is the mirrored
+/// Wikidot site slug (`<site>.wikidot.com`) — the read-only banner's
+/// backlink — and is the one field that cannot wait for the shell: it is
+/// what the banner exists to say.
 pub fn layout(
     space: impl Fn() -> Option<kolorinko_rt::SpaceId> + Clone + Send + 'static,
     site_name: impl Fn() -> String + Clone + Send + 'static,
     shell_title: impl Fn() -> Option<String> + Clone + Send + 'static,
     shell_subtitle: impl Fn() -> Option<String> + Clone + Send + 'static,
+    shell_site: impl Fn() -> Option<String> + Clone + Send + 'static,
     nav_top: impl Fn() -> Option<ArticleView> + Clone + Send + 'static,
     nav_side: impl Fn() -> Option<ArticleView> + Clone + Send + 'static,
     page_title: impl Fn() -> Option<String> + Clone + Send + 'static,
@@ -51,9 +70,38 @@ pub fn layout(
         space.clone(),
         space,
     ];
-    let [page_body, page_deps] = [page.clone(), page];
+    let [page_body, page_slug, page_deps] = [page.clone(), page.clone(), page];
     let show_deps = RwSignal::new(false);
     view! {
+        <style>{BANNER_CSS}</style>
+        <div id="dentrado-banner">
+            <span class="dentrado-note">
+                <span class="dentrado-brand">"Dentrado"</span>
+                <span>", read-only mode: mirroring "
+                    {move || match shell_site() {
+                        Some(site) => {
+                            // The page's Wikidot fullname (`cat:slug`) rides
+                            // the same URL the source wiki served; `None`
+                            // until the page arrives (never at hydration —
+                            // the SSR state already carries it). Cloning the
+                            // getter keeps this closure `Fn` (a fresh `url`
+                            // per re-run, the shared getter captured once).
+                            let page_slug = page_slug.clone();
+                            let url = move || page_slug()
+                                .map(|a| a.meta.slug)
+                                .map(|slug| format!("http://{site}.wikidot.com/{slug}"))
+                                .unwrap_or_else(|| format!("http://{site}.wikidot.com/"));
+                            let href = url.clone();
+                            view! { <a class="dentrado-mirror" href=href>{url}</a> }.into_any()
+                        }
+                        // A space the registry doesn't know (context-less
+                        // debug render) has no source wiki to point at.
+                        None => view! { <span class="dentrado-mirror">"…"</span> }.into_any(),
+                    }}
+                </span>
+            </span>
+            <a class="dentrado-about" href=ABOUT_PATH>"About Dentrado"</a>
+        </div>
         <div id="container-wrap-wrap">
         <div id="container-wrap">
             <div id="container">
@@ -189,4 +237,50 @@ pub fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kolorinko_wikitext::ArticleView;
+
+    /// Render the layout once, SSR-style, with the given mirrored site slug
+    /// and page fullname.
+    fn html(site: Option<&str>, slug: &str) -> String {
+        let mut page = ArticleView::default();
+        page.meta.slug = slug.into();
+        let site = site.map(str::to_string);
+        layout(
+            || None,
+            || "site".into(),
+            || None,
+            || None,
+            move || site.clone(),
+            || None,
+            || None,
+            || None,
+            move || Some(page.clone()),
+        )
+        .to_html()
+    }
+
+    /// `<style>` is a raw-text element: any entity the SSR serializer spelled
+    /// out would be taken literally by the CSS parser, breaking its rule. The
+    /// stylesheet avoids the escapable characters by construction, and must
+    /// survive serialization verbatim.
+    #[test]
+    fn banner_css_survives_raw() {
+        assert!(!BANNER_CSS.contains(['<', '>', '&', '"', '\'']));
+        assert!(html(None, "").contains(BANNER_CSS));
+    }
+
+    /// The banner names the source wiki (and page) it mirrors; a space the
+    /// registry doesn't know has no source to point at.
+    #[test]
+    fn banner_mirrors_source_url() {
+        let known = html(Some("obscurative"), "docs:guide");
+        assert!(known.contains("http://obscurative.wikidot.com/docs:guide"));
+        assert!(known.contains(r#"href="/~/about""#));
+        assert!(!html(None, "").contains("wikidot.com"));
+    }
 }

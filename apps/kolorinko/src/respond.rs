@@ -11,7 +11,11 @@
 //! 2. the system namespace `/-…` — the mirrored content-addressed blobs
 //!    under `/-/repo/…` ([`crate::repo`]); an unknown system path is a
 //!    plain 404 (no content, no SPA fallback — future platform endpoints
-//!    live here too).
+//!    live here too). The sibling `/~/…` namespace is the app's auxiliary
+//!    screens (rendered by kolorinko-web; the ServiceWorker serves their
+//!    navigations the app shell): `/~/about` is SSR'd into the shell on every
+//!    origin — wiki domains included — minus the embedded state (the screen
+//!    has no data), so the client boots CSR and takes over.
 //! 3. `/SPACE/LOCAL[/TITLE]` — the canonical page route, SSR'd from the
 //!    `article_latest(space, local)` + `shell(space)` cone (valid on any
 //!    origin — the canonical address carries its own space),
@@ -120,6 +124,22 @@ pub(crate) async fn resolve(
             return Reply::ok(mime, serve_body(&body, accept_zstd), IMMUTABLE);
         }
         return Reply::not_found();
+    }
+    // The app's auxiliary screens (`/~/…`): the about page is the one that
+    // exists. SSR'd into the shell like every route — same template, same
+    // OpenGraph slot; no page data behind it, so no embedded state (the
+    // client boots CSR there and re-renders the same static screen). On
+    // every origin — the banner links here from mirrored pages, wiki
+    // domains included.
+    if path == kolorinko_render::ABOUT_PATH {
+        return match crate::ssr::about_document(assets, host) {
+            Some(html) => Reply::ok(
+                "text/html; charset=utf-8",
+                serve_body(&compress(html.into_bytes()), accept_zstd),
+                NOCACHE,
+            ),
+            None => index_fallback(assets, accept_zstd, host),
+        };
     }
     route(path, accept_zstd, assets, core, host).await
 }

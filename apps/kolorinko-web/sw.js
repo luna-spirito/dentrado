@@ -1,13 +1,17 @@
-// App-shell service worker: serve the cached CSR shell for canonical page
-// navigations (stale-while-revalidate), so real browsers bypass SSR — the
-// wasm app boots from the cached `/index.html` and fetches page data over
-// WebTransport. Bots, the first load (before the SW controls the page), and
-// no-JS clients fall through to the server's SSR.
+// App-shell service worker: serve the cached CSR shell for navigations the
+// app itself can render — canonical page routes (stale-while-revalidate) —
+// so real browsers bypass SSR; the wasm app boots from the cached
+// `/index.html` and fetches page data over WebTransport. Bots, the first
+// load (before the SW controls the page), and no-JS clients fall through
+// to the server's SSR.
 //
-// Only canonical `/{space}/{local}[/title]` paths get the shell. Everything
-// else — slug-form paths (`/{space}/cat:name`, which the client can't
-// resolve), assets, `/-/repo/` blobs — passes through untouched: the server's
-// 301s, SSR, and Cache-Control policies answer directly.
+// The app-renderable paths: canonical `/{space}/{local}[/title]` pages plus
+// the auxiliary `/~/…` screens (about) — their navigations get the shell
+// too, and the app renders them client-side. Everything else — slug-form
+// paths (`/{space}/cat:name`, which the client can't resolve), assets,
+// `/-/repo/` blobs and the rest of the server-owned `/-…` namespace —
+// passes through untouched: the server's 301s, SSR, standalone documents,
+// and Cache-Control policies answer directly.
 //
 // Update contract: this script is served at `/sw.js` and the shell at
 // `/index.html`, both `no-cache` — and neither URL may ever move. A moved
@@ -54,12 +58,14 @@ self.addEventListener("activate", (e) => {
 
 self.addEventListener("fetch", (e) => {
 	if (e.request.mode !== "navigate") return;
-	if (!canonical(new URL(e.request.url).pathname)) return;
+	if (!shellPath(new URL(e.request.url).pathname)) return;
 	e.respondWith(swr(e));
 });
 
-// `/SPACE/LOCAL` or `/SPACE/LOCAL/title`, nothing else.
-function canonical(path) {
+// A navigation the app can render from the shell: `/SPACE/LOCAL[/title]`,
+// or an auxiliary `/~/…` screen.
+function shellPath(path) {
+	if (path.startsWith("/~/")) return true;
 	const segs = path
 		.replace(/^\/+/, "")
 		.split("/")

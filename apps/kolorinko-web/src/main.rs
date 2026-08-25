@@ -19,7 +19,7 @@ mod menu;
 mod router;
 mod wt;
 
-use kolorinko_render::{THEME_LINK_ID, document_title, layout};
+use kolorinko_render::{ABOUT_PATH, THEME_LINK_ID, about_page, document_title, layout};
 use kolorinko_rt::wire;
 use kolorinko_rt::{SSR_STATE_ID, SiteShell, SsrState};
 use kolorinko_wikitext::ArticleView;
@@ -78,16 +78,23 @@ fn app(initial: Option<SsrState>) -> AnyView {
     };
     let shell_title = move || shell.with(|s| s.as_ref().and_then(|x| x.title.clone()));
     let shell_subtitle = move || shell.with(|s| s.as_ref().and_then(|x| x.subtitle.clone()));
+    let shell_site = move || shell.with(|s| s.as_ref().and_then(|x| x.site.clone()));
     let nav_top = move || shell.with(|s| s.as_ref().map(|x| x.nav_top.clone()));
     let nav_side = move || shell.with(|s| s.as_ref().map(|x| x.nav_side.clone()));
     let page_title = move || page.with(|p| p.as_ref().map(|a| a.meta.title.clone()));
     let page_body = move || page.get();
 
-    // Keep the browser tab title in sync with the current page's title.
+    // Keep the browser tab title in sync with the current page's title
+    // (and with the about screen, which has a title of its own).
+    let about = router.about;
     Effect::new(move |_| {
         let Some(doc) = (|| web_sys::window()?.document())() else {
             return;
         };
+        if about.get() {
+            doc.set_title("Dentrado");
+            return;
+        }
         if let Some(title) = page_title() {
             doc.set_title(&document_title(&site_name(), &shell_title(), &title));
         }
@@ -147,16 +154,30 @@ fn app(initial: Option<SsrState>) -> AnyView {
         }
     });
 
-    layout(
-        move || space.get(),
-        site_name,
-        shell_title,
-        shell_subtitle,
-        nav_top,
-        nav_side,
-        page_title,
-        page_body,
-    )
+    // The two screens of the app: the platform's about page — switched to
+    // without a reload ([`ABOUT_PATH`], subscriptions off, its own chrome) —
+    // and the wiki layout. Both render from the same signals, so toggling
+    // between them re-runs nothing but the view. The getters are cloned
+    // *inside* the closure body: `layout` takes them by value, so a move out
+    // of the capture would make this a one-shot `FnOnce` instead of the
+    // re-runnable `Fn` a toggleable branch needs.
+    let wiki = move || {
+        layout(
+            move || space.get(),
+            site_name.clone(),
+            shell_title.clone(),
+            shell_subtitle.clone(),
+            shell_site.clone(),
+            nav_top.clone(),
+            nav_side.clone(),
+            page_title.clone(),
+            page_body.clone(),
+        )
+    };
+    view! {
+        <>{move || if about.get() { about_page() } else { wiki() }}</>
+    }
+    .into_any()
 }
 
 /// The current pathname (best-effort; `""` outside a window).
@@ -220,7 +241,23 @@ fn main() {
     register_service_worker();
     match ssr_state() {
         Some(state) => leptos::mount::hydrate_body(move || app(Some(state))),
-        None => leptos::mount::mount_to_body(|| app(None)),
+        None => {
+            // A CSR boot on the about path may find the body already carrying
+            // content: the SSR'd screen (a direct hit — bots and no-JS read
+            // exactly that markup) or the bare app placeholder (a shell the
+            // ServiceWorker served). `mount_to_body` appends, so the body is
+            // cleared first — the client re-renders the identical static view
+            // and owns routing from there.
+            if window_path().trim_end_matches('/') == ABOUT_PATH
+                && let Some(body) =
+                    web_sys::window().and_then(|w| w.document()).and_then(|d| d.body())
+            {
+                while let Some(child) = body.first_child() {
+                    let _ = body.remove_child(&child);
+                }
+            }
+            leptos::mount::mount_to_body(|| app(None));
+        }
     }
 }
 

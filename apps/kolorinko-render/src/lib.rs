@@ -8,10 +8,12 @@
 //!   [`kolorinko_wikitext`] tree and depend on no platform-specific API, so the
 //!   same source compiles under the `csr` and `ssr` features.
 
+mod about;
 mod css;
 pub mod layout;
 mod render;
 
+pub use about::{ABOUT_PATH, about_page};
 pub use css::{http_refs, http_tail, rewrite_with};
 pub use layout::{THEME_LINK_ID, document_title, html_escape, layout, theme_link};
 pub use render::{render_block, wrap_topbar_lists};
@@ -22,4 +24,4 @@ mod opengraph;
 mod skeleton;
 
 #[cfg(feature = "ssr")]
-pub use skeleton::{render_page_document, render_ssr_document};
+pub use skeleton::{render_about_document, render_page_document, render_ssr_document};
