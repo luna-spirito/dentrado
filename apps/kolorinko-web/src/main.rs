@@ -81,6 +81,7 @@ fn app(initial: Option<SsrState>) -> AnyView {
     let shell_title = move || shell.with(|s| s.as_ref().and_then(|x| x.title.clone()));
     let shell_subtitle = move || shell.with(|s| s.as_ref().and_then(|x| x.subtitle.clone()));
     let shell_site = move || shell.with(|s| s.as_ref().and_then(|x| x.site.clone()));
+    let shell_root = move || shell.with(|s| s.as_ref().and_then(|x| x.root.clone()));
     let nav_top = move || shell.with(|s| s.as_ref().map(|x| x.nav_top.clone()));
     let nav_side = move || shell.with(|s| s.as_ref().map(|x| x.nav_side.clone()));
     let page_title = move || page.with(|p| p.as_ref().map(|a| a.meta.title.clone()));
@@ -177,6 +178,7 @@ fn app(initial: Option<SsrState>) -> AnyView {
             shell_title.clone(),
             shell_subtitle.clone(),
             shell_site.clone(),
+            shell_root.clone(),
             nav_top.clone(),
             nav_side.clone(),
             page_title.clone(),

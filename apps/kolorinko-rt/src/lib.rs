@@ -314,6 +314,14 @@ pub struct SiteShell {
     /// there. `None` only for a space the registry doesn't know (the
     /// context-less debug render).
     pub site: Option<String>,
+    /// The landing page's canonical address — what a bare `/{space}` (and `/`
+    /// on the space's own domain) resolves to — as `(space, local, title)`: the
+    /// header's site link targets its titled canonical route (a route the
+    /// client router intercepts, so navigation stays in the app) instead of
+    /// the bare root the server answers with a 301. `None` while the shell
+    /// loads, for a space the registry doesn't know, or when the dataset
+    /// lacks the landing page.
+    pub root: Option<(SpaceId, LocalId, String)>,
     /// CA URL `/-/repo/<site>/files/<xx>/<yy>/<hash>.css`, or `None` if the site
     /// has no theme root mirrored into `files/`.
     pub theme_root: Option<String>,

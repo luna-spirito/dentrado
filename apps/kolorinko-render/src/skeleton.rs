@@ -29,6 +29,7 @@ fn render_app(state: &SsrState) -> String {
         move || shell.title.clone(),
         move || shell.subtitle.clone(),
         move || shell.site.clone(),
+        move || shell.root.clone(),
         move || Some(shell.nav_top.clone()),
         move || Some(shell.nav_side.clone()),
         move || Some(title.clone()),

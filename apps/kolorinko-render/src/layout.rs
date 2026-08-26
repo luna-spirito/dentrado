@@ -11,6 +11,7 @@
 //! the same tree from the same data — sharing this function is what guarantees
 //! that.
 
+use kolorinko_rt::{LocalId, SpaceId, format_page_route, simplify};
 use kolorinko_wikitext::{ArticleView, PageDep};
 use leptos::prelude::*;
 
@@ -49,12 +50,17 @@ const BANNER_CSS: &str = "\
 /// loads). `shell_site` is the mirrored Wikidot site slug
 /// (`<site>.wikidot.com`) — the read-only banner's backlink — and is the one
 /// field that cannot wait for the shell: it is what the banner exists to say.
+/// `shell_root` is the landing page's canonical address `(space, local,
+/// title)` — the header's site link targets its titled route (a route the
+/// client router intercepts, so navigation stays in the app) and falls back
+/// to the bare space root (a server 301) until it arrives.
 pub fn layout(
     scope: impl Fn() -> Scope + Clone + Send + 'static,
     site_name: impl Fn() -> String + Clone + Send + 'static,
     shell_title: impl Fn() -> Option<String> + Clone + Send + 'static,
     shell_subtitle: impl Fn() -> Option<String> + Clone + Send + 'static,
     shell_site: impl Fn() -> Option<String> + Clone + Send + 'static,
+    shell_root: impl Fn() -> Option<(SpaceId, LocalId, String)> + Clone + Send + 'static,
     nav_top: impl Fn() -> Option<ArticleView> + Clone + Send + 'static,
     nav_side: impl Fn() -> Option<ArticleView> + Clone + Send + 'static,
     page_title: impl Fn() -> Option<String> + Clone + Send + 'static,
@@ -73,6 +79,20 @@ pub fn layout(
     ];
     let [page_body, page_slug, page_deps] = [page.clone(), page.clone(), page];
     let show_deps = RwSignal::new(false);
+    // The site-title link: the landing page's titled canonical route once the
+    // shell names it — the same shape the server's redirects produce, and a
+    // route the client router intercepts (SPA navigation, no round-trip) —
+    // and until then the bare space root, which the server resolves with a
+    // 301 (also the only shape a context-less render or a pre-shell CSR boot
+    // can build). Simplified like every client href against the origin's
+    // default space.
+    let home_href = move || match shell_root() {
+        Some((space, local, title)) => simplify(
+            home().default,
+            &format_page_route(Some(space), local, &title),
+        ),
+        None => home().root(),
+    };
     view! {
         <style>{BANNER_CSS}</style>
         <div id="dentrado-banner">
@@ -108,7 +128,7 @@ pub fn layout(
             <div id="container">
                 <div id="header">
                     <h1>
-                        <a href=move || home().root()>
+                        <a href=home_href>
                             <span>{move || shell_title().unwrap_or_else(&site_title)}</span>
                         </a>
                     </h1>
@@ -242,9 +262,9 @@ mod tests {
     use super::*;
     use kolorinko_wikitext::ArticleView;
 
-    /// Render the layout once, SSR-style, with the given mirrored site slug
-    /// and page fullname.
-    fn html(site: Option<&str>, slug: &str) -> String {
+    /// Render the layout once, SSR-style, with the given mirrored site slug,
+    /// landing-page root, and page fullname.
+    fn html(site: Option<&str>, root: Option<(SpaceId, LocalId, String)>, slug: &str) -> String {
         let mut page = ArticleView::default();
         page.meta.slug = slug.into();
         let site = site.map(str::to_string);
@@ -257,6 +277,7 @@ mod tests {
             || None,
             || None,
             move || site.clone(),
+            move || root.clone(),
             || None,
             || None,
             || None,
@@ -272,16 +293,31 @@ mod tests {
     #[test]
     fn banner_css_survives_raw() {
         assert!(!BANNER_CSS.contains(['<', '>', '&', '"', '\'']));
-        assert!(html(None, "").contains(BANNER_CSS));
+        assert!(html(None, None, "").contains(BANNER_CSS));
     }
 
     /// The banner names the source wiki (and page) it mirrors; a space the
     /// registry doesn't know has no source to point at.
     #[test]
     fn banner_mirrors_source_url() {
-        let known = html(Some("obscurative"), "docs:guide");
+        let known = html(Some("obscurative"), None, "docs:guide");
         assert!(known.contains("http://obscurative.wikidot.com/docs:guide"));
         assert!(known.contains(r#"href="/~/about""#));
-        assert!(!html(None, "").contains("wikidot.com"));
+        assert!(!html(None, None, "").contains("wikidot.com"));
+    }
+
+    /// The site-title link targets the landing page's titled canonical route
+    /// — the same shape the server's redirects produce — whenever the shell
+    /// carries one, and only then falls back to the bare root the server
+    /// 301s.
+    #[test]
+    fn site_title_links_canonical_route() {
+        let space = SpaceId::parse("S70P6lbBZxbc-kcpGOCYmZA").unwrap();
+        let local = LocalId::parse("LAAAAADrF7w0").unwrap();
+        let root = Some((space, local, "Main".to_string()));
+        assert!(
+            html(None, root, "").contains(r#"href="/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0/main""#)
+        );
+        assert!(html(None, None, "").contains(r#"href="/""#));
     }
 }

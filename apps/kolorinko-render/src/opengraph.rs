@@ -163,6 +163,7 @@ mod tests {
             title: Some("Site Title".into()),
             subtitle: None,
             site: Some("obscurative".into()),
+            root: None,
             theme_root: None,
             nav_top: page(Vec::new()),
             nav_side: page(Vec::new()),

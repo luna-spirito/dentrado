@@ -113,7 +113,8 @@ pub(crate) fn repo_l_list_pages(
 }
 
 /// The space's whole chrome in one shot: the fully include-resolved `nav:top`
-/// and `nav:side` pages plus the theme-root URLs. Keyed on the canonical
+/// and `nav:side` pages, the theme-root URLs, and the landing page's
+/// canonical address (`root`). Keyed on the canonical
 /// `space` (the URL/subscription identity); the dataset site is resolved
 /// through the global registry, and each nav page is fetched by its
 /// `local` id (resolved from the followed [`RepoData`]) via an
@@ -131,11 +132,11 @@ pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
     let Some(site) = crate::globals::site_of(&space) else {
         return SiteShell::default();
     };
-    let nav = |name: &'static str| {
-        let slug = nav_slug(name);
+    let local_of = |slug: (Option<SafePathComponent>, SafePathComponent)| {
         data.article(site, &slug)
             .and_then(|a| LocalId::from_page_id(&a.meta.page_id))
     };
+    let nav = |name: &'static str| local_of(nav_slug(name));
     let nav_top = match nav("top") {
         Some(local) => {
             let view = crate::runtime::article_latest(space, local)
@@ -166,10 +167,21 @@ pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
             (w.title.clone(), w.subtitle.clone(), theme_root)
         })
         .unwrap_or_default();
+    // The landing page's canonical address — the same resolution the server's
+    // bare-root 301 performs (the registry's landing slug through the
+    // dataset), title included — so the client's site link skips the
+    // round-trip and lands on the same titled route the 301 would.
+    let root = crate::globals::reg_of(&space)
+        .map(|reg| (None, reg.landing.clone()))
+        .and_then(|slug| data.article(site, &slug))
+        .and_then(|a| {
+            LocalId::from_page_id(&a.meta.page_id).map(|local| (space, local, a.meta.title.clone()))
+        });
     SiteShell {
         title,
         subtitle,
         site: Some(site.to_string()),
+        root,
         theme_root,
         nav_top,
         nav_side,
