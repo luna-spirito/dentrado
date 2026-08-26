@@ -74,10 +74,14 @@ let
     cp ${root + "/apps/kolorinko-web/Cargo.lock"} $out/apps/kolorinko-web/Cargo.lock
   '';
 
+  # NB: pass the real src ONLY as `dummySrc`'s input. Any extra attr
+  # (e.g. `srcWeb`) leaks into the derivation env via mkDerivation and
+  # re-hashes webDeps on every commit, rebuilding all wasm deps — crane
+  # itself sets `src = dummySrc` and ignores (warns about) a real `src`.
   webDeps = craneLib.buildDepsOnly {
     pname = "kolorinko-web";
     inherit version;
-    inherit srcWeb cargoVendorDir;
+    inherit cargoVendorDir;
     dummySrc = webDummySrc;
     CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
     doCheck = false;
