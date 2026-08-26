@@ -307,13 +307,14 @@ impl<'de> serde::Deserialize<'de> for LocalId {
 
 /// `/{space}/{local}[/title]` → the canonical page address. The optional
 /// third segment is a decorative title: accepted (so shared pretty URLs keep
-/// working) but never inspected. Anything else — a trailing slash, a fourth
-/// segment, a bare space, a legacy site path — is `None`. Shared by the
-/// server's SSR dispatch and the web client's router, so both agree on what
-/// a canonical route is.
+/// working) but never inspected. Trailing slashes are insignificant — the
+/// server's routing, the ServiceWorker's shell paths, and this parser agree
+/// on what a canonical route is. Anything else — a fourth segment, a bare
+/// space, a legacy site path — is `None`. Shared by the server's SSR
+/// dispatch and the web client's router.
 #[must_use]
 pub fn parse_page_route(path: &str) -> Option<(SpaceId, LocalId)> {
-    let mut segs = path.trim_start_matches('/').split('/');
+    let mut segs = path.trim_matches('/').split('/');
     let space = SpaceId::parse(segs.next()?)?;
     let local = LocalId::parse(segs.next()?)?;
     title_only(segs).then_some((space, local))
@@ -327,7 +328,7 @@ pub fn parse_page_route(path: &str) -> Option<(SpaceId, LocalId)> {
 /// disjoint from every slug family a wiki domain serves.
 #[must_use]
 pub fn parse_local_route(path: &str) -> Option<LocalId> {
-    let mut segs = path.trim_start_matches('/').split('/');
+    let mut segs = path.trim_matches('/').split('/');
     let local = LocalId::parse(segs.next()?)?;
     title_only(segs).then_some(local)
 }
@@ -517,8 +518,17 @@ mod tests {
             parse_page_route("/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0/%D1%82%D0%B5%D0%BD%D1%8C")
                 .unwrap();
         assert_eq!((sp2, lo2), (sp, lo));
-        // Strict: trailing slash, a fourth segment, bare space, junk, legacy.
-        assert!(parse_page_route("/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0/").is_none());
+        // Trailing slashes are insignificant — same rule as the server's
+        // routing and the ServiceWorker's shell paths.
+        assert_eq!(
+            parse_page_route("/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0/"),
+            Some((sp, lo))
+        );
+        assert_eq!(
+            parse_page_route("/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0/%D1%82%D0%B5%D0%BD%D1%8C/"),
+            Some((sp, lo))
+        );
+        // Strict: a fourth segment, bare space, junk, legacy.
         assert!(parse_page_route("/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0/a/b").is_none());
         assert!(parse_page_route("/S70P6lbBZxbc-kcpGOCYmZA").is_none());
         assert!(parse_page_route("/").is_none());
@@ -564,9 +574,12 @@ mod tests {
             parse_local_route("/LAAAAADrF7w0/title").map(|l| l.page_id()),
             Some(986_050_317)
         );
-        // A space segment, a trailing slash, too deep, bare root, a slug.
+        assert_eq!(
+            parse_local_route("/LAAAAADrF7w0/").map(|l| l.page_id()),
+            Some(986_050_317)
+        );
+        // A space segment, too deep, bare root, a slug.
         assert!(parse_local_route("/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0").is_none());
-        assert!(parse_local_route("/LAAAAADrF7w0/").is_none());
         assert!(parse_local_route("/LAAAAADrF7w0/a/b").is_none());
         assert!(parse_local_route("/").is_none());
         assert!(parse_local_route("/some-page").is_none());

@@ -39,10 +39,12 @@ use leptos::prelude::*;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{Element, Event, MouseEvent};
 
-/// The CSR-boot fallback (Trunk dev, or a stale ServiceWorker shell on an
-/// unparseable path): the dev config's space (`obscurative`) landing page
-/// (`main`, page id 986050317). The URL is rewritten to it, so a reload is
-/// stable. Production boots always carry the SSR state and never land here.
+/// The debug-build CSR-boot fallback (Trunk dev serves no SSR state, so a
+/// boot on `/` or any other unparseable path lands here): the dev config's
+/// space (`obscurative`) landing page (`main`, page id 986050317). The URL
+/// is rewritten to it, so a reload is stable. Release builds carry no
+/// fallback space — [`fallback`] fails explicitly there instead.
+#[cfg(debug_assertions)]
 const FALLBACK_PATH: &str = "/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0";
 
 fn window() -> web_sys::Window {
@@ -86,12 +88,31 @@ fn parse_route(default: Option<SpaceId>, path: &str) -> Option<(SpaceId, LocalId
     parse_page_route(path).or_else(|| Some((default?, parse_local_route(path)?)))
 }
 
+/// A CSR boot on a path that parses to no route and carries no SSR state.
+/// Debug builds land on the dev space's landing page ([`FALLBACK_PATH`]);
+/// release builds panic — no fallback space is guaranteed to exist there,
+/// and redirecting to a nonexistent page would only disguise the bug.
+fn fallback(_path: &str) -> (Option<SpaceId>, Option<LocalId>) {
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(h) = window().history() {
+            let _ = h.replace_state_with_url(&JsValue::NULL, "", Some(FALLBACK_PATH));
+        }
+        let (s, l) = parse_page_route(FALLBACK_PATH).expect("fallback parses");
+        (Some(s), Some(l))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        panic!("CSR boot on unparseable path {_path:?} with no SSR state")
+    }
+}
+
 impl Router {
     /// Read the route from the current URL — or, on a hydration boot, from
     /// the embedded SSR state (which carries exactly the canonical address
     /// the server rendered with; the about path is never SSR'd through the
-    /// app shell, so it can't carry state). An unparseable path is rewritten
-    /// (replaceState) to the demo default so a refresh is stable.
+    /// app shell, so it can't carry state). An unparseable CSR-boot path
+    /// goes to [`fallback`].
     pub(crate) fn bootstrap(initial: Option<&SsrState>) -> Self {
         let default = default_space(&window());
         let path = window().location().pathname().unwrap_or_default();
@@ -111,13 +132,7 @@ impl Router {
                 .map(|s| (s.space, s.local))
                 .or_else(|| parse_route(default, &path))
                 .map(|(s, l)| (Some(s), Some(l)))
-                .unwrap_or_else(|| {
-                    if let Ok(h) = window().history() {
-                        let _ = h.replace_state_with_url(&JsValue::NULL, "", Some(FALLBACK_PATH));
-                    }
-                    let (s, l) = parse_page_route(FALLBACK_PATH).expect("fallback parses");
-                    (Some(s), Some(l))
-                })
+                .unwrap_or_else(|| fallback(&path))
         };
         Self {
             space: RwSignal::new(space),
