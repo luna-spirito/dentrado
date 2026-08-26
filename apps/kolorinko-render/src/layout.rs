@@ -15,7 +15,7 @@ use kolorinko_wikitext::{ArticleView, PageDep};
 use leptos::prelude::*;
 
 use crate::about::ABOUT_PATH;
-use crate::render::render_block;
+use crate::render::{Scope, render_block};
 
 /// `<link id>` of the per-site theme stylesheet, injected into `<head>` by the
 /// server (SSR) and managed reactively by the client.
@@ -38,18 +38,19 @@ const BANNER_CSS: &str = "\
 #dentrado-banner .dentrado-about{white-space:nowrap}\
 ";
 
-/// Render the full page layout. `space` is the canonical space the page
-/// renders under (the header link and internal-link prefix; `None` in a
-/// context-less render); `site_name` is the human-readable site name (the
-/// header's fallback text). The shell getters expose one chrome field each
-/// — `None` while the shell loads — so each reactive node clones only the
-/// field it renders, never the whole [`SiteShell`]; `page` likewise for the
-/// current page (or `None` while it loads). `shell_site` is the mirrored
-/// Wikidot site slug (`<site>.wikidot.com`) — the read-only banner's
-/// backlink — and is the one field that cannot wait for the shell: it is
-/// what the banner exists to say.
+/// Render the full page layout. `scope` — see [`Scope`] — is the render's
+/// addressing scope: the space pages render under and, on the client, the
+/// origin's default space every href simplifies against (the server passes
+/// `default: None` and emits full-weight links). `site_name` is the
+/// human-readable site name (the header's fallback text). The shell getters
+/// expose one chrome field each — `None` while the shell loads — so each
+/// reactive node clones only the field it renders, never the whole
+/// [`SiteShell`]; `page` likewise for the current page (or `None` while it
+/// loads). `shell_site` is the mirrored Wikidot site slug
+/// (`<site>.wikidot.com`) — the read-only banner's backlink — and is the one
+/// field that cannot wait for the shell: it is what the banner exists to say.
 pub fn layout(
-    space: impl Fn() -> Option<kolorinko_rt::SpaceId> + Clone + Send + 'static,
+    scope: impl Fn() -> Scope + Clone + Send + 'static,
     site_name: impl Fn() -> String + Clone + Send + 'static,
     shell_title: impl Fn() -> Option<String> + Clone + Send + 'static,
     shell_subtitle: impl Fn() -> Option<String> + Clone + Send + 'static,
@@ -60,15 +61,15 @@ pub fn layout(
     page: impl Fn() -> Option<ArticleView> + Clone + Send + 'static,
 ) -> AnyView {
     // One clone per capture site: `view!` moves each closure into the tree.
-    // `site_top`/`site_side`/`site_body`/`deps_space`/`home` carry the space
-    // (link prefix); `site_title` carries the display name.
+    // `site_top`/`site_side`/`site_body`/`deps_scope`/`home` feed the render
+    // scope to the reactive nodes; `site_title` carries the display name.
     let site_title = site_name;
-    let [site_top, site_side, site_body, deps_space, home] = [
-        space.clone(),
-        space.clone(),
-        space.clone(),
-        space.clone(),
-        space,
+    let [site_top, site_side, site_body, deps_scope, home] = [
+        scope.clone(),
+        scope.clone(),
+        scope.clone(),
+        scope.clone(),
+        scope,
     ];
     let [page_body, page_slug, page_deps] = [page.clone(), page.clone(), page];
     let show_deps = RwSignal::new(false);
@@ -107,11 +108,7 @@ pub fn layout(
             <div id="container">
                 <div id="header">
                     <h1>
-                        <a href=move || {
-                            home()
-                                .map(|s| format!("/{s}"))
-                                .unwrap_or_else(|| "/".to_string())
-                        }>
+                        <a href=move || home().root()>
                             <span>{move || shell_title().unwrap_or_else(&site_title)}</span>
                         </a>
                     </h1>
@@ -142,11 +139,11 @@ pub fn layout(
                         </div>
                         {move || {
                             let page_deps = page_deps.clone();
-                            let deps_space = deps_space.clone();
+                            let deps_scope = deps_scope.clone();
                             show_deps.get().then(|| view! {
                                 <div id="action-area">
                                     {move || match page_deps().map(|a| a.deps) {
-                                        Some(deps) if !deps.is_empty() => view_deps(deps_space(), &deps),
+                                        Some(deps) if !deps.is_empty() => view_deps(deps_scope(), &deps),
                                         _ => view! {
                                             <p class="kolorinko-status">"no dependencies"</p>
                                         }.into_any(),
@@ -165,11 +162,11 @@ pub fn layout(
 
 /// A page's dependency tree as nested lists: each fetched include target
 /// links to its page — the canonical slug form `/{space}/cat:name` (the
-/// server resolves the slug and 301s; `None` in a context-less render links
-/// nowhere), its own dependencies nested beneath it. Debug UI: cross-site
-/// includes link through the rendered page's space, which is right for the
-/// same-site cone and merely approximate otherwise.
-fn view_deps(space: Option<kolorinko_rt::SpaceId>, deps: &[PageDep]) -> AnyView {
+/// server resolves the slug and 301s; simplified on a wiki's own domain,
+/// context-less renders link nowhere), its own dependencies nested beneath
+/// it. Debug UI: cross-site includes link through the rendered page's space,
+/// which is right for the same-site cone and merely approximate otherwise.
+fn view_deps(scope: Scope, deps: &[PageDep]) -> AnyView {
     let items: Vec<AnyView> = deps
         .iter()
         .map(|d| {
@@ -178,12 +175,17 @@ fn view_deps(space: Option<kolorinko_rt::SpaceId>, deps: &[PageDep]) -> AnyView 
                 Some(cat) => format!("{cat}:{name}"),
                 None => name.to_string(),
             };
-            let href = match (space, &d.category) {
-                (Some(s), Some(cat)) => format!("/{s}/{cat}:{name}"),
-                (Some(s), None) => format!("/{s}/{name}"),
-                (None, _) => "javascript:;".to_string(),
+            let href = match scope.space {
+                Some(s) => kolorinko_rt::simplify(
+                    scope.default,
+                    &match &d.category {
+                        Some(cat) => format!("/{s}/{cat}:{name}"),
+                        None => format!("/{s}/{name}"),
+                    },
+                ),
+                None => "javascript:;".to_string(),
             };
-            let sub = (!d.deps.is_empty()).then(|| view_deps(space, &d.deps));
+            let sub = (!d.deps.is_empty()).then(|| view_deps(scope, &d.deps));
             view! { <li><a href=href>{label}</a>{sub}</li> }.into_any()
         })
         .collect();
@@ -195,17 +197,13 @@ fn view_deps(space: Option<kolorinko_rt::SpaceId>, deps: &[PageDep]) -> AnyView 
 /// `top_bar` is set the `nav:top` list transform is applied first, wrapping
 /// each top-level submenu item in the `<a href="javascript:;">` legacy themes
 /// target.
-fn view_nav(
-    space: Option<kolorinko_rt::SpaceId>,
-    nav: Option<ArticleView>,
-    top_bar: bool,
-) -> AnyView {
+fn view_nav(scope: Scope, nav: Option<ArticleView>, top_bar: bool) -> AnyView {
     match nav {
         Some(mut a) => {
             if top_bar {
                 crate::render::wrap_topbar_lists(&mut a.content);
             }
-            let blocks = render_block(space, &a.content);
+            let blocks = render_block(scope, &a.content);
             view! { <>{blocks}</> }.into_any()
         }
         None => ().into_any(),
@@ -251,7 +249,7 @@ mod tests {
         page.meta.slug = slug.into();
         let site = site.map(str::to_string);
         layout(
-            || None,
+            || Scope { space: None, default: None },
             || "site".into(),
             || None,
             || None,

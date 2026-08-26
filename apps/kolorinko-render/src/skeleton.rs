@@ -9,6 +9,7 @@ use leptos::prelude::*;
 use crate::about::about_page;
 use crate::layout::{document_title, html_escape, layout, theme_link};
 use crate::opengraph;
+use crate::render::Scope;
 
 /// Render `state` (page + shell) through the shared [`layout`] into HTML —
 /// exactly the tree the client renders from the same state, which is what
@@ -18,7 +19,9 @@ fn render_app(state: &SsrState) -> String {
     let name = shell.title.clone().unwrap_or_else(|| space.as_str());
     let title = page.meta.title.clone();
     layout(
-        move || Some(space),
+        // The server always emits full-weight links: `default: None` — the
+        // client simplifies against its origin's default space.
+        move || Scope { space: Some(space), default: None },
         move || name.clone(),
         move || shell.title.clone(),
         move || shell.subtitle.clone(),

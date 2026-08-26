@@ -292,16 +292,21 @@ fn spawn_stream(inner: Rc<Inner>, sub: u64, reg: Rc<Registration>) {
             let done = js_sys::Reflect::get(&read_res, &JsValue::from("done"))
                 .map(|v| v.as_bool().unwrap_or(true))
                 .unwrap_or(true);
-            // Server closed the stream: the subscription ended (gear evicted
-            // or errored). Drop the registration — unless the session died
-            // too (replay incoming), reported by the transport's absence; the
-            // generation match rules out a stale task from a dead session
-            // waking after the next one is up.
+            // Server closed the stream. The normal case is the cancel ack:
+            // our `cancel` removed the registration before half-closing, so
+            // an absent registration is silence. A registration still there
+            // is a server-initiated end (gear evicted or errored) — the one
+            // worth logging — and is dropped: never resubscribed until the
+            // route changes. Unless the session died too (replay incoming),
+            // reported by the transport's absence; the generation match
+            // rules out a stale task from a dead session waking after the
+            // next one is up.
             if done {
-                leptos::logging::warn!("wt sub closed");
                 reg.writer.borrow_mut().take();
-                if inner.transport.borrow().is_some() && inner.session_gen.get() == epoch {
-                    inner.subs.borrow_mut().remove(&sub);
+                if inner.transport.borrow().is_some() && inner.session_gen.get() == epoch
+                    && inner.subs.borrow_mut().remove(&sub).is_some()
+                {
+                    leptos::logging::warn!("wt sub closed");
                 }
                 return;
             }

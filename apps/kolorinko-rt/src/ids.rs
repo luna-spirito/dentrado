@@ -357,6 +357,26 @@ pub fn format_page_route(space: Option<SpaceId>, local: LocalId, title: &str) ->
     }
 }
 
+/// A path's short form against `default` — the space a wiki's own domain
+/// already names: the `/{default}` segment drops (`/{d}/rest` → `/rest`,
+/// `/{d}` → `/`), everything else passes verbatim (other spaces, slug
+/// families, assets — the id's fixed width keeps the prefix from bleeding
+/// into anything else). The single simplifier of the system: the server
+/// always emits full-weight links, and the client — address bar, pushed
+/// navigations, every href it builds or hydrates — shortens them against
+/// its origin's default space ([`crate::DEFAULT_SPACE_GLOBAL`]).
+#[must_use]
+pub fn simplify(default: Option<SpaceId>, path: &str) -> String {
+    let Some(d) = default else {
+        return path.to_string();
+    };
+    match path.strip_prefix(&format!("/{d}")) {
+        Some("") => "/".to_string(),
+        Some(rest) if rest.starts_with('/') => rest.to_string(),
+        _ => path.to_string(),
+    }
+}
+
 // ── title shaping ───────────────────────────────────────────────────────────
 
 /// Shape a page title into the decorative third URL segment: whitespace →
@@ -506,6 +526,33 @@ mod tests {
         assert!(parse_page_route("/S70P6lbBZxbc-kcpGOCYmZA").is_none());
         assert!(parse_page_route("/").is_none());
         assert!(parse_page_route("/obscurative/syntax").is_none());
+    }
+
+    #[test]
+    fn simplify_drops_default_space_segment() {
+        let d = SpaceId::parse("S70P6lbBZxbc-kcpGOCYmZA").unwrap();
+        let s = |p: &str| simplify(Some(d), p);
+        // The default space's segment drops — the root to `/`.
+        assert_eq!(s("/S70P6lbBZxbc-kcpGOCYmZA"), "/");
+        assert_eq!(
+            s("/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0/page"),
+            "/LAAAAADrF7w0/page"
+        );
+        assert_eq!(s("/S70P6lbBZxbc-kcpGOCYmZA/docs:guide"), "/docs:guide");
+        // Everything else passes verbatim: other spaces, slug families,
+        // assets, the about screen, absolute URLs.
+        assert_eq!(
+            s("/SNhwIJuhsyCE-mxtJJE6aWg/LAAAAADrF7w0"),
+            "/SNhwIJuhsyCE-mxtJJE6aWg/LAAAAADrF7w0"
+        );
+        assert_eq!(s("/docs:guide"), "/docs:guide");
+        assert_eq!(s("/~/about"), "/~/about");
+        assert_eq!(s("https://x.example/a"), "https://x.example/a");
+        // No default: the server side, always full-weight.
+        assert_eq!(
+            simplify(None, "/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0"),
+            "/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0"
+        );
     }
 
     #[test]

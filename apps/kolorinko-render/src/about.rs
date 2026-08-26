@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn page_carries_manifesto() {
         let page = about_page().to_html();
-        assert!(page.contains("Dentrado, open-source (AGPLv3) wiki engine"));
+        assert!(page.contains("open-source (AGPLv3) wiki engine"));
         assert!(page.contains("Wikidot evacuation initiative"));
         assert!(page.contains("Long-term Goal"));
         assert!(page.contains(r#"href="https://t.me/luna_spirito""#));

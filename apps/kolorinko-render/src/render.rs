@@ -15,12 +15,35 @@ use leptos::prelude::*;
 use leptos::tachys::html::element::custom;
 
 /// Rendering parameters threaded through every render function: the mirror
+/// The addressing scope of a render: `space` — the canonical space its
+/// pages render under (the prefix internal links point at) — and `default`
+/// — the space this origin already names (`None` on the server, which
+/// always emits full-weight links; the host's own space on the client,
+/// where every href simplifies against it — [`kolorinko_rt::simplify`]).
+#[derive(Clone, Copy)]
+pub struct Scope {
+    pub space: Option<kolorinko_rt::SpaceId>,
+    pub default: Option<kolorinko_rt::SpaceId>,
+}
+
+impl Scope {
+    /// The href of the space's root (its landing page): the full `/{space}`
+    /// through the scope's simplification — `/` on a wiki's own domain,
+    /// or on a context-less render.
+    pub fn root(&self) -> String {
+        self.space.map_or_else(
+            || "/".to_string(),
+            |s| kolorinko_rt::simplify(self.default, &format!("/{s}")),
+        )
+    }
+}
+
 /// site (internal link resolution) and, inside a collapsible's header
 /// subtree, which toggle link is being produced. The header subtree is
 /// walked once per link — see [`render_collapsible`].
 #[derive(Clone, Copy)]
 pub(crate) struct RenderCtx {
-    space: Option<kolorinko_rt::SpaceId>,
+    scope: Scope,
     link: Option<CollapsibleLinkCtx>,
 }
 
@@ -34,8 +57,8 @@ pub(crate) struct CollapsibleLinkCtx {
 }
 
 impl RenderCtx {
-    fn new(space: Option<kolorinko_rt::SpaceId>) -> Self {
-        Self { space, link: None }
+    fn new(scope: Scope) -> Self {
+        Self { scope, link: None }
     }
 
     fn with_link(&self, link: CollapsibleLinkCtx) -> Self {
@@ -74,10 +97,11 @@ fn trim_ws(content: &Content) -> &[Node] {
 /// Render `#page-content`: top-level inline runs are grouped into `<p>`,
 /// block nodes render standalone — exactly as Wikidot's renderer does. A run of
 /// blank lines inside a text node is a paragraph break; single newlines stay
-/// inside their paragraph as soft breaks (`<br>`). `space` is the canonical
-/// space the page renders under — the prefix internal page links point at.
-pub fn render_block(space: Option<kolorinko_rt::SpaceId>, content: &Content) -> Vec<AnyView> {
-    render_block_content(&RenderCtx::new(space), content)
+/// inside their paragraph as soft breaks (`<br>`). `scope` — see [`Scope`] —
+/// is the render's addressing scope: where internal links point, and what
+/// they simplify against.
+pub fn render_block(scope: Scope, content: &Content) -> Vec<AnyView> {
+    render_block_content(&RenderCtx::new(scope), content)
 }
 
 fn render_block_content(ctx: &RenderCtx, content: &Content) -> Vec<AnyView> {
@@ -799,39 +823,48 @@ fn render_link(
     text: &Content,
     class: Option<&str>,
 ) -> AnyView {
-    let href = match target {
-        LinkTarget::Url(u) => u.clone(),
-        // Still carries unresolved variable slots (no listed page in scope):
-        // flatten with the same default / verbatim `%%name%%` fallback as any
-        // other text run and use it as the href.
-        LinkTarget::Unresolved(objs) => text_objs_to_string(objs),
-        // A link resolution looked this up and found it: build the titled
-        // canonical route straight from the target's rename-stable identity —
-        // the form the client router intercepts, so navigation stays in the
-        // app.
-        LinkTarget::Canonical { page_id, title } => LocalId::from_page_id(page_id).map_or_else(
-            || "/".to_string(),
-            |l| format_page_route(ctx.space, l, title),
-        ),
-        // A page ref, resolved or not, renders the slug-family route — the
-        // canonical `cat:name` form (the colon can't collide with a base64url
-        // local id, so the server routes these by slug and 301s to the titled
-        // canonical address). Without a space (a context-less render) the
-        // href falls back to root-relative.
-        LinkTarget::Page(p) | LinkTarget::Missing(p) => {
-            let rest = p.path.join("/");
-            match ctx.space {
-                Some(space) => match &p.space {
-                    Some(cat) => format!("/{space}/{cat}:{rest}"),
-                    None => format!("/{space}/{rest}"),
-                },
-                None => match &p.space {
-                    Some(cat) => format!("/{cat}/{rest}"),
-                    None => format!("/{rest}"),
-                },
+    // Internal hrefs are always built full-weight — then simplified against
+    // the scope's default space (a no-op on the server, whose `default` is
+    // `None`). External URLs pass through `simplify` verbatim: it only
+    // strips a leading `/{default}` segment.
+    let href = kolorinko_rt::simplify(
+        ctx.scope.default,
+        &match target {
+            LinkTarget::Url(u) => u.clone(),
+            // Still carries unresolved variable slots (no listed page in scope):
+            // flatten with the same default / verbatim `%%name%%` fallback as any
+            // other text run and use it as the href.
+            LinkTarget::Unresolved(objs) => text_objs_to_string(objs),
+            // A link resolution looked this up and found it: build the titled
+            // canonical route straight from the target's rename-stable identity —
+            // the form the client router intercepts, so navigation stays in the
+            // app.
+            LinkTarget::Canonical { page_id, title } => {
+                LocalId::from_page_id(page_id).map_or_else(
+                    || "/".to_string(),
+                    |l| format_page_route(ctx.scope.space, l, title),
+                )
             }
-        }
-    };
+            // A page ref, resolved or not, renders the slug-family route — the
+            // canonical `cat:name` form (the colon can't collide with a base64url
+            // local id, so the server routes these by slug and 301s to the titled
+            // canonical address). Without a space (a context-less render) the
+            // href falls back to root-relative.
+            LinkTarget::Page(p) | LinkTarget::Missing(p) => {
+                let rest = p.path.join("/");
+                match ctx.scope.space {
+                    Some(space) => match &p.space {
+                        Some(cat) => format!("/{space}/{cat}:{rest}"),
+                        None => format!("/{space}/{rest}"),
+                    },
+                    None => match &p.space {
+                        Some(cat) => format!("/{cat}/{rest}"),
+                        None => format!("/{rest}"),
+                    },
+                }
+            }
+        },
+    );
     let inner = render_inline(ctx, text);
     // `class` omitted entirely when absent — SSR would otherwise emit a
     // spurious `class=""`. A `Missing` target is a page the site doesn't

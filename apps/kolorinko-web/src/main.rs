@@ -19,7 +19,9 @@ mod menu;
 mod router;
 mod wt;
 
-use kolorinko_render::{ABOUT_PATH, THEME_LINK_ID, about_page, document_title, layout};
+use kolorinko_render::{
+    ABOUT_PATH, THEME_LINK_ID, Scope, about_page, document_title, layout,
+};
 use kolorinko_rt::wire;
 use kolorinko_rt::{SSR_STATE_ID, SiteShell, SsrState};
 use kolorinko_wikitext::ArticleView;
@@ -100,11 +102,12 @@ fn app(initial: Option<SsrState>) -> AnyView {
         }
     });
 
-    // Show the pretty titled form (`/SPACE/LOCAL/TITLE` — or `/LOCAL/TITLE`
-    // when the page names this origin's default space) in the address bar
-    // once the page's title is known — the same segment the server's slug
-    // redirects land on, re-derived here from the article itself (renames
-    // propagate on the next render).
+    // Show the pretty titled form (`/SPACE/LOCAL/TITLE` — collapsed to
+    // `/LOCAL/TITLE` when the page names this origin's default space) in the
+    // address bar once the page's title is known — re-derived here from the
+    // article itself, so renames propagate on the next render. Full-weight
+    // addresses arrive from the server's 301s and SSR links; this is where
+    // they simplify.
     let titled_router = router.clone();
     Effect::new(move |_| {
         let Some((space, local)) = space.get().zip(local.get()) else {
@@ -161,9 +164,15 @@ fn app(initial: Option<SsrState>) -> AnyView {
     // *inside* the closure body: `layout` takes them by value, so a move out
     // of the capture would make this a one-shot `FnOnce` instead of the
     // re-runnable `Fn` a toggleable branch needs.
+    //
+    // The scope carries the origin's default space (`None` on the main
+    // origin), so every href the client builds is short at construction;
+    // SSR links arrive full and are simplified once at boot
+    // ([`router::Router::install`]).
+    let scope_default = router.default;
     let wiki = move || {
         layout(
-            move || space.get(),
+            move || Scope { space: space.get(), default: scope_default },
             site_name.clone(),
             shell_title.clone(),
             shell_subtitle.clone(),
@@ -190,15 +199,16 @@ fn window_path() -> String {
 /// One subscription to a gear, keyed on `make_query`, feeding `set`.
 ///
 /// The query is `Option`-valued: `None` (unknown address — a canonical route
-/// still resolving) holds no subscription at all. The effect re-runs whenever
-/// `make_query` reads a changed signal, cancelling the previous handle and
-/// subscribing to the new one; each server push lands in `set`, and `clear`
-/// runs when a *previously live* query goes away (stale content shouldn't
-/// linger while the new page loads). The first subscription keeps whatever
-/// is already there — the SSR state it hydrated from, with `initial_hash`
-/// telling the server to skip re-sending exactly that. Reconnects don't
-/// re-run this: the client replays its registry (hash included) on each fresh
-/// session.
+/// still resolving, or the about screen) holds no subscription at all. The
+/// effect re-runs whenever `make_query` reads a changed signal, cancelling
+/// the previous handle and subscribing to the new one; each server push
+/// lands in `set`, and `clear` runs when a *previously live* query goes
+/// away (stale content shouldn't linger while the new page loads). The
+/// hydration hash is claimed exactly once — by the boot subscription it
+/// describes; every later subscription starts from scratch, because its
+/// content was cleared on the way out (`clear`) or never arrived. Reconnects
+/// don't re-run this: the client replays its registry (hash included) on
+/// each fresh session.
 fn follow_opt<Out: 'static>(
     client: &Rc<WtClient>,
     initial_hash: Option<String>,
@@ -210,6 +220,7 @@ fn follow_opt<Out: 'static>(
     let set = Rc::new(set);
     let clear = Rc::new(clear);
     let prev = Cell::new(None::<u64>);
+    let boot = Cell::new(true);
     Effect::new(move |_| {
         let stale = prev.take();
         if let Some(p) = stale {
@@ -217,9 +228,7 @@ fn follow_opt<Out: 'static>(
             clear();
         }
         if let Some(q) = make_query() {
-            // Only the first run (hydration boot) may claim to know the
-            // content; later queries start from scratch.
-            let known = stale.is_none().then(|| initial_hash.clone()).flatten();
+            let known = boot.replace(false).then(|| initial_hash.clone()).flatten();
             let set = set.clone();
             let sub = client.subscribe(q, known.as_deref(), move |v: Out| set(v));
             prev.set(Some(sub));

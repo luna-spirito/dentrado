@@ -26,16 +26,21 @@
 //! 5. a configured custom domain (`Host` names a space — the wiki's own
 //!    domain): the same page family without the space segment —
 //!    `LOCAL[/TITLE]` canonical, `[cat:]slug…` redirected — and `/`
-//!    SSR'ing the wiki's landing page as its homepage. No SPA shell on a
+//!    permanently redirected to the wiki's landing page. No SPA shell on a
 //!    wiki domain: the platform's client app is not this origin's face, an
 //!    unknown page is a plain 404. Every HTML document served here (SSR
 //!    pages, the `/index.html` asset) carries
-//!    `window.__DEFAULT_SPACE_ID__`, so the client reads `/L…` addresses
-//!    the same way — and collapses `/S<default>/L…` ones to `/L…`
-//! 6. `/` — SSR'd in place with the first registered space's landing page,
+//!    `window.__DEFAULT_SPACE_ID__`, so the client addresses `/L…` paths
+//!    to that space and simplifies `/S<default>/L…` ones to it.
+//! 6. `/` — permanently redirected to the first registered space's landing
+//!    page.
 //! 7. anything else non-asset — the `/index.html` SPA shell (the client's
 //!    not-found view),
 //! 8. asset-like paths that don't exist — 404.
+//!
+//! Redirect `Location`s are always full canonical addresses (space segment
+//! included) — the server never emits a simplified link; simplification is
+//! the client's single job, against `window.__DEFAULT_SPACE_ID__`.
 //!
 //! Static assets, system paths, and content routes can't collide: ids start
 //! with 'S'/'L' and slugs are lowercase, while asset paths are known dist
@@ -158,33 +163,22 @@ async fn route(
     // makes this purely syntactic: no slug can imitate it — slugs are
     // lowercase, ids start with 'S').
     if let Some(space) = segs.first().and_then(|s| SpaceId::parse(s)) {
-        return tail_route(&segs[1..], space, true, accept_zstd, assets, core, host).await;
+        return tail_route(&segs[1..], space, accept_zstd, assets, core, host).await;
     }
     // A wiki's own domain (`Host` names a registered space): the same page
     // family addressed without the space segment, and `/` — the wiki's
-    // homepage — its landing page SSR'd in place.
+    // homepage — permanently redirected to its landing page's canonical
+    // address.
     if let Some((space, reg)) = host.and_then(crate::globals::space_of_domain) {
         if segs.as_slice() == [""] {
-            let slug = (None, reg.landing.clone());
-            return match page_local(core, &space, &slug).await {
-                Some((local, _title)) => ssr(accept_zstd, assets, core, host, space, local).await,
-                None => Reply::not_found(),
-            };
+            return landing_redirect(core, &space, &reg.landing).await;
         }
-        return tail_route(&segs, space, false, accept_zstd, assets, core, host).await;
+        return tail_route(&segs, space, accept_zstd, assets, core, host).await;
     }
-    // `/` — the first registered space's landing page, SSR'd in place.
+    // `/` — the first registered space's landing page, same redirect.
     if segs.as_slice() == [""] {
         return match crate::globals::first_space() {
-            Some((space, reg)) => {
-                let slug = (None, reg.landing.clone());
-                match page_local(core, &space, &slug).await {
-                    Some((local, _title)) => {
-                        ssr(accept_zstd, assets, core, host, space, local).await
-                    }
-                    None => index_fallback(assets, accept_zstd, host),
-                }
-            }
+            Some((space, reg)) => landing_redirect(core, &space, &reg.landing).await,
             None => index_fallback(assets, accept_zstd, host),
         };
     }
@@ -199,13 +193,12 @@ async fn route(
 /// segment: `LOCAL[/TITLE]` — the canonical route, SSR'd (the title is
 /// decorative, never inspected); `[cat:]slug…` — a page named by its slug:
 /// resolved and permanently redirected to its titled canonical form; a bare
-/// tail — the space's landing page, same redirect. `explicit` — whether
-/// redirect targets carry the space segment (the main origin) or rely on the
-/// host already naming the space (the wiki's own domain).
+/// tail — the space's landing page, same redirect. Redirect targets always
+/// carry the space segment (the full canonical form, valid on any origin);
+/// a wiki's own domain simplifies them client-side.
 async fn tail_route(
     tail: &[&str],
     space: SpaceId,
-    explicit: bool,
     accept_zstd: bool,
     assets: &Arc<HashMap<String, Body>>,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
@@ -233,9 +226,23 @@ async fn tail_route(
     match page_local(core, &space, &slug).await {
         // The title segment is regenerated from the page's own title, so a
         // rename never leaves a stale pretty URL behind.
-        Some((local, title)) => {
-            Reply::moved(&format_page_route(explicit.then_some(space), local, &title))
-        }
+        Some((local, title)) => Reply::moved(&format_page_route(Some(space), local, &title)),
+        None => Reply::not_found(),
+    }
+}
+
+/// `/` — a space's landing page (`start`, `main`, …), permanently redirected
+/// to its full canonical address: like every server output, the redirect
+/// carries the space segment; a wiki's own domain simplifies it
+/// client-side. `None` (unregistered space, unknown landing) is a 404.
+async fn landing_redirect(
+    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    space: &SpaceId,
+    landing: &SafePathComponent,
+) -> Reply {
+    let slug = (None, landing.clone());
+    match page_local(core, space, &slug).await {
+        Some((local, title)) => Reply::moved(&format_page_route(Some(*space), local, &title)),
         None => Reply::not_found(),
     }
 }

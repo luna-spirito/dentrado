@@ -16,7 +16,7 @@ mod render;
 pub use about::{ABOUT_PATH, about_page};
 pub use css::{http_refs, http_tail, rewrite_with};
 pub use layout::{THEME_LINK_ID, document_title, html_escape, layout, theme_link};
-pub use render::{render_block, wrap_topbar_lists};
+pub use render::{Scope, render_block, wrap_topbar_lists};
 
 #[cfg(feature = "ssr")]
 mod opengraph;

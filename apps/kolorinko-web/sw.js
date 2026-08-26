@@ -5,13 +5,18 @@
 // load (before the SW controls the page), and no-JS clients fall through
 // to the server's SSR.
 //
-// The app-renderable paths: canonical `/{space}/{local}[/title]` pages plus
-// the auxiliary `/~/…` screens (about) — their navigations get the shell
-// too, and the app renders them client-side. Everything else — slug-form
-// paths (`/{space}/cat:name`, which the client can't resolve), assets,
-// `/-/repo/` blobs and the rest of the server-owned `/-…` namespace —
-// passes through untouched: the server's 301s, SSR, standalone documents,
-// and Cache-Control policies answer directly.
+// The app-renderable paths: canonical `/{space}/{local}[/title]` pages —
+// full form on any origin, plus the space-less `/{local}[/title]` short
+// form a wiki's own domain serves (the shell there carries
+// `window.__DEFAULT_SPACE_ID__`, so the app addresses the short form to
+// the host's space) — and the auxiliary `/~/…` screens (about): their
+// navigations get the shell too, and the app renders them client-side.
+// Everything else — the site roots `/` and `/{space}` (which the server
+// 301s to canonical pages), slug-form paths (`/{space}/cat:name`, which
+// the client can't resolve), assets, `/-/repo/` blobs and the rest of the
+// server-owned `/-…` namespace — passes through untouched: the server's
+// 301s, SSR, standalone documents, and Cache-Control policies answer
+// directly.
 //
 // Update contract: this script is served at `/sw.js` and the shell at
 // `/index.html`, both `no-cache` — and neither URL may ever move. A moved
@@ -63,7 +68,8 @@ self.addEventListener("fetch", (e) => {
 });
 
 // A navigation the app can render from the shell: `/SPACE/LOCAL[/title]`,
-// or an auxiliary `/~/…` screen.
+// the space-less `/LOCAL[/title]` (a wiki's own domain), or an auxiliary
+// `/~/…` screen.
 function shellPath(path) {
 	if (path.startsWith("/~/")) return true;
 	const segs = path
@@ -71,9 +77,10 @@ function shellPath(path) {
 		.split("/")
 		.filter((s) => s.length > 0);
 	return (
-		(segs.length === 2 || segs.length === 3) &&
-		SPACE_RE.test(segs[0]) &&
-		LOCAL_RE.test(segs[1])
+			((segs.length === 2 || segs.length === 3) &&
+				SPACE_RE.test(segs[0]) &&
+				LOCAL_RE.test(segs[1])) ||
+			((segs.length === 1 || segs.length === 2) && LOCAL_RE.test(segs[0]))
 	);
 }
 

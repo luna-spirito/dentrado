@@ -30,6 +30,7 @@ web-sys = { version = "0.3", features = [
   "EventTarget",
   "MouseEvent",
   "History",
+  "NodeList",
   # WebTransport client (gated on `web_sys_unstable_apis`, enabled via
   # .cargo/config.toml).
   "WebTransport",

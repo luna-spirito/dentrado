@@ -5,9 +5,19 @@
 //! space-less sibling `/{local}[/title]` on a wiki's own domain, where the
 //! `Host` already names the space: the server injects that space as
 //! `window.__DEFAULT_SPACE_ID__` ([`DEFAULT_SPACE_GLOBAL`]) into every HTML
-//! document it serves there, and this router reads it, addresses `/L…`
-//! paths to it, and collapses `/S<default>/L…` hrefs to `/L…` — so the
-//! space segment appears in a URL only when it differs from the host's own.
+//! document it serves there, and this router reads it and addresses `/L…`
+//! paths to it.
+//!
+//! The division of labor is absolute: the server always outputs
+//! full-weight links (every href and redirect carries its space id); the
+//! client always simplifies them — [`simplify`] against the origin's
+//! default space, applied at href construction (the render `Scope` carries
+//! the default), to the address bar ([`address`]), to pushed navigations
+//! ([`navigate`]), and once over the hydrated SSR markup
+//! ([`collapse_document`] — hydration reuses the server's attributes
+//! verbatim). The space segment appears anywhere only when it differs from
+//! the host's own space.
+//!
 //! The server SSRs canonical routes and 301s slug-form paths to them; the
 //! client never resolves slugs, so a slug link is simply a full browser
 //! navigation.
@@ -23,7 +33,7 @@
 use kolorinko_render::ABOUT_PATH;
 use kolorinko_rt::{
     DEFAULT_SPACE_GLOBAL, LocalId, SpaceId, SsrState, format_page_route, parse_local_route,
-    parse_page_route,
+    parse_page_route, simplify,
 };
 use leptos::prelude::*;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
@@ -54,10 +64,9 @@ pub(crate) struct Router {
     /// The space this origin already names (`window.__DEFAULT_SPACE_ID__`,
     /// injected by the server on a wiki's own domain; `None` on the main
     /// origin). `/L…` paths address it ([`parse_route`]), and its own
-    /// canonical hrefs collapse to the space-less form ([`collapse`]).
-    default: Option<SpaceId>,
+    /// canonical hrefs simplify to the space-less form ([`simplify`]).
+    pub(crate) default: Option<SpaceId>,
 }
-
 /// `window.__DEFAULT_SPACE_ID__`, the space the origin itself names — the
 /// script the server injects into every HTML document of a wiki's own
 /// configured domain (absent on the main origin, where every URL carries
@@ -118,17 +127,20 @@ impl Router {
         }
     }
 
-    /// Install the `popstate` and delegated `click` listeners (fire-and-forget:
-    /// they outlive the reactive scope, for the page lifetime).
+    /// Install the `popstate` and delegated `click` listeners, and simplify
+    /// the hydrated document's links once (fire-and-forget: the listeners
+    /// outlive the reactive scope, for the page lifetime).
     pub(crate) fn install(&self) {
         self.clone().install_popstate();
         self.clone().install_clicks();
+        self.collapse_document();
     }
 
     /// Client-side navigate to an internal path: pushState + update signals,
     /// so subscriptions re-subscribe without a full reload. The pushed
-    /// address is the path's [`collapse`]d form. The about path switches the
-    /// app to the about screen (page subscriptions off) the same way.
+    /// address is the path's simplified form ([`simplify`]). The about path
+    /// switches the app to the about screen (page subscriptions off) the
+    /// same way.
     pub(crate) fn navigate(&self, path: String) {
         if path == ABOUT_PATH {
             if let Ok(h) = window().history() {
@@ -143,7 +155,7 @@ impl Router {
             return;
         };
         if let Ok(h) = window().history() {
-            let _ = h.push_state_with_url(&JsValue::NULL, "", Some(&self.collapse(&path)));
+            let _ = h.push_state_with_url(&JsValue::NULL, "", Some(&simplify(self.default, &path)));
         }
         self.set_about(false);
         self.set_space(Some(space));
@@ -157,20 +169,10 @@ impl Router {
     }
 
     /// The address-bar form of `(space, local)` titled `title` on this
-    /// origin: [`format_page_route`] with the space segment dropped when the
-    /// route names the default space — the host already does.
+    /// origin: the canonical full route — [`format_page_route`] always
+    /// carries the space — simplified against the origin's default space.
     pub(crate) fn address(&self, space: SpaceId, local: LocalId, title: &str) -> String {
-        format_page_route((self.default != Some(space)).then_some(space), local, title)
-    }
-
-    /// An internal href with its `/{default}` prefix dropped — the same
-    /// collapse as [`address`] applied to the href as-is, so its title
-    /// segment stays verbatim (ids are fixed-length, so the prefix never
-    /// bleeds into another space's).
-    fn collapse(&self, path: &str) -> String {
-        self.default
-            .and_then(|d| path.strip_prefix(&format!("/{d}/")).map(str::to_string))
-            .unwrap_or_else(|| path.to_string())
+        simplify(self.default, &format_page_route(Some(space), local, title))
     }
 
     fn sync_from_location(&self) {
@@ -266,5 +268,35 @@ impl Router {
                 cb.as_ref().unchecked_ref::<js_sys::Function>(),
             );
         cb.forget();
+    }
+
+    /// Simplify the links of the initial, hydrated document: the server
+    /// always emits full-weight hrefs and hydration reuses them verbatim
+    /// (a hydrated client never re-sets static attributes), so the SSR tree
+    /// needs one explicit pass — the only DOM rewrite in the system.
+    /// Everything the client builds afterwards is short at construction
+    /// (the render `Scope` carries the default space), so nothing further
+    /// is ever needed.
+    fn collapse_document(&self) {
+        let Some(doc) = window().document() else {
+            return;
+        };
+        let Ok(anchors) = doc.query_selector_all("a[href]") else {
+            return;
+        };
+        for i in 0..anchors.length() {
+            let Some(el) = anchors.item(i).and_then(|n| n.dyn_into::<Element>().ok()) else {
+                continue;
+            };
+            let Some(href) = el.get_attribute("href") else {
+                continue;
+            };
+            if href.starts_with('/') {
+                let short = simplify(self.default, &href);
+                if short != href {
+                    let _ = el.set_attribute("href", &short);
+                }
+            }
+        }
     }
 }
