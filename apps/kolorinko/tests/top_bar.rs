@@ -4,18 +4,16 @@
 //! entries and top-level entries without a submenu keep their real links.
 
 use kolorinko::wikidot_parser;
-use kolorinko_render::{render_block, wrap_topbar_lists};
+use kolorinko_render::{Scope, render_block, wrap_topbar_lists};
 use leptos::prelude::*;
 
-/// A fixed space for link-href assertions (raw bytes; Display adds the 'S' marker).
-fn test_space() -> Option<kolorinko_rt::SpaceId> {
-    Some(kolorinko_rt::SpaceId::from_bytes([0x2a; 16]))
-}
+mod common;
+use common::test_space;
 
-fn render_topbar_html(space: Option<kolorinko_rt::SpaceId>, src: &str) -> String {
+fn render_topbar_html(scope: Scope, src: &str) -> String {
     let mut content = wikidot_parser::parse(src);
     wrap_topbar_lists(&mut content);
-    let views = render_block(space, &content);
+    let views = render_block(scope, &content);
     view! { <div>{views}</div> }.to_html().replace("<!>", "")
 }
 
@@ -43,14 +41,14 @@ fn topbar_wraps_submenu_triggers() {
     assert!(
         html.contains(&format!(
             r#"<a href="/{s}/rpc-archive">001</a>"#,
-            s = test_space().unwrap()
+            s = test_space().space.unwrap()
         )),
         "{html}"
     );
     assert!(
         html.contains(&format!(
             r#"<a href="/{s}/non-canon-hub">Joke</a>"#,
-            s = test_space().unwrap()
+            s = test_space().space.unwrap()
         )),
         "{html}"
     );
@@ -59,7 +57,7 @@ fn topbar_wraps_submenu_triggers() {
     assert!(
         html.contains(&format!(
             r#"<a href="/{s}/home">Home</a>"#,
-            s = test_space().unwrap()
+            s = test_space().space.unwrap()
         )),
         "{html}"
     );
@@ -93,7 +91,7 @@ fn topbar_leaves_nested_levels_unwrapped() {
     assert!(
         html.contains(&format!(
             r#"<a href="/{s}/leaf">Leaf</a>"#,
-            s = test_space().unwrap()
+            s = test_space().space.unwrap()
         )),
         "{html}"
     );

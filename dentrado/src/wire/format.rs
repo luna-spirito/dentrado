@@ -118,6 +118,9 @@ pub enum MergeError {
     },
     DataVerify(crate::types::DataVerifyError),
     Route(crate::types::GroupRouteError),
+    /// A core the operation was routed to died (thread panic/exit or a
+    /// panicked task on it) before replying — see `InterCoreMsg::CoreDied`.
+    CoreDied,
 }
 
 impl std::fmt::Display for MergeError {
@@ -150,6 +153,7 @@ impl std::fmt::Display for MergeError {
             ),
             Self::DataVerify(e) => write!(f, "data verification failed: {e}"),
             Self::Route(e) => write!(f, "routing failed: {e}"),
+            Self::CoreDied => write!(f, "a core died before replying (panic or shutdown)"),
         }
     }
 }
@@ -170,6 +174,9 @@ pub enum RunGearError {
     /// The gear produced a non-shippable (core-local) output, which cannot be
     /// returned across the `RunGear` reply channel (a thread boundary).
     NotShippable,
+    /// The core the gear was routed to died (thread panic/exit or a
+    /// panicked task on it) before replying — see `InterCoreMsg::CoreDied`.
+    CoreDied,
 }
 
 impl std::fmt::Display for RunGearError {
@@ -178,6 +185,7 @@ impl std::fmt::Display for RunGearError {
             Self::Merge(e) => write!(f, "wire context merge failed: {e}"),
             Self::Route(e) => write!(f, "group route failed: {e}"),
             Self::NotShippable => write!(f, "gear produced a non-shippable (local) output"),
+            Self::CoreDied => write!(f, "a core died before replying (panic or shutdown)"),
         }
     }
 }
@@ -187,7 +195,7 @@ impl std::error::Error for RunGearError {
         match self {
             Self::Merge(e) => Some(e),
             Self::Route(e) => Some(e),
-            Self::NotShippable => None,
+            Self::NotShippable | Self::CoreDied => None,
         }
     }
 }

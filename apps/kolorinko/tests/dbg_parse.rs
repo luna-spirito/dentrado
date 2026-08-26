@@ -1,15 +1,13 @@
 //! Debug scratch: parse + render a source file and dump HTML.
 use kolorinko::wikidot_parser;
-use kolorinko_render::render_block;
+use kolorinko_render::{Scope, render_block};
 use leptos::prelude::*;
 
-/// A fixed space for link rendering (raw bytes; Display adds the 'S' marker).
-fn test_space() -> Option<kolorinko_rt::SpaceId> {
-    Some(kolorinko_rt::SpaceId::from_bytes([0x2a; 16]))
-}
+mod common;
+use common::test_space;
 
-fn render_html(space: Option<kolorinko_rt::SpaceId>, src: &str) -> String {
-    let views = render_block(space, &wikidot_parser::parse(src));
+fn render_html(scope: Scope, src: &str) -> String {
+    let views = render_block(scope, &wikidot_parser::parse(src));
     view! { <div>{views}</div> }.to_html()
 }
 

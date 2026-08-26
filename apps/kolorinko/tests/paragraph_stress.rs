@@ -6,11 +6,8 @@ use kolorinko::wikidot_parser;
 use kolorinko_render::render_block;
 use leptos::prelude::*;
 
-/// A fixed space for link-href assertions: byte 0x2a everywhere (the marker
-/// bit is forced by `from_bytes`), rendered via `Display` into expected hrefs.
-fn test_space() -> Option<kolorinko_rt::SpaceId> {
-    Some(kolorinko_rt::SpaceId::from_bytes([0x2a; 16]))
-}
+mod common;
+use common::test_space;
 
 /// Marker sentinels used to slice the SSR output back out of its wrapper.
 const OPEN: &str = "@@__KOLORINKO_OPEN__@@";

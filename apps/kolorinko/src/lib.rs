@@ -188,13 +188,13 @@ fn run_server(config: Config) -> anyhow::Result<()> {
         }
     };
 
-    // Keep the `Db` alive for the life of the process: its `Drop` impl sends
-    // `Shutdown` to every core and joins the worker threads.
-    let _db = Db::start_with_worker(db_config(cores), worker)?;
-
-    loop {
-        std::thread::park();
-    }
+    // The servers live on the cores' runtimes: a core panic cascades — every
+    // core dies, the tasks are cancelled — and `park` returns, letting the
+    // process exit so the supervisor can restart it. Without this the process
+    // would linger as a zombie serving nothing.
+    let mut db = Db::start_with_worker(db_config(cores), worker)?;
+    db.park();
+    anyhow::bail!("all core threads exited, the Db died (core panic)");
 }
 
 /// Core count for multi-core runs: the `NUM_CORES` env override if set (and

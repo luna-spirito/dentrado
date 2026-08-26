@@ -545,12 +545,30 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, msg: &ServerMsg) -> io::R
 
 #[cfg(test)]
 mod tests {
+    use std::{io, thread, time::Duration};
+
+    /// A compio runtime, retrying transient `ENOMEM`: io_uring ring allocation
+    /// fails under system memory pressure (many test processes at once) and
+    /// passes on a retry — see `dentrado::core::db::build_core_runtime`.
+    fn new_runtime() -> compio::runtime::Runtime {
+        for attempt in 0..5u32 {
+            match compio::runtime::Runtime::new() {
+                Ok(rt) => return rt,
+                Err(e) if e.kind() == io::ErrorKind::OutOfMemory && attempt < 4 => {
+                    thread::sleep(Duration::from_millis(10 << attempt));
+                }
+                Err(e) => panic!("compio runtime build failed: {e}"),
+            }
+        }
+        unreachable!()
+    }
+
     #[test]
     fn reuseport_shared_bind() {
         // The invariant the whole multi-core QUIC design rests on: two sockets
         // bind the same port. Catches a silent regression if set_reuse_port
         // were reordered after bind (it would no-op, second bind → EADDRINUSE).
-        compio::runtime::Runtime::new().unwrap().block_on(async {
+        new_runtime().block_on(async {
             let a = super::reuseport_udp_socket("127.0.0.1:0").unwrap();
             let port = a.local_addr().unwrap().port();
             let _b = super::reuseport_udp_socket(&format!("127.0.0.1:{port}")).unwrap();

@@ -106,3 +106,7 @@ let's talk just about ServiceWorker for now.
 * zstd-over-wire?
 * URL substitutions works horribly. Maybe... sw.js substitution?
 * article_latest urgently needs caching... and a good one... it makes way too much queries, by the way, doesn't it?
+
+* Title autofix? Capitalized title? Also, `/` has weird TITLE
+* `fetch` route
+* TODO: should core_event_loop await on processed messages? THIS IS A BOTTLENECK.

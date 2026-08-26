@@ -3,20 +3,28 @@ use std::{
     future::Future,
     io,
     num::NonZero,
+    panic::AssertUnwindSafe,
+    pin::Pin,
     rc::Rc,
     sync::{Arc, mpsc},
     thread,
+    time::Duration,
 };
 
 use crate::{
     core::{
-        core_ctx::{CoordCmd, Core, CoreCmd, InterCoreMsg, InterNodeMsg, RerouteMsg},
+        core_ctx::{
+            CoordCmd, Core, CoreCmd, HandleMsgResult, InterCoreMsg, InterNodeMsg, RerouteMsg,
+            broadcast_core_death,
+        },
         gear::IsRuntime,
         storage::Storage,
     },
     types::{GlobalCoreId, GlobalHash, NodeId},
     wire::{MergeError, RunGearError, WireEventBody, WireLocCtx},
 };
+use compio::runtime::JoinHandle;
+use futures::future::select_all;
 
 pub use crate::core::doorbell::{Doorbell, DoorbellHandle};
 
@@ -143,6 +151,20 @@ impl<R: IsRuntime> Db<R> {
     }
 
     /// Start the database with a user-provided worker function per core.
+    ///
+    /// # Core death
+    ///
+    /// A core can die at any moment — its thread panics (`io_uring` `ENOMEM`, a
+    /// bug), or a task running on it panics (compio detaches spawned tasks, so
+    /// their panics would otherwise vanish without unwinding the thread).
+    /// Death is *not* silent: the dying core broadcasts
+    /// [`InterCoreMsg::CoreDied`] to every peer — they stop too — so the whole
+    /// `Db` dies together (`Db::park`); queued ops fail through their channel
+    /// drops, parked awaiters are cancelled along with their cores, and the
+    /// callers of [`Db::post_events`] / [`Db::run_gear`] get
+    /// [`MergeError::CoreDied`] / [`RunGearError::CoreDied`] back, because
+    /// serving with a hole would only strand work routed through the
+    /// dead core.
     #[must_use]
     pub fn start_with_worker<S: Storage<R>, W, F>(
         mut config: DbConfig<R, S>,
@@ -248,41 +270,69 @@ impl<R: IsRuntime> Db<R> {
                 .name(format!("dentrado-core-{core_id}"))
                 // .stack_size(CORE_THREAD_STACK_SIZE)
                 .spawn(move || {
-                    // Build the storage backend on this thread so that
-                    // `!Send` single-threaded backends stay valid.
-                    let storage = make_storage();
+                    // Death guard: if this thread exits other than via a clean
+                    // event-loop shutdown (a panic, a runtime-build failure),
+                    // broadcast this core's death — every peer stops serving,
+                    // the whole `Db` dies together, and waiters get errors from
+                    // the closing channels instead of a freeze.
+                    let mut death =
+                        CoreDeathGuard::new(intercore_senders.clone(), core_doorbells.clone());
 
-                    let runtime = compio::runtime::RuntimeBuilder::new()
-                        .thread_affinity(HashSet::from([core_id as usize]))
-                        .build()
-                        .expect("compio runtime build failed");
+                    let body = AssertUnwindSafe(|| {
+                        // Build the storage backend on this thread so that
+                        // `!Send` single-threaded backends stay valid.
+                        let storage = make_storage();
 
-                    runtime.block_on(async move {
-                        let state = Rc::new(Core::new(
-                            num_cores,
-                            core_id,
-                            node_id,
-                            module,
-                            intercore_senders,
-                            reroute_senders,
-                            core_doorbells,
-                            inter_node_peers,
-                            storage,
-                        ));
+                        let runtime = build_core_runtime(core_id);
 
-                        compio::runtime::spawn(worker_fn(state.clone())).detach();
-                        compio::runtime::spawn(state.clone().epoch_ticker_task()).detach();
+                        runtime.block_on(async move {
+                            let state = Rc::new(Core::new(
+                                num_cores,
+                                core_id,
+                                node_id,
+                                module,
+                                intercore_senders,
+                                reroute_senders,
+                                core_doorbells,
+                                inter_node_peers,
+                                storage,
+                            ));
 
-                        core_event_loop(
-                            state,
-                            doorbell,
-                            cmd_rx,
-                            intercore_rxs,
-                            reroute_rx,
-                            core_inter_node_rxs,
-                        )
-                        .await;
+                            // A panic anywhere — the event loop (inline in
+                            // this `block_on`) or a supervised task — unwinds
+                            // this thread, and the death guard broadcasts.
+                            // Only the event loop's completion ends the core;
+                            // a worker/ticker that finishes normally early
+                            // just leaves supervision (`pending`).
+                            let tasks: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
+                                Box::pin(supervised(compio::runtime::spawn(worker_fn(
+                                    state.clone(),
+                                )))),
+                                Box::pin(supervised(compio::runtime::spawn(
+                                    state.clone().epoch_ticker_task(),
+                                ))),
+                                Box::pin(core_event_loop(
+                                    state,
+                                    doorbell,
+                                    cmd_rx,
+                                    intercore_rxs,
+                                    reroute_rx,
+                                    core_inter_node_rxs,
+                                )),
+                            ];
+                            let _ = select_all(tasks).await;
+                        });
                     });
+                    let result = std::panic::catch_unwind(body);
+                    // Clean shutdown — nothing to report. On panic the guard
+                    // stays armed and its `Drop` fires the broadcast while the
+                    // unwind leaves this thread.
+                    if result.is_ok() {
+                        death.disarm();
+                    }
+                    if let Err(panic) = result {
+                        std::panic::resume_unwind(panic);
+                    }
                 })?;
 
             handles.push(CoreHandle {
@@ -326,12 +376,12 @@ impl<R: IsRuntime> Db<R> {
                     forwarded_from: None,
                     reply: Some(reply_tx),
                 }))
-                .expect("core channel closed");
+                .map_err(|_| MergeError::CoreDied)?;
             handle.doorbell.ring();
             reply_rxs.push(reply_rx);
         }
         for reply_rx in reply_rxs {
-            reply_rx.recv().expect("core channel closed")?;
+            reply_rx.recv().map_err(|_| MergeError::CoreDied)??;
         }
 
         Ok(())
@@ -357,9 +407,21 @@ impl<R: IsRuntime> Db<R> {
                 wire_ctx,
                 reply: reply_tx,
             }))
-            .expect("core channel closed");
+            .map_err(|_| RunGearError::CoreDied)?;
         handle.doorbell.ring();
-        reply_rx.recv().expect("core channel closed")
+        match reply_rx.recv() {
+            Ok(result) => result,
+            Err(_) => Err(RunGearError::CoreDied),
+        }
+    }
+
+    /// Wait for every core thread to finish. A `Db` whose cores are dying
+    /// (the `CoreDied` cascade or a clean shutdown) parks until the last
+    /// thread is gone — it never hangs on a live-but-dead core.
+    pub fn park(&mut self) {
+        for join in self.join_handles.drain(..) {
+            let _ = join.join();
+        }
     }
 }
 
@@ -369,10 +431,77 @@ impl<R: IsRuntime> Drop for Db<R> {
             let _ = handle.cmd_tx.send(CoordCmd::<R>::Shutdown);
             handle.doorbell.ring();
         }
-        for join in self.join_handles.drain(..) {
-            let _ = join.join();
+        self.park();
+    }
+}
+
+/// Fires a core-death broadcast ([`broadcast_core_death`]) on drop, unless
+/// disarmed by a clean event-loop shutdown. Guards the whole body of a core
+/// thread: storage build, compio runtime build (the ENOMEM retry), and the
+/// event loop itself.
+struct CoreDeathGuard<R: IsRuntime> {
+    txs: Vec<mpsc::Sender<InterCoreMsg<R>>>,
+    doorbells: Vec<DoorbellHandle>,
+    armed: bool,
+}
+
+impl<R: IsRuntime> CoreDeathGuard<R> {
+    fn new(txs: Vec<mpsc::Sender<InterCoreMsg<R>>>, doorbells: Vec<DoorbellHandle>) -> Self {
+        Self {
+            txs,
+            doorbells,
+            armed: true,
         }
     }
+
+    /// A clean event-loop shutdown — no death to report.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<R: IsRuntime> Drop for CoreDeathGuard<R> {
+    fn drop(&mut self) {
+        if self.armed {
+            broadcast_core_death(&self.txs, &self.doorbells);
+        }
+    }
+}
+
+/// Await a supervised core task so its panic cannot vanish: compio catches a
+/// panicking task's unwind into its `JoinHandle` result, so resuming it here —
+/// on the `block_on` path, not from inside a task — unwinds the core thread,
+/// where the death guard broadcasts the node's death. A task that finishes
+/// normally early is simply left detached from supervision; only the event
+/// loop's completion ends the core.
+async fn supervised(handle: JoinHandle<()>) {
+    if let Err(e) = handle.await {
+        e.resume_unwind();
+    }
+    std::future::pending::<()>().await;
+}
+
+/// Build a core's compio runtime, retrying transient `ENOMEM`: `io_uring` ring
+/// allocation fails under system memory pressure (many test clusters at once,
+/// a busy host), which passes on a retry rather than indicating a real leak.
+/// A retry-exhausted or non-transient failure panics — the thread's death
+/// guard then notifies awaiters ([`Db::start_with_worker`]).
+fn build_core_runtime(core_id: u32) -> compio::runtime::Runtime {
+    for attempt in 0..5u32 {
+        let err = match compio::runtime::RuntimeBuilder::new()
+            .thread_affinity(HashSet::from([core_id as usize]))
+            .build()
+        {
+            Ok(runtime) => return runtime,
+            Err(e) => e,
+        };
+        assert!(
+            !(err.kind() != io::ErrorKind::OutOfMemory || attempt == 4),
+            "compio runtime build failed: {err}"
+        );
+        thread::sleep(Duration::from_millis(10 << attempt));
+    }
+    unreachable!()
 }
 
 async fn core_event_loop<R: IsRuntime, S: Storage<R>>(
@@ -413,7 +542,10 @@ async fn core_event_loop<R: IsRuntime, S: Storage<R>>(
             loop {
                 match rx.try_recv() {
                     Ok(msg) => {
-                        state.handle_intercore_msg(msg, from_core as u32).await;
+                        match state.handle_intercore_msg(msg, from_core as u32).await {
+                            HandleMsgResult::Ok => (),
+                            HandleMsgResult::Die => return, // A peer's `CoreDied` marks us dead — exit promptly.
+                        }
                         did_work = true;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,

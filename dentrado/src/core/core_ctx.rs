@@ -1,10 +1,11 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
     future::poll_fn,
     num::NonZero,
     ops::Deref,
+    panic::AssertUnwindSafe,
     rc::{Rc, Weak},
     sync::{Arc, mpsc},
     task::Poll,
@@ -12,6 +13,7 @@ use std::{
 };
 
 use compio::runtime::JoinHandle;
+use futures::FutureExt;
 use slotmap::{SlotMap, new_key_type};
 
 pub use crate::core::subscription::Subscription;
@@ -136,6 +138,11 @@ pub(crate) enum InterCoreMsg<R: IsRuntime> {
         session: GearKey,
         from_core: u32,
     },
+    /// A core of this node died (thread panic/exit). Sent by the dying core
+    /// to every core — itself included — via [`broadcast_core_death`];
+    /// recipients stop serving so the whole `Db` fails together instead of
+    /// freezing on gears the dead core owned.
+    CoreDied,
 }
 
 new_key_type! {
@@ -276,6 +283,25 @@ impl<R: IsRuntime> ActiveGear<R> {
     }
 }
 
+/// Tell every core of this node — the dying one included — that a core just
+/// died: send [`InterCoreMsg::CoreDied`] down every channel, then ring each
+/// doorbell so parked event loops wake and read it. Recipients mark themselves
+/// dead and let their threads end, so the whole `Db` fails together
+/// (`Db::park`) instead of freezing on gears a dead core will never update.
+/// Used by [`Core::link_task`] (a panicked task) and the thread-level death
+/// guard in `db.rs` (a panicked/failed core thread).
+pub(crate) fn broadcast_core_death<R: IsRuntime>(
+    txs: &[mpsc::Sender<InterCoreMsg<R>>],
+    doorbells: &[DoorbellHandle],
+) {
+    for tx in txs {
+        let _ = tx.send(InterCoreMsg::CoreDied);
+    }
+    for doorbell in doorbells {
+        doorbell.ring();
+    }
+}
+
 #[derive(Debug)]
 pub struct Core<R: IsRuntime, S: Storage<R>> {
     num_cores: NonZero<u32>,
@@ -304,6 +330,11 @@ pub struct Core<R: IsRuntime, S: Storage<R>> {
     /// churn never bounces the payload's cache line. Mutated only on this core's
     /// thread.
     shared_arena: RefCell<SharedArena<R>>,
+}
+
+pub(crate) enum HandleMsgResult {
+    Ok,
+    Die,
 }
 
 impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
@@ -348,6 +379,24 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
     /// The per-core storage backend.
     pub(crate) fn storage(&self) -> &S {
         &self.storage
+    }
+
+    /// Link a fire-and-forget task's panic to the node's death. compio
+    /// catches a panicking task's unwind into its `JoinHandle`, and a detached
+    /// handle's result is never taken — the panic would vanish while every
+    /// waiter on the task's work freezes. Awaited tasks need no link:
+    /// `supervised` in `db.rs` resumes the panic on the core thread, where the
+    /// death guard broadcasts. The default panic hook has already reported
+    /// the cause by the time we land here.
+    pub(crate) async fn link_task<F: std::future::Future>(self: Rc<Self>, fut: F) {
+        if AssertUnwindSafe(fut).catch_unwind().await.is_err() {
+            log::error!(
+                target: "dentrado::core",
+                "core {}: task panicked — stopping the node's cores",
+                self.core_id
+            );
+            broadcast_core_death(&self.intercore_tx, &self.doorbells);
+        }
     }
 
     #[must_use]
@@ -423,7 +472,11 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                     "kick core{} {:?} Eepy→Running",
                     self_rc.core_id, ag.id
                 );
-                let handle = compio::runtime::spawn(Self::run_loc_gear_task(self_rc.clone(), key));
+                let handle = compio::runtime::spawn(
+                    self_rc
+                        .clone()
+                        .link_task(Self::run_loc_gear_task(self_rc.clone(), key)),
+                );
                 *status = ActiveGearStatus::Running {
                     handle,
                     rerun: false,
@@ -845,6 +898,9 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
     /// via [`Subscription`] for worker reads) **before** awaiting. See
     /// `secondary_get_impl` / `StartSubscription` / `subscribe_gear*`.
     async fn wait_for_output_unpinned(self: &Rc<Self>, key: GearKey) -> Option<GearResult<R>> {
+        // No timeout needed: any core death cascades (`CoreDied`) through
+        // every core, the runtime drops, and this parked task is cancelled
+        // along with its reply channel — callers fail through the drop.
         loop {
             let seen = {
                 let inner = self.inner.borrow();
@@ -1222,20 +1278,21 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 reply,
             } => {
                 let this = Rc::clone(self);
-                compio::runtime::spawn(async move {
+                compio::runtime::spawn(this.clone().link_task(async move {
                     let result = this.run_gear(gear, &wire_ctx).await;
                     let _ = reply.send(result);
-                })
+                }))
                 .detach();
             }
         }
     }
 
+    #[must_use]
     pub(crate) async fn handle_intercore_msg(
         self: &Rc<Self>,
         msg: InterCoreMsg<R>,
         from_core: u32,
-    ) {
+    ) -> HandleMsgResult {
         match msg {
             InterCoreMsg::Op(op) => self.handle_client_op(op).await,
             InterCoreMsg::StartSubscription {
@@ -1245,7 +1302,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 session,
             } => {
                 let this = Rc::clone(self);
-                compio::runtime::spawn(async move {
+                compio::runtime::spawn(this.clone().link_task(async move {
                     let gear = {
                         let mut merger = WireLocCtxMerger::new(&wire_ctx, &this.storage);
                         merger
@@ -1286,7 +1343,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                             );
                         }
                     }
-                })
+                }))
                 .detach();
             }
             InterCoreMsg::SubscriptionUpdate {
@@ -1309,10 +1366,10 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 let dependents = {
                     let mut inner = self.inner.borrow_mut();
                     let Some(key) = inner.gear_index.get(&gear).copied() else {
-                        return;
+                        return HandleMsgResult::Ok;
                     };
                     let Some(ag) = inner.gears.get_mut(key) else {
-                        return;
+                        return HandleMsgResult::Ok;
                     };
                     ag.output = Some(GearResult::Ship(output));
                     ag.changed.bump();
@@ -1339,10 +1396,10 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 let dependents = {
                     let mut inner = self.inner.borrow_mut();
                     let Some(key) = inner.gear_index.get(&gear).copied() else {
-                        return;
+                        return HandleMsgResult::Ok;
                     };
                     let Some(ag) = inner.gears.get_mut(key) else {
-                        return;
+                        return HandleMsgResult::Ok;
                     };
                     ag.output = Some(GearResult::Shared(shared));
                     ag.changed.bump();
@@ -1365,7 +1422,13 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 // No localization: route purely by the opaque session token.
                 self.rebalance_remote_unsub(from_core, session);
             }
+            // A peer's core thread died — cascade: stop this core too. The
+            // event loop exits on `is_dead` right after the handler returns.
+            InterCoreMsg::CoreDied => {
+                return HandleMsgResult::Die;
+            }
         }
+        HandleMsgResult::Ok
     }
 
     /// Remove a remote subscriber and rebalance the (local) gear.
