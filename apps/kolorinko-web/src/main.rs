@@ -4,11 +4,11 @@
 //! containing the rendered layout plus an embedded [`SsrState`] script; the
 //! client then *hydrates* — rendering the same [`layout`] from the same data
 //! (so the trees match positionally) and attaching reactivity — and only
-//! afterwards goes live: a WebTransport session ([`wt::connect`], reconnected
-//! automatically)
-//! re-subscribes the page and site shell, pushing updates into the very
-//! signals the layout renders from. When no embedded state exists (a plain
-//! `index.html` boot, e.g. Trunk dev), the same app client-side renders from
+//! afterwards goes live: a transport session ([`transport::connect`] —
+//! WebTransport, falling back to fetch) re-subscribes the page and site
+//! shell, feeding updates into the very signals the layout renders from.
+//! When no embedded state exists (a plain `index.html` boot, e.g. Trunk
+//! dev), the same app client-side renders from
 //! `None` and fills in as subscriptions arrive.
 //!
 //! The layout itself lives in [`kolorinko_render::layout`], shared with the
@@ -17,7 +17,7 @@
 
 mod menu;
 mod router;
-mod wt;
+mod transport;
 
 use kolorinko_render::{
     ABOUT_PATH, THEME_LINK_ID, Scope, about_page, document_title, layout,
@@ -27,7 +27,7 @@ use kolorinko_rt::{SSR_STATE_ID, SiteShell, SsrState};
 use kolorinko_wikitext::ArticleView;
 use leptos::prelude::*;
 use std::{cell::Cell, rc::Rc};
-use wt::WtClient;
+use transport::Transport;
 
 /// The whole app: one layout driven by signals. `initial` is the embedded SSR
 /// state (hydrate boot); without it everything starts `None` (CSR boot).
@@ -38,7 +38,7 @@ fn app(initial: Option<SsrState>) -> AnyView {
 
     let space = router.space;
     let local = router.local;
-    let client = Rc::new(wt::connect());
+    let client = Rc::new(transport::connect());
     let page_hash = initial.as_ref().map(|s| s.page_hash.clone());
     let shell_hash = initial.as_ref().map(|s| s.shell_hash.clone());
     let (page, set_page) = signal(initial.as_ref().map(|s| s.page.clone()));
@@ -212,7 +212,7 @@ fn window_path() -> String {
 /// don't re-run this: the client replays its registry (hash included) on
 /// each fresh session.
 fn follow_opt<Out: 'static>(
-    client: &Rc<WtClient>,
+    client: &Rc<Transport>,
     initial_hash: Option<String>,
     make_query: impl Fn() -> Option<wire::GearQuery<Out>> + 'static,
     set: impl Fn(Out) + 'static,

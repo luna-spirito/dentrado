@@ -110,3 +110,4 @@ let's talk just about ServiceWorker for now.
 * Title autofix? Capitalized title? Also, `/` has weird TITLE
 * `fetch` route
 * TODO: should core_event_loop await on processed messages? THIS IS A BOTTLENECK.
+* Bottlenecks

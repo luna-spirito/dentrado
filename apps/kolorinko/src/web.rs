@@ -132,7 +132,7 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     alt_svc: Option<&str>,
 ) -> io::Result<()> {
-    let head = read_request_head(stream).await?;
+    let (head, rest) = read_request_head(stream).await?;
     let Some((method, path)) = parse_request_line(&head) else {
         write_http(
             stream,
@@ -148,6 +148,36 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         .await?;
         return Ok(());
     };
+
+    // The one POST the server speaks: the fetch-fallback gear endpoint
+    // (see [`crate::respond::legacy`]). Any other non-GET/HEAD stays 405.
+    if method == "POST" {
+        let reply = if path.split('?').next() == Some(kolorinko_rt::LEGACY_PATH) {
+            match read_body(stream, rest, &head).await {
+                Ok(body) => respond::legacy(&body, core).await,
+                Err(status) => match status {
+                    413 => respond::Reply::payload_too_large(),
+                    _ => respond::Reply::bad_request(),
+                },
+            }
+        } else {
+            respond::Reply::method_not_allowed()
+        };
+        write_http(
+            stream,
+            reply.status,
+            reply.mime,
+            reply.served.encoding,
+            &reply.served.bytes,
+            reply.cache_control,
+            reply.etag.as_deref(),
+            reply.location.as_deref(),
+            alt_svc,
+        )
+        .await?;
+        let _ = stream.shutdown().await; // send close_notify for a clean TLS close
+        return Ok(());
+    }
 
     if method != "GET" && method != "HEAD" {
         write_http(
@@ -220,10 +250,18 @@ fn if_none_match(head: &str) -> Option<&str> {
     })
 }
 
-/// Read bytes until the end of the HTTP request head (`\r\n\r\n`).
-async fn read_request_head<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<String> {
+/// Read the request head (through `\r\n\r\n`) plus any body bytes already
+/// read past it, so a POST body may continue from exactly where the head
+/// ended.
+async fn read_request_head<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<(String, Vec<u8>)> {
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
-    loop {
+    let head_len = loop {
+        if let Some(i) = find_double_crlf(&buf) {
+            break i + 4;
+        }
+        if buf.len() > 1 << 16 {
+            return Err(io::Error::other("HTTP request head too large"));
+        }
         let chunk: Vec<u8> = vec![0u8; 2048];
         let BufResult(res, chunk) = AsyncRead::read(stream, chunk).await;
         let n = res?;
@@ -231,14 +269,10 @@ async fn read_request_head<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<S
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
         }
         buf.extend_from_slice(&chunk[..n]);
-        if find_double_crlf(&buf).is_some() {
-            break;
-        }
-        if buf.len() > 1 << 16 {
-            return Err(io::Error::other("HTTP request head too large"));
-        }
-    }
-    String::from_utf8(buf).map_err(|_| io::Error::other("non-utf8 request head"))
+    };
+    let rest = buf.split_off(head_len);
+    let head = String::from_utf8(buf).map_err(|_| io::Error::other("non-utf8 request head"))?;
+    Ok((head, rest))
 }
 
 /// Write a complete HTTP/1.1 response (head + body) and flush. `encoding`, when
@@ -260,16 +294,21 @@ async fn write_http<S: AsyncWrite + Unpin>(
     let status_text = match status {
         200 => "OK",
         301 => "Moved Permanently",
+        204 => "No Content",
         304 => "Not Modified",
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        413 => "Payload Too Large",
         _ => "OK",
     };
     let mut head = format!(
-        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {mime}\r\nContent-Length: {len}\r\nConnection: close\r\nCache-Control: {cache_control}\r\nVary: Accept-Encoding\r\n",
-        len = body.len(),
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {mime}\r\nConnection: close\r\nCache-Control: {cache_control}\r\nVary: Accept-Encoding\r\n",
     );
+    // 204 carries no body, so no `Content-Length` either (RFC 9110).
+    if status != 204 {
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
     if let Some(etag) = etag {
         head.push_str("ETag: ");
         head.push_str(etag);
@@ -300,6 +339,47 @@ async fn write_http<S: AsyncWrite + Unpin>(
     // socket before the stream drops (otherwise the peer sees a truncated record).
     stream.flush().await?;
     Ok(())
+}
+
+/// The request's `Content-Length` (header name case-insensitive). Same
+/// raw-head scan as [`accepts_zstd`].
+fn content_length(head: &str) -> Option<usize> {
+    head.lines().find_map(|l| {
+        let mut parts = l.splitn(2, ':');
+        match parts.next().map(str::trim) {
+            Some(name) if name.eq_ignore_ascii_case("content-length") => {
+                parts.next()?.trim().parse().ok()
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Read a request body of `Content-Length` bytes, starting from `rest` (any
+/// bytes already read past the head), bounded by [`respond::LEGACY_MAX`].
+/// `Err(status)` is the HTTP status to answer with: 400 for a missing/
+/// invalid/truncated body, 413 for an oversize one.
+async fn read_body<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    rest: Vec<u8>,
+    head: &str,
+) -> Result<Vec<u8>, u16> {
+    let len: usize = content_length(head).ok_or(400u16)?;
+    if len > respond::LEGACY_MAX {
+        return Err(413);
+    }
+    let mut body = rest;
+    while body.len() < len {
+        let chunk: Vec<u8> = vec![0u8; len - body.len()];
+        let BufResult(res, chunk) = AsyncRead::read(stream, chunk).await;
+        let n = res.map_err(|_| 400u16)?;
+        if n == 0 {
+            return Err(400); // truncated body
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    body.truncate(len);
+    Ok(body)
 }
 
 /// Parse the request line into `(method, raw_path)` — `raw_path` includes any

@@ -28,6 +28,15 @@ pub type Slug = (Option<SafePathComponent>, SafePathComponent);
 /// The landing page a bare `/<site>/` resolves to.
 pub const START_PAGE: &str = "start";
 
+/// The fetch-fallback gear endpoint (`POST`): one wire `ClientMsg::Subscribe`
+/// in, one `ServerMsg::Push` out — the plain-HTTP alternative to WebTransport
+/// for clients it fails (no push channel; the client asks once per
+/// navigation, a content-hash echo skipping unchanged payloads exactly like
+/// the WebTransport wire). Lives in the `/-…` system namespace
+/// ([`SYSTEM_PREFIX`]); spelled once here so the server's two HTTP stacks
+/// and the client's fallback transport can never drift.
+pub const LEGACY_PATH: &str = "/-/legacy";
+
 /// `category:name` / `name` → a slug, mirroring how the dataset keys pages
 /// (the mirror's `slug_parts`): the colon form is Wikidot's canonical page
 /// URL and must resolve identically to the generated `/<site>/<cat>/<page>`

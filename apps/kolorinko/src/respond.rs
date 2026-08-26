@@ -63,6 +63,7 @@ use std::{collections::HashMap, rc::Rc, sync::Arc};
 
 use bytes::Bytes;
 use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
+use kolorinko_rt::wire::{ClientMsg, ServerMsg};
 use kolorinko_rt::{
     Body, LocalId, SYSTEM_PREFIX, SafePathComponent, SpaceId, format_page_route, simplify,
 };
@@ -71,6 +72,11 @@ use crate::assets::{Served, compress, looks_like_asset, mime_for, serve_body};
 use crate::repo::{self, RepoResp};
 use crate::runtime::{KolorinkoRT, repo_l_local_id};
 use kolorinko_rt::Slug;
+
+/// The largest `POST /-/legacy` body accepted (a `Subscribe` frame is at
+/// most a few KiB; anything bigger is a client bug or hostile). Shared by
+/// both HTTP stacks.
+pub(crate) const LEGACY_MAX: usize = 64 * 1024;
 
 /// Cache-Control policies. CA assets (trunk-hashed outputs, `/-/repo/` blobs,
 /// the base-theme tree — path-versioned on the rare change → safe under
@@ -151,6 +157,47 @@ pub(crate) async fn resolve(
         };
     }
     route(path, accept_zstd, assets, core, host).await
+}
+
+/// `POST /-/legacy`: one wire `ClientMsg::Subscribe` in, one
+/// `ServerMsg::Push` out — the fetch-fallback transport for clients whose
+/// WebTransport fails (see kolorinko-web's `transport`). There is no push
+/// channel: the client polls, and content hashes skip unchanged payloads
+/// exactly like the WebTransport wire. The gear subscription lives exactly
+/// as long as the request; `204` answers "nothing new" — a matching echoed
+/// hash, or a gear that ships nothing over the wire (the same silence a WT
+/// stream's silence encodes).
+pub(crate) async fn legacy(
+    body: &[u8],
+    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+) -> Reply {
+    let Ok(ClientMsg::Subscribe { id, hash }) = serde_json::from_slice(body) else {
+        return Reply::bad_request();
+    };
+    let sub = crate::server::subscribe_wire(id, core).await;
+    let Some(out) = crate::server::to_wire_out(sub.current()) else {
+        return Reply::no_content();
+    };
+    let hash_now = crate::server::out_hash(&out);
+    if hash.as_deref() == Some(hash_now.as_str()) {
+        return Reply::no_content();
+    }
+    let json = serde_json::to_vec(&ServerMsg::Push {
+        out,
+        hash: hash_now,
+    })
+    .expect("ServerMsg serializes");
+    Reply {
+        status: 200,
+        mime: "application/json",
+        served: Served {
+            bytes: Bytes::from(json),
+            encoding: None,
+        },
+        cache_control: NOSTORE,
+        location: None,
+        etag: None,
+    }
 }
 
 /// Content routing: canonical spaces, custom domains, then the SSR/SPA
@@ -476,6 +523,64 @@ impl Reply {
             mime: "text/plain",
             served: Served {
                 bytes: Bytes::from_static(b"not found\n"),
+                encoding: None,
+            },
+            cache_control: NOSTORE,
+            location: None,
+            etag: None,
+        }
+    }
+
+    pub(crate) fn bad_request() -> Self {
+        Self {
+            status: 400,
+            mime: "text/plain",
+            served: Served {
+                bytes: Bytes::from_static(b"bad request\n"),
+                encoding: None,
+            },
+            cache_control: NOSTORE,
+            location: None,
+            etag: None,
+        }
+    }
+
+    pub(crate) fn method_not_allowed() -> Self {
+        Self {
+            status: 405,
+            mime: "text/plain",
+            served: Served {
+                bytes: Bytes::from_static(b"method not allowed\n"),
+                encoding: None,
+            },
+            cache_control: NOSTORE,
+            location: None,
+            etag: None,
+        }
+    }
+
+    pub(crate) fn payload_too_large() -> Self {
+        Self {
+            status: 413,
+            mime: "text/plain",
+            served: Served {
+                bytes: Bytes::from_static(b"payload too large\n"),
+                encoding: None,
+            },
+            cache_control: NOSTORE,
+            location: None,
+            etag: None,
+        }
+    }
+
+    /// `204 No Content` — "nothing new" for the legacy endpoint. Carries no
+    /// body and (RFC 9110) no `Content-Length` either.
+    fn no_content() -> Self {
+        Self {
+            status: 204,
+            mime: "text/plain",
+            served: Served {
+                bytes: Bytes::new(),
                 encoding: None,
             },
             cache_control: NOSTORE,

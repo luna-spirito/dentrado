@@ -40,6 +40,10 @@ web-sys = { version = "0.3", features = [
   "WebTransportBidirectionalStream",
   "WebTransportReceiveStream",
   "WebTransportSendStream",
+  # Fetch-fallback transport (`POST /-/legacy`).
+  "Request",
+  "RequestInit",
+  "Response",
   "ReadableStream",
   "ReadableStreamDefaultReader",
   "WritableStream",

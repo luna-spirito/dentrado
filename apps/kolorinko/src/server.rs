@@ -44,7 +44,7 @@
 use std::sync::{Arc, OnceLock};
 use std::{collections::HashMap, io, rc::Rc};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use compio::runtime;
 use futures::{
     future::FutureExt,
@@ -245,9 +245,9 @@ async fn handle_conn(
             .detach();
             return Ok(()); // h3_conn consumed by the session
         }
-        // HTTP/3 request — resolved through [`crate::respond`] (static assets,
-        // `/repo/` assets, SSR'd pages) on this stream; the connection stays
-        // open for further multiplexed requests.
+        // HTTP/3 request — resolved through [`crate::respond`] (static
+        // assets, `/repo/` assets, SSR'd pages) on this stream; the
+        // connection stays open for further multiplexed requests.
         let assets = assets.clone();
         let core = core.clone();
         runtime::spawn(async move {
@@ -257,33 +257,53 @@ async fn handle_conn(
                 .path_and_query()
                 .map(|p| p.as_str().to_string())
                 .unwrap_or_else(|| req.uri().path().to_string());
-            let accept_zstd = req
-                .headers()
-                .get(http::header::ACCEPT_ENCODING)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.contains("zstd"));
             // HTTP/3 carries the origin as `:authority` (h3 folds any `Host`
             // header into the URI's authority); the SSR document absolutizes
             // its OpenGraph URLs with it.
             let host = req.uri().authority().map(|a| a.as_str().to_owned());
-            let inm = req
-                .headers()
-                .get(http::header::IF_NONE_MATCH)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            let reply = respond::resolve(&full, accept_zstd, &assets, &core, host.as_deref())
-                .await
-                .revalidated(inm.as_deref());
+            // The one POST the server speaks: the fetch-fallback gear
+            // endpoint. Its body is read to the end *before* answering;
+            // GET/HEAD have none — their receive half is drained after the
+            // response instead.
+            let post = req.method() == http::Method::POST;
+            let reply = if post {
+                let path = full.split('?').next().unwrap_or("");
+                if path == kolorinko_rt::LEGACY_PATH {
+                    match read_h3_body(&mut stream).await {
+                        Some(body) => respond::legacy(&body, &core).await,
+                        None => respond::Reply::bad_request(),
+                    }
+                } else {
+                    respond::Reply::method_not_allowed()
+                }
+            } else {
+                let accept_zstd = req
+                    .headers()
+                    .get(http::header::ACCEPT_ENCODING)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.contains("zstd"));
+                let inm = req
+                    .headers()
+                    .get(http::header::IF_NONE_MATCH)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                respond::resolve(&full, accept_zstd, &assets, &core, host.as_deref())
+                    .await
+                    .revalidated(inm.as_deref())
+            };
             let mut b = http::Response::builder()
                 .status(reply.status)
                 .header("content-type", reply.mime)
-                .header("content-length", reply.served.bytes.len().to_string())
                 .header("cache-control", reply.cache_control)
                 .header("vary", "Accept-Encoding");
+            // 204 carries no body, so no `Content-Length` either (RFC 9110).
+            if reply.status != 204 {
+                b = b.header("content-length", reply.served.bytes.len().to_string());
+            }
             if let Some(etag) = &reply.etag {
                 b = b.header("etag", etag);
             }
-            if let Some(loc) = reply.location {
+            if let Some(loc) = &reply.location {
                 b = b.header("location", loc);
             }
             if let Some(enc) = reply.served.encoding {
@@ -296,6 +316,14 @@ async fn handle_conn(
             }
             if let Err(e) = stream.send_data(reply.served.bytes).await {
                 warn!("h3 send_data: {e}");
+                return;
+            }
+            if post {
+                // The body was fully read before answering: just finalize
+                // with FIN.
+                if let Err(e) = stream.finish().await {
+                    warn!("h3 finish: {e}");
+                }
                 return;
             }
             // Drain the request body to its FIN so the bidi stream's receive
@@ -313,6 +341,27 @@ async fn handle_conn(
             }
         })
         .detach();
+    }
+}
+
+/// Read a POST body to its end, bounded by [`respond::LEGACY_MAX`]; `None`
+/// on an oversize or errored body.
+async fn read_h3_body<S>(stream: &mut h3::server::RequestStream<S, Bytes>) -> Option<Vec<u8>>
+where
+    S: h3::quic::RecvStream,
+{
+    let mut body = Vec::new();
+    loop {
+        match stream.recv_data().await {
+            Ok(Some(chunk)) => {
+                body.extend_from_slice(chunk.chunk());
+                if body.len() > respond::LEGACY_MAX {
+                    return None;
+                }
+            }
+            Ok(None) => return Some(body), // fully read
+            Err(_) => return None,
+        }
     }
 }
 
@@ -386,7 +435,7 @@ async fn subscription_stream<S>(
 // wire `GearOut` is a plain variant-by-variant relabel (same payloads, same
 // variant names).
 
-async fn subscribe_wire(
+pub(crate) async fn subscribe_wire(
     id: wire::GearId,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
 ) -> Subscription<KolorinkoRT, InMemoryStorage<KolorinkoRT>> {
@@ -433,7 +482,7 @@ async fn subscribe_wire(
 }
 
 // TODO: Annihilate. Also, no copies.
-fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
+pub(crate) fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
     match res {
         // Shippable gears carry their payload directly.
         GearResult::Ship(_) => None,

@@ -1,7 +1,8 @@
 // App-shell service worker: serve the cached CSR shell for navigations the
 // app itself can render — canonical page routes (stale-while-revalidate) —
 // so real browsers bypass SSR; the wasm app boots from the cached
-// `/index.html` and fetches page data over WebTransport. Bots, the first
+// `/index.html` and fetches page data over its transport (WebTransport,
+// falling back to `POST /-/legacy`). Bots, the first
 // load (before the SW controls the page), and no-JS clients fall through
 // to the server's SSR.
 //
