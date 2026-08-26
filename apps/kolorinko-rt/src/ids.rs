@@ -397,7 +397,7 @@ pub fn title_slug(title: &str) -> String {
                 prev_dash = true;
             }
         } else if ch.is_alphanumeric() {
-            out.extend(ch.to_lowercase());
+            out.push(ch);
             prev_dash = false;
         } else if (ch == '-' || ch == '_') && !prev_dash {
             out.push(ch);
@@ -409,9 +409,6 @@ pub fn title_slug(title: &str) -> String {
     }
     while out.ends_with('-') {
         out.pop();
-    }
-    if out.is_empty() {
-        out.push_str("page");
     }
     out
 }
