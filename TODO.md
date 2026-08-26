@@ -111,3 +111,46 @@ let's talk just about ServiceWorker for now.
 * `fetch` route
 * TODO: should core_event_loop await on processed messages? THIS IS A BOTTLENECK.
 * Bottlenecks
+
+-----
+
+## Parser: brackets split across `[[include]]` boundaries
+
+Wikidot assembles includes textually *before* parsing, so an included
+component may leave `[[div]]`/`[[cell]]`/`[[collapsible]]` open for the
+includer to close. Kolorinko parses each page separately and tree-splices,
+so both halves degrade to raw `[[div …]]` / `[[/div]]` text (pre-wrap
+spans) and memo/table structure collapses. Structural fix (re-pairing
+after assembly) was implemented and reverted: revisit with full table
+assembly (`[[cell]]`/`[[row]]`/`[[table]]`), not divs alone.
+
+Pages affected (rpc-authority corpus, render-diff verified):
+
+- `nav:side-right` — include ends with two unclosed `[[div_]]`s
+  (`desktop-only-container`, `desktop-only`); includer closes at page end:
+  - `rpc-archive`
+  - `directorate`
+  - `lexicon-auctoritas`
+- `component:footnote-box` → `footnote-box-base` opens
+  `[[div class="creditdrop"]]` + `[[collapsible]]`, never closes them;
+  includer ends with `[[/collapsible]] [[/div]]`:
+  - `a-summary-of-the-late-history-of-the-auctoritas-imperata`
+- `component:mi13adden` → `mi13adden-base` ends mid-table with an
+  unclosed `[[cell style="padding: 3px 4px 3px 20px"]]`;
+  `component:mi13adden-end` supplies `[[/cell]] [[/row]] [[/table]]`:
+  - `celtic-otherworlds`
+  - `mi13-format-guide`
+  - `mi13-hub`
+  - `monarch-security-personnel`
+  - `no-0100`
+  - `no-0288`
+  - `no-0773`
+  - `no-1567`
+  - `no-1571`
+  - `the-history-of-monarch-security`
+
+Obscurative corpus: unaffected.
+
+Separately pre-existing (unrelated to the parser): ListPages item order is
+nondeterministic between renders — `_ddtest`, `tales-by-author`,
+`mi13-hub`, `index.html` listings etc. flap on re-render.

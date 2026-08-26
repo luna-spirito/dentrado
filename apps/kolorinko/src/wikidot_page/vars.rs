@@ -247,6 +247,10 @@ fn subst_node(node: Node, vars: &Vars) -> Content {
             None => vec![node],
         },
         Node::Text(other) => vec![Node::Text(other)],
+        // Wikidot substitutes includes textually before parsing, so a
+        // `[[module css]]` body — carried verbatim as a raw string — sees
+        // the values, not the `{$var}` slots.
+        Node::Stylesheet(css) => vec![Node::Stylesheet(subst_stylesheet(css, vars))],
         Node::Container { kind, content } => vec![Node::Container {
             kind: subst_kind(kind, vars),
             content: apply_vars(content, vars),
@@ -334,6 +338,25 @@ fn subst_params(
         .into_iter()
         .map(|(k, v)| (k, subst_textobjs(v, vars)))
         .collect()
+}
+
+/// Substitute the `{$var}` slots of a stylesheet body line by line (the
+/// slot grammar is line-scoped, like everywhere else): each line resolves
+/// through the same text-only flattening as an attribute value, keeping
+/// its literal form when a slot cannot flatten.
+fn subst_stylesheet(css: String, vars: &Vars) -> String {
+    let mut out = String::with_capacity(css.len());
+    for (i, line) in css.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let objs = subst_textobjs(crate::wikidot_parser::text_objs_of(line), vars);
+        match TextObj::plain_concat(&objs) {
+            Some(s) => out.push_str(&s),
+            None => out.push_str(line),
+        }
+    }
+    out
 }
 
 /// Substitute variables inside one attribute value / image source — the

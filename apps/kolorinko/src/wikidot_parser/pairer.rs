@@ -16,14 +16,18 @@
 //! ## Line intervals
 //!
 //! Not every construct closes with a bracket token. Headings, centered
-//! lines, list items, table cells and `##color|` spans are line-scoped:
-//! their closer is the line's newline. Quote levels live even longer: a
-//! level stays open across consecutive quoted lines and closes just past
-//! the newline of the last line shallower than itself (the newline belongs
-//! to the quote's region; the closer itself never disappears). The `eats`
-//! flag says whether the closer token itself disappears from the stream: a
-//! `##`, a `||` and the newline a heading swallows do; the newline that
-//! merely ends a colour stays a plain newline leaf.
+//! lines, list items and table cells are line-scoped: their closer is the
+//! line's newline. Colours and sups reach further but not unboundedly:
+//! Wikidot tokenizes a single newline so its rules match across it, while a
+//! blank line survives as a real paragraph break — so a `##color|` span or
+//! `^^sup^^` crosses single newlines and dies (its opener degrading to raw
+//! text) at a blank line or the end of input. Quote levels live even
+//! longer: a level stays open across consecutive quoted lines and closes
+//! just past the newline of the last line shallower than itself (the newline
+//! belongs to the quote's region; the closer itself never disappears). The
+//! `eats` flag says whether the closer token itself disappears from the
+//! stream: a `##`, a `||` and the newline a heading swallows do; the
+//! newline that merely ends a colour stays a plain newline leaf.
 //!
 //! ## Verbatim checkpoints
 //!
@@ -119,6 +123,7 @@ pub(crate) struct Pairing {
 pub(crate) fn pair(src: &str, toks: &[Token]) -> Pairing {
     let n = toks.len();
     let mut p = Pairer {
+        toks,
         out: Vec::new(),
         stack: Vec::new(),
         serial: 0,
@@ -158,7 +163,8 @@ pub(crate) fn pair(src: &str, toks: &[Token]) -> Pairing {
     }
 }
 
-struct Pairer {
+struct Pairer<'a> {
+    toks: &'a [Token<'a>],
     out: Vec<Event>,
     stack: Vec<Entry>,
     serial: u32,
@@ -172,7 +178,7 @@ struct Pairer {
     unclosed: Vec<usize>,
 }
 
-impl Pairer {
+impl Pairer<'_> {
     fn token(&mut self, src: &str, i: usize, t: &Token, n: usize) {
         match &t.tok {
             Tok::Newline => self.newline(i, n),
@@ -192,33 +198,51 @@ impl Pairer {
             self.commit_line(n);
             self.line_start = false;
         }
-        self.close_line_scoped(i, true);
+        self.close_line_scoped(i);
+        if self.blank_ahead(i) {
+            self.kill_inline();
+        }
         self.last_nl = Some(i);
         self.line_start = true;
     }
 
+    /// A real paragraph break follows this newline: the next line holds
+    /// nothing but whitespace.
+    fn blank_ahead(&self, i: usize) -> bool {
+        self.toks[i + 1..]
+            .iter()
+            .find(|t| {
+                !matches!(&t.tok, Tok::Text(s) if s.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\r')))
+            })
+            .is_some_and(|t| matches!(t.tok, Tok::Newline))
+    }
+
+    /// Colours and sups die where Wikidot's rules cannot follow: a blank
+    /// line or the end of input. No closer will ever come, so the openers
+    /// degrade to raw leaves (tombstoned entries survive — a verbatim
+    /// rollback may still revive them).
+    fn kill_inline(&mut self) {
+        self.stack
+            .retain(|e| !matches!(&e.key, Key::Color | Key::Sup(_)) || e.dead.is_some());
+    }
+
     /// Close every live line-scoped interval at `close`, whatever sits
-    /// above it on the stack: headings, cells, colours and sups die at a
-    /// newline, while spans, marks, quotes and verbatim regions stay open
-    /// across it for the builder to cut. `colors` off: a `||` ends cells
-    /// and lines but lets colours and sups cross into the next cell.
-    fn close_line_scoped(&mut self, close: usize, colors: bool) {
+    /// above it on the stack: headings and cells die at a newline, while
+    /// colours, sups, spans, marks, quotes and verbatim regions stay open
+    /// across it — colours and sups until the next blank line, the rest for
+    /// the builder to cut.
+    fn close_line_scoped(&mut self, close: usize) {
         let mut due = Vec::new();
         let mut keep = Vec::new();
         let stack = std::mem::take(&mut self.stack);
         for e in stack {
-            let eats = match (&e.key, e.dead) {
-                (Key::Line | Key::Cell, None) => Some(true),
-                (Key::Color | Key::Sup(_), None) if colors => Some(false),
-                _ => None,
-            };
-            match eats {
-                Some(eats) => due.push(Event::Pair {
+            match &e.key {
+                Key::Line | Key::Cell if e.dead.is_none() => due.push(Event::Pair {
                     open: e.open,
                     close,
-                    eats,
+                    eats: true,
                 }),
-                None => keep.push(e),
+                _ => keep.push(e),
             }
         }
         self.stack = keep;
@@ -269,7 +293,7 @@ impl Pairer {
         match &t.tok {
             Tok::Heading(_) | Tok::CenterEq | Tok::ListMark { .. } => self.push(i, Key::Line),
             Tok::Pipe2 => {
-                self.close_line_scoped(i, false);
+                self.close_line_scoped(i);
                 self.push(i, Key::Cell);
             }
             Tok::ColorClose => self.close_keyed(i, Key::Color, true),
@@ -390,7 +414,8 @@ impl Pairer {
 
     fn eof(&mut self, n: usize) {
         self.commit_line(n);
-        self.close_line_scoped(n, true);
+        self.close_line_scoped(n);
+        self.kill_inline();
         self.unclosed = self
             .stack
             .iter()
@@ -568,7 +593,8 @@ mod tests {
     /// stays in the stream.
     #[test]
     fn color_dies_on_newline() {
-        assert_eq!(pair_str("##r| a\nb##").events, vec![pn(0, 2)]);
+        assert_eq!(pair_str("##r| a\nb##").events, vec![p(0, 4)]);
+        assert_eq!(pair_str("##r| a\n\nb##").events, vec![]);
     }
 
     #[test]
@@ -629,12 +655,13 @@ mod tests {
         assert_eq!(pr.unclosed, vec![0]);
     }
 
-    /// `^^a^^` pairs; `^^a` at EOF is simply unclosed.
+    /// `^^a^^` pairs; `^^a` at EOF degrades to raw text (no closer ever
+    /// comes).
     #[test]
     fn sup_pairs_greedily() {
         assert_eq!(pair_str("^^a^^").events, vec![p(0, 2)]);
         let pr = pair_str("a ^^b");
-        assert_eq!(pr.events, vec![pn(1, 3)]);
+        assert_eq!(pr.events, vec![]);
         assert!(pr.unclosed.is_empty());
     }
 

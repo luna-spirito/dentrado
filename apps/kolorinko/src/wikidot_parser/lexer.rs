@@ -615,17 +615,39 @@ fn mark2<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
     ))
 }
 
-/// `##spec|` — the `|` must appear on this line (the old `read_until` stopped
-/// at newlines); otherwise the `##` is a closer (or plain text when it
-/// degrades).
+/// `##spec|` — one or more CSS-value bytes (names, hex, `var(--x)`,
+/// `rgb(1,2,3)`), optionally space-padded, with the `|` required directly
+/// behind: Wikidot's rule pairs the leftmost `##…|` on the line, so a
+/// looser scan would swallow real markup as the spec. Otherwise the `##`
+/// is a closer (or plain text when it degrades).
 fn color_open<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
     choice((
-        just(b"##")
-            .ignore_then(read_until(b"|"))
-            .filter(|(_, found)| *found)
-            .map(|(spec, _)| Tok::ColorOpen(spec)),
+        just(b"##").ignore_then(color_spec()).map(Tok::ColorOpen),
         just(b"##").to(Tok::ColorClose),
     ))
+}
+
+fn is_color_spec_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'%' | b'#' | b'(' | b')' | b',' | b'_')
+}
+
+fn color_spec<'a>() -> impl Parser<'a, In<'a>, &'a str, E<'a>> + Clone + 'a {
+    custom(|inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let b = inp.full_slice();
+        let start = *inp.cursor().inner();
+        let mut j = skip_spaces(b, start);
+        let spec = j;
+        while j < b.len() && is_color_spec_char(b[j]) {
+            j += 1;
+        }
+        let spec_end = j;
+        j = skip_spaces(b, j);
+        if spec == spec_end || b.get(j) != Some(&b'|') {
+            return Err(perr(inp, "expected a color spec followed by '|'"));
+        }
+        advance(inp, j + 1 - start);
+        Ok(sub(b, spec, spec_end))
+    })
 }
 
 /// `[[user name]]` / `[[*user name]]`: the name runs to `]]` on the line.
@@ -1051,7 +1073,7 @@ fn lex_link1(b: &[u8], i: usize) -> Option<(usize, &str, Option<&str>)> {
     }
     let target = sub(b, i + 1, j);
     match b.get(j) {
-        Some(b']') => Some((j + 1, target, None)),
+        Some(b']') => None,
         Some(b' ') | Some(0xC2) => {
             // Skip the whole separator run (spaces and/or NBSPs) so the text
             // starts on a UTF-8 boundary.
@@ -1067,11 +1089,30 @@ fn lex_link1(b: &[u8], i: usize) -> Option<(usize, &str, Option<&str>)> {
                 t_end += 1;
             }
             let text = sub(b, text_start, t_end);
+            if t_end == text_start || !is_link1_target(target) {
+                return None;
+            }
             let end = if t_end < b.len() { t_end + 1 } else { t_end };
             Some((end, target, Some(text)))
         }
-        _ => Some((j, target, None)),
+        _ => None,
     }
+}
+
+/// Wikidot links a single-bracket `[target text]` only for full targets:
+/// a scheme URL, a same-page `#fragment`, a site-relative `/path` — or a
+/// target still carrying variable slots (`{$x}` / `%%x%%`), deferred to
+/// link resolution. Plain words (`[that]`) stay text.
+fn is_link1_target(t: &str) -> bool {
+    t.starts_with("http://")
+        || t.starts_with("https://")
+        || t.starts_with('/')
+        || (t.starts_with('#')
+            && t[1..]
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'%')))
+        || t.contains("{$")
+        || t.contains("%%")
 }
 
 /// A known `[[…]]` construct at `i`: a closer, an opener, or a listpages

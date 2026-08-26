@@ -1161,16 +1161,19 @@ mod tests {
         );
     }
 
-    /// `##f00|` without a closer dies at its newline; the newline survives.
+    /// A colour span crosses a single newline (Wikidot tokenizes it, so its
+    /// rules match over it) but dies at a blank line — a real paragraph
+    /// break no closer can reach across, leaving the opener literal.
     #[test]
-    fn color_spans_one_line() {
+    fn color_crosses_newlines() {
         assert_eq!(
-            parse("##f00| a\nb"),
-            vec![
-                container(ContainerKind::Color("#f00".into()), vec![txt(" a")]),
-                txt("\nb"),
-            ]
+            parse("##f00| a\nb##"),
+            vec![container(
+                ContainerKind::Color("#f00".into()),
+                vec![txt(" a\nb")]
+            )]
         );
+        assert_eq!(parse("##f00| a\n\nb##"), vec![txt("##f00| a\n\nb##")]);
     }
 
     #[test]
