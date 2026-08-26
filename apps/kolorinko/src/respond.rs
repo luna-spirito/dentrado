@@ -38,9 +38,11 @@
 //!    not-found view),
 //! 8. asset-like paths that don't exist — 404.
 //!
-//! Redirect `Location`s are always full canonical addresses (space segment
-//! included) — the server never emits a simplified link; simplification is
-//! the client's single job, against `window.__DEFAULT_SPACE_ID__`.
+//! Redirect `Location`s are the canonical route run through the one
+//! [`simplify`] — against the space the origin's `Host` names — so a wiki's
+//! own domain redirects straight to the short `/L…[/title]` form and the
+//! main origin to the full one; document hrefs stay full-weight (the client
+//! collapses them at boot).
 //!
 //! Static assets, system paths, and content routes can't collide: ids start
 //! with 'S'/'L' and slugs are lowercase, while asset paths are known dist
@@ -61,7 +63,9 @@ use std::{collections::HashMap, rc::Rc, sync::Arc};
 
 use bytes::Bytes;
 use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
-use kolorinko_rt::{Body, LocalId, SYSTEM_PREFIX, SafePathComponent, SpaceId, format_page_route};
+use kolorinko_rt::{
+    Body, LocalId, SYSTEM_PREFIX, SafePathComponent, SpaceId, format_page_route, simplify,
+};
 
 use crate::assets::{Served, compress, looks_like_asset, mime_for, serve_body};
 use crate::repo::{self, RepoResp};
@@ -171,14 +175,14 @@ async fn route(
     // address.
     if let Some((space, reg)) = host.and_then(crate::globals::space_of_domain) {
         if segs.as_slice() == [""] {
-            return landing_redirect(core, &space, &reg.landing).await;
+            return landing_redirect(core, &space, &reg.landing, host).await;
         }
         return tail_route(&segs, space, accept_zstd, assets, core, host).await;
     }
     // `/` — the first registered space's landing page, same redirect.
     if segs.as_slice() == [""] {
         return match crate::globals::first_space() {
-            Some((space, reg)) => landing_redirect(core, &space, &reg.landing).await,
+            Some((space, reg)) => landing_redirect(core, &space, &reg.landing, host).await,
             None => index_fallback(assets, accept_zstd, host),
         };
     }
@@ -193,9 +197,10 @@ async fn route(
 /// segment: `LOCAL[/TITLE]` — the canonical route, SSR'd (the title is
 /// decorative, never inspected); `[cat:]slug…` — a page named by its slug:
 /// resolved and permanently redirected to its titled canonical form; a bare
-/// tail — the space's landing page, same redirect. Redirect targets always
-/// carry the space segment (the full canonical form, valid on any origin);
-/// a wiki's own domain simplifies them client-side.
+/// tail — the space's landing page, same redirect. Redirect targets are the
+/// canonical route (valid on any origin) through the origin's `simplify`
+/// ([`Reply::moved`]) — a foreign space stays full, the origin's default
+/// drops its segment.
 async fn tail_route(
     tail: &[&str],
     space: SpaceId,
@@ -223,26 +228,35 @@ async fn tail_route(
         Some(slug) => slug,
         None => return Reply::not_found(),
     };
+    // A permanent redirect — the canonical route through the origin's
+    // `simplify` ([`Reply::moved`]).
     match page_local(core, &space, &slug).await {
         // The title segment is regenerated from the page's own title, so a
         // rename never leaves a stale pretty URL behind.
-        Some((local, title)) => Reply::moved(&format_page_route(Some(space), local, &title)),
+        Some((local, title)) => Reply::moved(
+            host_default(host),
+            &format_page_route(Some(space), local, &title),
+        ),
         None => Reply::not_found(),
     }
 }
 
 /// `/` — a space's landing page (`start`, `main`, …), permanently redirected
-/// to its full canonical address: like every server output, the redirect
-/// carries the space segment; a wiki's own domain simplifies it
-/// client-side. `None` (unregistered space, unknown landing) is a 404.
+/// to its canonical address, simplified against the origin's `Host` (the
+/// wiki's own domain lands on the short form, the main origin on the full
+/// one). `None` (unregistered space, unknown landing) is a 404.
 async fn landing_redirect(
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     space: &SpaceId,
     landing: &SafePathComponent,
+    host: Option<&str>,
 ) -> Reply {
     let slug = (None, landing.clone());
     match page_local(core, space, &slug).await {
-        Some((local, title)) => Reply::moved(&format_page_route(Some(*space), local, &title)),
+        Some((local, title)) => Reply::moved(
+            host_default(host),
+            &format_page_route(Some(*space), local, &title),
+        ),
         None => Reply::not_found(),
     }
 }
@@ -383,6 +397,14 @@ fn static_policy(key: &str) -> &'static str {
     }
 }
 
+/// The space this origin's `Host` names — a wiki domain's own space, `None`
+/// on the main origin: what the origin's redirects ([`Reply::moved`]) and
+/// HTML documents ([`crate::ssr`], [`shell_body`]) simplify against.
+fn host_default(host: Option<&str>) -> Option<SpaceId> {
+    host.and_then(crate::globals::space_of_domain)
+        .map(|(s, _)| s)
+}
+
 fn index_fallback(
     assets: &Arc<HashMap<String, Body>>,
     accept_zstd: bool,
@@ -407,7 +429,7 @@ fn shell_body(
     host: Option<&str>,
 ) -> Served {
     let stored = assets.get("/index.html").expect("index.html always loaded");
-    let Some((space, _)) = host.and_then(crate::globals::space_of_domain) else {
+    let Some(space) = host_default(host) else {
         return serve_body(stored, accept_zstd);
     };
     let html = crate::assets::inject_head_script(
@@ -429,8 +451,12 @@ impl Reply {
         }
     }
 
-    /// A permanent redirect to `location`.
-    fn moved(location: &str) -> Self {
+    /// A permanent redirect to `location` — the full canonical route run
+    /// through [`simplify`] against `default`, the space this origin names
+    /// (`None`: verbatim): every redirect lands the address bar on the short
+    /// form the client itself would have produced. The single redirect
+    /// constructor, so the shortening is automatic everywhere.
+    fn moved(default: Option<SpaceId>, location: &str) -> Self {
         Self {
             status: 301,
             mime: "text/plain",
@@ -439,7 +465,7 @@ impl Reply {
                 encoding: None,
             },
             cache_control: NOCACHE,
-            location: Some(location.to_string()),
+            location: Some(simplify(default, location)),
             etag: None,
         }
     }

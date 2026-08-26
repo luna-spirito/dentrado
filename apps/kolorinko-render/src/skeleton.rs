@@ -21,7 +21,10 @@ fn render_app(state: &SsrState) -> String {
     layout(
         // The server always emits full-weight links: `default: None` — the
         // client simplifies against its origin's default space.
-        move || Scope { space: Some(space), default: None },
+        move || Scope {
+            space: Some(space),
+            default: None,
+        },
         move || name.clone(),
         move || shell.title.clone(),
         move || shell.subtitle.clone(),

@@ -249,7 +249,10 @@ mod tests {
         page.meta.slug = slug.into();
         let site = site.map(str::to_string);
         layout(
-            || Scope { space: None, default: None },
+            || Scope {
+                space: None,
+                default: None,
+            },
             || "site".into(),
             || None,
             || None,

@@ -839,12 +839,10 @@ fn render_link(
             // canonical route straight from the target's rename-stable identity —
             // the form the client router intercepts, so navigation stays in the
             // app.
-            LinkTarget::Canonical { page_id, title } => {
-                LocalId::from_page_id(page_id).map_or_else(
-                    || "/".to_string(),
-                    |l| format_page_route(ctx.scope.space, l, title),
-                )
-            }
+            LinkTarget::Canonical { page_id, title } => LocalId::from_page_id(page_id).map_or_else(
+                || "/".to_string(),
+                |l| format_page_route(ctx.scope.space, l, title),
+            ),
             // A page ref, resolved or not, renders the slug-family route — the
             // canonical `cat:name` form (the colon can't collide with a base64url
             // local id, so the server routes these by slug and 301s to the titled
