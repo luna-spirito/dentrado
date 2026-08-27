@@ -23,6 +23,7 @@ use std::{
 use crate::runtime::KolorinkoRT;
 mod assets;
 mod globals;
+mod metrics;
 mod render_cli;
 mod repo;
 mod respond;
@@ -140,6 +141,7 @@ fn init_globals(config: &Config) -> anyhow::Result<()> {
 /// `kolorinko <config.toml>` — run the H3 + WebTransport server.
 fn run_server(config: Config) -> anyhow::Result<()> {
     let cores = core_count();
+    metrics::init(cores);
 
     init_globals(&config)?;
     let bind = config.server.bind.clone();
@@ -173,6 +175,11 @@ fn run_server(config: Config) -> anyhow::Result<()> {
         let bind = bind.clone();
         let assets = assets.clone();
         async move {
+            metrics::register(core.core_id(), core.stats());
+            // One aggregator for the whole process; core 0 is the convention.
+            if core.core_id() == 0 {
+                compio::runtime::spawn(metrics::log_loop()).detach();
+            }
             let core_h3 = core.clone();
             let bind_h3 = bind.clone();
             let assets_h3 = assets.clone();

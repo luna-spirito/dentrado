@@ -23,6 +23,7 @@ use crate::{
         doorbell::DoorbellHandle,
         gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime},
         shared::{RemoteShared, Shared, SharedArena, SharedBus, SharedData, SharedKey},
+        stats::CoreStats,
         storage::{GroupStore, Storage},
         subscription::Epoch,
     },
@@ -330,6 +331,10 @@ pub struct Core<R: IsRuntime, S: Storage<R>> {
     /// churn never bounces the payload's cache line. Mutated only on this core's
     /// thread.
     shared_arena: RefCell<SharedArena<R>>,
+    /// Host-readable introspection gauges ([`CoreStats`]): the engine writes
+    /// (only this core's instance, relaxed atomics), the host app reads and
+    /// aggregates across cores.
+    stats: Arc<CoreStats>,
 }
 
 pub(crate) enum HandleMsgResult {
@@ -364,6 +369,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
             inter_node_peers,
             storage,
             shared_arena: RefCell::new(SharedArena::new()),
+            stats: Arc::new(CoreStats::default()),
             inner: RefCell::new(CoreLocCtx {
                 gears: SlotMap::with_key(),
                 gear_index: HashMap::new(),
@@ -428,6 +434,13 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
     #[must_use]
     pub(crate) fn num_cores(&self) -> NonZero<u32> {
         self.num_cores
+    }
+
+    /// This core's introspection gauges, shared to the host app for
+    /// cross-core aggregation (the engine writes, the host reads).
+    #[must_use]
+    pub fn stats(&self) -> &Arc<CoreStats> {
+        &self.stats
     }
 
     /// A group-bound async read view over this core's storage, for the one
@@ -564,6 +577,10 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
     ///
     /// Pre: `status` is `Running` (set by `kick_loc_gear` or by re-loop).
     async fn run_loc_gear_task(self: Rc<Self>, key: GearKey) {
+        // Hold `gear_running` for the task's whole life: the guard drops on
+        // every exit path *and* on cancellation (a dropped future drops its
+        // state), so the gauge cannot leak.
+        let _running = self.stats.running_guard();
         loop {
             // Pull the gear id + cache + run trigger via the arena key. A stale
             // key (gear evicted, or evicted-and-recreated under a new

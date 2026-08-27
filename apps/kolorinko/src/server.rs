@@ -42,7 +42,7 @@
 //! [`Core::db_run_gear`]: dentrado::core::core_ctx::Core::db_run_gear
 
 use std::sync::{Arc, OnceLock};
-use std::{collections::HashMap, io, rc::Rc};
+use std::{collections::HashMap, io, rc::Rc, time::Instant};
 
 use bytes::{Buf, Bytes};
 use compio::runtime;
@@ -59,6 +59,7 @@ use kolorinko_rt::{
     wire::{self, ClientMsg, ServerMsg},
 };
 
+use crate::metrics;
 use crate::respond;
 use crate::runtime::KolorinkoRT;
 
@@ -392,12 +393,22 @@ async fn subscription_stream<S>(
         Ok(Some(msg)) => msg,
         _ => return,
     };
+    // One stream is one subscription: the gauge is held for its whole life,
+    // dropping on every exit — and on cancellation, like any future state.
+    let m = metrics::for_core(core.core_id());
+    let _subs = m.subs_hold();
+    // `Subscribe` read → first response (push or hash-skip): the server-side
+    // share of what the client waits for this subscription's first answer.
+    let start = Instant::now();
+    let mut unanswered = true;
     let s = core.subscribe_gear(id.into()).await;
     let mut last = hash;
-    if let Some(out) = to_wire_out(s.current())
-        && push_if_changed(&mut writer, &out, &mut last).await.is_err()
-    {
-        return;
+    if let Some(out) = to_wire_out(s.current()) {
+        if push_if_changed(&mut writer, &out, &mut last).await.is_err() {
+            return;
+        }
+        m.first_answer(start.elapsed());
+        unanswered = false;
     }
     loop {
         select! {
@@ -411,6 +422,12 @@ async fn subscription_stream<S>(
                 Some(out) => {
                     if push_if_changed(&mut writer, &out, &mut last).await.is_err() {
                         return;
+                    }
+                    // A gear whose current output doesn't ship answers with
+                    // its first push instead — still the first response.
+                    if unanswered {
+                        unanswered = false;
+                        m.first_answer(start.elapsed());
                     }
                 }
                 None => return, // subscription ended → closing = Dropped

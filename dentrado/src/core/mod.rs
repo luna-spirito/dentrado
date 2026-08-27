@@ -4,6 +4,7 @@ pub mod doorbell;
 pub mod gear;
 pub mod loc_ctx;
 pub mod shared;
+pub mod stats;
 pub mod storage;
 mod subscription;
 
