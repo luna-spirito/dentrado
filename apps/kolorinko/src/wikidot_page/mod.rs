@@ -82,7 +82,7 @@
 //!   plus the theme-root URLs — so the client fetches the site frame under a
 //!   single `site`-keyed subscription.
 
-use crate::wikidot_parser::{parse, parse_link_target};
+use crate::wikidot_parser::{parse, parse_link_target, wikidot_verbatim};
 use compio::fs;
 use dentrado::core::{core_ctx::GearCtx, gear::GearResult, storage::Storage};
 use git2::{ObjectType, Oid, Repository, Tree, TreeWalkMode};

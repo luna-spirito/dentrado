@@ -1318,7 +1318,7 @@ impl<'src> Merger<'src> {
         _tag: OpenTag<'src>,
     ) -> (Content, Option<Stop<'src>>) {
         self.raw_body(opener, ClosedTag::Module, |body| {
-            Node::Stylesheet(body.trim().to_string())
+            Node::Stylesheet(wikidot_verbatim(body))
         })
     }
 

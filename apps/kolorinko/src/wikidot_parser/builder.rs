@@ -655,7 +655,7 @@ impl<'src> Builder<'src, '_> {
                 let body = self.src[self.toks[open].end..self.toks[close].start].to_string();
                 match verb {
                     Verb::Code(ty) => vec![Node::Code { ty, raw: body }],
-                    Verb::Css => vec![Node::Stylesheet(body.trim().to_string())],
+                    Verb::Css => vec![Node::Stylesheet(wikidot_verbatim(&body))],
                     // A comment discards everything it spanned.
                     Verb::Comment => Vec::new(),
                 }

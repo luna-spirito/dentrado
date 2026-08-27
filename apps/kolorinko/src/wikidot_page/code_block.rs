@@ -16,8 +16,8 @@ use super::*;
 // `/SPACE/<cat:><name>/code/N` on the main origin, `/<cat:><name>/code/N` on
 // a wiki's own domain (see `crate::respond`); the render-time rewrite in
 // [`crate::wikidot_page::resources`] points CSS `@import`s here. The body
-// goes through Wikidot's serving pipeline (see [`wikidot_serve`]),
-// reverse-engineered byte-for-byte from the live endpoint; one deliberate
+// goes through Wikidot's verbatim-stylesheet pipeline
+// ([`wikidot_verbatim`], shared with `[[module css]]`); one deliberate
 // divergence remains — a plain 404 for a missing block or page (Wikidot
 // answers an odd `200 text/plain`), which a CSS `@import` silently
 // no-ops anyway.
@@ -53,9 +53,10 @@ pub(crate) fn code_block(
 }
 
 /// Shape a located block into the served [`CodeBlock`] (the body through
-/// [`wikidot_serve`], the `type="css"` MIME hint, ETag of the served body).
+/// [`wikidot_verbatim`], the `type="css"` MIME hint, ETag of the served
+/// body).
 fn serve(block: CodeNode<'_>) -> CodeBlock {
-    let served = wikidot_serve(block.raw);
+    let served = wikidot_verbatim(block.raw);
     CodeBlock {
         css: block
             .ty
@@ -64,21 +65,6 @@ fn serve(block: CodeNode<'_>) -> CodeBlock {
         etag: etag_of(served.as_bytes()),
         body: crate::assets::compress(served.into_bytes()),
     }
-}
-
-/// Wikidot's `/code/N` serving pipeline, verified byte-for-byte against the
-/// live endpoint on two corpus pages (`component:terrible-trio-theme`,
-/// `component:research-style`): NBSP (U+00A0) becomes a space, `&amp;`
-/// becomes `&amp;amp;` (a bare `&` stays as written), the edges are trimmed,
-/// and exactly one trailing newline is appended.
-fn wikidot_serve(raw: &str) -> String {
-    let mut served = raw
-        .replace('\u{a0}', " ")
-        .replace("&amp;", "&amp;amp;")
-        .trim()
-        .to_owned();
-    served.push('\n');
-    served
 }
 
 /// A located code block — the opener's `type` attribute as written and the
@@ -135,7 +121,7 @@ fn etag_of(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::nth_code_block;
-    use crate::wikidot_parser::parse;
+    use crate::wikidot_parser::{parse, wikidot_verbatim};
 
     /// `ty` of block 1 of `src` (the caller owns the parsed content).
     macro_rules! ty1 {
@@ -226,7 +212,7 @@ mod tests {
         );
         let b1 = nth_code_block(&content, 1).unwrap();
         assert_eq!(
-            super::wikidot_serve(b1.raw),
+            wikidot_verbatim(b1.raw),
             "a { content: \"A &amp;amp; B\" }\n b&c\n"
         );
         let served = super::serve(b1);
@@ -278,7 +264,7 @@ mod tests {
         // Byte-fidelity through the parse tree: the served body (pipeline
         // applied) is exactly what the live endpoint returns.
         assert_eq!(
-            super::etag_of(super::wikidot_serve(b1.raw).as_bytes()),
+            super::etag_of(wikidot_verbatim(b1.raw).as_bytes()),
             "\"34cc20f112337e4ab7f00b3000f2c82d9b275a39ce29b1905cda37cb19d864c6\""
         );
     }

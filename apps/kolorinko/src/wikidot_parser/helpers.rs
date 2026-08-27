@@ -544,6 +544,27 @@ pub(crate) fn merge_text(content: Content) -> Content {
     out
 }
 
+/// Wikidot's verbatim-stylesheet pipeline — the one filter shared by every
+/// context that serves markup as CSS: `[[module css]]` bodies (emitted into
+/// the page's `<style>`) and `[[code]]` blocks served by the legacy
+/// `/code/N` endpoint (see [`crate::wikidot_page::code_block`]). NBSP
+/// (U+00A0) becomes a space, `&amp;` becomes `&amp;amp;` (a bare `&` stays
+/// as written), the edges are trimmed, and exactly one trailing newline is
+/// appended. Byte-verified against the live site: the whole pipeline on
+/// `/code/N` (two corpus pages), the NBSP/trim/newline behaviour on the
+/// `discord` page's inline `<style>` — whose NBSP-indented declarations
+/// would otherwise fail to parse in the browser (U+00A0 is a name-start
+/// code point, so it glues onto the following property).
+pub(crate) fn wikidot_verbatim(raw: &str) -> String {
+    let mut served = raw
+        .replace('\u{a0}', " ")
+        .replace("&amp;", "&amp;amp;")
+        .trim()
+        .to_owned();
+    served.push('\n');
+    served
+}
+
 /// The Text_Wiki Typography substitutions applied to plain text: `...` and
 /// `. . .` become an ellipsis. (`--` → em-dash is handled at the mark level.)
 pub(crate) fn typography(s: &str) -> String {
