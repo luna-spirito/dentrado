@@ -26,6 +26,12 @@
 //! which transport works on *this* network; only the probe decides, and only
 //! a reload re-probes.
 //!
+//! Every subscription is served stale-while-revalidate through the
+//! persistent cache ([`crate::cache`]): its entry (if any) renders before the
+//! request goes out and its hash rides the `Subscribe`, so the request only
+//! pushes what changed since the cached content — and every push, either
+//! transport, refreshes the cache. See [`swr`].
+//!
 //! # WebTransport
 //! The whole site is one origin — `https://<host>:<port>`. The page loads over
 //! HTTP/1.1-over-TLS on the first visit, then over HTTP/3 once the browser
@@ -59,6 +65,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::cache;
 use kolorinko_rt::LEGACY_PATH;
 use kolorinko_rt::wire::{ClientMsg, GearId, GearOut, GearQuery, ServerMsg};
 use wasm_bindgen::{JsCast, JsValue};
@@ -109,10 +116,15 @@ type UpdateCb = Rc<dyn Fn(GearOut)>;
 /// hash of the content the client last held. Its stream writer (present only
 /// while its WebTransport stream is up) doubles as the cancel handle —
 /// closing it half-closes the stream, which the server reads as a cancel.
+///
+/// `ready` marks a subscription past its [`swr`] prologue: until then the
+/// transport's replay/probe paths leave it alone — the prologue itself hands
+/// it over (once, with the cached hash in place).
 struct Registration {
     id: GearId,
     cb: UpdateCb,
     hash: RefCell<Option<String>>,
+    ready: Cell<bool>,
     writer: RefCell<Option<Rc<WritableStreamDefaultWriter>>>,
 }
 
@@ -140,10 +152,14 @@ pub struct Transport {
 }
 
 impl Transport {
-    /// Subscribe to a gear query: register `on_update` under a fresh handle
-    /// and hand it to the locked transport (or leave it for the probe's
-    /// replay). `known` is the hash of the content the caller already holds
-    /// (SSR hydration), if any; the server then skips re-sending it. Returns
+    /// Subscribe to a gear query, stale-while-revalidate: register `on_update`
+    /// under a fresh handle, serve the persistent cache's entry for the query
+    /// (if any) immediately, then hand the registration to the locked
+    /// transport (or leave it for the probe's replay) — the request echoing
+    /// the cached hash, so only changed content comes back. `known` is the
+    /// hash of content the caller *already renders* (SSR hydration): the
+    /// cache step is skipped (an entry could only be older than what's on
+    /// screen) and the subscription goes straight to the transport. Returns
     /// the handle for [`cancel`](Self::cancel). Safe while probing or
     /// disconnected: the registration is replayed once a transport is live.
     pub fn subscribe<Out: 'static>(
@@ -161,10 +177,15 @@ impl Transport {
             id,
             cb,
             hash: RefCell::new(known.map(str::to_owned)),
+            ready: Cell::new(known.is_some()),
             writer: RefCell::new(None),
         });
         self.inner.subs.borrow_mut().insert(sub, reg.clone());
-        spawn_sub(self.inner.clone(), sub, reg);
+        if known.is_some() {
+            spawn_sub(self.inner.clone(), sub, reg);
+        } else {
+            spawn_local(swr(self.inner.clone(), sub, reg));
+        }
         sub
     }
 
@@ -197,6 +218,33 @@ pub(crate) fn connect() -> Rc<Transport> {
     });
     spawn_local(supervise(inner.clone()));
     Rc::new(Transport { inner })
+}
+
+/// A fresh subscription's stale-while-revalidate prologue ([`subscribe`]'s
+/// cache half): serve the persistent cache's entry *before* the request goes
+/// out, then hand the registration to the transport. A hit renders
+/// immediately and its hash becomes the `Subscribe` echo — the server then
+/// pushes only what changed since the cached content, and that push (the
+/// normal update path) re-renders and refreshes the cache. The injection is
+/// dropped when the subscription is gone or was already served — a non-`None`
+/// hash means something fresher rendered first, and stale content must never
+/// overwrite it. A miss — or a browser with no working IndexedDB — is just
+/// the plain from-scratch flow, one cache-read later.
+async fn swr(inner: Rc<Inner>, sub: u64, reg: Rc<Registration>) {
+    if let Some((out, hash)) = cache::get(&reg.id).await
+        && inner.subs.borrow().contains_key(&sub)
+        && reg.hash.borrow().is_none()
+    {
+        *reg.hash.borrow_mut() = Some(hash);
+        (reg.cb)(out);
+    }
+    // Ready before spawning (a registration that lands mid-lock-in must not
+    // be skipped by the replay and then never spawn), and only if still
+    // live (a canceled subscription's prologue ends here).
+    reg.ready.set(true);
+    if inner.subs.borrow().contains_key(&sub) {
+        spawn_sub(inner, sub, reg);
+    }
 }
 
 /// Hand one registration to the locked transport: WebTransport opens its
@@ -308,15 +356,18 @@ async fn open_wt() -> Option<WebTransport> {
 
 /// A fresh session goes live: generation bump (stale stream tasks from a dead
 /// session can't mistake it for theirs), install the transport, replay every
-/// registration on its own fresh stream — each echoing its last-held hash, so
-/// unchanged content isn't re-sent.
+/// ready registration on its own fresh stream — each echoing its last-held
+/// hash, so unchanged content isn't re-sent. Not-yet-ready registrations
+/// (mid-`swr` prologue) are left for their own prologues to hand over.
 fn install_session(inner: &Rc<Inner>, wt: &WebTransport) {
     inner
         .session_gen
         .set(inner.session_gen.get().wrapping_add(1));
     *inner.transport.borrow_mut() = Some(wt.clone());
     for (&sub, reg) in inner.subs.borrow().iter() {
-        spawn_wt_stream(inner.clone(), sub, reg.clone());
+        if reg.ready.get() {
+            spawn_wt_stream(inner.clone(), sub, reg.clone());
+        }
     }
 }
 
@@ -449,6 +500,7 @@ fn spawn_wt_stream(inner: Rc<Inner>, sub: u64, reg: Rc<Registration>) {
                         // in-flight pushes go nowhere.
                         let live = inner.subs.borrow().get(&sub).is_some();
                         if live {
+                            cache::put(&reg.id, &out, &hash);
                             *reg.hash.borrow_mut() = Some(hash);
                             (reg.cb)(out);
                         }
@@ -521,13 +573,14 @@ async fn fetch_once(reg: &Registration) -> FetchRes {
 }
 
 /// Apply one fetch result to its registration: a push fires the callback
-/// (hash advanced) if the subscription is still live — a canceled
-/// subscription's in-flight answer goes nowhere. `true` when the round trip
-/// itself succeeded (push or unchanged), `false` when it failed.
+/// (hash advanced, cache refreshed) if the subscription is still live — a
+/// canceled subscription's in-flight answer goes nowhere. `true` when the
+/// round trip itself succeeded (push or unchanged), `false` when it failed.
 fn deliver(inner: &Inner, sub: u64, reg: &Registration, res: FetchRes) -> bool {
     match res {
         FetchRes::Push { out, hash } => {
             if inner.subs.borrow().contains_key(&sub) {
+                cache::put(&reg.id, &out, &hash);
                 *reg.hash.borrow_mut() = Some(hash);
                 (reg.cb)(out);
             }
@@ -554,26 +607,29 @@ async fn fetch_oneshot(inner: Rc<Inner>, sub: u64, reg: Rc<Registration>) {
     }
 }
 
-/// The fetch probe: one real round-trip for the first live registration —
+/// The fetch probe: one real round-trip for the first ready registration —
 /// success means plain HTTP reaches the gears, the answer's content lands
 /// in a real subscriber on the way, and the served sub's handle comes back
-/// so the lock-in replay doesn't round-trip it twice. No registrations yet:
-/// nothing to ask, answer `None` (the probe loop will be back).
+/// so the lock-in replay doesn't round-trip it twice. Registrations still
+/// mid-`swr` prologue don't count (their hash isn't settled); none ready —
+/// or no registrations at all — answers `None` (the probe loop will be
+/// back).
 async fn fetch_probe(inner: &Rc<Inner>) -> Option<u64> {
     let (sub, reg) = inner
         .subs
         .borrow()
         .iter()
-        .next()
+        .find(|(_, r)| r.ready.get())
         .map(|(s, r)| (*s, r.clone()))?;
     deliver(inner, sub, &reg, fetch_once(&reg).await).then_some(sub)
 }
 
-/// Fetch lock-in: every registration gets its one round-trip — except the
-/// probe's (`done`), already served by the probe itself.
+/// Fetch lock-in: every ready registration gets its one round-trip — except
+/// the probe's (`done`), already served by the probe itself. Not-yet-ready
+/// registrations are left for their `swr` prologues to hand over.
 fn replay_fetch(inner: &Rc<Inner>, done: u64) {
     for (&sub, reg) in inner.subs.borrow().iter() {
-        if sub != done {
+        if sub != done && reg.ready.get() {
             spawn_local(fetch_oneshot(inner.clone(), sub, reg.clone()));
         }
     }

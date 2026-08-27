@@ -15,6 +15,7 @@
 //! server's SSR response; this module only wires reactivity around it (router,
 //! subscriptions, `<head>` management).
 
+mod cache;
 mod menu;
 mod router;
 mod transport;
@@ -39,6 +40,12 @@ fn app(initial: Option<SsrState>) -> AnyView {
     let space = router.space;
     let local = router.local;
     let client = Rc::new(transport::connect());
+    // Prime the output cache with what the SSR document already rendered:
+    // the subscription below skips the cache (its content is on screen), so
+    // this is what makes the *next* visit to this page instant.
+    if let Some(s) = initial.as_ref() {
+        cache::seed_ssr(s);
+    }
     let page_hash = initial.as_ref().map(|s| s.page_hash.clone());
     let shell_hash = initial.as_ref().map(|s| s.shell_hash.clone());
     let (page, set_page) = signal(initial.as_ref().map(|s| s.page.clone()));
