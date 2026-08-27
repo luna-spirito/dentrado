@@ -1,11 +1,14 @@
 // The single source of truth for the kolorinko gears. This file is **macro
 // input only** — it is never compiled directly. Two attribute macros read it:
 //
-// - `#[gears(file = "...", runtime = KolorinkoRT)]` (in the server's
-//   `runtime.rs`) emits the full dentrado runtime — the impl fns below keep
-//   their bodies (the `crate::wikidot_page::…` calls resolve there), and the
-//   gear names are freed for the generated `GearQuery` builders.
-// - `#[gears_schema(file = "...")]` (in this crate's `lib.rs`) emits a
+// - `#[gears(file = "...", runtime = KolorinkoRT, wire = kolorinko_rt::wire)]`
+//   (in the server's `runtime.rs`) emits the full dentrado runtime — the impl
+//   fns below keep their bodies (the `crate::wikidot_page::…` calls resolve
+//   there), and the gear names are freed for the generated `GearQuery`
+//   builders. `wire = …` additionally aliases the wire schema's `GearOut` as
+//   the runtime's `GearOut`/`GearOutShared` (one payload enum for both sides,
+//   no per-variant relabel at the wire boundary) and generates the
+//   field-for-field `From<wire::GearId>` id bridge.// - `#[gears_schema(file = "...")]` (in this crate's `lib.rs`) emits a
 //   wasm-safe, dentrado-free wire schema (serde `GearId` / `GearOut` /
 //   `GearQuery`) for the client. It reads only the signatures; the bodies are
 //   dropped.
@@ -36,9 +39,11 @@
 // form — the whole (sorted, deduplicated) link set of one page resolved in a
 // single lens read, so a thousand-link index page declares one dependency
 // instead of a thousand — and `repo_l_list_pages` / `repo_resource` / `asset`
-// stay slug/site-keyed. These server-internal gears
-// never appear in a client subscription (the wire schema carries them only
-// because the schema is generated from this one file).
+// stay slug/site-keyed. Wire exposure is an explicit **allowlist**: only
+// `#[gear(exposed)]` gears appear in the wire `GearId` and can be pushed to
+// a client — everything else is server-internal by default (unnamed on the
+// wire, and its output variants gated by the generated `GearOut::is_exposed`
+// filter the push bridge applies).
 
 #[dentrado::gear(timer(period = crate::globals::interval()), local, name = Repo)]
 pub(crate) async fn repo(tick: bool, cache: &mut RepoCache) -> Rc<RepoData> {
@@ -150,6 +155,7 @@ pub(crate) fn code_block(
 #[dentrado::gear(
     follow(target = GearId::Repo {}),
     shared,
+    exposed,
     name = Shell,
 )]
 pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
@@ -178,6 +184,7 @@ pub(crate) async fn article_latest_parsed<S: Storage<KolorinkoRT>>(
 #[dentrado::gear(
     follow(target = GearId::ArticleLatestParsed { space, local }),
     shared,
+    exposed,
     name = ArticleLatest,
 )]
 pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(

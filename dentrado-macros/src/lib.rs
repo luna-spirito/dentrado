@@ -33,10 +33,14 @@ pub fn gears(attr: TokenStream, item: TokenStream) -> TokenStream {
     gears::gears_impl(attr, item)
 }
 
-/// Emit a **wasm-safe, dentrado-free** wire schema (serde `GearId` / `GearOut` /
-/// `GearQuery`) from the same gear-declaration file, for the client side. The
-/// server's [`gears`] macro and this macro read one shared file so a gear is
-/// declared exactly once. See [`gears`].
+/// Emit a **wasm-safe** (no dentrado core) wire schema — serde `GearId` /
+/// `GearOut` / `GearQuery` — from the same gear-declaration file, for the
+/// client side. The server's [`gears`] macro and this macro read one shared
+/// file so a gear is declared exactly once. `#[gear(local)]` gears
+/// (core-pinned, no shippable output) and non-`exposed` gears (server-
+/// internal by default) are omitted from `GearId` and the builders; their
+/// outputs keep a `GearOut` variant, gated by the `GearOut::is_exposed`
+/// allowlist filter. See [`gears`].
 #[proc_macro_attribute]
 pub fn gears_schema(attr: TokenStream, item: TokenStream) -> TokenStream {
     gears::gears_schema_impl(attr, item)

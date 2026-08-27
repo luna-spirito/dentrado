@@ -53,22 +53,14 @@ use futures::{
 };
 use log::{error, info, warn};
 
-use dentrado::core::{
-    core_ctx::{Core, Subscription},
-    gear::GearResult,
-    storage::InMemoryStorage,
-};
+use dentrado::core::{core_ctx::Core, gear::GearResult, storage::InMemoryStorage};
 use kolorinko_rt::{
     Body,
     wire::{self, ClientMsg, ServerMsg},
 };
 
 use crate::respond;
-use crate::runtime::{
-    GearOutShared, KolorinkoRT, article_latest, article_latest_parsed, asset, code_block,
-    repo_l_article_latest, repo_l_list_pages, repo_l_local_id, repo_l_query_pages, repo_resource,
-    shell,
-};
+use crate::runtime::KolorinkoRT;
 
 /// Max concurrent WebTransport sessions advertised per HTTP/3 connection
 /// (`SETTINGS_H3_WEBTRANSPORT_MAX_SESSIONS`). Default-0 means "none", which
@@ -400,7 +392,7 @@ async fn subscription_stream<S>(
         Ok(Some(msg)) => msg,
         _ => return,
     };
-    let s = subscribe_wire(id, &core).await;
+    let s = core.subscribe_gear(id.into()).await;
     let mut last = hash;
     if let Some(out) = to_wire_out(s.current())
         && push_if_changed(&mut writer, &out, &mut last).await.is_err()
@@ -427,92 +419,24 @@ async fn subscription_stream<S>(
     }
 }
 
-// ---- wire dispatch ----------------------------------------------------------
+// ---- wire bridge ------------------------------------------------------------
 //
-// Wire `GearId` → runtime `Subscription`. Since the globals refactor the wire
-// and runtime ids are the same shape (no injected server-config fields): the
-// builder forwards the client-supplied id fields as-is. Runtime `GearOut` →
-// wire `GearOut` is a plain variant-by-variant relabel (same payloads, same
-// variant names).
-
-pub(crate) async fn subscribe_wire(
-    id: wire::GearId,
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
-) -> Subscription<KolorinkoRT, InMemoryStorage<KolorinkoRT>> {
-    match id {
-        // The client-facing gears are keyed by the canonical URL identity
-        // (`space`/`local`): what a URL names is what a subscription names.
-        wire::GearId::ArticleLatest { space, local } => {
-            article_latest(space, local).subscribe_raw(core).await
-        }
-        wire::GearId::Shell(space) => shell(space).subscribe_raw(core).await,
-        // The canonical resolution cone (server-internal; exhaustive match).
-        wire::GearId::ArticleLatestParsed { space, local } => {
-            article_latest_parsed(space, local)
-                .subscribe_raw(core)
-                .await
-        }
-        wire::GearId::RepoLArticleLatest { space, local } => {
-            repo_l_article_latest(space, local)
-                .subscribe_raw(core)
-                .await
-        }
-        wire::GearId::RepoLLocalId { site, slug } => {
-            repo_l_local_id(site, slug).subscribe_raw(core).await
-        }
-        wire::GearId::RepoLQueryPages { site, query } => {
-            repo_l_query_pages(site, query).subscribe_raw(core).await
-        }
-        wire::GearId::RepoLListPages { site, query } => {
-            repo_l_list_pages(site, query).subscribe_raw(core).await
-        }
-        // Assets are HTTP-only — never shipped over WebTransport. The match is
-        // exhaustive on the generated wire enum, but `to_wire_out` drops these.
-        wire::GearId::Asset { site, hash, ext } => asset(site, hash, ext).subscribe_raw(core).await,
-        // Code blocks likewise: HTTP-only.
-        wire::GearId::CodeBlock { space, local, n } => {
-            code_block(space, local, n).subscribe_raw(core).await
-        }
-        // Server-internal resolution dependency of `article_latest`; the client
-        // never subscribes to it, but the match must be exhaustive.
-        wire::GearId::RepoResource { site, path } => {
-            repo_resource(site, path).subscribe_raw(core).await
-        }
-    }
-}
-
-// TODO: Annihilate. Also, no copies.
+// `#[gears(wire = kolorinko_rt::wire)]` makes the wire schema's `GearOut` the
+// runtime's `GearOut`/`GearOutShared` (same variants, same payloads — both
+// generated from the one gear file) and generates `From<wire::GearId>` (the
+// runtime id is the strict superset carrying the `local` and non-`exposed`
+// gears). Bridging is therefore extraction, not variant-by-variant relabeling:
+// a `Ship` output already *is* a wire output, a `Shared` handle clones its
+// payload out of the allocation (one copy per push; TODO serialize from the
+// shared borrow instead — no copies), and `Local` / non-`exposed` outputs
+// never ship.
 pub(crate) fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
     match res {
-        // Shippable gears carry their payload directly.
-        GearResult::Ship(_) => None,
-        // Shared gears are shared *across cores* by reference; to the client
-        // they serialize the same way, so clone the payload out of the handle.
-        GearResult::Shared(s) => match &*s {
-            GearOutShared::ShellOut(a) => Some(wire::GearOut::ShellOut(a.clone())),
-            GearOutShared::ArticleLatestOut(a) => Some(wire::GearOut::ArticleLatestOut(a.clone())),
-            GearOutShared::ArticleLatestParsedOut(a) => {
-                Some(wire::GearOut::ArticleLatestParsedOut(a.clone()))
-            }
-            GearOutShared::RepoLArticleLatestOut(a) => {
-                Some(wire::GearOut::RepoLArticleLatestOut(a.clone()))
-            }
-            // Server-internal resolution dependencies; the client never
-            // subscribes to them.
-            GearOutShared::RepoLLocalIdOut(_) => None,
-            GearOutShared::RepoLQueryPagesOut(_) => None,
-            GearOutShared::RepoLListPagesOut(_) => None,
-            // Assets are served over plain HTTP, never the WebTransport wire —
-            // the browser fetches them via `<img>`/`<link>`/`url()`. Dropping
-            // here keeps their bytes out of the subscription channel.
-            GearOutShared::AssetOut(_) => None,
-            // Code blocks: same HTTP-only treatment as assets.
-            GearOutShared::CodeBlockOut(_) => None,
-            // Server-internal: never shipped to the client.
-            GearOutShared::RepoResourceOut(_) => None,
-        },
+        GearResult::Ship(out) => Some(out),
+        GearResult::Shared(s) => Some((*s).clone()),
         GearResult::Local(_) => None,
     }
+    .filter(|out| out.is_exposed())
 }
 
 /// Push `out` on `w` unless its hash equals `last` (the client already holds

@@ -416,8 +416,7 @@ impl SsrState {
 #[dentrado_macros::gears_schema(file = "gears.def.rs")]
 pub mod wire {
     use crate::{
-        Body, CaRef, CodeBlock, ListPagesQuery, ListPagesResult, LocalId, PageQuery,
-        PageQueryResult, RepoAssetPath, SafePathComponent, SiteShell, SpaceId,
+        Body, CaRef, CodeBlock, ListPagesResult, LocalId, PageQueryResult, SiteShell, SpaceId,
     };
     use kolorinko_wikitext::{ArticleLatest, ArticleView};
 
@@ -446,6 +445,7 @@ pub mod wire {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::GearOut;
 
     /// The injected script's exact spelling is the server↔client contract:
     /// the server writes it, the client reads `window.__DEFAULT_SPACE_ID__`.
@@ -456,5 +456,33 @@ mod tests {
             default_space_script(space),
             r#"<script>window.__DEFAULT_SPACE_ID__="S70P6lbBZxbc-kcpGOCYmZA";</script>"#
         );
+    }
+
+    /// Wire exposure is an allowlist: only `#[gear(exposed)]` gears appear in
+    /// the wire `GearId` (an internal gear's JSON shape fails to deserialize —
+    /// a client cannot even name it), and `GearOut::is_exposed` gates which
+    /// outputs a push bridge may ship.
+    #[test]
+    fn wire_exposure_allowlist() {
+        let id = wire::GearId::ArticleLatest {
+            space: SpaceId::parse("S70P6lbBZxbc-kcpGOCYmZA").unwrap(),
+            local: LocalId::from_page_id("109108").unwrap(),
+        };
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(serde_json::from_str::<wire::GearId>(&json).unwrap(), id);
+
+        // An internal gear is unnamed on the wire: its JSON shape is no longer
+        // a `GearId` (which is also why `is_exposed` exists — its output keeps
+        // a `GearOut` variant that a push bridge must drop).
+        let internal = r#"{\"RepoLListPages\":{\"site\":\"x\",\"query\":{}}}"#;
+        assert!(serde_json::from_str::<wire::GearId>(internal).is_err());
+        assert!(
+            !GearOut::RepoLListPagesOut(ListPagesResult {
+                pages: vec![],
+                total: 0
+            })
+            .is_exposed()
+        );
+        assert!(GearOut::ShellOut(SiteShell::default()).is_exposed());
     }
 }

@@ -174,7 +174,7 @@ pub(crate) async fn legacy(
     let Ok(ClientMsg::Subscribe { id, hash }) = serde_json::from_slice(body) else {
         return Reply::bad_request();
     };
-    let sub = crate::server::subscribe_wire(id, core).await;
+    let sub = core.subscribe_gear(id.into()).await;
     let Some(out) = crate::server::to_wire_out(sub.current()) else {
         return Reply::no_content();
     };

@@ -19,13 +19,27 @@
 //! ```
 //!
 //! The `#[gear]` marker carries only the metadata the signature cannot express
-//! (kind: timer/event/follow, the period expression, `local`, and the enum
-//! *variant* base name). The id fields, cache type, and output type are all read
-//! straight off the `fn`, so there is no DSL restating them.
+//! (kind: timer/event/follow, the period expression, `local`/`exposed`, and
+//! the enum *variant* base name). The id fields, cache type, and output type
+//! are all read straight off the `fn`, so there is no DSL restating them.
 //!
 //! `local` marks a gear whose output is pinned to its owning core: it goes to
 //! `GearOutLocal` (not `Send`/`Localizable`), gets no `GearQuery` builder, and
 //! is readable only through a `follow` gear placed on the same core.
+//!
+//! `exposed` is the **allowlist** for the client: only `#[gear(exposed)]`
+//! gears appear in the wire schema's `GearId` and builders (a client cannot
+//! even name the rest), and only their outputs pass the generated
+//! `GearOut::is_exposed` filter the server's push bridge applies. Orthogonal
+//! to the output family — an exposed gear may be `shared`; exposed-ness is
+//! about the client, not the core topology.
+//!
+//! `wire = <module>` (on `#[gears]`) names a `#[gears_schema]`-generated
+//! module: its `GearOut` is then aliased as this runtime's `GearOut` /
+//! `GearOutShared` — one payload enum for both sides, no per-variant relabel
+//! at the wire boundary — and a field-for-field `From<wire::GearId>` bridges
+//! the ids (the runtime id is the strict superset carrying the `local` and
+//! non-`exposed` gears).
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -55,34 +69,43 @@ pub(crate) fn gears_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 // ── attribute arg parsing ─────────────────────────────────────────────────
 
-/// `runtime = <Type>` (required by `#[gears]`) and `file = "…"` (reads the
-/// gear declarations from a shared file instead of the inline module body).
+/// `runtime = <Type>` (required by `#[gears]`), `file = "…"` (reads the gear
+/// declarations from a shared file instead of the inline module body), and
+/// `wire = <module>` (optional, `#[gears]` only: the `#[gears_schema]`-generated
+/// module whose `GearOut` doubles as this runtime's `GearOut`/`GearOutShared`).
 /// `#[gears_schema]` uses only `file = "…"`.
 struct GearsAttr {
     runtime: Option<Type>,
     file: Option<LitStr>,
+    wire: Option<Type>,
 }
 
 impl Parse for GearsAttr {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut runtime = None;
         let mut file = None;
+        let mut wire = None;
         while !input.is_empty() {
             let kw: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
             match kw.to_string().as_str() {
                 "runtime" => runtime = Some(input.parse()?),
                 "file" => file = Some(input.parse()?),
+                "wire" => wire = Some(input.parse()?),
                 _ => {
                     return Err(syn::Error::new(
                         kw.span(),
-                        "expected `runtime =` or `file =`",
+                        "expected `runtime =`, `file =`, or `wire =`",
                     ));
                 }
             }
             let _ = input.parse::<Token![,]>();
         }
-        Ok(GearsAttr { runtime, file })
+        Ok(GearsAttr {
+            runtime,
+            file,
+            wire,
+        })
     }
 }
 
@@ -98,6 +121,14 @@ enum GearArg {
     /// `#[gear(shared)]` — the output is an opaque `Sync` monolith shared by
     /// reference across consumers/cores (the `Shared` family → `GearOutShared`).
     Shared,
+    /// `#[gear(exposed)]` — the gear is client-facing: it appears in the
+    /// wire schema's `GearId` and builders, and its output variant passes the
+    /// generated `GearOut::is_exposed` filter the server's push bridge
+    /// applies. The **allowlist** for the client — everything else is
+    /// server-internal by default. Orthogonal to the output family — an
+    /// exposed gear may be `shared`; exposed-ness is about the client, not
+    /// the core topology.
+    Exposed,
     /// `wire_skip(a, b, …)` — id fields excluded from the wire schema (server
     /// config the client never supplies, e.g. `repo_meta`). Ignored by the
     /// runtime expansion; the schema expansion drops these fields.
@@ -145,6 +176,7 @@ impl Parse for GearArg {
             }
             "local" => Ok(GearArg::Local),
             "shared" => Ok(GearArg::Shared),
+            "exposed" => Ok(GearArg::Exposed),
             "wire_skip" => {
                 let inner;
                 syn::parenthesized!(inner in input);
@@ -211,6 +243,9 @@ struct GearSpec {
     /// families — `Out` distinguishes them). Exactly one of `is_local`/
     /// `is_shared` may be set.
     is_shared: bool,
+    /// `#[gear(exposed)]`: the gear is client-facing — present in the wire
+    /// schema's `GearId`/builders, its output passing the `is_exposed` filter.
+    is_exposed: bool,
     params: Vec<ParamRole>,
     out_ty: Type,
     kind: KindSpec,
@@ -322,6 +357,7 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
     let mut kind: Option<KindSpec> = None;
     let mut is_local = false;
     let mut is_shared = false;
+    let mut is_exposed = false;
     let mut wire_skip = std::collections::HashSet::new();
     for arg in args {
         match arg {
@@ -330,6 +366,7 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
             GearArg::Follow { target } => kind = Some(KindSpec::Follow { target }),
             GearArg::Local => is_local = true,
             GearArg::Shared => is_shared = true,
+            GearArg::Exposed => is_exposed = true,
             GearArg::WireSkip(v) => {
                 wire_skip = v.into_iter().map(|i| i.to_string()).collect();
             }
@@ -343,6 +380,12 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
         return Err(syn::Error::new_spanned(
             gear_attr,
             "a gear cannot be both `local` and `shared`",
+        ));
+    }
+    if is_local && is_exposed {
+        return Err(syn::Error::new_spanned(
+            gear_attr,
+            "a `local` gear is never wire-visible — drop `exposed`",
         ));
     }
     let kind = kind.ok_or_else(|| {
@@ -432,6 +475,7 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
         is_async,
         is_local,
         is_shared,
+        is_exposed,
         params,
         out_ty,
         kind,
@@ -706,6 +750,11 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
 
     let (specs, track) = resolve_specs(&attr, &mut item_mod)?;
 
+    // `wire = <module>`: the wire schema module. When set, its `GearOut` is
+    // aliased as this runtime's `GearOut`/`GearOutShared` (below) and the ids
+    // are bridged by a generated `From`.
+    let wire = attr.wire.as_ref();
+
     let id_variants = specs.iter().map(|g| {
         let v = &g.name;
         let fields = g.id_fields();
@@ -748,6 +797,78 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         let t = &g.out_ty;
         quote! { #v(#t) }
     });
+
+    // The shippable/shared payload enums: declared here, or — with
+    // `wire = <module>` — aliased to the wire schema's `GearOut`, which the
+    // schema macro emits with exactly the same variants (every non-local
+    // gear) and the `Debug + Clone + Send + Sync + Localizable` bounds both
+    // assoc types require. One payload enum for both sides: the wire bridge
+    // extracts instead of relabeling variant-by-variant.
+    let out_decl = match wire {
+        Some(w) => quote! {
+            pub(crate) use #w::GearOut as GearOut;
+            pub(crate) use #w::GearOut as GearOutShared;
+        },
+        None => quote! {
+            #[derive(Debug, Clone, dentrado_types::Localizable)]
+            pub(crate) enum GearOut {
+                #( #out_variants ),*
+            }
+
+            // Shared outputs: exactly the `#[gear(shared)]` gears. `Debug`
+            // only — no `Clone` (the core refcounts, never copies) and no
+            // `Localizable` (crosses cores by pointer). `Sync` is asserted by
+            // the assoc-type bound.
+            #[derive(Debug)]
+            pub(crate) enum GearOutShared {
+                #( #out_shared_variants ),*
+            }
+        },
+    };
+
+    // `wire = …` also bridges the ids: the runtime `GearId` is a strict
+    // superset of the wire `GearId` (it additionally carries the `local` and
+    // non-`exposed` gears), so the conversion is a total, field-for-field
+    // `From`. An exposed gear with `wire_skip`ped fields could not be
+    // reconstructed — reject it up front.
+    let wire_from = if let Some(w) = wire {
+        let arms = specs
+            .iter()
+            .filter(|g| g.is_exposed)
+            .map(|g| {
+                if !g.wire_skip.is_empty() {
+                    return Err(syn::Error::new_spanned(
+                        &g.name,
+                        format!(
+                            "`{}` is `exposed` but `wire_skip`s id fields — \
+                             the generated `From` cannot reconstruct its runtime id",
+                            g.name
+                        ),
+                    ));
+                }
+                let v = &g.name;
+                let fields = g.id_fields();
+                Ok(if fields.len() == 1 {
+                    let (n, _) = &fields[0];
+                    quote! { #w::GearId::#v(#n) => GearId::#v(#n), }
+                } else {
+                    let names: Vec<Ident> = fields.iter().map(|(f, _)| f.clone()).collect();
+                    quote! { #w::GearId::#v { #( #names ),* } => GearId::#v { #( #names ),* }, }
+                })
+            })
+            .collect::<syn::Result<Vec<_>>>()?;
+        quote! {
+            impl From<#w::GearId> for GearId {
+                fn from(id: #w::GearId) -> Self {
+                    match id {
+                        #( #arms )*
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
 
     let cache_variants = specs.iter().map(|g| {
         let v = &g.name;
@@ -1061,10 +1182,9 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             #( #id_variants, )*
         }
 
-        #[derive(Debug, Clone, dentrado_types::Localizable)]
-        pub(crate) enum GearOut {
-            #( #out_variants, )*
-        }
+        #wire_from
+
+        #out_decl
 
         // Core-local outputs (never serialized, never sent across a thread):
         // exactly the `#[gear(local)]` gears. `GearOut` (shippable) has no
@@ -1073,14 +1193,6 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         #[derive(Debug, Clone)]
         pub(crate) enum GearOutLocal {
             #( #out_local_variants, )*
-        }
-
-        // Shared outputs: exactly the `#[gear(shared)]` gears. `Debug` only — no
-        // `Clone` (the core refcounts, never copies) and no `Localizable`
-        // (crosses cores by pointer). `Sync` is asserted by the assoc-type bound.
-        #[derive(Debug)]
-        pub(crate) enum GearOutShared {
-            #( #out_shared_variants, )*
         }
 
         #[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado_types::Localizable)]
@@ -1199,14 +1311,21 @@ fn expand_schema(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStr
     })?;
     let (file_items, track) = load_gear_file(rel)?;
     let specs = collect_specs(&file_items)?;
-    // Every non-local gear — shippable or shared — is wire-exposed: shared
-    // gears are shared *across cores* by reference, but to the client they
-    // serialize the same way (the server derefs the `Shared` handle and sends
-    // the value). Only `#[gear(local)]` gears (core-pinned, no output variant)
-    // are absent from the wire schema.
+    // Every non-local gear — shippable or shared — carries a wire output
+    // variant: shared gears are shared *across cores* by reference, but to
+    // the client they serialize the same way, and when the server runtime
+    // declares `wire = …` this enum *is* its `GearOut`/`GearOutShared`.
+    // Only `#[gear(local)]` gears (core-pinned, no output variant) are
+    // absent entirely.
     let shippable: Vec<&GearSpec> = specs.iter().filter(|g| !g.is_local).collect();
+    // `exposed` is the allowlist: only `#[gear(exposed)]` gears get a
+    // `GearId` variant and a builder — a client cannot even name the rest.
+    // Their outputs keep `GearOut` variants (the enum doubles as the server
+    // runtime's shared-output payload enum), gated by the generated
+    // `is_exposed` filter the server's push bridge applies.
+    let client: Vec<&GearSpec> = specs.iter().filter(|g| g.is_exposed).collect();
 
-    let id_variants = shippable.iter().map(|g| {
+    let id_variants = client.iter().map(|g| {
         let v = &g.name;
         let fields = wire_fields(g);
         if fields.len() == 1 {
@@ -1221,10 +1340,10 @@ fn expand_schema(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStr
     let out_variants = shippable.iter().map(|g| {
         let v = format_ident!("{}Out", g.name);
         let t = &g.out_ty;
-        quote! { #v(#t) }
+        quote! { #[localizable(skip)] #v(#t) }
     });
 
-    let builders = shippable.iter().map(|g| {
+    let builders = client.iter().map(|g| {
         let builder = &g.fn_name;
         let out_v = format_ident!("{}Out", g.name);
         let out_t = &g.out_ty;
@@ -1252,6 +1371,19 @@ fn expand_schema(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStr
         }
     });
 
+    // The `is_exposed` body: the `#[gear(exposed)]` output variants (empty
+    // set → constant `false`: nothing is pushable).
+    let exposed_outs: Vec<Ident> = shippable
+        .iter()
+        .filter(|g| g.is_exposed)
+        .map(|g| format_ident!("{}Out", g.name))
+        .collect();
+    let is_exposed_body = if exposed_outs.is_empty() {
+        quote! { false }
+    } else {
+        quote! { ::core::matches!(self, #( Self::#exposed_outs(..) )|*) }
+    };
+
     let generated = quote! {
         #track
         #[derive(Debug, Clone, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize)]
@@ -1259,9 +1391,24 @@ fn expand_schema(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStr
             #( #id_variants, )*
         }
 
-        #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize)]
+        // `Localizable` (with per-variant `skip`: the payloads are plain
+        // data) because a server runtime may alias this enum as its
+        // `GearOut`/`GearOutShared` via `#[gears(wire = …)]`, whose
+        // assoc-type bounds require it.
+        #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, dentrado_types::Localizable)]
         pub enum GearOut {
             #( #out_variants, )*
+        }
+
+        impl GearOut {
+            /// The output of an `#[gear(exposed)]` gear — pushable to a
+            /// client. Everything else is server-internal: its variants
+            /// exist only because this enum doubles as the server runtime's
+            /// shared-output payload enum, and the server's push bridge
+            /// filters them out.
+            pub fn is_exposed(&self) -> bool {
+                #is_exposed_body
+            }
         }
 
         #[derive(Clone)]
@@ -1333,6 +1480,17 @@ mod parse_tests {
         assert_eq!(args.len(), 2);
         assert!(matches!(args[0], GearArg::Local));
         assert!(matches!(args[1], GearArg::Name(_)));
+    }
+
+    #[test]
+    fn gear_arg_exposed() {
+        let src = "event, shared, exposed, name = Shell,";
+        let args = parse_gear_args(src).unwrap_or_else(|e| panic!("exposed failed: {e}"));
+        assert_eq!(args.len(), 4);
+        assert!(matches!(args[0], GearArg::Event));
+        assert!(matches!(args[1], GearArg::Shared));
+        assert!(matches!(args[2], GearArg::Exposed));
+        assert!(matches!(args[3], GearArg::Name(_)));
     }
 
     #[test]
