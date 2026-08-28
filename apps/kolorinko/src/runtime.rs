@@ -44,6 +44,6 @@ mod gears {
 // boundary. `GearOutShared` (an alias of `kolorinko_rt::wire::GearOut`) and
 // the builders are re-exported for the server's dispatch/stale-read code.
 pub(crate) use gears::{
-    GearOutShared, article_latest, article_latest_parsed, asset, code_block, repo_l_article_latest,
-    repo_l_list_pages, repo_l_local_id, repo_l_query_pages, repo_resource, shell,
+    GearOutShared, article_latest, asset, code_block, repo_l_article_latest, repo_l_list_pages,
+    repo_l_local_id, repo_l_query_pages, repo_resource, shell,
 };

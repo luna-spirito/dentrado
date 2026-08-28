@@ -54,12 +54,13 @@ pub(super) async fn resolve_listpages<S: Storage<KolorinkoRT>>(
 /// `content` needs, cached in `state.bodies` by fullname (so a page reached
 /// from several modules or transclusions is resolved once per run), together
 /// with each resolved page as a [`PageDep`] (its own resolution deps nested
-/// under it). Each page is declared as an [`article_latest_parsed`]
-/// `secondary_get` dependency (reactive to its edits) and run through
-/// [`resolve_full`] in its own context; `state.resolved` — extended before
-/// each resolution — is what stops a transclusion cycle (a listed page
-/// embedding, transitively, a page already being resolved). The listed
-/// page's own id is already the canonical local id — no slug round-trip.
+/// under it). Each body is read through the [`repo_l_article_latest`] lens
+/// and declared as a `secondary_get` dependency (reactive to its edits),
+/// then run through [`resolve_full`] in its own context; `state.resolved` —
+/// extended before each resolution — is what stops a transclusion cycle (a
+/// listed page embedding, transitively, a page already being resolved). The
+/// listed page's own id is already the canonical local id — no slug
+/// round-trip.
 async fn resolve_content_bodies<S: Storage<KolorinkoRT>>(
     content: &Content,
     host: &HostCtx,
@@ -74,12 +75,12 @@ async fn resolve_content_bodies<S: Storage<KolorinkoRT>>(
             continue;
         }
         let raw = match LocalId::from_page_id(&page.page_id) {
-            Some(local) => crate::runtime::article_latest_parsed(state.space, local)
+            Some(local) => crate::runtime::repo_l_article_latest(state.space, local)
                 .secondary_get(ctx)
                 .await
-                .content
+                .body
                 .clone(),
-            None => Vec::new(),
+            None => String::new(),
         };
         let host = HostCtx {
             fullname: page.fullname(),

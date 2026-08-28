@@ -1,23 +1,14 @@
 use super::*;
 
 // =========================================================================
-// Variable substitution — include vars (`{$x}`) and ListPages module
-// vars (`%%x%%`)
+// Variable substitution — ListPages module vars (`%%x%%`). The include
+// vars (`{$x}`) never reach this pass: include assembly is textual (see
+// [`super::includes`]), so by the time a tree exists every `{$x}` has
+// already been replaced by literal text.
 // =========================================================================
 
-/// Replace every [`TextObj::IncludeVar`] in `content` using `vars`: a standalone
-/// variable expands to its (recursively substituted) [`Content`]; inside an
-/// attribute or image source it is flattened to plain text. An unresolved
-/// variable falls back to its `//default`, or to nothing when it has none.
-///
-/// `vars` keeps duplicate keys in source order; a lookup takes the first
-/// non-empty value, so the `key={$key}|key=default` include idiom resolves to
-/// the passed value when set and to the default otherwise.
-pub(super) fn apply_include_vars(content: Content, vars: &[(String, Content)]) -> Content {
-    apply_vars(content, &Vars::include_only(vars))
-}
-
-/// Substitute every variable throughout `content` per the visible [`Vars`].
+/// Substitute every module variable throughout `content` per the visible
+/// [`Vars`].
 pub(super) fn apply_vars(content: Content, vars: &Vars) -> Content {
     content
         .into_iter()
@@ -25,12 +16,10 @@ pub(super) fn apply_vars(content: Content, vars: &Vars) -> Content {
         .collect()
 }
 
-/// Variable bindings visible while assembling a page: the include vars
-/// (`{$x}`, ordered, first non-empty value winning) and — while a ListPages
-/// template is instantiated for one listed page — that page's module vars
-/// (`%%x%%`). Outside an instantiation module vars pass through untouched.
+/// The variable bindings visible while a ListPages template is instantiated
+/// for one listed page — that page's module vars (`%%x%%`). Outside an
+/// instantiation they pass through untouched.
 pub(super) struct Vars<'a> {
-    include: &'a [(String, Content)],
     module: Option<ModuleVars<'a>>,
 }
 
@@ -49,12 +38,11 @@ struct ModuleVars<'a> {
 }
 
 impl<'a> Vars<'a> {
-    /// Only include vars visible — the plain include-resolution phase.
-    pub(super) fn include_only(include: &'a [(String, Content)]) -> Self {
-        Self {
-            include,
-            module: None,
-        }
+    /// No module instantiation in scope — module vars pass through
+    /// untouched.
+    #[cfg(test)]
+    pub(super) fn none() -> Self {
+        Self { module: None }
     }
 
     /// The `%%x%%` bindings of one ListPages template instantiation: the
@@ -70,7 +58,6 @@ impl<'a> Vars<'a> {
         limit: Option<i64>,
     ) -> Self {
         Self {
-            include: &[],
             module: Some(ModuleVars {
                 site,
                 page,
@@ -193,42 +180,14 @@ impl ModuleVars<'_> {
     }
 }
 
-/// A substitution value is "empty" when it renders to nothing — the form an
-/// unset `{$key}` passthrough takes (an empty [`Content`]), or a bare
-/// passthrough of the binding's own name (`x={$x}`, Wikidot's "inherit the
-/// outer value, else default" idiom — no outer scope exists at substitution
-/// time, so it can only mean unset). Both are skipped so the fallback idiom
-/// reaches its literal default; skipping the self-passthrough is also what
-/// breaks the `x := {$x}` reference cycle.
-fn binding_is_empty(name: &str, c: &[Node]) -> bool {
-    content_is_empty(c)
-        || matches!(c, [Node::Text(TextObj::IncludeVar { name: n, .. })] if *n == name)
-}
-
-fn content_is_empty(c: &[Node]) -> bool {
-    c.iter().all(|n| match n {
-        Node::Text(TextObj::Plain(s)) => s.is_empty(),
-        _ => false,
-    })
-}
-
-/// Look up `name` among ordered include `vars`, taking the first value that is
-/// not empty.
-fn include_var_value<'a>(vars: &'a [(String, Content)], name: &str) -> Option<&'a Content> {
-    vars.iter()
-        .find(|(k, v)| k == name && !binding_is_empty(k, v))
-        .map(|(_, v)| v)
-}
-
 /// Substitute every variable inside one node; a node may expand to several
-/// (a spliced value) or to none (an unset variable without a default).
+/// (a resolved module var) or to none.
 fn subst_node(node: Node, vars: &Vars) -> Content {
     match node {
-        Node::Text(TextObj::IncludeVar { name, default }) => {
-            match include_var_value(vars.include, &name) {
-                Some(v) => apply_vars(v.clone(), vars),
-                None => default.map(|d| apply_vars(d, vars)).unwrap_or_default(),
-            }
+        // Include vars are resolved before the tree exists; a stray one can
+        // only show its default.
+        Node::Text(TextObj::IncludeVar { default, .. }) => {
+            default.map(|d| apply_vars(d, vars)).unwrap_or_default()
         }
         // A module var resolves against the listed page in scope; without one
         // (outside a ListPages instantiation) it passes through untouched for
@@ -340,7 +299,7 @@ fn subst_params(
         .collect()
 }
 
-/// Substitute the `{$var}` slots of a stylesheet body line by line (the
+/// Substitute the `%%var%%` slots of a stylesheet body line by line (the
 /// slot grammar is line-scoped, like everywhere else): each line resolves
 /// through the same text-only flattening as an attribute value, keeping
 /// its literal form when a slot cannot flatten.
@@ -365,13 +324,9 @@ fn subst_textobjs(objs: Vec<TextObj>, vars: &Vars) -> Vec<TextObj> {
     let mut out: Vec<TextObj> = Vec::new();
     for o in objs {
         let resolved: Vec<TextObj> = match o {
-            TextObj::IncludeVar { name, default } => match include_var_value(vars.include, &name) {
-                Some(v) => flatten_textobjs(&apply_vars(v.clone(), vars)),
-                None => match default {
-                    Some(d) => flatten_textobjs(&apply_vars(d, vars)),
-                    None => Vec::new(),
-                },
-            },
+            TextObj::IncludeVar { default, .. } => default
+                .map(|d| flatten_textobjs(&apply_vars(d, vars)))
+                .unwrap_or_default(),
             TextObj::ModuleVar {
                 ref name,
                 ref default,
@@ -470,7 +425,7 @@ mod tests {
 
     #[test]
     fn unknown_module_var_passes_through() {
-        let vars = Vars::include_only(&[]);
+        let vars = Vars::none();
         let out = apply_vars(parse("%%nope%%"), &vars);
         // Untouched: the module var survives for the render fallback.
         assert!(
@@ -495,41 +450,6 @@ mod tests {
         assert_eq!(plain(text), "Foo");
     }
 
-    fn page_content(s: &str) -> Content {
-        vec![Node::Text(TextObj::Plain(s.to_string()))]
-    }
-
-    #[test]
-    fn unresolved_anchor_href_resolves_via_include_vars() {
-        let vars = [("page".to_string(), page_content("terrible-trio-event"))];
-        let out = apply_include_vars(
-            parse("[[a href=\"https://www.obscurative.ru/{$page}\"]]x[[/a]]"),
-            &vars,
-        );
-        let Node::Link { target, .. } = &out[0] else {
-            panic!("expected link: {out:?}")
-        };
-        assert!(matches!(
-            target,
-            LinkTarget::Url(u) if u == "https://www.obscurative.ru/terrible-trio-event"
-        ));
-    }
-
-    #[test]
-    fn unresolved_anchor_href_reclassifies_as_page() {
-        // `{$page}` alone resolves to a bare page slug: the flattened target
-        // must classify as a page, not an external URL.
-        let vars = [("page".to_string(), page_content("terrible-trio-event"))];
-        let out = apply_include_vars(parse("[[a href=\"{$page}\"]]x[[/a]]"), &vars);
-        let Node::Link { target, .. } = &out[0] else {
-            panic!("expected link: {out:?}")
-        };
-        let LinkTarget::Page(p) = target else {
-            panic!("expected page target: {target:?}")
-        };
-        assert_eq!(p.path, ["terrible-trio-event"]);
-    }
-
     #[test]
     fn unresolved_anchor_href_module_var_resolves_in_scope() {
         let site = SafePathComponent::new("site".into()).unwrap();
@@ -549,7 +469,7 @@ mod tests {
     fn unresolved_anchor_href_without_scope_stays_verbatim() {
         // No listed page in scope: the module var slot survives for the
         // render fallback instead of being dropped or half-substituted.
-        let vars = Vars::include_only(&[]);
+        let vars = Vars::none();
         let out = apply_vars(parse("[[a href=\"/tag/%%name%%\"]]x[[/a]]"), &vars);
         let Node::Link { target, .. } = &out[0] else {
             panic!("expected link: {out:?}")

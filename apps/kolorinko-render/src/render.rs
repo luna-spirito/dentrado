@@ -787,9 +787,11 @@ fn render_image(
             view! { <div class=container>{img}</div> }.into_any()
         }
         // No alignment → a bare `<img>`; `link=` wraps it in an anchor.
+        // A bare `#` link (the image-block default `link={$link}|link=#`)
+        // means "no link" — real Wikidot renders the bare `<img>`.
         None => {
             let link = param_or(params, "link", String::new);
-            if link.is_empty() {
+            if link.is_empty() || link == "#" {
                 img.into_any()
             } else {
                 view! { <a href=link>{img}</a> }.into_any()

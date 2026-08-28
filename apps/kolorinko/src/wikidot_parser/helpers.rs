@@ -96,9 +96,10 @@ pub(crate) fn normalize_color(c: String) -> String {
 // ── Include arguments ─────────────────────────────────────────────────────
 
 /// Split the body of a `[[include ...]]` into the source page reference and
-/// its variable substitution map. Values are parsed as real wikitext markup
-/// ([`Content`]), so `{$x}` becomes an [`TextObj::IncludeVar`] node (enabling
-/// nested passthrough) and `[[image ...]]` becomes an [`Node::Image`].
+/// its variable substitution map, parsing each value as real wikitext
+/// markup ([`Content`]) — the parser's `Node::Include` form, where `{$x}`
+/// becomes a [`TextObj::IncludeVar`] node and `[[image ...]]` an
+/// [`Node::Image`].
 ///
 /// Two assignment syntaxes are recognised, distinguished by a depth-0 `|`:
 /// • pipe-separated — `source | k1=v1 | k2=v2` (a value runs to the next
@@ -113,6 +114,16 @@ pub(crate) fn normalize_color(c: String) -> String {
 /// every slice lands on a UTF-8 character boundary and `[[[...]]]` stays
 /// depth-balanced (one `[[`/`]]` pair plus a literal `[`/`]`).
 pub(crate) fn parse_include_args(raw: &str) -> (PageRef, Vec<(String, Content)>) {
+    split_include_args_with(raw, builder::parse_sub)
+}
+
+/// The same split with every value kept as literal text (quotes unwrapped,
+/// whitespace trimmed) — the form the textual include assembly works with.
+pub(crate) fn split_include_args(raw: &str) -> (PageRef, Vec<(String, String)>) {
+    split_include_args_with(raw, |v| v.to_string())
+}
+
+fn split_include_args_with<V>(raw: &str, map: impl Fn(&str) -> V) -> (PageRef, Vec<(String, V)>) {
     let b = raw.as_bytes();
     let n = b.len();
     let mut i = 0;
@@ -126,9 +137,9 @@ pub(crate) fn parse_include_args(raw: &str) -> (PageRef, Vec<(String, Content)>)
     let source = parse_page_ref(&raw[src_start..i]);
     let remainder = &raw[i..];
     let vars = if has_depth0_pipe(remainder) {
-        parse_pipe_vars(remainder)
+        parse_pipe_vars(remainder, &map)
     } else {
-        parse_space_vars(remainder)
+        parse_space_vars(remainder, &map)
     };
     (source, vars)
 }
@@ -145,7 +156,9 @@ pub(crate) fn unquote(value: &str) -> &str {
 
 /// Record a `key=value` segment: split on the first `=`, parse the value as
 /// wikitext markup. Quoted values are unwrapped first.
-fn insert_kv(seg: &str, vars: &mut Vec<(String, Content)>) {
+/// Record a `key=value` segment: split on the first `=`, map the value
+/// through `value`. Quoted values are unwrapped first.
+fn insert_kv<V>(seg: &str, vars: &mut Vec<(String, V)>, value: &impl Fn(&str) -> V) {
     let Some(eq) = seg.find('=') else {
         return;
     };
@@ -153,7 +166,7 @@ fn insert_kv(seg: &str, vars: &mut Vec<(String, Content)>) {
     if key.is_empty() {
         return;
     }
-    vars.push((key.to_string(), builder::parse_sub(unquote(&seg[eq + 1..]))));
+    vars.push((key.to_string(), value(unquote(&seg[eq + 1..]))));
 }
 
 /// Track `[[`/`]]` depth (and skip over `"..."` quotes) across `s`; return
@@ -184,7 +197,7 @@ fn has_depth0_pipe(s: &str) -> bool {
             i += 2;
             continue;
         }
-        if b[i] == b'"' {
+        if b[i] == b'"' && i > 0 && b[i - 1] == b'=' {
             quote = true;
             i += 1;
             continue;
@@ -197,7 +210,8 @@ fn has_depth0_pipe(s: &str) -> bool {
     false
 }
 
-fn parse_pipe_vars(remainder: &str) -> Vec<(String, Content)> {
+fn parse_pipe_vars<V>(remainder: &str, map: &impl Fn(&str) -> V) -> Vec<(String, V)> {
+    let insert = |seg: &str, vars: &mut Vec<(String, V)>| insert_kv(seg, vars, map);
     let b = remainder.as_bytes();
     let mut vars = Vec::new();
     let mut seg_start = 0;
@@ -224,26 +238,26 @@ fn parse_pipe_vars(remainder: &str) -> Vec<(String, Content)> {
             i += 2;
             continue;
         }
-        if b[i] == b'"' {
+        if b[i] == b'"' && i > 0 && b[i - 1] == b'=' {
             quote = true;
             i += 1;
             continue;
         }
         if depth == 0 && b[i] == b'|' {
-            insert_kv(&remainder[seg_start..i], &mut vars);
+            insert(&remainder[seg_start..i], &mut vars);
             seg_start = i + 1;
         }
         i += 1;
     }
-    insert_kv(&remainder[seg_start..], &mut vars);
+    insert(&remainder[seg_start..], &mut vars);
     vars
 }
 
-fn parse_space_vars(remainder: &str) -> Vec<(String, Content)> {
+fn parse_space_vars<V>(remainder: &str, map: &impl Fn(&str) -> V) -> Vec<(String, V)> {
     let b = remainder.as_bytes();
     let n = b.len();
     let mut i = 0;
-    let mut vars: Vec<(String, Content)> = Vec::new();
+    let mut vars: Vec<(String, V)> = Vec::new();
     while i < n {
         while i < n && b[i].is_ascii_whitespace() {
             i += 1;
@@ -299,7 +313,7 @@ fn parse_space_vars(remainder: &str) -> Vec<(String, Content)> {
         };
         let key = remainder[key_start..key_end].trim();
         if !key.is_empty() {
-            vars.push((key.to_string(), builder::parse_sub(value.trim())));
+            vars.push((key.to_string(), map(value.trim())));
         }
     }
     vars

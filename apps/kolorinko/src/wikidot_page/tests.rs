@@ -197,11 +197,22 @@ fn flat(content: &Content) -> String {
     s
 }
 
-fn raws(pairs: Vec<(Key, &str)>) -> HashMap<Key, Content> {
+fn raws(pairs: Vec<(Key, &str)>) -> HashMap<Key, String> {
     pairs
         .into_iter()
-        .map(|(k, body)| (k, parse(body)))
+        .map(|(k, body)| (k, body.to_string()))
         .collect()
+}
+
+/// One origin body textually assembled (vars substituted, includes spliced)
+/// and parsed — the `article_latest` include half, minus the fetching.
+fn assemble(origin: &str, raws: &HashMap<Key, String>) -> Content {
+    parse(&splice_includes(
+        &subst_vars(origin, &[]),
+        &site("scp"),
+        raws,
+        &[key(None, "root")],
+    ))
 }
 
 #[test]
@@ -211,12 +222,7 @@ fn include_assembly_splices_nested_cone_with_cascading_vars() {
         (key(None, "b"), "B {$x} [[include c | y={$x}]]"),
         (key(None, "c"), "C({$y})"),
     ]);
-    let out = substitute_includes(
-        parse("[[include b | x=1]]"),
-        &site("scp"),
-        &raws,
-        &[key(None, "root")],
-    );
+    let out = assemble("[[include b | x=1]]", &raws);
     assert_eq!(flat(&out), "B 1 C(1)");
 }
 
@@ -227,29 +233,20 @@ fn include_diamond_splices_target_in_both_branches() {
         (key(None, "c"), "C [[include d]]"),
         (key(None, "d"), "D"),
     ]);
-    let out = substitute_includes(
-        parse("[[include b]] [[include c]]"),
-        &site("scp"),
-        &raws,
-        &[key(None, "root")],
-    );
+    let out = assemble("[[include b]] [[include c]]", &raws);
     assert_eq!(flat(&out), "B D C D");
 }
 
 #[test]
 fn include_cycle_stops_at_the_back_edge() {
     // b includes c includes b: both splice once, the back-edge stays a
-    // literal directive and its var values erase to defaults.
+    // literal directive (the render fallback) and its var values erase to
+    // defaults.
     let raws = raws(vec![
         (key(None, "b"), "B0 [[include c | z=9]]"),
         (key(None, "c"), "C0 [[include b | z={$z}]]"),
     ]);
-    let out = substitute_includes(
-        parse("[[include b | z=7]]"),
-        &site("scp"),
-        &raws,
-        &[key(None, "root")],
-    );
+    let out = assemble("[[include b | z=7]]", &raws);
     assert_eq!(flat(&out), "B0 C0 ");
     let back_edge = out.iter().find_map(|n| match n {
         Node::Include(Include { source, .. }) if source.path == ["b".to_string()] => Some(source),
@@ -259,35 +256,63 @@ fn include_cycle_stops_at_the_back_edge() {
 }
 
 #[test]
-fn include_vars_outside_any_include_erase_to_defaults() {
-    let out = substitute_includes(
-        parse("a {$x//dflt} b {$y}"),
-        &site("scp"),
-        &HashMap::new(),
-        &[key(None, "root")],
-    );
-    assert_eq!(flat(&out), "a dflt b ");
-}
-
-#[test]
-fn include_vars_in_root_level_attributes_erase_to_defaults() {
-    let out = substitute_includes(
-        parse("[[div style=\"color:{$c//red}\"]]x[[/div]]"),
-        &site("scp"),
-        &HashMap::new(),
-        &[key(None, "root")],
+fn include_splice_pairs_brackets_across_the_boundary() {
+    // The component opens a div and a table cell it never closes; the
+    // includer closes both after the include point — Wikidot assembles
+    // includes textually before parsing, so the brackets pair across the
+    // seam instead of degrading to raw markup on both halves.
+    let raws = raws(vec![(
+        key(None, "b"),
+        "[[div class=\"box\"]]
+[[table]]
+[[row]]
+[[cell style=\"padding: 3px\"]]
+",
+    )]);
+    let out = assemble(
+        "[[include b]]
+cell body
+[[/cell]][[/row]][[/table]][[/div]]",
+        &raws,
     );
     let Node::Container {
-        kind: ContainerKind::Div { params, .. },
+        kind: ContainerKind::Div { .. },
+        content,
         ..
     } = &out[0]
     else {
-        panic!("expected div: {out:#?}")
+        panic!("expected the div to pair: {out:#?}")
     };
-    assert_eq!(
-        params.get("style"),
-        Some(&vec![TextObj::Plain("color:red".to_string())])
-    );
+    let Node::BlockTable(t) = content
+        .iter()
+        .find(|n| matches!(n, Node::BlockTable(_)))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let cell = &t.rows[0].content;
+    assert_eq!(flat(cell).trim(), "cell body");
+}
+
+#[test]
+fn include_inside_code_block_stays_literal() {
+    let raws = raws(vec![(key(None, "b"), "B")]);
+    let out = assemble("[[code]][[include b]][[/code]]", &raws);
+    let Node::Code { raw, .. } = &out[0] else {
+        panic!("expected a code block: {out:#?}")
+    };
+    assert_eq!(raw, "[[include b]]");
+}
+
+#[test]
+fn directive_past_unclosed_code_block_stays_live() {
+    // An unclosed [[code]] degrades to raw text with the rest parsing
+    // normally, so an include after one still splices.
+    let raws = raws(vec![(key(None, "b"), "B")]);
+    let out = assemble("[[code]]\ntail [[include b]]", &raws);
+    // The unclosed opener itself renders as raw markup (invisible to the
+    // text projection), the tail and the splice parse normally.
+    assert_eq!(flat(&out), "\ntail B");
 }
 
 #[test]
@@ -329,33 +354,20 @@ fn dep_tree_nests_each_page_under_its_includer() {
     );
 }
 
-fn plain(s: &str) -> Content {
-    vec![Node::Text(TextObj::Plain(s.to_string()))]
-}
-
-fn ivar(name: &str) -> Node {
-    Node::Text(TextObj::IncludeVar {
-        name: name.to_string(),
-        default: None,
-    })
-}
-
 #[test]
 fn include_var_resolves_to_value() {
-    let vars = vec![("align".to_string(), plain("right"))];
-    let out = apply_include_vars(vec![ivar("align")], &vars);
-    assert_eq!(out, plain("right"));
+    let vars = vec![("align".to_string(), "right".to_string())];
+    assert_eq!(subst_vars("{$align}", &vars), "right");
 }
 
 #[test]
 fn include_var_fallback_idiom_prefers_passed_value() {
     // `k={$k}|k=default`: a passed value shadows the literal default.
     let vars = vec![
-        ("name".to_string(), plain("conspiracy.png")),
-        ("name".to_string(), plain("unknown.png")),
+        ("name".to_string(), "conspiracy.png".to_string()),
+        ("name".to_string(), "unknown.png".to_string()),
     ];
-    let out = apply_include_vars(vec![ivar("name")], &vars);
-    assert_eq!(out, plain("conspiracy.png"));
+    assert_eq!(subst_vars("{$name}", &vars), "conspiracy.png");
 }
 
 #[test]
@@ -363,60 +375,72 @@ fn include_var_fallback_idiom_uses_default_when_passthrough_empty() {
     // An empty passthrough (an unset `{$k}`) is skipped, so the literal
     // default is used — the fallback half of the idiom.
     let vars = vec![
-        ("name".to_string(), vec![]),
-        ("name".to_string(), plain("unknown.png")),
+        ("name".to_string(), String::new()),
+        ("name".to_string(), "unknown.png".to_string()),
     ];
-    let out = apply_include_vars(vec![ivar("name")], &vars);
-    assert_eq!(out, plain("unknown.png"));
+    assert_eq!(subst_vars("{$name}", &vars), "unknown.png");
 }
 
 #[test]
 fn unresolved_include_var_uses_default() {
-    let node = Node::Text(TextObj::IncludeVar {
-        name: "x".to_string(),
-        default: Some(plain("fallback")),
-    });
-    let out = apply_include_vars(vec![node], &[]);
-    assert_eq!(out, plain("fallback"));
+    assert_eq!(subst_vars("{$x//fallback}", &[]), "fallback");
 }
 
 #[test]
 fn unresolved_include_var_without_default_vanishes() {
-    let out = apply_include_vars(vec![ivar("x")], &[]);
-    assert!(out.is_empty());
+    assert_eq!(subst_vars("a{$x}b", &[]), "ab");
 }
 
 #[test]
-fn include_var_in_div_param_flattens_to_text() {
-    let div = Node::Container {
-        kind: ContainerKind::Div {
-            inline: false,
-            block: true,
-            params: HashMap::from([(
-                "style".to_string(),
-                vec![
-                    TextObj::Plain("text-align: ".to_string()),
-                    TextObj::IncludeVar {
-                        name: "align".to_string(),
-                        default: None,
-                    },
-                ],
-            )]),
-        },
-        content: vec![],
-    };
-    let vars = vec![("align".to_string(), plain("right"))];
-    let out = apply_include_vars(vec![div], &vars);
+fn newline_before_the_closing_brace_leaves_the_slot_literal() {
+    // The lexer's own {$…} grammar: a slot runs to the line's end, so an
+    // unclosed slot is plain text, not a variable.
+    assert_eq!(subst_vars("a {$x\n} b", &[]), "a {$x\n} b");
+}
+
+#[test]
+fn include_var_in_div_param_substitutes_before_parse() {
+    // A value pasted into an attribute re-parses in place as literal text.
+    let raws = raws(vec![(
+        key(None, "b"),
+        "[[div style=\"text-align: {$align}\"]]x[[/div]]",
+    )]);
+    let out = assemble("[[include b | align=right]]", &raws);
     let Node::Container {
         kind: ContainerKind::Div { params, .. },
         ..
     } = &out[0]
     else {
-        panic!("expected a div")
+        panic!("expected a div: {out:#?}")
     };
     assert_eq!(
         params.get("style"),
         Some(&vec![TextObj::Plain("text-align: right".to_string())])
+    );
+}
+
+#[test]
+fn include_vars_outside_any_include_erase_to_defaults() {
+    let out = assemble("a {$x//dflt} b {$y}", &HashMap::new());
+    assert_eq!(flat(&out), "a dflt b ");
+}
+
+#[test]
+fn include_vars_in_root_level_attributes_erase_to_defaults() {
+    let out = assemble(
+        "[[div style=\"color:{$c//red}\"]]x[[/div]]",
+        &HashMap::new(),
+    );
+    let Node::Container {
+        kind: ContainerKind::Div { params, .. },
+        ..
+    } = &out[0]
+    else {
+        panic!("expected div: {out:#?}")
+    };
+    assert_eq!(
+        params.get("style"),
+        Some(&vec![TextObj::Plain("color:red".to_string())])
     );
 }
 

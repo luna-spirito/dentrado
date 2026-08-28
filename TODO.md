@@ -111,6 +111,7 @@ let's talk just about ServiceWorker for now.
 * `fetch` route
 * TODO: should core_event_loop await on processed messages? THIS IS A BOTTLENECK.
 * Bottlenecks
+* INTER for other fonts
 
 -----
 

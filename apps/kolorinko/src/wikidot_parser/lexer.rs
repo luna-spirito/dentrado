@@ -1028,7 +1028,7 @@ fn read_to(b: &[u8], k: usize, delim: &[u8]) -> Option<usize> {
 }
 
 /// `[[[target|text]]]` — one token spanning to the first `]]]`.
-fn lex_link3(b: &[u8], i: usize) -> Option<(usize, &str, Option<&str>)> {
+pub(crate) fn lex_link3(b: &[u8], i: usize) -> Option<(usize, &str, Option<&str>)> {
     let mut j = i + 3;
     while j < b.len() && b[j] != b'|' && b[j] != b'\n' && !b[j..].starts_with(b"]]]") {
         j += 1;
@@ -1057,7 +1057,7 @@ fn lex_link3(b: &[u8], i: usize) -> Option<(usize, &str, Option<&str>)> {
 
 /// `[url text]` / `[url]`, rejected when the `[` is followed by `[`, `!`,
 /// `]` or a newline (the predecessor check lives in the caller).
-fn lex_link1(b: &[u8], i: usize) -> Option<(usize, &str, Option<&str>)> {
+pub(crate) fn lex_link1(b: &[u8], i: usize) -> Option<(usize, &str, Option<&str>)> {
     match b.get(i + 1) {
         Some(b'[') | Some(b'!') | Some(b']') | Some(b'\n') | None => return None,
         _ => {}
@@ -1118,7 +1118,7 @@ fn is_link1_target(t: &str) -> bool {
 /// A known `[[…]]` construct at `i`: a closer, an opener, or a listpages
 /// section marker. Keywords sit directly after `[[` (the only exceptions:
 /// closers and section markers may carry inner spaces, and `[[ tab]]`).
-fn lex_bracket<'src>(b: &'src [u8], i: usize) -> Option<(usize, Tok<'src>)> {
+pub(crate) fn lex_bracket<'src>(b: &'src [u8], i: usize) -> Option<(usize, Tok<'src>)> {
     let j = i + 2;
     if b.get(j) == Some(&b'/') {
         let mut k = j + 1;
@@ -1467,6 +1467,17 @@ fn image_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     lex_image(b, j)
 }
 
+/// A `key=`-shaped token at `k`: prop-chars immediately followed by `=`.
+/// Used by [`lex_image`] to keep an include-erased empty source from
+/// swallowing the first parameter.
+fn param_key_at(b: &[u8], k: usize) -> bool {
+    let mut i = k;
+    while b.get(i).is_some_and(|&c| is_prop_char(c)) {
+        i += 1;
+    }
+    i > k && b.get(i) == Some(&b'=')
+}
+
 /// `[[<image source params]]` with an optional alignment prefix.
 fn lex_image(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     let (align, mut m) = if b[j..].starts_with(b"f<") {
@@ -1511,9 +1522,16 @@ fn lex_image(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
         return None;
     }
     m = skip_spaces(b, m);
-    let (after_source, source) = collect_text_objs(b, m, &[b" ", b"]]"]);
+    // An include assembly that erased `{$name}` leaves the source empty
+    // (`[[image  class=…]]`); a `key=`-shaped token right after the tag
+    // then starts the parameters instead of being swallowed as the source.
+    let (after_source, source) = if param_key_at(b, m) {
+        (m, Vec::new())
+    } else {
+        collect_text_objs(b, m, &[b" ", b"]]"])
+    };
     let mut params = Params::new();
-    let end = lex_params(b, after_source, &mut params);
+    let end = lex_params_with(b, after_source, &mut params, true);
     let end = skip_spaces(b, end);
     b.get(end..).is_some_and(|r| r.starts_with(b"]]")).then(|| {
         (
@@ -1530,7 +1548,17 @@ fn lex_image(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
 /// `key="value"` / `key=value` attributes. Ports the old `params_block`
 /// byte-for-byte, including the quirk that a key without `=` consumes the one
 /// character that follows it before giving up.
-fn lex_params(b: &[u8], mut k: usize, out: &mut Params) -> usize {
+fn lex_params(b: &[u8], k: usize, out: &mut Params) -> usize {
+    lex_params_with(b, k, out, false)
+}
+
+/// `lenient` — image directives only: an include assembly pasting a value
+/// with spaces into the source position leaves junk words between the
+/// source and the real attributes (`[[image 1899 rescue rangers.jpg
+/// class=…]]`); instead of aborting the scan (and degrading the whole
+/// directive to raw text) skip the junk, the way Wikidot's own attribute
+/// scanner drops unknown words.
+fn lex_params_with(b: &[u8], mut k: usize, out: &mut Params, lenient: bool) -> usize {
     loop {
         while k < b.len() && is_param_ws(b, k) {
             k += char_len_at(b, k);
@@ -1544,10 +1572,17 @@ fn lex_params(b: &[u8], mut k: usize, out: &mut Params) -> usize {
             k += 1;
         }
         if k == key_start {
+            if lenient {
+                k += char_len_at(b, k);
+                continue;
+            }
             return k;
         }
         let key = sub(b, key_start, k).to_ascii_lowercase();
         if b.get(k) != Some(&b'=') {
+            if lenient {
+                continue;
+            }
             return k + char_len_at(b, k);
         }
         k += 1;

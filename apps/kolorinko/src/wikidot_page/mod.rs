@@ -66,16 +66,19 @@
 //!   another (which would let two pages that include each other form a gear
 //!   cycle).
 //! - [`article_latest`] (`follow` over [`article_latest_parsed`], co-located
-//!   with it): runs the full resolution pipeline — `[[include]]` splicing
-//!   and `[[module ListPages]]` instantiation via
-//!   [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get)-ing
-//!   [`article_latest_parsed`] (includes bridged through [`repo_l_local_id`])
-//!   / [`repo_l_list_pages`] (data-level cycles broken by a path-based
-//!   guard), then internal links through [`repo_l_query_pages`] — producing
-//!   the final [`ArticleView`] with the tree of every
-//!   fetched page as its `deps`. Declaring each fetch as a dependency makes
-//!   the result reactive: an edit to any page in the transitive
-//!   include/transclusion cone re-runs this gear.
+//!   with it): runs the full resolution pipeline — the page's raw body
+//!   pulled through the same [`repo_l_article_latest`] lens and assembled
+//!   textually (`[[include]]` cones spliced into the raw text with their
+//!   `{$vars}` substituted, Wikidot's own order of operations, fetched via
+//!   [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get) with
+//!   includes bridged through [`repo_l_local_id`], data-level cycles broken
+//!   by a path-based guard), then parsed as one page and resolved:
+//!   `[[module ListPages]]` instantiation via [`repo_l_list_pages`], then
+//!   internal links through [`repo_l_query_pages`] — producing the final
+//!   [`ArticleView`] with the tree of every fetched page as its `deps`.
+//!   Declaring each fetch as a dependency makes the result reactive: an edit
+//!   to any page in the transitive include/transclusion cone re-runs this
+//!   gear.
 //! - [`shell`] (`follow` over `repo`): the whole site chrome in one shot — the
 //!   resolved `nav:top` / `nav:side` pages (declared as [`article_latest`]
 //!   [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get) deps)

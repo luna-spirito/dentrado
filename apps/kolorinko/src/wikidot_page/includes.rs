@@ -1,7 +1,12 @@
 use super::*;
+use crate::wikidot_parser::ClosedTag;
+use crate::wikidot_parser::lexer::{OpenTag, Tok, lex_bracket, lex_link1, lex_link3};
+use crate::wikidot_parser::split_include_args;
+use std::ops::Range;
 
 // =========================================================================
-// `[[include]]` resolution — target collection, splicing, dependency tree
+// `[[include]]` resolution — textual splicing, variable substitution,
+// dependency tree
 // =========================================================================
 
 /// Resolve an include's [`PageRef`] to `(site, slug)` on the current site.
@@ -22,81 +27,245 @@ fn include_target(
     Some((current_site.clone(), (category, name)))
 }
 
-/// Walk `content` and record every `[[include]]` target not already fetched
-/// (in `raws`) and not already batched in `out`, so [`resolve_include`] can
-/// fetch the whole cone at once. Sync recursion over the tree — no awaits.
-pub(super) fn collect_include_targets(
-    content: &Content,
-    current_site: &SafePathComponent,
-    raws: &HashMap<Key, Content>,
-    out: &mut Vec<(Key, Slug)>,
-) {
-    for node in content {
-        match node {
-            Node::Include(inc) => {
-                if let Some((inc_site, inc_slug)) = include_target(&inc.source, current_site)
-                    && let key = (inc_site.clone(), inc_slug.0.clone(), inc_slug.1.clone())
-                    && !raws.contains_key(&key)
-                    && !out.iter().any(|(k, _)| *k == key)
-                {
-                    out.push((key, inc_slug));
-                }
-            }
-            other => {
-                other.visit_node(&mut |c| collect_include_targets(c, current_site, raws, out));
+/// One `[[include …]]` directive of a raw page body that the parser will
+/// honour: the directive's byte span, its source page, and its raw
+/// `key=value` bindings (values literal text, quotes unwrapped).
+pub(super) struct LiveDirective {
+    span: Range<usize>,
+    source: PageRef,
+    vars: Vec<(String, String)>,
+}
+
+impl LiveDirective {
+    /// The `(site, slug)` this directive names on `current_site`.
+    pub(super) fn target(
+        &self,
+        current_site: &SafePathComponent,
+    ) -> Option<(SafePathComponent, Slug)> {
+        include_target(&self.source, current_site)
+    }
+}
+
+/// The `[[include]]` directives of a raw body that survive to the parse.
+/// A hand-rolled scan over the raw bytes that reuses the lexer's own
+/// recognisers (`lex_bracket`, `lex_link3`, `lex_link1`), so it sees exactly
+/// the constructs the lexer would — the whole point being that it never
+/// lexes or pairs: this runs once per splice level and the full parse is
+/// exactly once, at the end.
+///
+/// The scan tracks the constructs that can hide a directive: the line
+/// escape `@@…@@`, the inline `{{…}}`/`%%…%%`/`{$…}` slots, links — and
+/// above all the verbatim regions (`[!--…--]`, `[[code]]`, `[[module
+/// css]]`), pairing their openers and closers the way the pairer does:
+/// `[[/module]]` claims the topmost module entry (a verbatim css region or
+/// a plain module body), a verbatim close drops every region opened inside
+/// it, and an opener that never closes keeps the rest of the page live
+/// (no rollback). A directive inside a *closed* verbatim region stays
+/// literal; that is exactly the set the parser builds [`Node::Include`]s
+/// from — and so exactly the set Wikidot splices; an include "documented"
+/// inside a code block stays literal.
+pub(super) fn live_directives(text: &str) -> Vec<LiveDirective> {
+    let b = text.as_bytes();
+    // (start, key, verbatim) open module/comment/code regions; module
+    // bodies are plain (non-verbatim) but still claim a `[[/module]]`.
+    #[derive(PartialEq, Clone, Copy)]
+    enum Key {
+        Comment,
+        Code,
+        Module,
+    }
+    let mut stack: Vec<(usize, Key, bool)> = Vec::new();
+    let mut closed: Vec<Range<usize>> = Vec::new();
+    let mut directives = Vec::new();
+    let close = |stack: &mut Vec<(usize, Key, bool)>,
+                 closed: &mut Vec<Range<usize>>,
+                 key: Key,
+                 end: usize| {
+        if let Some(j) = stack.iter().rposition(|&(_, k, _)| k == key) {
+            let (start, _, verbatim) = stack[j];
+            stack.truncate(j);
+            if verbatim {
+                closed.push(start..end);
             }
         }
+    };
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'@' if b[i..].starts_with(b"@@") => {
+                // `@@…@@` escape: the body hides constructs; it ends at the
+                // closing `@@`, a newline, or end of input.
+                let mut j = i + 2;
+                while j < b.len() && b[j] != b'\n' && !b[j..].starts_with(b"@@") {
+                    j += 1;
+                }
+                i = if b[j..].starts_with(b"@@") { j + 2 } else { j };
+            }
+            b'{' if b[i..].starts_with(b"{{") || b[i..].starts_with(b"{$") => {
+                // `{{…}}` / `{$…}` slots: hidden when they close on the line.
+                let (delim, dl) = if b[i + 1] == b'{' {
+                    (b"}}" as &[u8], 2)
+                } else {
+                    (b"}" as &[u8], 1)
+                };
+                let mut j = i + 2;
+                while j < b.len() && b[j] != b'\n' && !b[j..].starts_with(delim) {
+                    j += 1;
+                }
+                i = if b[j..].starts_with(delim) {
+                    j + dl
+                } else {
+                    i + 1
+                };
+            }
+            b'%' if b[i..].starts_with(b"%%") => {
+                let mut j = i + 2;
+                while j < b.len() && b[j] != b'\n' && !b[j..].starts_with(b"%%") {
+                    j += 1;
+                }
+                i = if b[j..].starts_with(b"%%") {
+                    j + 2
+                } else {
+                    i + 1
+                };
+            }
+            b'-' if b[i..].starts_with(b"--]") => {
+                close(&mut stack, &mut closed, Key::Comment, i + 3);
+                i += 3;
+            }
+            b'[' => {
+                if b[i..].starts_with(b"[!--") {
+                    stack.push((i, Key::Comment, true));
+                    i += 4;
+                } else if b[i..].starts_with(b"[[[")
+                    && let Some((end, _, _)) = lex_link3(b, i)
+                {
+                    i = end;
+                } else if b[i..].starts_with(b"[[")
+                    && let Some((end, tok)) = lex_bracket(b, i)
+                {
+                    match &tok {
+                        Tok::Open(OpenTag::Include { raw }) => {
+                            let (source, vars) = split_include_args(raw);
+                            directives.push(LiveDirective {
+                                span: i..end,
+                                source,
+                                vars,
+                            });
+                        }
+                        Tok::Open(OpenTag::Code { .. }) => {
+                            stack.push((i, Key::Code, true));
+                        }
+                        Tok::Open(OpenTag::Css) => {
+                            stack.push((i, Key::Module, true));
+                        }
+                        Tok::Open(OpenTag::ModuleBlock { .. })
+                        | Tok::Open(OpenTag::ListPages { .. }) => {
+                            stack.push((i, Key::Module, false));
+                        }
+                        Tok::Close(ClosedTag::Code) => {
+                            close(&mut stack, &mut closed, Key::Code, end);
+                        }
+                        Tok::Close(ClosedTag::Module) => {
+                            close(&mut stack, &mut closed, Key::Module, end);
+                        }
+                        _ => {}
+                    }
+                    i = end;
+                } else if let Some((end, _, _)) = lex_link1(b, i) {
+                    i = end;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
     }
+    directives.retain(|d| {
+        !closed
+            .iter()
+            .any(|r| r.start < d.span.start && d.span.end <= r.end)
+    });
+    directives
 }
 
 /// Assemble the body of the page at the head of `path` in one recursive
-/// pass: every `[[include]]` whose target's body is in `raws` and is not
-/// already on the recursion `path` (a data-level cycle) is replaced by that
-/// body with the directive's vars applied — which resolves the values of
-/// directives nested inside it too, so vars cascade top-down through the
-/// chain — and the spliced body is assembled in turn with the target pushed
-/// onto the path. One closing pass then erases what could not resolve (a
-/// back-edge directive, a `{$var}` outside any include — in bare text or an
-/// attribute value) to its defaults.
-pub(super) fn substitute_includes(
-    content: Content,
+/// pass: every live `[[include]]` whose target's body is in `raws` and is
+/// not already on the recursion `path` (a data-level cycle) is replaced by
+/// that body with the directive's bindings substituted into it — which
+/// resolves the values of directives nested inside it too, so vars cascade
+/// top-down through the chain — and the spliced body is assembled in turn
+/// with the target pushed onto the path. Directives that cannot be spliced
+/// — a cycle, a target with no fetched body, a cross-site include — stay
+/// verbatim, degrading to [`Node::Include`] in the final parse (the render
+/// fallback).
+///
+/// Wikidot splices includes into the raw text and parses the assembled
+/// whole, which is what makes a component's half-open `[[div]]` or
+/// `[[cell]]` pair with the includer's closer — this pass keeps that
+/// property by construction: it never parses, it only replaces text.
+pub(super) fn splice_includes(
+    text: &str,
     current_site: &SafePathComponent,
-    raws: &HashMap<Key, Content>,
+    raws: &HashMap<Key, String>,
     path: &[Key],
-) -> Content {
-    apply_include_vars(assemble_includes(content, current_site, raws, path), &[])
-}
-
-/// The structural half: splice each include's body (recursing with the
-/// target on the path); directives that cannot be spliced — a cycle, or a
-/// target with no fetched body — stay verbatim.
-fn assemble_includes(
-    content: Content,
-    current_site: &SafePathComponent,
-    raws: &HashMap<Key, Content>,
-    path: &[Key],
-) -> Content {
-    let mut walk = |c: Content| assemble_includes(c, current_site, raws, path);
-    let mut out: Content = Vec::with_capacity(content.len());
-    for node in content {
-        match node {
-            Node::Include(inc) => {
-                let key = include_target(&inc.source, current_site)
-                    .map(|(site, slug)| (site, slug.0, slug.1));
-                if let Some(k) = key.as_ref().filter(|k| !path.contains(k))
-                    && let Some(raw) = raws.get(k)
-                {
-                    let spliced = apply_include_vars(raw.to_vec(), &inc.vars);
-                    let mut deeper = path.to_vec();
-                    deeper.push(k.clone());
-                    out.extend(assemble_includes(spliced, current_site, raws, &deeper));
-                } else {
-                    out.push(Node::Include(inc));
-                }
-            }
-            other => out.push(other.map_node(&mut walk)),
+) -> String {
+    let directives = live_directives(text);
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    for d in directives {
+        out.push_str(&text[pos..d.span.start]);
+        pos = d.span.end;
+        let target = d
+            .target(current_site)
+            .map(|(site, slug)| (site, slug.0, slug.1));
+        if let Some(key) = target.as_ref().filter(|k| !path.contains(k))
+            && let Some(raw) = raws.get(key)
+        {
+            let inner = subst_vars(raw, &d.vars);
+            let mut deeper = path.to_vec();
+            deeper.push(key.clone());
+            out.push_str(&splice_includes(&inner, current_site, raws, &deeper));
+        } else {
+            out.push_str(&text[d.span]);
         }
     }
+    out.push_str(&text[pos..]);
+    out
+}
+
+/// Substitute the `{$var}` slots of `text` — the textual half of Wikidot's
+/// include assembly: values are pasted into the raw body, so a value's
+/// markup re-parses in place (bold stays bold in body text and attribute
+/// values alike). The lookup mirrors the tree walk this replaces: bindings
+/// stay in source order and the first non-empty value wins — which is what
+/// makes the `key={$key}|key=default` fallback idiom work, since an unset
+/// `{$key}` has already substituted to empty here — and an unresolved name
+/// falls back to its `//default`, or to nothing. The scan is the lexer's own
+/// `{$…}` grammar: a slot runs to the closing `}`, and a newline or end of
+/// input before one leaves the `{$` literal.
+pub(super) fn subst_vars(text: &str, vars: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(rel) = text[i..].find("{$") {
+        let at = i + rel;
+        out.push_str(&text[i..at]);
+        let rest = &text[at + 2..];
+        match rest.find(['}', '\n']) {
+            Some(j) if rest.as_bytes()[j] == b'}' => {
+                let raw = &rest[..j];
+                let (name, default) = raw.split_once("//").unwrap_or((raw, ""));
+                let value = vars.iter().find(|(k, v)| k == name && !v.trim().is_empty());
+                out.push_str(value.map_or(default, |(_, v)| v.as_str()));
+                i = at + 2 + j + 1;
+            }
+            _ => {
+                out.push_str("{$");
+                i = at + 2;
+            }
+        }
+    }
+    out.push_str(&text[i..]);
     out
 }
 
