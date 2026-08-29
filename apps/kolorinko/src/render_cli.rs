@@ -28,7 +28,11 @@
 //! — group hash → jump-consistent hash), so every core's worker renders
 //! exactly the pages it owns and the parse/`[[include]]` work spreads across
 //! cores, while the `repo` oracle, the shell, and the page enumeration stay
-//! single shared instances wherever routing puts them.
+//! single shared instances wherever routing puts them. Within one core, a
+//! small bounded window of pages ([`IN_FLIGHT_PAGES`]) is kept in flight, so
+//! each page's await phases (blob materialisation on the git worker thread,
+//! cross-core include resolution) overlap with neighbouring pages' parse and
+//! render CPU instead of idling the core.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -36,7 +40,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt, stream};
 use kolorinko_render::render_page_document;
 use kolorinko_rt::{
     ListPagesQuery, ListPagesResult, ListedPage, SafePathComponent, SiteShell, Slug, parse_route,
@@ -160,6 +164,16 @@ enum Out {
     Fatal(anyhow::Error),
 }
 
+/// Pages kept in flight per core during a mass render. Parallelism *across*
+/// cores already rides deterministic gear routing; the window only overlaps
+/// each page's await phases (blob materialisation on the single git worker
+/// thread, include/link resolution through the `repo` oracle's core) with the
+/// parse and render CPU of neighbouring pages on this core — CPU work stays
+/// serial on the core's single-threaded runtime either way, and the window
+/// bounds how much per-page state (pinned gear outputs, views, rendered
+/// documents) is alive at once.
+const IN_FLIGHT_PAGES: usize = 4;
+
 /// `kolorinko render <site>` — render every page of one site into a directory
 /// of standalone `.html` files. One worker per core renders exactly the pages
 /// its `article_latest` gears own ([`Core::owns`] — deterministic routing) and
@@ -278,6 +292,9 @@ fn coordinate(
             }
         }
         if done_workers == cores.get() {
+            // Arrival order interleaves cores (and, within a core, the
+            // in-flight window), so sort the index back to `fullname` order.
+            listing.sort_unstable_by(|a, b| a.1.cmp(&b.1));
             return Ok((rendered, listing, site_title));
         }
     }
@@ -289,9 +306,9 @@ fn coordinate(
 /// `article_latest` gear this core owns ([`Core::owns`] — the same
 /// deterministic routing every core computes, so the shards partition the
 /// site with no coordination). Each owned page is resolved, SSR-rendered
-/// through [`render_page_document`], and streamed to the coordinator; its
-/// subscription is dropped after reading so per-page state doesn't pile up
-/// over a long run.
+/// through [`render_page_document`], and streamed to the coordinator,
+/// [`IN_FLIGHT_PAGES`] at a time; a page's subscription is dropped after
+/// reading, so per-page state never outlives the window over a long run.
 async fn render_owned(
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     shared: &Shared,
@@ -306,25 +323,46 @@ async fn render_owned(
     let list_q = crate::runtime::repo_l_list_pages(shared.site.clone(), enumerate_query());
     let listed: ListPagesResult = (*list_q.subscribe(core).await.current()).clone();
 
-    let mut rendered = 0usize;
-    for page in listed.pages {
+    // Read the site title out up front: the render window borrows `shell`
+    // until it is dropped at the end of the function.
+    let site_title = shell.title.clone().filter(|t| !t.is_empty());
+
+    // Exactly this core's owned pages, each as an independent
+    // resolve-render-send future, driven with a bounded window: while one
+    // page's subscription awaits its gear (blob materialisation off-core,
+    // include/link resolution), other pages' parse and render CPU keeps this
+    // core busy instead of idling. A future dropped mid-await cancels
+    // cleanly (subscription `Drop` releases interest), so erroring out of
+    // the drain loop tears the window down safely.
+    let owned = listed.pages.into_iter().filter_map(|page| {
         // The listed page id is the canonical local id — no slug round-trip
         // needed.
-        let Some(local) = kolorinko_rt::LocalId::from_page_id(&page.page_id) else {
-            continue;
-        };
+        let local = kolorinko_rt::LocalId::from_page_id(&page.page_id)?;
         let page_q = crate::runtime::article_latest(shared.space, local);
-        if !core.owns(page_q.id()) {
-            continue; // another core owns this page
-        }
-        let sub = page_q.subscribe(core).await;
-        let view: ArticleView = (*sub.current()).clone();
-        drop(sub);
-        let html = render_page_document(&shell, &view, shared.base_css.as_deref());
-        shared
-            .tx
-            .send(Out::Page { page, html })
-            .map_err(|_| anyhow::anyhow!("coordinator gone"))?;
+        core.owns(page_q.id()).then_some((page, page_q))
+    });
+    let mut rendering = stream::iter(owned)
+        .map(|(page, page_q)| {
+            // Borrow the shell instead of moving it — the closure must stay
+            // `FnMut` across the window's futures (`core`/`shared` are
+            // already shared references, so they copy).
+            let shell = &shell;
+            async move {
+                let sub = page_q.subscribe(core).await;
+                let view: ArticleView = (*sub.current()).clone();
+                drop(sub);
+                let html = render_page_document(shell, &view, shared.base_css.as_deref());
+                shared
+                    .tx
+                    .send(Out::Page { page, html })
+                    .map_err(|_| anyhow::anyhow!("coordinator gone"))?;
+                anyhow::Ok(())
+            }
+        })
+        .buffer_unordered(IN_FLIGHT_PAGES);
+    let mut rendered = 0usize;
+    while let Some(result) = rendering.next().await {
+        result?;
         rendered += 1;
     }
     info!("core{} rendered {rendered} pages", core.core_id());
@@ -332,7 +370,7 @@ async fn render_owned(
         .tx
         .send(Out::PagesDone {
             rendered,
-            site_title: shell.title.filter(|t| !t.is_empty()),
+            site_title,
         })
         .map_err(|_| anyhow::anyhow!("coordinator gone"))?;
     Ok(())
@@ -425,9 +463,10 @@ fn prepare_out_dir(out: &Path, force: bool) -> anyhow::Result<()> {
 }
 
 /// Write the mass render's `index.html`: the site title plus one link per
-/// page (in the same `fullname`-ascending order the pages were rendered in),
-/// so a consumer — LLM agent or human — can navigate the whole export from a
-/// single entry point.
+/// page (sorted by `fullname`, mirroring the enumeration order — arrival
+/// order interleaves cores and the per-core in-flight window), so a consumer
+/// — LLM agent or human — can navigate the whole export from a single entry
+/// point.
 fn write_index(
     out: &Path,
     site: &str,
