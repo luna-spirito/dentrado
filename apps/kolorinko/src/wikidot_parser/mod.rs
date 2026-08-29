@@ -161,18 +161,15 @@ mod tests {
     }
 
     /// A `[[module css]]` body runs Wikidot's verbatim-stylesheet pipeline
-    /// ([`helpers::wikidot_verbatim`]): NBSP → space, `&amp;` → `&amp;amp;`,
-    /// edges trimmed, one trailing newline — an NBSP-indented declaration
-    /// otherwise glues onto the property name (U+00A0 is a name-start code
-    /// point) and every rule dies in the browser.
+    /// ([`helpers::wikidot_verbatim`]): `&amp;` → `&amp;amp;` (a bare `&`
+    /// stays as written), edges trimmed, one trailing newline.
     #[test]
     fn stylesheet_body_runs_the_verbatim_pipeline() {
-        let c =
-            parse("[[module css]]\n\n\u{a0}a { content: \"A &amp; B\" }\n\u{a0}b&c\n\n[[/module]]");
+        let c = parse("[[module css]]\n\na { content: \"A &amp; B\" }\nb&c\n\n[[/module]]");
         assert_eq!(
             c,
             vec![Node::Stylesheet(
-                "a { content: \"A &amp;amp; B\" }\n b&c\n".into()
+                "a { content: \"A &amp;amp; B\" }\nb&c\n".into()
             )]
         );
     }

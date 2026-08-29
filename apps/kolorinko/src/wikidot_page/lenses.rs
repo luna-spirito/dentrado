@@ -32,8 +32,16 @@ pub(crate) struct ShellCache;
 
 /// Project one page out of `repo`'s dataset into a shippable [`ArticleLatest`],
 /// materialising the latest body blob via the worker thread (off-core). The
-/// page is addressed canonically: the lens resolves `(space, local)` to the
-/// page's current slug through the rename-stable page id
+/// body crosses this lens NBSP-free: every non-breaking space (U+00A0) in the
+/// blob is rewritten to a plain space. Wikidot exports lean on NBSP for list
+/// indentation and trailing whitespace, and a faithfully shipped NBSP
+/// resurfaces as `&nbsp;` in every whitespace-structural consumer (the
+/// top-bar renderer, the verbatim CSS pipeline — each of which used to carry
+/// its own manual workaround); one substitution at this single dataset
+/// boundary retires them all. List
+/// structure survives (an NBSP and a space count as one indent unit each).
+/// The page is addressed canonically: the lens resolves `(space, local)` to
+/// the page's current slug through the rename-stable page id
 /// ([`super::page_slug`]) — this is the cross-core bridge every off-`repo`
 /// gear reads the dataset through. An unknown address (or an unopenable
 /// repository) yields an empty [`ArticleLatest`] (blank render).
@@ -53,7 +61,7 @@ pub(crate) async fn repo_l_article_latest(
     match data.mailbox.blob(a.latest_body).await {
         Some(body) => ArticleLatest {
             meta,
-            body,
+            body: body.replace('\u{a0}', " "),
             revisions,
         },
         None => ArticleLatest::default(),

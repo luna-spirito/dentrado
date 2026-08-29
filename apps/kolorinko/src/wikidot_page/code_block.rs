@@ -204,16 +204,17 @@ mod tests {
 
     #[test]
     fn wikidot_serve_pipeline() {
-        // NBSP → space, `&amp;` → `&amp;amp;` (bare `&` untouched), edges
-        // trimmed, one trailing newline — byte-verified against the live
-        // endpoint on two corpus pages.
-        let content = parse(
-            "[[code type=\"css\"]]\n\n\u{a0}a { content: \"A &amp; B\" }\n\u{a0}b&c\n\n[[/code]]",
-        );
+        // `&amp;` → `&amp;amp;` (bare `&` untouched), edges trimmed, one
+        // trailing newline — byte-verified against the live endpoint on two
+        // corpus pages. (Live Wikidot additionally maps NBSP to space here;
+        // bodies arrive NBSP-free — `repo_l_article_latest` normalizes — so
+        // the fixtures do too.)
+        let content =
+            parse("[[code type=\"css\"]]\n\na { content: \"A &amp; B\" }\nb&c\n\n[[/code]]");
         let b1 = nth_code_block(&content, 1).unwrap();
         assert_eq!(
             wikidot_verbatim(b1.raw),
-            "a { content: \"A &amp;amp; B\" }\n b&c\n"
+            "a { content: \"A &amp;amp; B\" }\nb&c\n"
         );
         let served = super::serve(b1);
         assert!(served.css, "type=\"css\" → CSS MIME");
@@ -222,7 +223,7 @@ mod tests {
             format!("\"{}\"", {
                 use ring::digest::{Context, SHA256};
                 let mut cx = Context::new(&SHA256);
-                cx.update(b"a { content: \"A &amp;amp; B\" }\n b&c\n");
+                cx.update(b"a { content: \"A &amp;amp; B\" }\nb&c\n");
                 cx.finish()
                     .as_ref()
                     .iter()
@@ -248,7 +249,11 @@ mod tests {
         };
         // Strip the leading frontmatter block (blank-line-terminated header).
         let body = raw.split_once("\n\n").map(|(_, b)| b).unwrap_or(&raw);
-        let content = parse(body);
+        // The lens serves bodies NBSP-free; this test reads the raw blob, so
+        // the same normalization is replicated here (the exported file leans
+        // on NBSP indentation).
+        let body = body.replace('\u{a0}', " ");
+        let content = parse(&body);
         let b1 = nth_code_block(&content, 1).expect("block 1");
         assert_eq!(
             b1.ty.as_deref(),

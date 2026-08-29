@@ -561,20 +561,15 @@ pub(crate) fn merge_text(content: Content) -> Content {
 /// Wikidot's verbatim-stylesheet pipeline — the one filter shared by every
 /// context that serves markup as CSS: `[[module css]]` bodies (emitted into
 /// the page's `<style>`) and `[[code]]` blocks served by the legacy
-/// `/code/N` endpoint (see [`crate::wikidot_page::code_block`]). NBSP
-/// (U+00A0) becomes a space, `&amp;` becomes `&amp;amp;` (a bare `&` stays
-/// as written), the edges are trimmed, and exactly one trailing newline is
-/// appended. Byte-verified against the live site: the whole pipeline on
-/// `/code/N` (two corpus pages), the NBSP/trim/newline behaviour on the
-/// `discord` page's inline `<style>` — whose NBSP-indented declarations
-/// would otherwise fail to parse in the browser (U+00A0 is a name-start
-/// code point, so it glues onto the following property).
+/// `/code/N` endpoint (see [`crate::wikidot_page::code_block`]). `&amp;`
+/// becomes `&amp;amp;` (a bare `&` stays as written), the edges are trimmed,
+/// and exactly one trailing newline is appended. Byte-verified against the
+/// live site on `/code/N` (two corpus pages) and the `discord` page's inline
+/// `<style>`. (Live Wikidot also maps NBSP to space in this pipeline; bodies
+/// reach it NBSP-free — [`crate::wikidot_page::repo_l_article_latest`]
+/// normalizes at the dataset boundary — so there is nothing left to map.)
 pub(crate) fn wikidot_verbatim(raw: &str) -> String {
-    let mut served = raw
-        .replace('\u{a0}', " ")
-        .replace("&amp;", "&amp;amp;")
-        .trim()
-        .to_owned();
+    let mut served = raw.replace("&amp;", "&amp;amp;").trim().to_owned();
     served.push('\n');
     served
 }
