@@ -273,6 +273,16 @@ pub(crate) struct ActiveGear<R: IsRuntime> {
     /// awaiters. Bumped on every completed run (local) or `SubscriptionUpdate`
     /// (remote); waiters park on its epoch via [`Core::wait_change`].
     pub(crate) changed: Epoch,
+    /// Gears whose tasks are currently parked in
+    /// [`Core::wait_for_output_unpinned`] awaiting **this** gear's next output
+    /// (follow sources and `secondary_get` callers). Transient parking state,
+    /// not interest: the `changed` bump of a completed run wakes them and they
+    /// consume the fresh output directly, so the delivery fan-out skips
+    /// kicking them (see [`ActiveGear::delivery_kicks`]) — a kick on top would
+    /// flag a redundant `rerun` for an input they are already about to consume
+    /// (every cold activation of an edge would run the dependent twice: once
+    /// for the delivery, once for the spurious rerun).
+    pub(crate) waiting: HashSet<GearKey>,
 }
 
 impl<R: IsRuntime> ActiveGear<R> {
@@ -281,6 +291,20 @@ impl<R: IsRuntime> ActiveGear<R> {
         !self.local_dependents.is_empty()
             || !self.remote_subscribers.is_empty()
             || self.direct_subscriber_count > 0
+    }
+
+    /// The local dependents to kick when a fresh output is installed:
+    /// everyone except the gears currently parked awaiting **this very
+    /// output** — the `changed` bump that precedes the kick already woke
+    /// those, and on resume they consume the fresh value, so kicking them
+    /// would only flag a redundant `rerun` on the identical input. A dependent
+    /// parked on a *different* dependency, or mid-`run_step` computing against
+    /// an older output, is kicked as before.
+    fn delivery_kicks(&self) -> impl Iterator<Item = GearKey> + '_ {
+        self.local_dependents
+            .iter()
+            .copied()
+            .filter(|dep| !self.waiting.contains(dep))
     }
 }
 
@@ -616,7 +640,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                             let target = *target;
                             drop(inner);
                             let out = self
-                                .wait_for_output_unpinned(target)
+                                .wait_for_output_unpinned(Some(key), target)
                                 .await
                                 .expect("run_loc_gear_task: followed gear evicted mid-run");
                             GearInput::Follow { out }
@@ -693,7 +717,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                     *status = ActiveGearStatus::Eepy;
                     false
                 };
-                let dependents: Vec<GearKey> = ag.local_dependents.iter().copied().collect();
+                let dependents: Vec<GearKey> = ag.delivery_kicks().collect();
                 let remote_subs: Vec<u32> = ag.remote_subscribers.iter().copied().collect();
                 ag.changed.bump();
                 (removed_deps, dependents, remote_subs, do_rerun)
@@ -734,7 +758,8 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 }
             }
 
-            // Cascade reruns to local dependents.
+            // Cascade reruns to local dependents — minus those the delivery
+            // itself woke (see `ActiveGear::delivery_kicks`).
             for dep in dependents {
                 self.kick_loc_gear(dep);
             }
@@ -854,6 +879,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                 remote_subscribers: HashSet::new(),
                 direct_subscriber_count: 0,
                 changed: Epoch::new(),
+                waiting: HashSet::new(),
             });
             inner.gear_index.insert(gear.clone(), key);
             log::debug!(
@@ -900,6 +926,14 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
     /// Returns `None` if the gear was evicted — the generation tag on `key`
     /// turns that into a safe staleness check instead of a dangling read.
     ///
+    /// `waiter`, when given, is the arena key of the *gear* whose task is
+    /// waiting (a follow source or a `secondary_get` caller): it is parked in
+    /// the target's `waiting` set for the duration so the delivery fan-out
+    /// doesn't kick — and thus flag a spurious `rerun` on — a gear that the
+    /// very same delivery is about to wake and hand the value. Worker-side
+    /// callers (`subscribe_gear*`, `StartSubscription`) pass `None`: they own
+    /// no `rerun` flag.
+    ///
     /// # This call is *unpinned* — it registers no interest of its own.
     ///
     /// This is the single shared "produce an output" primitive for *all*
@@ -914,25 +948,44 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
     /// edges, `remote_subscribers` for cross-core subs, `direct_subscriber_count`
     /// via [`Subscription`] for worker reads) **before** awaiting. See
     /// `secondary_get_impl` / `StartSubscription` / `subscribe_gear*`.
-    async fn wait_for_output_unpinned(self: &Rc<Self>, key: GearKey) -> Option<GearResult<R>> {
+    async fn wait_for_output_unpinned(
+        self: &Rc<Self>,
+        waiter: Option<GearKey>,
+        key: GearKey,
+    ) -> Option<GearResult<R>> {
+        // Parked-on-`key` registration for the duration of the wait (skipped
+        // for non-gear waiters); removed on every exit path below. A
+        // cancellation in between is only ever the waiter gear's own eviction,
+        // whose teardown purges `waiting` alongside `local_dependents`.
+        if let Some(w) = waiter
+            && let Some(ag) = self.inner.borrow_mut().gears.get_mut(key)
+        {
+            ag.waiting.insert(w);
+        }
         // No timeout needed: any core death cascades (`CoreDied`) through
         // every core, the runtime drops, and this parked task is cancelled
         // along with its reply channel — callers fail through the drop.
-        loop {
+        let out = loop {
             let seen = {
                 let inner = self.inner.borrow();
                 let Some(ag) = inner.gears.get(key) else {
-                    return None;
+                    break None;
                 };
                 if let Some(out) = ag.output.clone() {
-                    return Some(out);
+                    break Some(out);
                 }
                 ag.changed.current()
             };
             if !self.wait_change(key, seen).await {
-                return None;
+                break None;
             }
+        };
+        if let Some(w) = waiter
+            && let Some(ag) = self.inner.borrow_mut().gears.get_mut(key)
+        {
+            ag.waiting.remove(&w);
         }
+        out
     }
 
     /// Declare a dependency on `gear`'s output and pull its current value,
@@ -952,7 +1005,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
         gear: R::GearId,
     ) -> GearResult<R> {
         let gear_key = self.force_active(&gear).await;
-        {
+        let caller_key = {
             let mut inner = self.inner.borrow_mut();
             let Some(caller_key) = inner.gear_index.get(&caller).copied() else {
                 panic!("secondary_get_impl: caller not active");
@@ -965,8 +1018,9 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
             {
                 dep_set.insert(gear_key);
             }
-        }
-        self.wait_for_output_unpinned(gear_key)
+            caller_key
+        };
+        self.wait_for_output_unpinned(Some(caller_key), gear_key)
             .await
             .expect("secondary_get_impl: dependency evicted while awaiting its output")
     }
@@ -1340,7 +1394,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                         // carries only `session`, no gear to localize).
                         inner.incoming_subs.insert((from_core, session), key);
                     }
-                    let output = this.wait_for_output_unpinned(key).await.expect(
+                    let output = this.wait_for_output_unpinned(None, key).await.expect(
                         "StartSubscription: gear evicted while a remote subscriber was attached",
                     );
                     // A remote subscription is satisfied by a shippable or a
@@ -1390,7 +1444,9 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                     };
                     ag.output = Some(GearResult::Ship(output));
                     ag.changed.bump();
-                    ag.local_dependents.iter().copied().collect::<Vec<_>>()
+                    // Delivery: parked waiters were woken by the bump above —
+                    // don't also kick them.
+                    ag.delivery_kicks().collect::<Vec<_>>()
                 };
                 for dep in dependents {
                     self.kick_loc_gear(dep);
@@ -1420,7 +1476,9 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                     };
                     ag.output = Some(GearResult::Shared(shared));
                     ag.changed.bump();
-                    ag.local_dependents.iter().copied().collect::<Vec<_>>()
+                    // Delivery: parked waiters were woken by the bump above —
+                    // don't also kick them.
+                    ag.delivery_kicks().collect::<Vec<_>>()
                 };
                 for dep in dependents {
                     self.kick_loc_gear(dep);
@@ -1655,7 +1713,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
         // Fresh: wait for the first output, and for any in-flight run, so
         // `current()` returns the latest value rather than a pre-recompute one.
         if self.current_output_key(key).is_none() || self.is_locally_running_key(key) {
-            let _ = self.wait_for_output_unpinned(key).await;
+            let _ = self.wait_for_output_unpinned(None, key).await;
         }
         sub
     }
@@ -1674,7 +1732,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
             key,
         };
         if self.current_output_key(key).is_none() {
-            let _ = self.wait_for_output_unpinned(key).await;
+            let _ = self.wait_for_output_unpinned(None, key).await;
         }
         sub
     }
@@ -1820,9 +1878,10 @@ impl<R: IsRuntime> CoreLocCtx<R> {
     /// Fully tear down a gear: fire remote `StopSubscription` if it was a
     /// subscribed remote dep, drop its trigger registration (event group or
     /// epoch counter), remove ourselves from each dependency's
-    /// `local_dependents`, and cascade-rebalance dependencies that lose their
-    /// last dependent. The dependency graph is acyclic by construction, so this
-    /// terminates. Remote stops are emitted directly via `stop_ctx`.
+    /// `local_dependents` (and any cancelled parked-wait registration), and
+    /// cascade-rebalance dependencies that lose their last dependent. The
+    /// dependency graph is acyclic by construction, so this terminates.
+    /// Remote stops are emitted directly via `stop_ctx`.
     fn evict_gear(&mut self, key: GearKey, ag: ActiveGear<R>, stop_ctx: &StopCtx<'_, R>) {
         let gear_id = ag.id.clone();
         self.gear_index.remove(&gear_id);
@@ -1856,9 +1915,11 @@ impl<R: IsRuntime> CoreLocCtx<R> {
                         // Mirrors the generic `dep_set` walk below for dynamic
                         // edges. (If the gear also `secondary_get`s its own
                         // target, the duplicate removal/rebalance is a harmless
-                        // no-op.)
+                        // no-op.) Also drops any parked-on-target registration
+                        // left by a wait this eviction just cancelled.
                         if let Some(dag) = self.gears.get_mut(target) {
                             dag.local_dependents.remove(&key);
+                            dag.waiting.remove(&key);
                         }
                         self.rebalance_gear(target, stop_ctx);
                     }
@@ -1866,10 +1927,12 @@ impl<R: IsRuntime> CoreLocCtx<R> {
                 dep_set
             }
         };
-        // Gear-dep edges: drop ourselves from each dependency, then cascade.
+        // Gear-dep edges: drop ourselves from each dependency (interest and
+        // any cancelled parked-wait registration), then cascade.
         for dep in &dep_set {
             if let Some(dag) = self.gears.get_mut(*dep) {
                 dag.local_dependents.remove(&key);
+                dag.waiting.remove(&key);
             }
             self.rebalance_gear(*dep, stop_ctx);
         }
