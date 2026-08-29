@@ -1381,9 +1381,13 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                             .await
                             .expect("StartSubscription: failed to localize gear")
                     };
-                    // Register the remote subscriber, ensure a run, await output,
-                    // then push it back. The subscriber is attached before the
-                    // await, so the gear can't be evicted mid-wait.
+                    // Register the remote subscriber, ensure a run, await
+                    // output, then push it back. The subscriber is attached
+                    // before the await, so the gear can't *enter* limbo
+                    // interest-less while we wait — but our StopSubscription
+                    // can still arrive mid-wait (the mirror on the
+                    // subscriber's core was torn down), which reaps the gear;
+                    // the wait below unwinds gracefully in that case.
                     let key = this.force_active(&gear).await;
                     {
                         let mut inner = this.inner.borrow_mut();
@@ -1394,9 +1398,22 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
                         // carries only `session`, no gear to localize).
                         inner.incoming_subs.insert((from_core, session), key);
                     }
-                    let output = this.wait_for_output_unpinned(None, key).await.expect(
-                        "StartSubscription: gear evicted while a remote subscriber was attached",
-                    );
+                    let Some(output) = this.wait_for_output_unpinned(None, key).await else {
+                        // The target was evicted before its first output:
+                        // our subscriber's StopSubscription either already
+                        // arrived (its mirror on the subscriber's core was
+                        // torn down mid-wait, dropping this gear's last
+                        // interest) or every local dependent vanished the same
+                        // way. Nobody is left to push to — drop our
+                        // route-table entry (if the Stop hasn't already) and
+                        // unwind; the update we were about to send had no
+                        // recipient anyway.
+                        this.inner
+                            .borrow_mut()
+                            .incoming_subs
+                            .remove(&(from_core, session));
+                        return;
+                    };
                     // A remote subscription is satisfied by a shippable or a
                     // shared output; a `Local` gear reached this way is a
                     // routing bug.
