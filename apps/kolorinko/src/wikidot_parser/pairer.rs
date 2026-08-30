@@ -318,7 +318,17 @@ impl Pairer<'_> {
             Tok::Mark(style) if !src[t.end..].starts_with(' ') => self.push(i, Key::Mark(*style)),
             Tok::CommentOpen => self.push_verbatim(i, Key::Comment),
             Tok::Open(open) => match opener_key(open) {
-                Some((key, verbatim)) if verbatim => self.push_verbatim(i, key),
+                // `[[module css]]` is line-anchored on Wikidot: its `^`-anchored
+                // rule runs before the blockquote rule strips `> `, so a quoted
+                // CSS region is documentation code, not a live stylesheet.
+                Some((key, true))
+                    if !matches!(open, OpenTag::Css)
+                        || t.start == 0
+                        || src.as_bytes()[t.start - 1] == b'\n' =>
+                {
+                    self.push_verbatim(i, key)
+                }
+                Some((_, true)) => {}
                 Some((key, _)) => self.push(i, key),
                 None => {}
             },

@@ -174,6 +174,19 @@ mod tests {
         );
     }
 
+    /// Wikidot's Module rule is `^`-anchored and runs before the blockquote
+    /// rule strips `> `, so a quote-prefixed CSS region never opens: it stays
+    /// literal documentation code (with the URL still linking), unlike the
+    /// same region at a line start.
+    #[test]
+    fn quoted_css_region_stays_literal() {
+        let c = parse("> [[module css]]\n> @import url(https://x.example/t/1);\n> [[/module]]");
+        let dump = format!("{c:?}");
+        assert!(!dump.contains("Stylesheet"));
+        assert!(dump.contains("Raw(\"[[module css]]\")"));
+        assert!(dump.contains("Raw(\"[[/module]]\")"));
+    }
+
     /// Marks split the same way: `**hi--hello**hey--` closes the strike
     /// inside the bold, then re-opens it for the tail.
     #[test]

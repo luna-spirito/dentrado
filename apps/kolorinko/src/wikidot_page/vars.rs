@@ -103,6 +103,7 @@ impl ModuleVars<'_> {
                 target: LinkTarget::Url(format!("{prefix}{tag}")),
                 text: text(tag.to_string()),
                 class: None,
+                new_tab: false,
             }]
         };
         let tags_linked = || {
@@ -143,6 +144,7 @@ impl ModuleVars<'_> {
                 }),
                 text: text(page.title.clone()),
                 class: None,
+                new_tab: false,
             }],
             "created_by" | "author" => text(page.created_by.clone()),
             "updated_by" | "author_edited" | "user_edited" => text(page.updated_by.clone()),
@@ -243,10 +245,12 @@ fn subst_node(node: Node, vars: &Vars) -> Content {
             target,
             text,
             class,
+            new_tab,
         } => vec![Node::Link {
             target: subst_link_target(target, vars),
             text: apply_vars(text, vars),
             class,
+            new_tab,
         }],
         Node::Include(inc) => vec![Node::Include(Include {
             source: inc.source,

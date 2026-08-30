@@ -5,6 +5,16 @@
 
 use super::*;
 
+/// `[*target …]` / `[[[*target|…]]]` — Wikidot's asterisk prefix opens the
+/// link in a new tab; it is stripped from the target (`toUnixName` would
+/// discard it anyway).
+pub(crate) fn new_tab_mark(target: &str) -> (&str, bool) {
+    (
+        target.strip_prefix('*').unwrap_or(target),
+        target.starts_with('*'),
+    )
+}
+
 /// Turn a raw link target string into a [`LinkTarget`]: external URL if it
 /// starts with `http://`/`https://` (or is a same-page `#fragment`),
 /// otherwise an internal wiki page reference.

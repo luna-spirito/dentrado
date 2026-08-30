@@ -76,10 +76,12 @@ impl Node {
                 target,
                 text,
                 class,
+                new_tab,
             } => Node::Link {
                 target,
                 text: f(text),
                 class,
+                new_tab,
             },
             Node::IfExpr { cond, then, els } => Node::IfExpr {
                 cond,

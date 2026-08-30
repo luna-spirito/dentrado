@@ -513,7 +513,9 @@ fn rule<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
 fn center_eq<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
     at_line_start()
         .ignore_then(just(b'='))
-        .ignore_then(just(b' ').repeated())
+        // Live Wikidot centers `=\xa0\xa0text` too — the post-`=` run is
+        // spaces and NBSPs, and it is consumed (not part of the content).
+        .ignore_then(ws().repeated())
         .to(Tok::CenterEq)
 }
 
@@ -697,8 +699,13 @@ fn include_var<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
 }
 
 fn escape<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
-    just(b"@@")
+    // Wikidot's raw rule `(?<!@)@@(.*[^@]?)@@U`: the opener must not follow
+    // an `@` (so the tail of `@@@@@@@@` stays literal text), the body ends at
+    // the first `@@`, and an unclosed `@@` is plain text.
+    not_after(b'@')
+        .ignore_then(just(b"@@"))
         .ignore_then(read_until(b"@@"))
+        .filter(|(_, found)| *found)
         .map(|(body, _)| Tok::Escape(body))
 }
 
@@ -750,11 +757,28 @@ fn bracket<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
         just(b"[!--").to(Tok::CommentOpen),
         link3(),
         known_bracket(),
-        not_after(b'[').ignore_then(link1()),
+        link1(),
+        link1_peel(),
         just(b"[[")
             .to(Tok::Text("[["))
             .or(just(b"[").to(Tok::Text("["))),
     ))
+}
+
+/// The outer bracket of a `[[*url label]]`: Wikidot's Url rule has no
+/// bracket lookbehind, so the inner `[*url label]` still links while the
+/// stray outer brackets stay literal (`[<a …>label</a>]`). Peel one bracket
+/// as text; the next dispatch step lexes the link itself.
+fn link1_peel<'a>() -> impl Parser<'a, In<'a>, Tok<'a>, E<'a>> + Clone + 'a {
+    custom(|inp: &mut InputRef<'a, '_, In<'a>, E<'a>>| {
+        let b = inp.full_slice();
+        let start = *inp.cursor().inner();
+        if !b[start..].starts_with(b"[[*") || lex_link1(b, start + 1).is_none() {
+            return Err(perr(inp, "no '[[*…]]' link"));
+        }
+        advance(inp, 1);
+        Ok(Tok::Text("["))
+    })
 }
 
 /// `[[[target|text]]]` — or, when the construct does not close on this
@@ -953,6 +977,8 @@ type Tail = fn(&[u8], usize) -> Option<(usize, OpenTag)>;
 /// The opener keywords and their tail parsers (a keyword matches by prefix,
 /// exactly like the old `kw_ci` combinators; `hcell` shadows `cell`, `table`
 /// and `tabview` shadow `tab`).
+/// Keywords of [`OPENERS`] whose Wikidot rules anchor to `^`: the construct
+/// is only recognized when it opens the line.
 const OPENERS: &[(&[u8], Tail)] = &[
     (b"collapsible", collapsible_tail),
     (b"tabview", tabview_tail),
@@ -1102,8 +1128,13 @@ pub(crate) fn lex_link1(b: &[u8], i: usize) -> Option<(usize, &str, Option<&str>
 /// Wikidot links a single-bracket `[target text]` only for full targets:
 /// a scheme URL, a same-page `#fragment`, a site-relative `/path` — or a
 /// target still carrying variable slots (`{$x}` / `%%x%%`), deferred to
-/// link resolution. Plain words (`[that]`) stay text.
+/// link resolution. Plain words (`[that]`) stay text. A leading `*` is
+/// Wikidot's new-tab mark (`[*url label]`) and does not disqualify.
 fn is_link1_target(t: &str) -> bool {
+    is_link1_target_plain(t.strip_prefix('*').unwrap_or(t))
+}
+
+fn is_link1_target_plain(t: &str) -> bool {
     t.starts_with("http://")
         || t.starts_with("https://")
         || t.starts_with('/')
@@ -1152,6 +1183,18 @@ pub(crate) fn lex_bracket<'src>(b: &'src [u8], i: usize) -> Option<(usize, Tok<'
         return Some((end, tok));
     }
     // Exact alignment openers (no params, no inner spaces): `[[f<]]`, `[[==]]`…
+    // The non-floating forms are Wikidot's Divalign rule, anchored to `^` —
+    // but Divalign runs AFTER the blockquote rule stripped the `> ` marks, so
+    // a `> [[>]]` line counts as line-start (mid-line `[[=]]` stays literal).
+    let line_start = i == 0 || b[i - 1] == b'\n' || {
+        let mut k = i;
+        let mut saw_gt = false;
+        while k > 0 && matches!(b[k - 1], b'>' | b' ') {
+            saw_gt |= b[k - 1] == b'>';
+            k -= 1;
+        }
+        saw_gt && (k == 0 || b[k - 1] == b'\n')
+    };
     for (form, floating, side) in [
         (&b"f<]]"[..], true, AlignSide::Left),
         (&b"f>]]"[..], true, AlignSide::Right),
@@ -1160,7 +1203,7 @@ pub(crate) fn lex_bracket<'src>(b: &'src [u8], i: usize) -> Option<(usize, Tok<'
         (&b">]]"[..], false, AlignSide::Right),
         (&b"=]]"[..], false, AlignSide::Center),
     ] {
-        if b[j..].starts_with(form) {
+        if b[j..].starts_with(form) && (floating || line_start) {
             return Some((j + form.len(), Tok::Open(OpenTag::Align { floating, side })));
         }
     }
@@ -1485,6 +1528,7 @@ fn lex_image(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
             Some(Align {
                 floating: true,
                 side: AlignSide::Left,
+                paragraph: false,
             }),
             j + 2,
         )
@@ -1493,6 +1537,7 @@ fn lex_image(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
             Some(Align {
                 floating: true,
                 side: AlignSide::Right,
+                paragraph: false,
             }),
             j + 2,
         )
@@ -1508,6 +1553,7 @@ fn lex_image(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
                 Some(Align {
                     floating: false,
                     side,
+                    paragraph: false,
                 }),
                 j + 1,
             ),

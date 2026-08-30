@@ -219,40 +219,56 @@ fn assemble(origin: &str, raws: &HashMap<Key, String>) -> Content {
 fn include_assembly_splices_nested_cone_with_cascading_vars() {
     // root includes b with x=1; b passes its {$x} through to c.
     let raws = raws(vec![
-        (key(None, "b"), "B {$x} [[include c | y={$x}]]"),
+        (key(None, "b"), "B {$x}\n[[include c | y={$x}]]"),
         (key(None, "c"), "C({$y})"),
     ]);
     let out = assemble("[[include b | x=1]]", &raws);
-    assert_eq!(flat(&out), "B 1 C(1)");
+    assert_eq!(flat(&out), "B 1\nC(1)");
 }
 
 #[test]
 fn include_diamond_splices_target_in_both_branches() {
     let raws = raws(vec![
-        (key(None, "b"), "B [[include d]]"),
-        (key(None, "c"), "C [[include d]]"),
+        (key(None, "b"), "B\n[[include d]]"),
+        (key(None, "c"), "C\n[[include d]]"),
         (key(None, "d"), "D"),
     ]);
-    let out = assemble("[[include b]] [[include c]]", &raws);
-    assert_eq!(flat(&out), "B D C D");
+    let out = assemble("[[include b]]\n[[include c]]", &raws);
+    assert_eq!(flat(&out), "B\nD\nC\nD");
 }
 
 #[test]
 fn include_cycle_stops_at_the_back_edge() {
     // b includes c includes b: both splice once, the back-edge stays a
-    // literal directive (the render fallback) and its var values erase to
-    // defaults.
+    // literal directive (render-degraded to text — the cycle leaves the
+    // directive unspliced) and its var values erase to defaults.
     let raws = raws(vec![
-        (key(None, "b"), "B0 [[include c | z=9]]"),
-        (key(None, "c"), "C0 [[include b | z={$z}]]"),
+        (key(None, "b"), "B0\n[[include c | z=9]]"),
+        (key(None, "c"), "C0\n[[include b | z={$z}]]"),
     ]);
     let out = assemble("[[include b | z=7]]", &raws);
-    assert_eq!(flat(&out), "B0 C0 ");
-    let back_edge = out.iter().find_map(|n| match n {
-        Node::Include(Include { source, .. }) if source.path == ["b".to_string()] => Some(source),
-        _ => None,
+    assert_eq!(flat(&out), "B0\nC0\n");
+    let back_edge = out.iter().any(|n| match n {
+        Node::Raw(s) => s.contains("[[include b | z=9]]"),
+        Node::Include(Include { source, .. }) if source.path == ["b".to_string()] => true,
+        _ => false,
     });
-    assert!(back_edge.is_some(), "no literal back-edge: {:#?}", out);
+    assert!(back_edge, "no literal back-edge: {:#?}", out);
+}
+
+#[test]
+fn include_off_line_start_stays_unspliced() {
+    // Wikidot's include rule is `^`-anchored: a directive with anything
+    // before it on the line (a quote prefix, an attribute value) never
+    // splices — documented samples stay literal markup.
+    let raws = raws(vec![(key(None, "b"), "B")]);
+    let out = assemble("> [[include b]]\n[[div]]prepend=\"[[include b]]\"", &raws);
+    assert!(!flat(&out).contains('B'), "spliced: {:#?}", out);
+    assert!(
+        format!("{out:?}").contains("[[include b]]"),
+        "directive not literal: {:#?}",
+        out
+    );
 }
 
 #[test]
@@ -309,10 +325,10 @@ fn directive_past_unclosed_code_block_stays_live() {
     // An unclosed [[code]] degrades to raw text with the rest parsing
     // normally, so an include after one still splices.
     let raws = raws(vec![(key(None, "b"), "B")]);
-    let out = assemble("[[code]]\ntail [[include b]]", &raws);
+    let out = assemble("[[code]]\ntail\n[[include b]]", &raws);
     // The unclosed opener itself renders as raw markup (invisible to the
     // text projection), the tail and the splice parse normally.
-    assert_eq!(flat(&out), "\ntail B");
+    assert_eq!(flat(&out), "\ntail\nB");
 }
 
 #[test]
@@ -460,6 +476,7 @@ fn external_refs_are_collected_and_content_addressed() {
             target: LinkTarget::Url(hot.into()),
             text: vec![],
             class: None,
+            new_tab: false,
         },
         Node::Stylesheet(css.into()),
     ];
@@ -688,6 +705,7 @@ fn page_refs_are_collected_and_query_canonicalized() {
             target: page(None, &["index"]),
             text: vec![],
             class: None,
+            new_tab: false,
         },
         // Nested inside a container — the walk reaches it.
         Node::Container {
@@ -700,6 +718,7 @@ fn page_refs_are_collected_and_query_canonicalized() {
                 target: page(Some("database"), &["vika-owl"]),
                 text: vec![],
                 class: None,
+                new_tab: false,
             }],
         },
         // Duplicate: deduplicated.
@@ -707,23 +726,27 @@ fn page_refs_are_collected_and_query_canonicalized() {
             target: page(None, &["index"]),
             text: vec![],
             class: None,
+            new_tab: false,
         },
         // Empty ref and a `/`-bearing name: not slugs, never queried.
         Node::Link {
             target: page(None, &[]),
             text: vec![],
             class: None,
+            new_tab: false,
         },
         Node::Link {
             target: page(None, &["forum/t-1"]),
             text: vec![],
             class: None,
+            new_tab: false,
         },
         // External URL: untouched by this pass.
         Node::Link {
             target: LinkTarget::Url("https://x.example".into()),
             text: vec![],
             class: None,
+            new_tab: false,
         },
     ];
     let mut slugs = Vec::new();
@@ -766,11 +789,13 @@ fn link_substitution_rewrites_hits_and_keeps_misses() {
             target: page(None, "index"),
             text: vec![],
             class: None,
+            new_tab: false,
         },
         Node::Link {
             target: page(None, "missing"),
             text: vec![],
             class: None,
+            new_tab: false,
         },
         // A site-root ref: unclassifiable, never touched (never a red link).
         Node::Link {
@@ -780,6 +805,7 @@ fn link_substitution_rewrites_hits_and_keeps_misses() {
             }),
             text: vec![],
             class: None,
+            new_tab: false,
         },
         Node::Container {
             kind: ContainerKind::Div {
@@ -791,6 +817,7 @@ fn link_substitution_rewrites_hits_and_keeps_misses() {
                 target: page(Some("database"), "vika-owl"),
                 text: vec![],
                 class: None,
+                new_tab: false,
             }],
         },
     ];

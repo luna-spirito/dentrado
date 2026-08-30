@@ -116,7 +116,9 @@ pub(super) fn substitute_links(
                 target,
                 text,
                 class,
+                new_tab,
             } => Node::Link {
+                new_tab,
                 target: match target {
                     LinkTarget::Page(p) => match &link_slug(&p) {
                         // Classified as a page slug and found: canonical.

@@ -105,6 +105,18 @@ enum Keep {
     Table,
 }
 
+/// The tail-trim action for [`Builder::trim_ascii_ws_tail`].
+enum TailTrim {
+    Pop,
+    Cut,
+}
+
+/// PCRE `\s` — the whitespace class Wikidot's footnote rule eats. An NBSP is
+/// deliberately outside it.
+fn ascii_ws(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0B}' | '\u{0C}')
+}
+
 /// The node a closed tag frame builds from its opener and body.
 fn build_tag_node(open: OpenTag, children: Content) -> Node {
     match open {
@@ -137,6 +149,7 @@ fn build_tag_node(open: OpenTag, children: Content) -> Node {
                 target,
                 text: children,
                 class,
+                new_tab: false,
             }
         }
         OpenTag::Footnote => Node::Footnote(children),
@@ -157,7 +170,11 @@ fn build_tag_node(open: OpenTag, children: Content) -> Node {
             }
         }
         OpenTag::Align { floating, side } => Node::Container {
-            kind: ContainerKind::Align(Align { floating, side }),
+            kind: ContainerKind::Align(Align {
+                floating,
+                side,
+                paragraph: false,
+            }),
             content: children,
         },
         OpenTag::Cell { header, params } => Node::BlockCell(BlockCell {
@@ -356,6 +373,7 @@ impl<'src> Builder<'src, '_> {
                     Some(Tok::CellAlign(side)) => Some(Align {
                         floating: false,
                         side: *side,
+                        paragraph: false,
                     }),
                     _ => None,
                 };
@@ -404,6 +422,13 @@ impl<'src> Builder<'src, '_> {
 
     fn open_frame(&mut self, i: usize) {
         let kind = self.kind_of(i);
+        // Wikidot's footnote rule matches `\s*\[\[footnote\]\]` — the whole
+        // whitespace run before the opener is part of the match, so the
+        // `<sup class="footnoteref">` glues straight onto the text (or even
+        // across the newline of the line above).
+        if matches!(&kind, FrameKind::Tag(OpenTag::Footnote)) {
+            self.trim_ascii_ws_tail();
+        }
         let close = self.event_close(i);
         // The stack invariant: a block opener splits the inline frames
         // above it — sealed halves land here, fresh halves re-open inside.
@@ -437,6 +462,41 @@ impl<'src> Builder<'src, '_> {
         for r in restarts {
             self.frames.push(r);
         }
+    }
+
+    /// Pop whitespace-only text nodes off the sink's tail and right-trim a
+    /// partially-whitespace one. PCRE `\s` is ASCII — an NBSP stays.
+    fn trim_ascii_ws_tail(&mut self) {
+        loop {
+            let action = match self.sink().last() {
+                Some(Node::Text(TextObj::Plain(s))) if s.ends_with(ascii_ws) => {
+                    if s.chars().all(ascii_ws) {
+                        TailTrim::Pop
+                    } else {
+                        TailTrim::Cut
+                    }
+                }
+                _ => break,
+            };
+            match action {
+                TailTrim::Pop => {
+                    self.sink().pop();
+                }
+                TailTrim::Cut => {
+                    if let Some(Node::Text(TextObj::Plain(s))) = self.sink().last_mut() {
+                        *s = s.trim_end_matches(ascii_ws).to_string();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Wikidot's `^` anchor: the token must sit at the very start of its
+    /// line (byte 0 or right after a newline) to count as the construct.
+    fn at_line_start(&self, i: usize) -> bool {
+        let start = self.toks[i].start;
+        start == 0 || self.src.as_bytes()[start - 1] == b'\n'
     }
 
     /// Close the due frame at `j` plus everything above it: each frame
@@ -644,6 +704,7 @@ impl<'src> Builder<'src, '_> {
                 kind: ContainerKind::Align(Align {
                     floating: false,
                     side: AlignSide::Center,
+                    paragraph: true,
                 }),
                 content,
             }],
@@ -769,11 +830,15 @@ impl<'src> Builder<'src, '_> {
                 kind: ContainerKind::Tt,
                 content: parse_sub(body),
             }],
-            Tok::Escape(body) => vec![txt(body)],
+            // Wikidot's raw rule: the body is served html-escaped in a
+            // pre-wrap span; even `@@@@` stays in the tree so the newlines
+            // around it keep their soft-break context.
+            Tok::Escape(body) => vec![Node::NoParse(body.to_string())],
             Tok::Url(u) => vec![Node::Link {
                 target: LinkTarget::Url(u.to_string()),
                 text: vec![txt(u)],
                 class: None,
+                new_tab: false,
             }],
             Tok::AnchorTarget(name) => vec![Node::AnchorTarget(name.to_string())],
             Tok::IfExpr { cond, then, els } => vec![Node::IfExpr {
@@ -790,7 +855,8 @@ impl<'src> Builder<'src, '_> {
                 default: default.map(parse_sub),
             })],
             Tok::Link3 { target, text } => {
-                let objs = text_objs_of(target.trim());
+                let (target, new_tab) = new_tab_mark(target.trim());
+                let objs = text_objs_of(target);
                 vec![Node::Link {
                     target: parse_link_target_objs(&objs),
                     text: match text {
@@ -798,10 +864,12 @@ impl<'src> Builder<'src, '_> {
                         None => objs.into_iter().map(Node::Text).collect(),
                     },
                     class: None,
+                    new_tab,
                 }]
             }
             Tok::Link1 { target, text } => {
-                let objs = text_objs_of(target.trim());
+                let (target, new_tab) = new_tab_mark(target.trim());
+                let objs = text_objs_of(target);
                 vec![Node::Link {
                     target: parse_link_target_objs(&objs),
                     text: match text {
@@ -809,6 +877,7 @@ impl<'src> Builder<'src, '_> {
                         None => objs.into_iter().map(Node::Text).collect(),
                     },
                     class: None,
+                    new_tab,
                 }]
             }
             Tok::Open(tag) => self.open_leaf(tag, i),
@@ -854,6 +923,14 @@ impl<'src> Builder<'src, '_> {
     }
 
     fn open_leaf(&mut self, tag: &OpenTag<'src>, i: usize) -> Content {
+        // Include and the single-tag Module are Wikidot's line-anchored
+        // rules (`^\[\[include …`): mid-line occurrences stay literal text.
+        // The lexer still tokenizes them so the include-splicing pipeline
+        // finds them; only the render degrades.
+        if matches!(tag, OpenTag::Include { .. } | OpenTag::Module { .. }) && !self.at_line_start(i)
+        {
+            return vec![Node::Raw(self.raw_of(i))];
+        }
         match tag {
             OpenTag::User { avatar, name } => vec![Node::User {
                 name: name.to_string(),
@@ -1191,6 +1268,7 @@ mod tests {
         c.align = Some(Align {
             floating: false,
             side: AlignSide::Center,
+            paragraph: false,
         });
         assert_eq!(parse("||~= H ||"), vec![Node::Table(vec![vec![c]])]);
     }

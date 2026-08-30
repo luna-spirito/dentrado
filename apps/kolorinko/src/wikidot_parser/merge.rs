@@ -268,6 +268,7 @@ fn build_tag_node(open: OpenTag, children: Content) -> Node {
                 target,
                 text: children,
                 class,
+                new_tab: false,
             }
         }
         OpenTag::Footnote => Node::Footnote(children),
@@ -288,7 +289,11 @@ fn build_tag_node(open: OpenTag, children: Content) -> Node {
             }
         }
         OpenTag::Align { floating, side } => Node::Container {
-            kind: ContainerKind::Align(Align { floating, side }),
+            kind: ContainerKind::Align(Align {
+                floating,
+                side,
+                paragraph: false,
+            }),
             content: children,
         },
         OpenTag::Cell { header, params } => Node::BlockCell(BlockCell {
@@ -801,6 +806,7 @@ impl<'src> Merger<'src> {
                 target: LinkTarget::Url(u.to_string()),
                 text: vec![self.text_node(u)],
                 class: None,
+                new_tab: false,
             }],
             None,
         )
@@ -903,6 +909,7 @@ impl<'src> Merger<'src> {
                 kind: ContainerKind::Align(Align {
                     floating: false,
                     side: AlignSide::Center,
+                    paragraph: true,
                 }),
                 content,
             }],
@@ -932,6 +939,7 @@ impl<'src> Merger<'src> {
                     None => objs.into_iter().map(Node::Text).collect(),
                 },
                 class: None,
+                new_tab: false,
             }],
             None,
         )
@@ -951,6 +959,7 @@ impl<'src> Merger<'src> {
                     None => objs.into_iter().map(Node::Text).collect(),
                 },
                 class: None,
+                new_tab: false,
             }],
             None,
         )
@@ -1120,6 +1129,7 @@ impl<'src> Merger<'src> {
                     Some(Align {
                         floating: false,
                         side,
+                        paragraph: false,
                     })
                 } else {
                     None

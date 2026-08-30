@@ -118,6 +118,16 @@ fn render_block_content(ctx: &RenderCtx, content: &Content) -> Vec<AnyView> {
                     ParaToken::Break => flush(&mut para, &mut out),
                 }
             }
+        } else if let Node::NoParse(s) = node {
+            // An empty no-parse span renders nothing, but Wikidot's raw-rule
+            // placeholder still occupies the line: in an otherwise empty gap
+            // between blocks it surfaces as a bare `<br />` (the `@@@@`
+            // spacer line).
+            para.push(if s.is_empty() {
+                Piece::Spacer
+            } else {
+                Piece::Node(render_node(ctx, node))
+            });
         } else if let Node::Container {
             kind:
                 ContainerKind::Div {
@@ -209,46 +219,87 @@ fn para_tokens(s: &str) -> Vec<ParaToken> {
 enum Piece {
     Text(String),
     Node(AnyView),
+    /// An empty `@@…@@` no-parse span — Wikidot's opaque raw placeholder.
+    Spacer,
 }
 
 /// Assemble a paragraph: trim whitespace off the paragraph's outer edges,
 /// dropping text pieces left empty and moving inward past them — Wikidot's
 /// `<p>`s never open or close with a `<br>` or stray spaces, however many
 /// text nodes sit at the rim. Trimming stops at the first surviving piece
-/// (text with content, or any pre-rendered inline node). Text between two
-/// inline nodes is a mid-paragraph seam and survives verbatim, single
-/// newlines and all. An all-whitespace paragraph yields no views (no `<p>`).
-fn para_views(para: &mut Vec<Piece>) -> Vec<AnyView> {
-    while let Some(Piece::Text(s)) = para.first_mut() {
-        *s = s.trim_start().to_string();
-        if s.is_empty() {
-            para.remove(0);
-        } else {
-            break;
+/// (text with content, or any pre-rendered inline node). An all-whitespace
+/// paragraph yields no views (no `<p>`).
+///
+/// When the paragraph carries real text (`shield`), trimming also stops at a
+/// spacer: Wikidot's raw-rule placeholder is opaque to its newline rule, so
+/// the single newlines around a `@@@@` are soft breaks, not rim whitespace.
+fn para_views(para: &mut Vec<Piece>, shield: bool) -> Vec<AnyView> {
+    let spacer = |p: Option<&Piece>| p.is_some_and(|p| matches!(p, Piece::Spacer));
+    let mut lo = 0usize;
+    let mut hi = para.len();
+    while lo < hi {
+        let shielded = shield && spacer(para.get(lo + 1));
+        match &mut para[lo] {
+            Piece::Text(s) if !shielded => {
+                let trimmed = s.trim_start().to_string();
+                if trimmed.is_empty() {
+                    lo += 1;
+                } else {
+                    *s = trimmed;
+                    break;
+                }
+            }
+            _ => break,
         }
     }
-    while let Some(Piece::Text(s)) = para.last_mut() {
-        *s = s.trim_end().to_string();
-        if s.is_empty() {
-            para.pop();
-        } else {
-            break;
+    while hi > lo {
+        let shielded = shield && hi >= 2 && spacer(para.get(hi - 2));
+        match &mut para[hi - 1] {
+            Piece::Text(s) if !shielded => {
+                let trimmed = s.trim_end().to_string();
+                if trimmed.is_empty() {
+                    hi -= 1;
+                } else {
+                    *s = trimmed;
+                    break;
+                }
+            }
+            _ => break,
         }
     }
+    para.drain(..lo);
+    para.truncate(hi - lo);
     std::mem::take(para)
         .into_iter()
         .filter_map(|piece| match piece {
             Piece::Text(s) if s.is_empty() => None,
             Piece::Text(s) => Some(render_plain(&s)),
             Piece::Node(view) => Some(view),
+            Piece::Spacer => None,
         })
         .collect()
 }
 
 fn flush(para: &mut Vec<Piece>, out: &mut Vec<AnyView>) {
-    let views = para_views(para);
+    // Spacers count only in a text-less paragraph: a `@@@@` line between two
+    // blocks is Wikidot's skipped-wrapped block whose single newlines became
+    // `<br />` tokens — one bare `<br />` per spacer line. With real content
+    // around, the placeholder renders as nothing (the surrounding newlines
+    // already became the soft breaks).
+    let spacers = para.iter().filter(|p| matches!(p, Piece::Spacer)).count();
+    let had_text = para.iter().any(|p| matches!(p, Piece::Text(_)));
+    // Real (non-whitespace) text shields spacer-adjacent newlines from the
+    // rim trim — they are soft breaks, not paragraph-edge whitespace.
+    let has_text = para
+        .iter()
+        .any(|p| matches!(p, Piece::Text(s) if !s.chars().all(char::is_whitespace)));
+    let views = para_views(para, has_text);
     if !views.is_empty() {
         out.push(view! { <p>{views}</p> }.into_any());
+    } else if had_text {
+        for _ in 0..spacers {
+            out.push(view! { <br /> }.into_any());
+        }
     }
 }
 
@@ -344,7 +395,7 @@ fn render_block_div_(ctx: &RenderCtx, content: &Content) -> Vec<AnyView> {
         Inline(Vec<AnyView>),
     }
     let flush = |para: &mut Vec<Piece>, units: &mut Vec<Unit>| {
-        let views = para_views(para);
+        let views = para_views(para, false);
         if !views.is_empty() {
             units.push(Unit::Inline(views));
         }
@@ -419,6 +470,11 @@ fn render_node(ctx: &RenderCtx, node: &Node) -> AnyView {
     match node {
         Node::Text(t) => render_text_obj(t),
         Node::Raw(s) => view! { <span style="white-space: pre-wrap">{s.clone()}</span> }.into_any(),
+        // `@@…@@`: the body served verbatim (html-escaped by the view) inside
+        // Wikidot's pre-wrap span.
+        Node::NoParse(s) => {
+            view! { <span style="white-space: pre-wrap">{s.clone()}</span> }.into_any()
+        }
         Node::Container { kind, content } => render_container(ctx, kind, content),
         Node::Heading {
             level,
@@ -444,7 +500,8 @@ fn render_node(ctx: &RenderCtx, node: &Node) -> AnyView {
             target,
             text,
             class,
-        } => render_link(ctx, target, text, class.as_deref()),
+            new_tab,
+        } => render_link(ctx, target, text, class.as_deref(), *new_tab),
         Node::SupSubscript { sup, sub } => view! {
             <>
                 {(!sup.is_empty()).then(|| view! { <sup>{render_inline(ctx, sup)}</sup> })}
@@ -590,17 +647,29 @@ fn render_container(ctx: &RenderCtx, kind: &ContainerKind, content: &Content) ->
             </span>
         }
         .into_any(),
-        ContainerKind::Align(Align { side, .. }) => {
+        ContainerKind::Align(Align {
+            side, paragraph, ..
+        }) => {
             let align = match side {
                 AlignSide::Left => "left",
                 AlignSide::Center => "center",
                 AlignSide::Right => "right",
                 AlignSide::Justify => "justify",
             };
-            view! {
-                <div style=format!("text-align: {align}")>{render_block_content(ctx, content)}</div>
+            let style = format!("text-align: {align}");
+            if *paragraph {
+                // The one-line `= text` form: Wikidot's Center rule renders a
+                // paragraph, not a div. An empty one stays empty on the live
+                // site (tidy drops it), so skip it.
+                let inner = render_inline(ctx, content);
+                if trim_ws(content).is_empty() {
+                    empty_view()
+                } else {
+                    view! { <p style=style>{inner}</p> }.into_any()
+                }
+            } else {
+                view! { <div style=style>{render_block_content(ctx, content)}</div> }.into_any()
             }
-            .into_any()
         }
         ContainerKind::Quote => {
             view! { <blockquote>{render_block_content(ctx, content)}</blockquote> }.into_any()
@@ -666,6 +735,7 @@ pub fn wrap_topbar_lists(content: &mut Content) {
                             target: LinkTarget::Url("javascript:;".to_string()),
                             text,
                             class: None,
+                            new_tab: false,
                         }];
                     }
                 }
@@ -750,11 +820,22 @@ fn collect_grid_cells(content: &Content) -> Vec<&BlockCell> {
 
 fn render_grid_cell(ctx: &RenderCtx, cell: &BlockCell) -> AnyView {
     let (class, style) = params_to_class_style(&cell.params);
+    // `colspan` / `rowspan` are HTML attributes, not style declarations
+    // (`<td class="hcell" colspan="3">` on the live site).
+    let span = |key: &str| {
+        cell.params
+            .get(key)
+            .map(|v| text_objs_to_string(v))
+            .filter(|s| !s.is_empty())
+    };
+    let (colspan, rowspan) = (span("colspan"), span("rowspan"));
     let inner = render_inline(ctx, trim_ws(&cell.content));
     if cell.header {
-        view! { <th class=class style=style>{inner}</th> }.into_any()
+        view! { <th class=class style=style colspan=colspan rowspan=rowspan>{inner}</th> }
+            .into_any()
     } else {
-        view! { <td class=class style=style>{inner}</td> }.into_any()
+        view! { <td class=class style=style colspan=colspan rowspan=rowspan>{inner}</td> }
+            .into_any()
     }
 }
 
@@ -824,6 +905,7 @@ fn render_link(
     target: &LinkTarget,
     text: &Content,
     class: Option<&str>,
+    new_tab: bool,
 ) -> AnyView {
     // Internal hrefs are always built full-weight — then simplified against
     // the scope's default space (a no-op on the server, whose `default` is
@@ -878,8 +960,10 @@ fn render_link(
         _ => class.map(str::to_string),
     };
     match class {
-        Some(c) => view! { <a class=c href=href>{inner}</a> }.into_any(),
-        None => view! { <a href=href>{inner}</a> }.into_any(),
+        Some(c) => {
+            view! { <a class=c href=href target=new_tab.then_some("_blank")>{inner}</a> }.into_any()
+        }
+        None => view! { <a href=href target=new_tab.then_some("_blank")>{inner}</a> }.into_any(),
     }
 }
 
@@ -1177,7 +1261,7 @@ fn params_to_class_style(
         style.pop();
     }
     for (k, v) in params {
-        if matches!(k.as_str(), "class" | "style" | "id") {
+        if matches!(k.as_str(), "class" | "style" | "id" | "colspan" | "rowspan") {
             continue;
         }
         if !style.is_empty() {

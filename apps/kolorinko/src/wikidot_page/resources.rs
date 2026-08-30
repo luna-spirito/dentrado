@@ -122,7 +122,9 @@ pub(super) fn substitute_resources(
                 target,
                 text,
                 class,
+                new_tab,
             } => Node::Link {
+                new_tab,
                 target: match target {
                     LinkTarget::Url(u) => match http_tail(&u, None).and_then(|t| url_for(&t)) {
                         Some(url) => LinkTarget::Url(url),

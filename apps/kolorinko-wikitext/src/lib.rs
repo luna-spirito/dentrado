@@ -103,6 +103,9 @@ pub struct Align {
     /// block.
     pub floating: bool,
     pub side: AlignSide,
+    /// `true` for the one-line `= text` form, which Wikidot renders as a
+    /// `<p style="text-align: …">` — the `[[=]]` tag form renders `<div>`.
+    pub paragraph: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -228,6 +231,13 @@ pub enum Node {
     /// nothing is silently dropped.
     Raw(String),
 
+    /// `@@…@@` no-parse span: its body is served verbatim (Wikidot renders it
+    /// html-escaped inside a `white-space: pre-wrap` span). Even an empty body
+    /// stays in the tree — Wikidot's raw-rule placeholder is opaque to its
+    /// newline rule, so `@@@@` between two lines keeps both soft breaks alive
+    /// instead of fusing them into a paragraph break.
+    NoParse(String),
+
     /// A run of text, possibly with variable references.
     Text(TextObj),
 
@@ -291,6 +301,8 @@ pub enum Node {
         target: LinkTarget,
         text: Content,
         class: Option<String>,
+        /// `[*target …]` / `[[[*target|…]]]` — open in a new tab.
+        new_tab: bool,
     },
 
     /// `[[include source vars…]]`. Inlined from the old `subpagx` table

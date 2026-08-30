@@ -64,6 +64,13 @@ impl LiveDirective {
 /// literal; that is exactly the set the parser builds [`Node::Include`]s
 /// from — and so exactly the set Wikidot splices; an include "documented"
 /// inside a code block stays literal.
+///
+/// The splice set is line-anchored like the live rule itself
+/// (`/^\[\[include …\]\]$/ims`): a directive must sit at the very start
+/// of its line or the raw rule never fires and the text stays literal
+/// (quoted samples, attribute values); only the tail stays loose — the
+/// live rule's lazy args run to the next `]]` before a newline, loose
+/// enough that a stray bracket after our balanced close still splices.
 pub(super) fn live_directives(text: &str) -> Vec<LiveDirective> {
     let b = text.as_bytes();
     // (start, key, verbatim) open module/comment/code regions; module
@@ -145,7 +152,7 @@ pub(super) fn live_directives(text: &str) -> Vec<LiveDirective> {
                     && let Some((end, tok)) = lex_bracket(b, i)
                 {
                     match &tok {
-                        Tok::Open(OpenTag::Include { raw }) => {
+                        Tok::Open(OpenTag::Include { raw }) if i == 0 || b[i - 1] == b'\n' => {
                             let (source, vars) = split_include_args(raw);
                             directives.push(LiveDirective {
                                 span: i..end,
