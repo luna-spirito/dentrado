@@ -204,6 +204,79 @@ pub struct CaRef {
     pub ext: String,
 }
 
+/// A git object id as raw bytes — the body-store key of [`RepoSnapshot`].
+/// Keeps this crate git-free (it must build for wasm) while the snapshot
+/// stays content-addressed: a changed body is a new id, so nothing is ever
+/// invalidated, only added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct BlobId(pub [u8; 20]);
+
+impl BlobId {
+    /// From a `git2::Oid`'s raw bytes (the server-side boundary conversion).
+    pub const fn from_bytes(bytes: [u8; 20]) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw bytes (for a `git2::Oid::from_bytes` round-trip).
+    pub const fn bytes(&self) -> [u8; 20] {
+        self.0
+    }
+}
+
+/// The whole-corpus snapshot the git worker builds and every consumer core
+/// reads: each site's metadata and `files/` index, plus **every latest page
+/// body materialised exactly once** (`Arc<str>`: frontmatter stripped,
+/// NBSP-normalised) — RAM is the cheaper currency, and the lazy per-visit
+/// odb reads this replaced measured as roughly half the CPU of a
+/// full-corpus render. Persistent [`imbl::HashMap`]s throughout, so cloning
+/// (the `repo` → `repo_snap` bridge, and once per page resolution) is O(1)
+/// and an update is non-destructive. `Send + Sync`: no repository handle,
+/// no `Rc` — it crosses the worker→core channel once, then crosses cores by
+/// reference. The serde impls exist only because the gear-output enums
+/// derive them; an internal snapshot is never serialized in practice
+/// (never exposed, never pushed).
+#[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RepoSnapshot {
+    /// The mirrored sites, nested by slug family.
+    pub sites: imbl::HashMap<SafePathComponent, WDWebsite>,
+    /// Materialised latest bodies by content-addressed blob id.
+    pub bodies: imbl::HashMap<BlobId, std::sync::Arc<str>>,
+}
+
+/// One mirrored site: its pages nested by category; the site chrome from
+/// `<site>/shell` (title, subtitle, and the theme-root path into `files/`);
+/// and the content-addressed `files/` index — each mirrored attachment's
+/// `<host>/<path>` tail (percent-decoded) mapped to its [`CaRef`].
+#[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct WDWebsite {
+    pub articles:
+        imbl::HashMap<Option<SafePathComponent>, imbl::HashMap<SafePathComponent, Article>>,
+    /// Wikidot numeric page id → the page's current slug. Page ids are stable
+    /// across renames (the slug is not), so this index stays authoritative
+    /// while `articles` re-keys — the incremental update maintains both.
+    pub by_page_id: imbl::HashMap<u64, Slug>,
+    pub title: Option<String>,
+    pub subtitle: Option<String>,
+    /// The theme stylesheet's `<host>/<path>` tail (`files/` prefix stripped);
+    /// resolved against [`WDWebsite::files`] to a CA URL by the `shell` gear.
+    pub theme_root: Option<RepoAssetPath>,
+    pub files: imbl::HashMap<RepoAssetPath, CaRef>,
+}
+
+/// One page: metadata, the full revision-history summary, and the
+/// content-addressed ids of the latest body and **every** revision body.
+/// The latest body's text lives materialised once in the owning
+/// [`RepoSnapshot`]; the per-revision ids stay cheap identity for a
+/// revision-serving gear to page in later.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Article {
+    pub meta: kolorinko_wikitext::ArticleMeta,
+    pub latest_body: BlobId,
+    pub revisions: Vec<kolorinko_wikitext::RevMeta>,
+    /// Every revision body's blob id.
+    pub bodies: imbl::HashMap<u64, BlobId>,
+}
+
 /// One `[[code]]` block served through Wikidot's `/code/N` endpoint shape —
 /// the legacy slug family's `/<cat:><name>/code/<N>` tail (on the space-\
 ///segmented main origin or a wiki's own domain). The opener's
@@ -415,10 +488,8 @@ impl SsrState {
 /// in `Subscribe`, and the server pushes only when the output's hash differs.
 #[dentrado_macros::gears_schema(file = "gears.def.rs")]
 pub mod wire {
-    use crate::{
-        Body, CaRef, CodeBlock, ListPagesResult, LocalId, PageQueryResult, SiteShell, SpaceId,
-    };
-    use kolorinko_wikitext::{ArticleLatest, ArticleView};
+    use crate::{Body, CodeBlock, LocalId, RepoSnapshot, SiteShell, SpaceId};
+    use kolorinko_wikitext::ArticleView;
 
     /// Client → server: subscribe to a gear. This is the stream's only
     /// client→server message. `hash` is the SHA-256 of the wire `GearOut` JSON
@@ -476,13 +547,7 @@ mod tests {
         // a `GearOut` variant that a push bridge must drop).
         let internal = r#"{\"RepoLListPages\":{\"site\":\"x\",\"query\":{}}}"#;
         assert!(serde_json::from_str::<wire::GearId>(internal).is_err());
-        assert!(
-            !GearOut::RepoLListPagesOut(ListPagesResult {
-                pages: vec![],
-                total: 0
-            })
-            .is_exposed()
-        );
+        assert!(!GearOut::RepoSnapOut(RepoSnapshot::default()).is_exposed());
         assert!(GearOut::ShellOut(SiteShell::default()).is_exposed());
     }
 }

@@ -95,20 +95,23 @@ fn build_and_materialise_from_odb() {
     );
     let tip = commit(&repo, "c1", &[]);
 
-    let (sites, index) = build_from_tree(&repo, tip, &dir);
+    let mut bodies = ImHashMap::new();
+    let (sites, index) = build_from_tree(&repo, tip, &dir, &mut bodies);
 
-    // Two pages indexed; bodies stay as Oids until read on demand.
+    // Two pages indexed, both latest bodies materialised into the snapshot's
+    // store (frontmatter stripped).
     assert_eq!(index.len(), 2);
+    assert_eq!(bodies.len(), 2);
     let foo = find_article(&sites, &site("scp"), &root_slug("foo")).unwrap();
     assert_eq!(
-        read_body(&repo, foo.latest_body),
+        read_body(&repo, oid(foo.latest_body)),
         Some("Foo body".to_string())
     );
     assert_eq!(foo.meta.slug, "foo");
     assert_eq!(foo.meta.page_id, "1305054470");
     let bar = find_article(&sites, &site("scp"), &root_slug("bar")).unwrap();
     assert_eq!(
-        read_body(&repo, bar.latest_body),
+        read_body(&repo, oid(bar.latest_body)),
         Some("Bar body".to_string())
     );
 }
@@ -142,10 +145,10 @@ fn incremental_patch_on_tip_move() {
     );
     let tip1 = commit(&repo, "c1", &[]);
 
-    let (sites, mut index) = build_from_tree(&repo, tip1, &dir);
+    let (sites, mut index) = build_from_tree(&repo, tip1, &dir, &mut ImHashMap::new());
     let foo = find_article(&sites, &site("scp"), &root_slug("foo")).unwrap();
     assert_eq!(
-        read_body(&repo, foo.latest_body),
+        read_body(&repo, oid(foo.latest_body)),
         Some("Foo v1".to_string())
     );
 
@@ -168,17 +171,25 @@ fn incremental_patch_on_tip_move() {
         .find_commit(tip2)
         .and_then(|c| repo.find_tree(c.tree_id()))
         .unwrap();
-    let next = incremental_update(&repo, &tree2, &dir, &sites, &mut index, affected);
+    let next = incremental_update(
+        &repo,
+        &tree2,
+        &dir,
+        &sites,
+        &mut index,
+        affected,
+        &mut ImHashMap::new(),
+    );
 
     // `bar` is structurally shared from the old snapshot; `foo` re-read.
     let foo = find_article(&next, &site("scp"), &root_slug("foo")).unwrap();
     assert_eq!(
-        read_body(&repo, foo.latest_body),
+        read_body(&repo, oid(foo.latest_body)),
         Some("Foo v2".to_string())
     );
     let bar = find_article(&next, &site("scp"), &root_slug("bar")).unwrap();
     assert_eq!(
-        read_body(&repo, bar.latest_body),
+        read_body(&repo, oid(bar.latest_body)),
         Some("Bar v1".to_string())
     );
 }
@@ -191,22 +202,28 @@ fn key(cat: Option<&str>, name: &str) -> Key {
     )
 }
 
+/// Snapshot body-store key → git2 oid (tests read bodies back through the
+/// tree walker).
+fn oid(b: BlobId) -> Oid {
+    Oid::from_bytes(&b.bytes()).unwrap()
+}
+
 fn flat(content: &Content) -> String {
     let mut s = String::new();
     collect_plain(content, &mut s);
     s
 }
 
-fn raws(pairs: Vec<(Key, &str)>) -> HashMap<Key, String> {
+fn raws(pairs: Vec<(Key, &str)>) -> HashMap<Key, Arc<str>> {
     pairs
         .into_iter()
-        .map(|(k, body)| (k, body.to_string()))
+        .map(|(k, body)| (k, Arc::from(body)))
         .collect()
 }
 
 /// One origin body textually assembled (vars substituted, includes spliced)
 /// and parsed — the `article_latest` include half, minus the fetching.
-fn assemble(origin: &str, raws: &HashMap<Key, String>) -> Content {
+fn assemble(origin: &str, raws: &HashMap<Key, Arc<str>>) -> Content {
     parse(&splice_includes(
         &subst_vars(origin, &[]),
         &site("scp"),
@@ -578,7 +595,7 @@ fn real_repo_indexes_sharded_files_and_shell() {
     }
     let repo = Repository::open(&root).expect("open repo");
     let tip = repo.head().unwrap().peel_to_commit().unwrap().id();
-    let (sites, _index) = super::build_from_tree(&repo, tip, &root);
+    let (sites, _index) = super::build_from_tree(&repo, tip, &root, &mut ImHashMap::new());
     let w = sites.get(&site("rpcauthority")).expect("site indexed");
     // The shell manifest round-trips.
     assert_eq!(w.title.as_deref(), Some("RPC Authority"));

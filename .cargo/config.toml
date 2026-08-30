@@ -6,3 +6,13 @@
 # Target-scoped, so it is a no-op for the workspace's native builds.
 [target.wasm32-unknown-unknown]
 rustflags = ["--cfg=web_sys_unstable_apis"]
+
+# NixOS's cc wrapper injects `-D_FORTIFY_SOURCE` into *every* compilation —
+# including `-O0` debug builds, where glibc downgrades it to a `#warning`.
+# jemalloc's `configure` probes run with `-Werror`, so the whole probe battery
+# fails in debug profile (`cannot determine return type of strerror_r` and
+# friends) and `cargo test` can't build `tikv-jemalloc-sys`. Fortify is a
+# no-op without optimization anyway, so drop it from the wrapper's hardening
+# set and keep the rest.
+[env]
+NIX_HARDENING_ENABLE = { value = "stackprotector pic strictoverflow format relro bindnow", force = true }

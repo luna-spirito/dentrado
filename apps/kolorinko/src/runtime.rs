@@ -1,15 +1,11 @@
 use std::rc::Rc;
 
 use crate::wikidot_page::{
-    AssetCache, CodeBlockCache, LatestCache, ParsedCache, RepoCache, RepoData, RepoLArticleCache,
-    RepoLListPagesCache, RepoLLocalIdCache, RepoLQueryPagesCache, RepoResourceCache, ShellCache,
+    AssetCache, CodeBlockCache, LatestCache, ParsedCache, RepoCache, RepoSnapCache, ShellCache,
 };
 use dentrado::core::{core_ctx::GearCtx, storage::Storage};
-use kolorinko_rt::{
-    Body, CaRef, CodeBlock, ListPagesQuery, ListPagesResult, LocalId, PageQuery, PageQueryResult,
-    RepoAssetPath, SafePathComponent, SiteShell, SpaceId,
-};
-use kolorinko_wikitext::{ArticleLatest, ArticleView};
+use kolorinko_rt::{Body, CodeBlock, LocalId, RepoSnapshot, SafePathComponent, SiteShell, SpaceId};
+use kolorinko_wikitext::ArticleView;
 
 /// The Kolorinko runtime.
 ///
@@ -43,7 +39,4 @@ mod gears {
 // `From`, which a client-supplied wire id crosses at the subscription
 // boundary. `GearOutShared` (an alias of `kolorinko_rt::wire::GearOut`) and
 // the builders are re-exported for the server's dispatch/stale-read code.
-pub(crate) use gears::{
-    GearOutShared, article_latest, asset, code_block, repo_l_article_latest, repo_l_list_pages,
-    repo_l_local_id, repo_l_query_pages, repo_resource, shell,
-};
+pub(crate) use gears::{GearOutShared, article_latest, asset, code_block, repo_snap, shell};

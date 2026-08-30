@@ -1,82 +1,6 @@
 use super::*;
 
 // =========================================================================
-// `repo_resource` gear — content-addressed resolution
-// =========================================================================
-
-/// No carry-over state: a [`repo_resource`] run is a pure lookup in the
-/// followed [`RepoData`] snapshot's `files/` index, re-derived whenever the
-/// export tip moves.
-#[derive(Default, Clone, Debug)]
-pub(crate) struct RepoResourceCache;
-
-/// Resolve one `files/<host>/<path>` attachment to its content-addressed
-/// [`CaRef`] by table lookup in [`RepoData`]. The index is built from the
-/// `files/` symlinks (pointing into `_files/<xx>/<yy>/<hash>`) at tree-build
-/// time; `path` is the percent-decoded `<host>/<path>` tail. `None` when the
-/// URL is not mirrored (a hotlink) — the caller then leaves the original URL.
-///
-/// `.wdfiles.com` is Wikidot's file-serving CDN alias for the canonical
-/// `.wikidot.com` host, and a site's configured alias domains are its custom
-/// domains: pages reference either, but the mirror indexes attachments under
-/// the canonical host. So a tail whose host is an alias is retried there
-/// before concluding it is a hotlink.
-pub(crate) fn repo_resource(
-    data: &RepoData,
-    site: &SafePathComponent,
-    path: &RepoAssetPath,
-) -> Option<CaRef> {
-    let files = &data.sites.get(site)?.files;
-    files.get(path).cloned().or_else(|| {
-        crate::globals::space_of(site)
-            .and_then(|space| crate::globals::domains_of(&space))
-            .and_then(|domains| repo_alias(site, domains, path))
-            .and_then(|alt| files.get(&alt).cloned())
-    })
-}
-
-/// The canonical-host form of a [`RepoAssetPath`] whose host is an alias of
-/// `site`: `<sub>.wdfiles.com` (Wikidot's file CDN) rewrites to
-/// `<sub>.wikidot.com`, and any of the site's configured alias domains
-/// (case-insensitively — hosts are) rewrites to `<site>.wikidot.com`.
-/// `None` when the host is neither — including another site's alias domain.
-fn repo_alias(
-    site: &SafePathComponent,
-    domains: &[String],
-    path: &RepoAssetPath,
-) -> Option<RepoAssetPath> {
-    let s = path.as_str();
-    let (host, rest) = s.split_once('/')?;
-    let canonical = match host.strip_suffix(".wdfiles.com") {
-        Some(sub) => format!("{sub}.wikidot.com"),
-        None if domains.iter().any(|d| d.eq_ignore_ascii_case(host)) => {
-            format!("{}.wikidot.com", **site)
-        }
-        None => return None,
-    };
-    RepoAssetPath::new(format!("{canonical}/{rest}"))
-}
-
-/// Serialize a [`CaRef`] to its served URL:
-/// `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>`, embedding the sha256
-/// (xx=key[0:2], yy=key[2:4], leaf=full hash) so the URL is self-describing
-/// and collision-free with real `files/<host>/<path>` paths (a 64-hex leaf
-/// never occurs naturally). The extension rides along so the server derives
-/// the MIME without a side table; an empty extension yields a bare `<hash>`
-/// leaf. The on-disk `_files/` layout (sharded rest-leaf) is reconstructed at
-/// read time.
-pub(crate) fn ca_url(site: &SafePathComponent, ca: &CaRef) -> String {
-    let site = &**site;
-    let h = &ca.hash;
-    let ext = if ca.ext.is_empty() {
-        String::new()
-    } else {
-        format!(".{}", ca.ext)
-    };
-    format!("/-/repo/{site}/files/{}/{}/{}{}", &h[..2], &h[2..4], h, ext)
-}
-
-// =========================================================================
 // `asset` gear — content-addressed blob serving
 // =========================================================================
 
@@ -147,21 +71,64 @@ pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
     Some(body)
 }
 
-/// Resolve one `host/path` tail to its [`CaRef`] via the [`repo_resource`] gear
-/// using a **non-tracking** (stale) read — so [`asset`]'s cache key stays the
-/// blob identity alone (see the PURE-FUNCTION note above). `None` when the URL
-/// is not mirrored (a hotlink).
+/// The canonical-host form of a [`RepoAssetPath`] whose host is an alias of
+/// `site`: `<sub>.wdfiles.com` (Wikidot's file CDN) rewrites to
+/// `<sub>.wikidot.com`, and any of the site's configured alias domains
+/// (case-insensitively — hosts are) rewrites to `<site>.wikidot.com`.
+/// `None` when the host is neither — including another site's alias domain.
+/// The retry itself lives in [`RepoSnapshot::resource`].
+pub(super) fn repo_alias(
+    site: &SafePathComponent,
+    domains: &[String],
+    path: &RepoAssetPath,
+) -> Option<RepoAssetPath> {
+    let s = path.as_str();
+    let (host, rest) = s.split_once('/')?;
+    let canonical = match host.strip_suffix(".wdfiles.com") {
+        Some(sub) => format!("{sub}.wikidot.com"),
+        None if domains.iter().any(|d| d.eq_ignore_ascii_case(host)) => {
+            format!("{}.wikidot.com", **site)
+        }
+        None => return None,
+    };
+    RepoAssetPath::new(format!("{canonical}/{rest}"))
+}
+
+/// Serialize a [`CaRef`] to its served URL:
+/// `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>`, embedding the sha256
+/// (xx=key[0:2], yy=key[2:4], leaf=full hash) so the URL is self-describing
+/// and collision-free with real `files/<host>/<path>` paths (a 64-hex leaf
+/// never occurs naturally). The extension rides along so the server derives
+/// the MIME without a side table; an empty extension yields a bare `<hash>`
+/// leaf. The on-disk `_files/` layout (sharded rest-leaf) is reconstructed at
+/// read time.
+pub(crate) fn ca_url(site: &SafePathComponent, ca: &CaRef) -> String {
+    let site = &**site;
+    let h = &ca.hash;
+    let ext = if ca.ext.is_empty() {
+        String::new()
+    } else {
+        format!(".{}", ca.ext)
+    };
+    format!("/-/repo/{site}/files/{}/{}/{}{}", &h[..2], &h[2..4], h, ext)
+}
+
+/// Resolve one `host/path` tail to its [`CaRef`] via the [`repo_snap`]
+/// snapshot using a **non-tracking** (stale) read — so [`asset`]'s cache key
+/// stays the blob identity alone (see the PURE-FUNCTION note above). `None`
+/// when the URL is not mirrored (a hotlink).
+///
+/// [`repo_snap`]: crate::runtime::repo_snap
+/// [`asset`]: crate::wikidot_page::asset
 pub(super) async fn get_ca<S: Storage<KolorinkoRT>>(
     site: &SafePathComponent,
     path: RepoAssetPath,
     ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> Option<CaRef> {
-    let id = crate::runtime::repo_resource(site.clone(), path)
-        .id()
-        .clone();
+    let id = crate::runtime::repo_snap().id().clone();
     match ctx.core().read_gear_stale(id).await {
         GearResult::Shared(s) => match &*s {
-            GearOutShared::RepoResourceOut(ca) => ca.clone(),
+            GearOutShared::RepoSnapOut(snap) => resource(snap, site, &path),
             _ => None,
         },
         _ => None,

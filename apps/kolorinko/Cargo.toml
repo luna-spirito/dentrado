@@ -6,6 +6,7 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+tikv-jemallocator = "0.7"
 anyhow = "1.0.102"
 bytes = "1"
 chumsky = "0.13.0"
