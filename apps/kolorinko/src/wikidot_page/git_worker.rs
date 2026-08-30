@@ -11,27 +11,25 @@ pub(super) enum GitReq {
     /// Fetch + rebuild if the tip moved. The reply is `Some` only when the
     /// dataset actually changed; `None` lets the caller keep its cached `Rc`.
     Tick {
-        reply: flume::Sender<Option<RepoData>>,
+        reply: flume::Sender<Option<RepoSnapshot>>,
     },
     /// The current dataset without pulling (cold start / first non-tick run).
-    Snapshot { reply: flume::Sender<RepoData> },
-    /// Read one body blob out of the object database (frontmatter stripped).
-    Blob {
-        oid: Oid,
-        reply: flume::Sender<Option<String>>,
-    },
+    Snapshot { reply: flume::Sender<RepoSnapshot> },
 }
 
-/// Cloneable, `Send` handle to the git worker thread, embedded in [`RepoData`]
-/// so the [`repo_l_article_latest`] lens — co-located on the oracle's core —
-/// can materialise body blobs off-core. Cheap to clone (one `Arc` bump inside
-/// the `flume` sender).
+/// Cloneable, `Send` handle to the git worker thread, held by the [`repo`]
+/// oracle's cache so it can pull and build off-core (libgit2 is synchronous
+/// and `git2::Repository` is `!Send`, so no gear ever touches it directly).
+/// Body text never crosses this channel — it is materialised into the
+/// snapshot itself (see [`RepoSnapshot`]).
+///
+/// [`repo`]: crate::wikidot_page::repo
 #[derive(Clone)]
 pub(crate) struct GitMailbox(flume::Sender<GitReq>);
 
 impl GitMailbox {
     /// Fetch + rebuild if the tip moved; `Some` only when the dataset changed.
-    pub(super) async fn tick(&self) -> Option<RepoData> {
+    pub(super) async fn tick(&self) -> Option<RepoSnapshot> {
         let (tx, rx) = flume::bounded(1);
         if self.0.send_async(GitReq::Tick { reply: tx }).await.is_err() {
             return None;
@@ -40,7 +38,7 @@ impl GitMailbox {
     }
 
     /// Current dataset without pulling.
-    pub(super) async fn snapshot(&self) -> RepoData {
+    pub(super) async fn snapshot(&self) -> RepoSnapshot {
         let (tx, rx) = flume::bounded(1);
         if self
             .0
@@ -48,37 +46,23 @@ impl GitMailbox {
             .await
             .is_err()
         {
-            return RepoData::empty(self.clone());
+            return RepoSnapshot::default();
         }
         rx.recv_async()
             .await
-            .unwrap_or_else(|_| RepoData::empty(self.clone()))
-    }
-
-    /// Read one body blob off the worker thread. `None` if missing/bad UTF-8.
-    pub(super) async fn blob(&self, oid: Oid) -> Option<String> {
-        let (tx, rx) = flume::bounded(1);
-        if self
-            .0
-            .send_async(GitReq::Blob { oid, reply: tx })
-            .await
-            .is_err()
-        {
-            return None;
-        }
-        rx.recv_async().await.unwrap_or(None)
+            .unwrap_or_else(|_| RepoSnapshot::default())
     }
 }
 
-/// The git worker thread's owned state. Everything `!Send` or git-bound lives
-/// here: the [`Repository`] (created *on* this thread and never moved), the
-/// reverse [`Index`], the last tip, and the current sites snapshot. The thread
-/// runs [`GitWorker::run`], servicing [`GitReq`]s until every [`GitMailbox`]
-/// (and thus every [`RepoData`]) is gone. Body blobs are read **uncached** —
-/// git odb lookups are cheap (content-addressed) and run only on the oracle's
-/// timer tick; the expensive work (parsing) is dedup'd downstream by
-/// [`ParsedCache`](crate::wikidot_page::ParsedCache), so a worker-side blob
-/// cache would only duplicate that for no gain.
+/// The git worker thread's owned state. Everything `!Send` or git-bound
+/// lives here: the [`Repository`] (created *on* this thread and never
+/// moved), the reverse [`Index`], the last tip, the current sites map, and
+/// the materialised-body store — the persistent half of every
+/// [`RepoSnapshot`], filled once per body at first sight (content
+/// addressing: a changed body is a new oid) and pruned to the live set as
+/// the tip moves. The thread runs [`GitWorker::run`], servicing
+/// [`GitReq`]s until every [`GitMailbox`] (and thus every snapshot-holding
+/// gear) is gone.
 pub(super) struct GitWorker {
     pub(super) repo: Option<Repository>,
     pub(super) url: &'static str,
@@ -87,6 +71,8 @@ pub(super) struct GitWorker {
     pub(super) last_tip: Option<Oid>,
     pub(super) sites: ImHashMap<SafePathComponent, WDWebsite>,
     pub(super) index: Index,
+    /// Materialised latest bodies by blob id — see [`GitWorker`].
+    pub(super) bodies: ImHashMap<BlobId, Arc<str>>,
 }
 
 impl GitWorker {
@@ -99,6 +85,7 @@ impl GitWorker {
             last_tip: None,
             sites: ImHashMap::new(),
             index: HashMap::new(),
+            bodies: ImHashMap::new(),
         }
     }
 
@@ -114,9 +101,6 @@ impl GitWorker {
                     self.snapshot();
                     let _ = reply.send(self.data());
                 }
-                GitReq::Blob { oid, reply } => {
-                    let _ = reply.send(self.blob(oid));
-                }
             }
         }
     }
@@ -124,14 +108,14 @@ impl GitWorker {
     /// Fetch + rebuild if the tip moved. `Some(data)` when the dataset changed
     /// (the caller adopts a fresh snapshot); `None` when nothing changed (the
     /// caller keeps its prior `Rc`). The first tick always pulls + builds.
-    pub(super) fn tick(&mut self) -> Option<RepoData> {
+    pub(super) fn tick(&mut self) -> Option<RepoSnapshot> {
         self.ensure_repo();
         let repo = self.repo.as_ref()?;
         let outcome = pull_for_diff(repo);
         if self.last_tip.is_none() {
             let tip = current_tip(repo);
             if let Some(t) = tip {
-                let (sites, index) = build_from_tree(repo, t, self.root);
+                let (sites, index) = build_from_tree(repo, t, self.root, &mut self.bodies);
                 self.sites = sites;
                 self.index = index;
             }
@@ -164,18 +148,20 @@ impl GitWorker {
                                 &self.sites,
                                 &mut index,
                                 affected,
+                                &mut self.bodies,
                             );
                             Some((sites, index))
                         }
-                        None => Some(build_from_tree(repo, new_tip, self.root)),
+                        None => Some(build_from_tree(repo, new_tip, self.root, &mut self.bodies)),
                     }
                 }
-                _ => Some(build_from_tree(repo, new_tip, self.root)),
+                _ => Some(build_from_tree(repo, new_tip, self.root, &mut self.bodies)),
             };
         self.last_tip = Some(new_tip);
         if let Some((sites, index)) = rebuilt {
             self.sites = sites;
             self.index = index;
+            retain_latest(&self.sites, &mut self.bodies);
             Some(self.data())
         } else {
             None
@@ -196,7 +182,7 @@ impl GitWorker {
         };
         let tip = current_tip(repo);
         if let Some(t) = tip {
-            let (sites, index) = build_from_tree(repo, t, self.root);
+            let (sites, index) = build_from_tree(repo, t, self.root, &mut self.bodies);
             self.sites = sites;
             self.index = index;
         }
@@ -211,19 +197,12 @@ impl GitWorker {
         }
     }
 
-    /// A fresh [`RepoData`] snapshot (structurally shared `sites` + our mailbox).
-    pub(super) fn data(&self) -> RepoData {
-        RepoData {
+    /// A fresh [`RepoSnapshot`] — O(1) structural clones of both halves.
+    pub(super) fn data(&self) -> RepoSnapshot {
+        RepoSnapshot {
             sites: self.sites.clone(),
-            mailbox: self.mailbox.clone(),
+            bodies: self.bodies.clone(),
         }
-    }
-
-    /// Read body blob `oid` straight from the odb (frontmatter stripped).
-    /// Uncached — see [`GitWorker`]: odb lookups are cheap and infrequent, and
-    /// the parse layer dedup's the expensive work. `None` if missing/bad UTF-8.
-    pub(super) fn blob(&self, oid: Oid) -> Option<String> {
-        read_body(self.repo.as_ref()?, oid)
     }
 }
 

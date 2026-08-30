@@ -1,12 +1,9 @@
+use super::assets_gear::repo_alias;
 use super::*;
 
 // =========================================================================
-// Dataset
+// Dataset projections (the snapshot's data live in `kolorinko_rt`)
 // =========================================================================
-
-/// `(Option<category>, name)` — the per-site page address. `None` category =
-/// a root page (slug has no `:`).
-pub(super) type Slug = (Option<SafePathComponent>, SafePathComponent);
 
 /// `(site, Option<category>, name)` — the full address of a page within the
 /// dataset. Used both as the include-resolution visited key and as the
@@ -17,44 +14,106 @@ pub(super) type Key = (
     SafePathComponent,
 );
 
-/// All sites mirrored out of the repository at one point in time, plus the
-/// [`GitMailbox`] back to the worker thread that owns their source
-/// [`Repository`]. A persistent [`imbl::HashMap`] so cloning the
-/// [`Rc`]`<RepoData>` is O(1) and an update is non-destructive (dependents
-/// holding a prior snapshot see a stable view). `Send`: no `Repository`, no
-/// `Rc` — it crosses the worker→core channel once, then lives behind an `Rc`
-/// on the oracle's core.
-pub(crate) struct RepoData {
-    pub(super) sites: ImHashMap<SafePathComponent, WDWebsite>,
-    pub(super) mailbox: GitMailbox,
+/// One page's latest projection, borrowed straight out of a [`RepoSnapshot`].
+pub(crate) struct PageLatest<'a> {
+    pub(crate) meta: &'a ArticleMeta,
+    pub(crate) revisions: &'a [RevMeta],
+    pub(crate) body: &'a Arc<str>,
 }
 
-impl fmt::Debug for RepoData {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RepoData")
-            .field("sites", &self.sites)
-            .finish_non_exhaustive()
+/// Look up one page by `(site, slug)` — the nested-map core of every other
+/// projection below.
+pub(crate) fn article<'a>(
+    snap: &'a RepoSnapshot,
+    site: &SafePathComponent,
+    slug: &Slug,
+) -> Option<&'a Article> {
+    find_article(&snap.sites, site, slug)
+}
+
+/// Project one page out of the snapshot by canonical address — the body of
+/// the old `repo_l_article_latest` lens, now a local read. `None` when the
+/// space is unregistered, the address names no page, or the body failed to
+/// materialise (the old failed-RPC blank-page convention).
+pub(crate) fn latest<'a>(
+    snap: &'a RepoSnapshot,
+    space: SpaceId,
+    local: LocalId,
+) -> Option<PageLatest<'a>> {
+    let (site, slug) = super::page_slug(snap, space, local)?;
+    let a = article(snap, &site, &slug)?;
+    Some(PageLatest {
+        meta: &a.meta,
+        revisions: &a.revisions,
+        body: snap.bodies.get(&a.latest_body)?,
+    })
+}
+
+/// The slug-family → canonical bridge — the body of the old `repo_l_local_id`
+/// lens: the `(local id, title)` a legacy `(site, slug)` address names (HTTP
+/// slug redirects, the `/code/N` endpoint, the render CLI, and the include
+/// cone).
+pub(crate) fn local_id(
+    snap: &RepoSnapshot,
+    site: &SafePathComponent,
+    slug: &Slug,
+) -> Option<(LocalId, String)> {
+    let a = article(snap, site, slug)?;
+    Some((
+        LocalId::from_page_id(&a.meta.page_id)?,
+        a.meta.title.clone(),
+    ))
+}
+
+/// The batched [`local_id`]: a page's whole (sorted, deduplicated) link set
+/// answered in one pass.
+pub(crate) fn query_pages(
+    snap: &RepoSnapshot,
+    site: &SafePathComponent,
+    query: &PageQuery,
+) -> PageQueryResult {
+    query
+        .0
+        .iter()
+        .map(|slug| local_id(snap, site, slug))
+        .collect()
+}
+
+/// Project one ListPages selection over one site — the body of the old
+/// `repo_l_list_pages` lens. An unknown site yields an empty selection.
+pub(crate) fn list_pages(
+    snap: &RepoSnapshot,
+    site: &SafePathComponent,
+    query: &ListPagesQuery,
+) -> ListPagesResult {
+    match snap.sites.get(site) {
+        Some(w) => select(w, &query.0),
+        None => ListPagesResult {
+            pages: Vec::new(),
+            total: 0,
+        },
     }
 }
 
-impl RepoData {
-    /// An empty snapshot that still carries `mailbox` (used when the worker has
-    /// no repository yet, or has died — body reads then resolve to `None`).
-    pub(super) fn empty(mailbox: GitMailbox) -> Self {
-        Self {
-            sites: ImHashMap::new(),
-            mailbox,
-        }
-    }
-
-    /// Look up one page by `(site, slug)`.
-    #[must_use]
-    pub(super) fn article(&self, site: &SafePathComponent, slug: &Slug) -> Option<&Article> {
-        find_article(&self.sites, site, slug)
-    }
+/// Resolve one `files/<host>/<path>` attachment to its content-addressed
+/// [`CaRef`] — the body of the old `repo_resource` gear, CDN/alias-domain
+/// retry included ([`repo_alias`]). `None` when the URL is not mirrored (a
+/// hotlink).
+pub(crate) fn resource(
+    snap: &RepoSnapshot,
+    site: &SafePathComponent,
+    path: &RepoAssetPath,
+) -> Option<CaRef> {
+    let files = &snap.sites.get(site)?.files;
+    files.get(path).cloned().or_else(|| {
+        crate::globals::space_of(site)
+            .and_then(|space| crate::globals::domains_of(&space))
+            .and_then(|domains| repo_alias(site, domains, path))
+            .and_then(|alt| files.get(&alt).cloned())
+    })
 }
 
-/// The nested-map lookup underlying [`RepoData::article`], factored out so the
+/// The nested-map lookup underlying [`article`], factored out so the
 /// build/incremental tests can resolve a page from a bare sites map.
 pub(super) fn find_article<'a>(
     sites: &'a ImHashMap<SafePathComponent, WDWebsite>,
@@ -64,41 +123,18 @@ pub(super) fn find_article<'a>(
     sites.get(site)?.articles.get(&slug.0)?.get(&slug.1)
 }
 
-/// One mirrored site: its pages nested by category; the site chrome from
-/// `<site>/shell` (title, subtitle, and the theme-root path into `files/`);
-/// and the content-addressed `files/` index — each mirrored attachment's
-/// `<host>/<path>` tail (percent-decoded) mapped to its [`CaRef`] (read from
-/// the `files/` symlink target, which points into the `_files/<xx>/<yy>/<hash>`
-/// blob store). The index resolves in-article URLs ([`repo_resource`]) and the
-/// theme root ([`shell`]); the `by_page_id` index resolves canonical
-/// `/space/local` routes ([`page_addr`](crate::wikidot_page::page_addr)).
-#[derive(Default, Clone, Debug)]
-pub(crate) struct WDWebsite {
-    pub(super) articles:
-        ImHashMap<Option<SafePathComponent>, ImHashMap<SafePathComponent, Article>>,
-    /// Wikidot numeric page id → the page's current slug. Page ids are stable
-    /// across renames (the slug is not), so this index stays authoritative
-    /// while `articles` re-keys — [`incremental_update`] maintains both.
-    pub(super) by_page_id: ImHashMap<u64, Slug>,
-    pub(super) title: Option<String>,
-    pub(super) subtitle: Option<String>,
-    /// The theme stylesheet's `<host>/<path>` tail (`files/` prefix stripped);
-    /// resolved against [`WDWebsite::files`] to a CA URL by the [`shell`] gear.
-    pub(super) theme_root: Option<RepoAssetPath>,
-    pub(super) files: ImHashMap<RepoAssetPath, CaRef>,
-}
-
-/// One page: metadata, the full revision-history summary, and blob Oids for the
-/// latest body and **every** revision body. Bodies are never materialised here
-/// — they live in the git object database, paged in lazily via
-/// [`GitMailbox::blob`].
-#[derive(Clone, Debug)]
-pub(crate) struct Article {
-    pub(super) meta: ArticleMeta,
-    pub(super) latest_body: Oid,
-    pub(super) revisions: Vec<RevMeta>,
-    /// Every revision body's blob Oid (cheap; not text). Read on demand by the
-    /// postponed `repo_l_article_revision` gear.
-    #[allow(dead_code)]
-    pub(super) bodies: ImHashMap<u64, Oid>,
+/// Drop materialised bodies no longer referenced as any page's latest —
+/// bounds [`RepoSnapshot::bodies`] to the corpus's live set however long the
+/// process runs and however the tip moves (a force-push re-mirror included).
+pub(super) fn retain_latest(
+    sites: &ImHashMap<SafePathComponent, WDWebsite>,
+    bodies: &mut ImHashMap<BlobId, Arc<str>>,
+) {
+    let live: HashSet<BlobId> = sites
+        .values()
+        .flat_map(|w| w.articles.values())
+        .flat_map(|by_name| by_name.values())
+        .map(|a| a.latest_body)
+        .collect();
+    bodies.retain(|oid, _| live.contains(oid));
 }

@@ -1608,6 +1608,7 @@ dependencies = [
  "imbl-sized-chunks",
  "rand_core 0.9.5",
  "rand_xoshiro",
+ "serde_core",
  "version_check",
  "wide",
 ]
@@ -1791,6 +1792,7 @@ dependencies = [
  "bytes",
  "dentrado-macros",
  "dentrado-types",
+ "imbl",
  "kolorinko-wikitext",
  "serde",
  "serde_json",

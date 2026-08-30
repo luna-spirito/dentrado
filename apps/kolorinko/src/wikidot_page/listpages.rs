@@ -17,17 +17,15 @@ pub(super) struct HostCtx {
 
 /// Resolve every `[[module ListPages]]` in `content`: each distinct module
 /// selection (context selectors resolved against the rendering page) is
-/// queried from the [`repo_l_list_pages`] lens — declared as a
-/// [`secondary_get`](dentrado::core::gear::GearQuery::secondary_get)
-/// dependency, so an edit that changes any selection re-runs this gear — and
-/// every module node is replaced by its instantiated template: prepend, one
-/// repeat per matching page with that page's `%%vars%%` bound, append,
-/// wrapped in Wikidot's `list-pages-box` / `list-pages-item` containers.
-pub(super) async fn resolve_listpages<S: Storage<KolorinkoRT>>(
+/// projected straight off the local snapshot
+/// ([`RepoSnapshot::list_pages`]), and every module node is replaced by its
+/// instantiated template: prepend, one repeat per matching page with that
+/// page's `%%vars%%` bound, append, wrapped in Wikidot's `list-pages-box` /
+/// `list-pages-item` containers.
+pub(super) fn resolve_listpages(
     content: Content,
     state: &mut ResolveState,
     host: &HostCtx,
-    ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> (Content, Vec<PageDep>) {
     let mut queries: Vec<ListPagesQuery> = Vec::new();
     collect_listpages_queries(&content, host, &mut queries);
@@ -36,14 +34,11 @@ pub(super) async fn resolve_listpages<S: Storage<KolorinkoRT>>(
     }
     let mut results: HashMap<ListPagesQuery, ListPagesResult> = HashMap::new();
     for query in &queries {
-        let result = crate::runtime::repo_l_list_pages(state.site.clone(), query.clone())
-            .secondary_get(ctx)
-            .await;
-        results.insert(query.clone(), (*result).clone());
+        results.insert(query.clone(), list_pages(&state.snap, &state.site, query));
     }
     // A template referencing `%%content%%` embeds each listed page's rendered
     // body, fetched and resolved below.
-    let listed = resolve_content_bodies(&content, host, &results, state, ctx).await;
+    let listed = resolve_content_bodies(&content, host, &results, state);
     (
         substitute_listpages(content, &results, &state.bodies, &state.site, host),
         listed,
@@ -54,19 +49,16 @@ pub(super) async fn resolve_listpages<S: Storage<KolorinkoRT>>(
 /// `content` needs, cached in `state.bodies` by fullname (so a page reached
 /// from several modules or transclusions is resolved once per run), together
 /// with each resolved page as a [`PageDep`] (its own resolution deps nested
-/// under it). Each body is read through the [`repo_l_article_latest`] lens
-/// and declared as a `secondary_get` dependency (reactive to its edits),
-/// then run through [`resolve_full`] in its own context; `state.resolved` —
-/// extended before each resolution — is what stops a transclusion cycle (a
-/// listed page embedding, transitively, a page already being resolved). The
-/// listed page's own id is already the canonical local id — no slug
-/// round-trip.
-async fn resolve_content_bodies<S: Storage<KolorinkoRT>>(
+/// under it). Each body is a local snapshot read, then run through
+/// [`resolve_full`] in its own context; `state.resolved` — extended before
+/// each resolution — is what stops a transclusion cycle (a listed page
+/// embedding, transitively, a page already being resolved). The listed
+/// page's own id is already the canonical local id — no slug round-trip.
+fn resolve_content_bodies(
     content: &Content,
     host: &HostCtx,
     results: &HashMap<ListPagesQuery, ListPagesResult>,
     state: &mut ResolveState,
-    ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> Vec<PageDep> {
     let pages = content_needing_bodies(content, &state.site, host, results);
     let mut deps = Vec::new();
@@ -74,20 +66,15 @@ async fn resolve_content_bodies<S: Storage<KolorinkoRT>>(
         if state.bodies.contains_key(&page.fullname()) || !state.resolved.insert(key.clone()) {
             continue;
         }
-        let raw = match LocalId::from_page_id(&page.page_id) {
-            Some(local) => crate::runtime::repo_l_article_latest(state.space, local)
-                .secondary_get(ctx)
-                .await
-                .body
-                .clone(),
-            None => String::new(),
-        };
+        let raw = LocalId::from_page_id(&page.page_id)
+            .and_then(|local| latest(&state.snap, state.space, local))
+            .map_or_else(|| Arc::from(""), |p| Arc::clone(p.body));
         let host = HostCtx {
             fullname: page.fullname(),
             category: page.category.clone(),
             tags: page.tags.clone(),
         };
-        let (content, page_deps) = resolve_full(raw, slug, host, state, ctx).await;
+        let (content, page_deps) = resolve_full(raw, slug, host, state);
         state.bodies.insert(page.fullname(), content);
         deps.push(page_dep(&key, page_deps));
     }
@@ -302,7 +289,7 @@ fn class_div(class: &str, content: Content) -> Node {
 }
 
 // =========================================================================
-// ListPages selection (the `repo_l_list_pages` lens core)
+// ListPages selection (the `RepoSnapshot::list_pages` core)
 // =========================================================================
 
 /// Project a resolved [`ListPagesQuery`] over one site: filter the site's pages
@@ -483,8 +470,12 @@ fn time_matches(filter: &TimeFilter, ts: i64, now: i64) -> bool {
 /// `random`, data-form fields) and an absent `order` fall back to Wikidot's
 /// default: `created_at desc`.
 fn cmp_order(order: &Option<ListOrder>, a: &ListedPage, b: &ListedPage) -> Ordering {
+    // The final `page_id` tiebreak makes equal-key orders deterministic —
+    // the hash-map iteration order it replaces varied per process, which
+    // broke render-to-render diffs over the corpus.
+    let tie = || a.page_id.cmp(&b.page_id);
     let Some(ListOrder { by, ascending }) = order else {
-        return b.created_at.cmp(&a.created_at);
+        return b.created_at.cmp(&a.created_at).then_with(tie);
     };
     let cmp = match by.as_str() {
         "name" => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
@@ -496,7 +487,7 @@ fn cmp_order(order: &Option<ListOrder>, a: &ListedPage, b: &ListedPage) -> Order
         "created_at" => a.created_at.cmp(&b.created_at),
         "updated_at" => a.updated_at.cmp(&b.updated_at),
         "revisions" => a.revisions.cmp(&b.revisions),
-        _ => return b.created_at.cmp(&a.created_at),
+        _ => return b.created_at.cmp(&a.created_at).then_with(tie),
     };
-    if *ascending { cmp } else { cmp.reverse() }
+    if *ascending { cmp } else { cmp.reverse() }.then_with(tie)
 }

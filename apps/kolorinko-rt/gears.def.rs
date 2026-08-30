@@ -21,103 +21,48 @@
 // interval from the globals.
 //
 // The page pipeline is split across cores: `repo` is a `local` oracle pinned
-// to its own core, and every gear off that core reads it only through the
-// `follow` lenses (co-located with `repo`, outputs shared across cores by
-// reference). The parse/resolution gears are keyed by the canonical address,
-// so each `follow` target is statically derivable from the follower's own
-// id fields:
+// to its own core, and its [`repo_snap`] follow lens — the *only* cross-core
+// bridge — publishes the whole-corpus snapshot (`Arc`-shared bodies and all)
+// as one `shared` value. Every consumer off the `repo` core reads the
+// dataset through one `secondary_get` per gear *run* and resolves pages,
+// includes, selections, links, and resources by local lookups thereafter:
 //
-//   repo → repo_l_article_latest (lens over the dataset)
-//        → article_latest_parsed (event; pulls the lens via `secondary_get`,
+//   repo (local oracle, own core; git worker thread below it)
+//     → repo_snap (the one bridge: snapshot → every core)
+//        → article_latest_parsed (event; one `repo_snap` read per run,
 //          lives off the `repo` core)
 //        → article_latest (follows `ArticleLatestParsed { space, local }`,
-//          co-located with the parse)
+//          co-located with the parse; one `repo_snap` read per run, then the
+//          whole include/ListPages/link/resource resolution is local)
 //        → code_block (follows the same parse: a lens over its output)
 //
-// `repo_l_local_id` is the slug-family → canonical bridge (a legacy
-// `(site, slug)` address to its `local` id), `repo_l_query_pages` its batched
-// form — the whole (sorted, deduplicated) link set of one page resolved in a
-// single lens read, so a thousand-link index page declares one dependency
-// instead of a thousand — and `repo_l_list_pages` / `repo_resource` / `asset`
-// stay slug/site-keyed. Wire exposure is an explicit **allowlist**: only
-// `#[gear(exposed)]` gears appear in the wire `GearId` and can be pushed to
-// a client — everything else is server-internal by default (unnamed on the
-// wire, and its output variants gated by the generated `GearOut::is_exposed`
-// filter the push bridge applies).
+// `asset` stays site/hash-keyed and reads blobs lazily from the worktree's
+// content-addressed `_files/` store. Wire exposure is an explicit
+// **allowlist**: only `#[gear(exposed)]` gears appear in the wire `GearId`
+// and can be pushed to a client — everything else is server-internal by
+// default (unnamed on the wire, and its output variants gated by the
+// generated `GearOut::is_exposed` filter the push bridge applies).
 
 #[dentrado::gear(timer(period = crate::globals::interval()), local, name = Repo)]
-pub(crate) async fn repo(tick: bool, cache: &mut RepoCache) -> Rc<RepoData> {
+pub(crate) async fn repo(tick: bool, cache: &mut RepoCache) -> Rc<RepoSnapshot> {
     crate::wikidot_page::repo(crate::globals::repo(), tick, cache).await
 }
 
+/// The `repo` core's snapshot as a cross-core `shared` value: an O(1)
+/// structural clone of the followed `Rc`, so every consumer core holds the
+/// whole corpus by reference and reads pages, slugs, selections, and bodies
+/// locally — the single bridge that replaced the whole `repo_l_*` lens
+/// family (one cross-core read per consuming gear *run*, none per hop).
 #[dentrado::gear(
     follow(target = GearId::Repo {}),
     shared,
-    name = RepoLArticleLatest,
+    name = RepoSnap,
 )]
-pub(crate) async fn repo_l_article_latest(
-    space: SpaceId,
-    local: LocalId,
-    repo_data: Rc<RepoData>,
-    _cache: &mut RepoLArticleCache,
-) -> ArticleLatest {
-    crate::wikidot_page::repo_l_article_latest(&repo_data, space, local).await
-}
-
-#[dentrado::gear(
-    follow(target = GearId::Repo {}),
-    shared,
-    name = RepoLLocalId,
-)]
-pub(crate) fn repo_l_local_id(
-    site: SafePathComponent,
-    slug: (Option<SafePathComponent>, SafePathComponent),
-    repo_data: Rc<RepoData>,
-    _cache: &mut RepoLLocalIdCache,
-) -> Option<(LocalId, String)> {
-    crate::wikidot_page::repo_l_local_id(&repo_data, &site, &slug)
-}
-
-#[dentrado::gear(
-    follow(target = GearId::Repo {}),
-    shared,
-    name = RepoLQueryPages,
-)]
-pub(crate) fn repo_l_query_pages(
-    site: SafePathComponent,
-    query: PageQuery,
-    repo_data: Rc<RepoData>,
-    _cache: &mut RepoLQueryPagesCache,
-) -> PageQueryResult {
-    crate::wikidot_page::repo_l_query_pages(&repo_data, &site, &query)
-}
-
-#[dentrado::gear(
-    follow(target = GearId::Repo {}),
-    shared,
-    name = RepoLListPages,
-)]
-pub(crate) fn repo_l_list_pages(
-    site: SafePathComponent,
-    query: ListPagesQuery,
-    repo_data: Rc<RepoData>,
-    _cache: &mut RepoLListPagesCache,
-) -> ListPagesResult {
-    crate::wikidot_page::repo_l_list_pages(&repo_data, &site, &query)
-}
-
-#[dentrado::gear(
-    follow(target = GearId::Repo {}),
-    shared,
-    name = RepoResource,
-)]
-pub(crate) fn repo_resource(
-    site: SafePathComponent,
-    path: RepoAssetPath,
-    repo_data: Rc<RepoData>,
-    _cache: &mut RepoResourceCache,
-) -> Option<CaRef> {
-    crate::wikidot_page::repo_resource(&repo_data, &site, &path)
+pub(crate) fn repo_snap(
+    repo_data: Rc<RepoSnapshot>,
+    _cache: &mut RepoSnapCache,
+) -> RepoSnapshot {
+    crate::wikidot_page::repo_snap(&repo_data)
 }
 
 #[dentrado::gear(event, shared, name = Asset)]
@@ -160,15 +105,15 @@ pub(crate) fn code_block(
 )]
 pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
     space: SpaceId,
-    repo_data: Rc<RepoData>,
+    repo_data: Rc<RepoSnapshot>,
     ctx: &mut GearCtx<KolorinkoRT, S>,
     _cache: &mut ShellCache,
 ) -> SiteShell {
     crate::wikidot_page::shell(&repo_data, space, ctx).await
 }
 
-// Parses a page's latest body (fetched through the `repo_l_article_latest`
-// lens via `secondary_get`) into an unresolved `ArticleView`. Keyed by the
+// Parses a page's latest body (read out of the one `repo_snap` snapshot
+// dependency per run) into an unresolved `ArticleView`. Keyed by the
 // canonical address, so it lives on its own core — off `repo`'s — and its
 // output is what `article_latest` / `code_block` statically follow.
 #[dentrado::gear(event, shared, name = ArticleLatestParsed)]

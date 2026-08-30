@@ -15,7 +15,7 @@ use super::*;
 pub(super) type Index = HashMap<PathBuf, Key>;
 
 /// Per-instance cache for [`repo`]: the [`GitMailbox`] (the worker is spawned
-/// lazily on the first run) and the last adopted [`RepoData`] snapshot — the
+/// lazily on the first run) and the last adopted [`RepoSnapshot`] — the
 /// `Rc` returned on a non-tick run, and the stable pointer kept when a tick
 /// found the tip unchanged (so dependents aren't re-run for nothing). Wrapped
 /// in `Rc<RefCell<…>>` so the cache (which must be `Clone + Debug`) is a cheap
@@ -26,7 +26,7 @@ pub(crate) struct RepoCache(Rc<RefCell<RepoOracleState>>);
 #[derive(Default)]
 pub(super) struct RepoOracleState {
     pub(super) mailbox: Option<GitMailbox>,
-    pub(super) data: Option<Rc<RepoData>>,
+    pub(super) data: Option<Rc<RepoSnapshot>>,
 }
 
 impl fmt::Debug for RepoCache {
@@ -44,7 +44,7 @@ impl fmt::Debug for RepoCache {
 /// `Rc` is handed back unchanged. Each `borrow()` is its own statement — never
 /// a `match`/`if let` scrutinee — so no RefCell borrow is held across a
 /// re-borrow (the classic scrutinee-temporary foot-gun).
-pub(crate) async fn repo(meta: &RepoMeta, tick: bool, cache: &mut RepoCache) -> Rc<RepoData> {
+pub(crate) async fn repo(meta: &RepoMeta, tick: bool, cache: &mut RepoCache) -> Rc<RepoSnapshot> {
     let mailbox = cache.0.borrow().mailbox.clone();
     let mailbox = match mailbox {
         Some(mb) => mb,
@@ -78,7 +78,7 @@ pub(crate) async fn repo(meta: &RepoMeta, tick: bool, cache: &mut RepoCache) -> 
         .borrow()
         .data
         .clone()
-        .unwrap_or_else(|| Rc::new(RepoData::empty(mailbox.clone())))
+        .unwrap_or_else(|| Rc::new(RepoSnapshot::default()))
 }
 
 /// The outcome of a `git fetch` + hard-reset: the tip either moved or not.

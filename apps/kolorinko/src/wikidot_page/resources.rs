@@ -7,17 +7,15 @@ use super::*;
 /// Resolve every mirrored external resource — `[[image source]]`, `[[[url]]]`
 /// link targets, and `url()`/`@import` references inside `[[module css]]` — to
 /// its content-addressed `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` URL and
-/// substitute. Each resource is declared as a [`repo_resource`]
-/// `secondary_get` dependency, so the result is reactive to an attachment
-/// being re-mirrored (new hash) anywhere in the (already include-resolved)
-/// tree. A URL that isn't mirrored is retried as Wikidot's `/code/N`
-/// endpoint ([`code_url_for_tail`]) and pointed at the local slug-family
-/// code route; anything else is left as its original absolute URL (a hotlink
-/// the client loads straight from the origin).
-pub(super) async fn resolve_resources<S: Storage<KolorinkoRT>>(
+/// substitute, each through a local snapshot lookup
+/// ([`RepoSnapshot::resource`]). A URL that isn't mirrored is retried as
+/// Wikidot's `/code/N` endpoint ([`code_url_for_tail`]) and pointed at the
+/// local slug-family code route; anything else is left as its original
+/// absolute URL (a hotlink the client loads straight from the origin).
+pub(super) fn resolve_resources(
     content: Content,
     site: &SafePathComponent,
-    ctx: &mut GearCtx<KolorinkoRT, S>,
+    snap: &RepoSnapshot,
 ) -> Content {
     let mut tails: Vec<String> = Vec::new();
     collect_external_refs(&content, &mut tails);
@@ -30,12 +28,9 @@ pub(super) async fn resolve_resources<S: Storage<KolorinkoRT>>(
         let Some(path) = RepoAssetPath::new(percent_decode(tail)) else {
             continue;
         };
-        let ca = crate::runtime::repo_resource(site.clone(), path)
-            .secondary_get(ctx)
-            .await;
-        match &*ca {
+        match resource(snap, site, &path) {
             Some(ca_ref) => {
-                resolved.insert(tail.clone(), ca_ref.clone());
+                resolved.insert(tail.clone(), ca_ref);
             }
             None => {
                 if let Some(url) = code_url_for_tail(tail) {

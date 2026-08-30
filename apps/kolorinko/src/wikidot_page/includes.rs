@@ -214,7 +214,7 @@ pub(super) fn live_directives(text: &str) -> Vec<LiveDirective> {
 pub(super) fn splice_includes(
     text: &str,
     current_site: &SafePathComponent,
-    raws: &HashMap<Key, String>,
+    raws: &HashMap<Key, Arc<str>>,
     path: &[Key],
 ) -> String {
     let directives = live_directives(text);

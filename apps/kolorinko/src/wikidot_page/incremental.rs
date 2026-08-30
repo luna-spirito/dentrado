@@ -7,7 +7,9 @@ use super::*;
 /// Patch [`old`] for exactly the pages in [`affected`] (each an absolute
 /// `_meta` path). For each: drop the old nested-map entry (if any, via the
 /// [`Index`]), then re-read the page (as blob Oids) from the new tip's `tree`
-/// and re-insert under its current slug. Unaffected pages are structurally
+/// and re-insert under its current slug, materialising the page's new latest
+/// body into `bodies` (a re-materialised page is a new oid, so unchanged
+/// pages share the old `Arc`s untouched). Unaffected pages are structurally
 /// shared from [`old`] (`imbl::HashMap`), so only the touched pages are re-read.
 pub(super) fn incremental_update(
     repo: &Repository,
@@ -16,6 +18,7 @@ pub(super) fn incremental_update(
     old: &ImHashMap<SafePathComponent, WDWebsite>,
     index: &mut Index,
     affected: HashSet<PathBuf>,
+    bodies: &mut ImHashMap<BlobId, Arc<str>>,
 ) -> ImHashMap<SafePathComponent, WDWebsite> {
     let mut sites = old.clone();
     for meta_path in affected {
@@ -28,6 +31,9 @@ pub(super) fn incremental_update(
         let Some(article) = read_page(repo, tree, &site, &p1, &p2, &id) else {
             continue;
         };
+        if let Some(body) = materialize_body(repo, article.latest_body) {
+            bodies.insert(article.latest_body, body);
+        }
         let Some(site_c) = SafePathComponent::new(site) else {
             continue;
         };

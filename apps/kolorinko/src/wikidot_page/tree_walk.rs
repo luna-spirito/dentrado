@@ -7,13 +7,16 @@ use super::*;
 /// Walk the commit's tree at `tip` and build the sites map: for each site,
 /// every `_meta/<p1>/<p2>/<pageid>` blob yields one [`Article`] (metadata parsed
 /// from the blob, body blob Oids recorded from the sibling `_pages_by_id`
-/// subtree). Bodies stay as Oids — never read into memory here. Returns the bare
-/// sites map + reverse [`Index`]; the worker attaches its mailbox to form the
-/// [`RepoData`] snapshot.
+/// subtree), and each latest body is materialised once into `bodies` — the
+/// persistent half of every [`RepoSnapshot`], so a rebuild re-inflates only
+/// genuinely new blobs (content addressing: a changed body is a new oid).
+/// Returns the bare sites map + reverse [`Index`]; the worker pairs them
+/// with `bodies` to form the snapshot.
 pub(super) fn build_from_tree(
     repo: &Repository,
     tip: Oid,
     root: &Path,
+    bodies: &mut ImHashMap<BlobId, Arc<str>>,
 ) -> (ImHashMap<SafePathComponent, WDWebsite>, Index) {
     let mut sites: ImHashMap<SafePathComponent, WDWebsite> = ImHashMap::new();
     let mut index: Index = HashMap::new();
@@ -26,7 +29,8 @@ pub(super) fn build_from_tree(
     };
     // `(site, p1, p2, id)` keyed: the `_meta` blob Oid + per-revision body Oids.
     let mut metas: HashMap<(String, String, String, String), Oid> = HashMap::new();
-    let mut bodies: HashMap<(String, String, String, String), ImHashMap<u64, Oid>> = HashMap::new();
+    let mut rev_bodies: HashMap<(String, String, String, String), ImHashMap<u64, Oid>> =
+        HashMap::new();
     let mut shells: HashMap<String, Oid> = HashMap::new();
     // `<site>/files/<host>/<path>` symlink → [`CaRef`], keyed by the
     // percent-decoded `<host>/<path>` tail (matching the form `http_tail`
@@ -51,7 +55,7 @@ pub(super) fn build_from_tree(
                 }
                 [site, "_pages_by_id", p1, p2, id, rfile] => {
                     if let Some(n) = rev_number(rfile) {
-                        bodies
+                        rev_bodies
                             .entry(((*site).into(), (*p1).into(), (*p2).into(), (*id).into()))
                             .or_default()
                             .insert(n, entry.id());
@@ -108,7 +112,7 @@ pub(super) fn build_from_tree(
             continue;
         };
         let pm = parse_meta(&meta_text);
-        let body_map = bodies.remove(&key).unwrap_or_default();
+        let body_map = rev_bodies.remove(&key).unwrap_or_default();
         let Some(latest) = body_map.keys().max().copied() else {
             continue;
         };
@@ -125,10 +129,14 @@ pub(super) fn build_from_tree(
                 slug: pm.slug,
                 page_id: format!("{p1}{p2}{id}"),
             },
-            latest_body,
+            latest_body: blob_id(latest_body),
             revisions: pm.revisions,
-            bodies: body_map,
+            bodies: body_map.iter().map(|(n, o)| (*n, blob_id(*o))).collect(),
         };
+        let body_id = blob_id(latest_body);
+        if let Some(body) = materialize_body(repo, body_id) {
+            bodies.insert(body_id, body);
+        }
         let meta_path = root.join(site).join("_meta").join(p1).join(p2).join(id);
         index.insert(meta_path, (site_c.clone(), cat.clone(), name.clone()));
         insert_page(&mut sites, site_c, cat, name, article);
@@ -184,9 +192,9 @@ pub(super) fn read_page(
             slug: pm.slug,
             page_id: format!("{p1}{p2}{id}"),
         },
-        latest_body,
+        latest_body: blob_id(latest_body),
         revisions: pm.revisions,
-        bodies: body_map,
+        bodies: body_map.iter().map(|(n, o)| (*n, blob_id(*o))).collect(),
     })
 }
 
@@ -271,12 +279,31 @@ pub(super) fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
-/// Read a body blob by Oid, stripping its frontmatter. Uncached (the worker
-/// reads blobs straight from the odb on demand); used directly by tests
-/// against a live `Repository`.
+/// Read a body blob by Oid, stripping its frontmatter (uncached; used by
+/// [`materialize_body`] and by tests against a live `Repository`).
 pub(super) fn read_body(repo: &Repository, oid: Oid) -> Option<String> {
     let raw = blob_str(repo, oid)?;
     Some(revision_body(&raw).to_string())
+}
+
+/// Materialise one body blob as its [`RepoSnapshot`] entry — frontmatter
+/// stripped, and every NBSP (U+00A0) rewritten to a plain space. The
+/// rewrite is the dataset-boundary normalisation the old lens layer
+/// performed per delivery: Wikidot exports lean on NBSP for list
+/// indentation and trailing whitespace, and one substitution here retires
+/// every whitespace-structural consumer's `&nbsp;` workaround (list
+/// structure survives — an NBSP and a space each count as one indent unit).
+/// `None` if the blob is missing or not UTF-8 (the page then reads as
+/// blank — the old failed-RPC convention).
+/// git2 oid → snapshot body-store key (the git-side [`BlobId`] boundary
+/// conversion — the raw 20 bytes are the same on both sides).
+pub(super) fn blob_id(oid: Oid) -> BlobId {
+    BlobId(oid.as_bytes().try_into().expect("git2 oid is 20 bytes"))
+}
+
+pub(super) fn materialize_body(repo: &Repository, id: BlobId) -> Option<Arc<str>> {
+    let oid = git2::Oid::from_bytes(&id.bytes()).ok()?;
+    read_body(repo, oid).map(|b| Arc::from(b.replace('\u{a0}', " ")))
 }
 
 /// Strip a revision file's `---\n…\n---\n` frontmatter, returning the body.

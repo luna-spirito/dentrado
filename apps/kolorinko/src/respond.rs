@@ -70,7 +70,8 @@ use kolorinko_rt::{
 
 use crate::assets::{Served, compress, looks_like_asset, mime_for, serve_body};
 use crate::repo::{self, RepoResp};
-use crate::runtime::{KolorinkoRT, repo_l_local_id};
+use crate::runtime::{KolorinkoRT, repo_snap};
+use crate::wikidot_page::local_id;
 use kolorinko_rt::Slug;
 
 /// The largest `POST /-/legacy` body accepted (a `Subscribe` frame is at
@@ -338,11 +339,9 @@ async fn code_reply(
     let Some(site) = crate::globals::site_of(&space) else {
         return Reply::not_found();
     };
-    // The slug family bridges to the canonical parse through the repo lens.
-    let id_sub = crate::runtime::repo_l_local_id(site.clone(), slug)
-        .subscribe(core)
-        .await;
-    let Some((local, _)) = (*id_sub.current()).clone() else {
+    // The slug family bridges to the canonical parse through the snapshot.
+    let snap = repo_snap().subscribe(core).await;
+    let Some((local, _)) = local_id(&snap.current(), site, &slug) else {
         return Reply::not_found();
     };
     let block = crate::runtime::code_block(space, local, n)
@@ -394,8 +393,8 @@ async fn page_local(
     slug: &Slug,
 ) -> Option<(LocalId, String)> {
     let site = crate::globals::site_of(space)?.clone();
-    let sub = repo_l_local_id(site, slug.clone()).subscribe(core).await;
-    (*sub.current()).clone()
+    let snap = repo_snap().subscribe(core).await;
+    local_id(&snap.current(), &site, slug)
 }
 
 /// SSR the page at a canonical address. The 404 check is part of the deal: an
