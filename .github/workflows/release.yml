@@ -8,6 +8,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+    branches: [gh-actions] # tests
   workflow_dispatch:
 
 permissions:
