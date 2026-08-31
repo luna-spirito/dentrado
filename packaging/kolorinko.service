@@ -1,0 +1,35 @@
+# kolorinko systemd unit for non-NixOS hosts — the plain-systemd twin of the
+# NixOS module (nix/kolorinko-module.nix); keep the two in sync.
+# Install: cp kolorinko.service /etc/systemd/system/ && systemctl daemon-reload
+[Unit]
+Description=kolorinko (HTTP/3 + WebTransport wiki mirror)
+Documentation=https://github.com/luna-spirito/dentrado
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=RUST_LOG=info
+ExecStart=/opt/kolorinko/bin/kolorinko /etc/kolorinko/config.toml
+# PID 1 (root) reads the sources and republishes them per-start in
+# /run/credentials, owned by the dynamic user — private keys can keep
+# root-only permissions on disk and never touch the service's view.
+LoadCredential=cert:/etc/kolorinko/cert.pem
+LoadCredential=key:/etc/kolorinko/key.pem
+StateDirectory=kolorinko
+WorkingDirectory=/var/lib/kolorinko
+DynamicUser=yes
+# Binding 443.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# io_uring buffer registration.
+LimitMEMLOCK=infinity
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,71 @@
+# Release builds: a fully static musl server binary (libgit2 + OpenSSL
+# compiled in via the `portable` feature) plus the Trunk-built frontend and
+# the deploy files from packaging/, assembled into one tarball. Attached to a
+# GitHub Release on `v*` tags; `workflow_dispatch` produces the same artifact
+# without publishing. The binary carries no interpreter and no .so deps, so
+# one artifact runs on any Linux — no per-distro or glibc-baseline builds.
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl C toolchain (jemalloc / libgit2 / OpenSSL builds)
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Rust nightly (matches the flake's rust-bin.nightly.latest)
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+          rustup target add x86_64-unknown-linux-musl wasm32-unknown-unknown
+
+      - name: Build server (static)
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: >
+          cargo build -p kolorinko --release --locked --features portable
+          --target x86_64-unknown-linux-musl
+
+      # `wasm-bindgen-cli` must byte-match the `wasm-bindgen` version in the
+      # web crate's lockfile (see nix/kolorinko-package.nix).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: trunk,wasm-bindgen-cli@0.2.126
+
+      - name: Build web frontend
+        run: cd apps/kolorinko-web && trunk build --release
+
+      - name: Assemble tarball
+        run: |
+          version=$(grep -m1 '^version = ' apps/kolorinko/Cargo.toml | cut -d'"' -f2)
+          name="kolorinko-$version-x86_64-linux"
+          mkdir -p pkg/bin pkg/share
+          cp target/x86_64-unknown-linux-musl/release/kolorinko pkg/bin/
+          cp -r apps/kolorinko-web/dist pkg/share/web-dist
+          cp apps/kolorinko/config.example.toml packaging/kolorinko.service pkg/
+          tar -C pkg -czf "$name.tar.gz" .
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kolorinko-x86_64-linux
+          path: kolorinko-*.tar.gz*
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            kolorinko-*.tar.gz
+            kolorinko-*.tar.gz.sha256

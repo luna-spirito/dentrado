@@ -57,6 +57,12 @@ clap = { version = "4.6.6", features = ["derive"] }
 clap_derive = { version = "4.6.4" }
 zstd = "0.13"
 
+[features]
+# Self-contained release binary (musl): compile libgit2 + OpenSSL in
+# instead of linking them from the host, so the artifact runs on any Linux
+# with zero host dependencies. See .github/workflows/release.yml.
+portable = ["git2/vendored-libgit2", "git2/vendored-openssl"]
+
 [dev-dependencies]
 leptos = { version = "0.8", features = ["ssr"] }
 

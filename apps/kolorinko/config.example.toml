@@ -1,0 +1,32 @@
+# Production config template — copy to /etc/kolorinko/config.toml and edit.
+# Paths assume the release-tarball layout (see .github/workflows/release.yml
+# and packaging/kolorinko.service):
+#   /opt/kolorinko/bin/kolorinko, /opt/kolorinko/share/web-dist,
+#   state in /var/lib/kolorinko (systemd StateDirectory),
+#   TLS material in /etc/kolorinko, exposed to the service by systemd as
+#   credentials under /run/credentials/kolorinko.service/.
+# Site-registration lore (space-id derivation, `landing`, `domains`) lives in
+# config.dev.toml.
+
+# Wikidot-export sites to register, in serving order (first entry's landing
+# page is what the bare `/` serves).
+[ensure-evakuilo-sites]
+"obscurative" = { landing = "main", domains = ["www.obscurative.ru"] }
+"rpcauthority" = { domains = ["rpc-wiki.net", "www.rpc-wiki.net"] }
+
+[repo]
+url = "https://github.com/luna-spirito/wikidot-kolorinko-export.git"
+# Auto-created on first page load if missing.
+dir = "/var/lib/kolorinko/repo"
+# Seconds between forced `git pull`s of the backup repository.
+interval = 900
+
+[server]
+# HTTP/3: TCP *and* UDP must reach this port (QUIC rides UDP — remember the
+# firewall's UDP hole, which `https`-style TCP-only services don't open).
+bind = "[::]:443"
+web_dist = "/opt/kolorinko/share/web-dist"
+inject_wt_hash = false
+# Served from systemd LoadCredential (see kolorinko.service).
+cert_file = "/run/credentials/kolorinko.service/cert"
+key_file = "/run/credentials/kolorinko.service/key"
