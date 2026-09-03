@@ -32,7 +32,7 @@ use kolorinko_rt::{SafePathComponent, SpaceId};
 use ring::digest::{SHA256, digest};
 use serde::Deserialize;
 
-use crate::wikidot_page::RepoMeta;
+use crate::wikidot_page::OutMeta;
 
 /// One `ensure-evakuilo-sites` table entry: the site's landing page (`start`,
 /// Wikidot's default, unless named otherwise — e.g. obscurative's `main`) and
@@ -70,7 +70,7 @@ pub(crate) struct SpaceReg {
 /// process runs until it doesn't, and `&'static` access keeps every reader
 /// lock-free.
 pub(crate) struct Globals {
-    repo: RepoMeta,
+    repo: OutMeta,
     /// Registered content spaces in config order: canonical id → registry
     /// entry. The first entry is whose landing page `/` serves.
     spaces: Vec<(SpaceId, SpaceReg)>,
@@ -80,7 +80,7 @@ pub(crate) struct Globals {
 
 static GLOBALS: OnceLock<Globals> = OnceLock::new();
 
-/// Fallback pull interval when the config's is zero ([`RepoCfg::interval`]).
+/// Fallback pull interval when the config's is zero ([`OutMeta::interval`]).
 const DEFAULT_INTERVAL: u32 = 900;
 
 /// The derivation domain for Wikidot-export.
@@ -101,16 +101,14 @@ pub(crate) fn evakuilo_space_id(site: &str) -> SpaceId {
 /// second initialization. A TOML table cannot repeat a key, so duplicate
 /// sites and duplicate space ids are unrepresentable by construction.
 pub(crate) fn init(
-    repo_url: &str,
     repo_dir: &str,
     interval: u32,
     sites: &IndexMap<String, SiteCfg>,
 ) -> anyhow::Result<()> {
-    // `RepoMeta` fields are `&'static` by design (they name the repo the
-    // worker thread owns for the process lifetime); the config's strings
-    // are leaked here — the single leak point in the crate.
-    let repo = RepoMeta::new(
-        Box::leak(repo_url.to_owned().into_boxed_str()),
+    // `OutMeta` fields are `&'static` by design (they name the publication
+    // directory the worker thread reads for the process lifetime); the
+    // config's strings are leaked here — the single leak point in the crate.
+    let repo = OutMeta::new(
         Box::leak(std::path::PathBuf::from(repo_dir).into_boxed_path()),
         if interval == 0 {
             DEFAULT_INTERVAL
@@ -165,12 +163,12 @@ fn g() -> &'static Globals {
     GLOBALS.get().expect("global config not initialized")
 }
 
-/// The export-repo configuration (url/path/interval bundle).
-pub(crate) fn repo() -> &'static RepoMeta {
+/// The export publication configuration (dir/interval bundle).
+pub(crate) fn repo() -> &'static OutMeta {
     &g().repo
 }
 
-/// The pull interval for the `repo` oracle's timer (never zero).
+/// The rescan interval for the `repo` oracle's timer (never zero).
 pub(crate) fn interval() -> NonZero<u64> {
     NonZero::new(u64::from(g().repo.interval()))
         .unwrap_or_else(|| NonZero::new(u64::from(DEFAULT_INTERVAL)).expect("900 != 0"))
@@ -207,11 +205,28 @@ pub(crate) fn space_of_domain(host: &str) -> Option<(SpaceId, &'static SpaceReg)
 }
 
 /// The configured alias domains of a registered space (`None`: unregistered
-/// id). The resource resolver retries a missed lookup under the canonical
-/// `<site>.wikidot.com` host for each of them
-/// ([`crate::wikidot_page::repo_resource`]).
+/// id). The resource resolver (`wikidot_page::dataset::resource`) treats
+/// these hosts — bare and `files.`-prefixed — as the site's own: it retries
+/// the bare site-relative key for them, then the canonical
+/// `<site>.wikidot.com` host.
 pub(crate) fn domains_of(space: &SpaceId) -> Option<&'static [String]> {
     reg_of(space).map(|r| &r.domains[..])
+}
+
+/// The configured alias domains of a dataset site — empty (not an error)
+/// when the site is unregistered or globals were never initialized (test
+/// fixtures index publication files without a registry).
+pub(crate) fn domains_of_site(site: &SafePathComponent) -> &'static [String] {
+    GLOBALS
+        .get()
+        .and_then(|g| {
+            let space = g.by_site.get(site)?;
+            g.spaces
+                .iter()
+                .find(|(s, _)| s == space)
+                .map(|(_, r)| &r.domains[..])
+        })
+        .unwrap_or(&[])
 }
 
 /// The first registered space and its registry entry — whose landing page the

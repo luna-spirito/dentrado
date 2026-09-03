@@ -1,3 +1,8 @@
+// Evaluating `Send` for the publication worker's spawn closure recurses
+// through flume's `Hook<T>` → `Option<T>` → the carried `RepoSnapshot` (deep
+// imbl/wikitext nesting) and brushes the default limit; harmless to raise.
+#![recursion_limit = "256"]
+
 use clap::Parser;
 use dentrado::{
     core::{
@@ -36,11 +41,11 @@ mod wikidot_page;
 pub mod wikidot_parser;
 /// Process configuration, loaded once from a `.toml` file whose path is passed
 /// as the sole CLI argument. Every setting that used to live in env vars or
-/// `const`s (repo source/interval, bind address, frontend dist, WebTransport
-/// trust mode) is gathered here.
+/// `const`s (publication source/interval, bind address, frontend dist,
+/// WebTransport trust mode) is gathered here.
 #[derive(Debug, Deserialize)]
 struct Config {
-    repo: RepoCfg,
+    evakuilo: EvakuiloCfg,
     server: ServerCfg,
     /// Wikidot-export sites to register as content spaces, in serving order
     /// (the first entry's landing page is what the bare `/` serves): site →
@@ -53,10 +58,12 @@ struct Config {
 }
 
 #[derive(Debug, Deserialize)]
-struct RepoCfg {
-    url: String,
+struct EvakuiloCfg {
+    /// The evakuilo daemon's instance directory — the one holding the
+    /// `out/<site>/` publications kolorinko serves.
     dir: String,
-    /// Seconds between forced `git pull`s.
+    /// Seconds between publication rescans (mtime checks per site; a scan
+    /// of an unchanged corpus is a few `stat`s).
     interval: u32,
 }
 
@@ -131,9 +138,8 @@ fn load_config(config_path: &Path) -> anyhow::Result<Config> {
 /// ([`render_cli`]), so both derive the same space registry.
 fn init_globals(config: &Config) -> anyhow::Result<()> {
     globals::init(
-        &config.repo.url,
-        &config.repo.dir,
-        config.repo.interval,
+        &config.evakuilo.dir,
+        config.evakuilo.interval,
         &config.ensure_evakuilo_sites,
     )
 }

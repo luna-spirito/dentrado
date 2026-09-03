@@ -204,10 +204,12 @@ pub struct CaRef {
     pub ext: String,
 }
 
-/// A git object id as raw bytes — the body-store key of [`RepoSnapshot`].
-/// Keeps this crate git-free (it must build for wasm) while the snapshot
-/// stays content-addressed: a changed body is a new id, so nothing is ever
-/// invalidated, only added.
+/// A content-addressed body id: the SHA-256 of the materialised body text,
+/// truncated to 20 bytes — the body-store key of [`RepoSnapshot`]. The
+/// snapshot stays content-addressed (a changed body is a new id, so nothing
+/// is ever invalidated, only added; identical bodies dedup to one entry)
+/// without dragging the storage format into this crate (it must build for
+/// wasm).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BlobId(pub [u8; 20]);
 
@@ -223,7 +225,7 @@ impl BlobId {
     }
 }
 
-/// The whole-corpus snapshot the git worker builds and every consumer core
+/// The whole-corpus snapshot the publication worker builds and every consumer core
 /// reads: each site's metadata and `files/` index, plus **every latest page
 /// body materialised exactly once** (`Arc<str>`: frontmatter stripped,
 /// NBSP-normalised) — RAM is the cheaper currency, and the lazy per-visit
@@ -264,17 +266,15 @@ pub struct WDWebsite {
 }
 
 /// One page: metadata, the full revision-history summary, and the
-/// content-addressed ids of the latest body and **every** revision body.
-/// The latest body's text lives materialised once in the owning
-/// [`RepoSnapshot`]; the per-revision ids stay cheap identity for a
-/// revision-serving gear to page in later.
+/// content-addressed id of the latest body. The latest body's text lives
+/// materialised once in the owning [`RepoSnapshot`]; older revisions stay
+/// in the per-page archive on disk for a revision-serving gear to page in
+/// later.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Article {
     pub meta: kolorinko_wikitext::ArticleMeta,
     pub latest_body: BlobId,
     pub revisions: Vec<kolorinko_wikitext::RevMeta>,
-    /// Every revision body's blob id.
-    pub bodies: imbl::HashMap<u64, BlobId>,
 }
 
 /// One `[[code]]` block served through Wikidot's `/code/N` endpoint shape —

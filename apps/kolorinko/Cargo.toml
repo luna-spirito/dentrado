@@ -47,7 +47,6 @@ kolorinko-wikitext = { path = "../kolorinko-wikitext" }
 ring = "0.17"
 time = "0.3"
 serde_json = "1"
-git2 = { version = "0.21.0", features = ["https"] }
 log = "0.4.32"
 rcgen = "0.14"
 rustls-pki-types = "1.15"
@@ -55,13 +54,14 @@ serde = "1.0.228"
 toml = "0.8"
 clap = { version = "4.6.6", features = ["derive"] }
 clap_derive = { version = "4.6.4" }
+tar = "0.4"
 zstd = "0.13"
 
 [features]
-# Self-contained release binary (musl): compile libgit2 + OpenSSL in
-# instead of linking them from the host, so the artifact runs on any Linux
-# with zero host dependencies. See .github/workflows/release.yml.
-portable = ["git2/vendored-libgit2", "git2/vendored-openssl"]
+# Kept as an empty feature so release builds passing `--features portable`
+# keep working; nothing to vendor anymore since the git export source was
+# replaced by the evakuilo publication reader.
+portable = []
 
 [dev-dependencies]
 leptos = { version = "0.8", features = ["ssr"] }

@@ -1,55 +1,63 @@
-//! The Wikidot-export data layer and the four gears built on top of it.
+//! The Wikidot-evacuation data layer and the four gears built on top of it.
 //!
-//! The export repository layout (one git clone mirroring many sites) is:
+//! The data source is an `evakuilo` daemon's publication (its instance
+//! directory, laid out one dir per site under `out/`):
 //! ```text
-//! <site>/_meta/<p1>/<p2>/<pageid>                ← page metadata + revision table
-//! <site>/_pages_by_id/<p1>/<p2>/<pageid>/r{N}.txt ← revision bodies (frontmatter + text)
-//! <site>/pages/…                                  ← human-readable symlinks (ignored here)
-//! <site>/files/…                                  ← attachments (not yet served)
+//! <dir>/out/<site>/pages.json                    ← page manifest (id, slug,
+//!                                                    title, tags, revision
+//!                                                    counts, archive path)
+//! <dir>/out/<site>/pages_by_id/ab/cd/<id>.zst    ← one deterministic
+//!                                                    tar+zst per page, holding
+//!                                                    an rNNN.txt entry (v1
+//!                                                    frontmatter + text) per
+//!                                                    stored revision
+//! <dir>/out/<site>/files.json                    ← attachment manifest (URL,
+//!                                                    sha256, size, status)
+//! <dir>/out/<site>/files_ca/ab/cd/<sha[4..]>     ← content-addressed blobs
+//! <dir>/out/<site>/shell                         ← title/subtitle/theme_root
 //! ```
-//! `<p1>/<p2>/<pageid>` is the page id split as 2/2/rest (e.g. id `1305054470`
-//! → `13/05/054470`); the `_meta` and `_pages_by_id` subtrees share that exact
-//! suffix, so a `_meta` path maps to its bodies directory by swapping the top
-//! segment. The `_meta` file holds `slug`/`title`/`tags` header lines followed
-//! by one TAB-separated `revision  revision_id  timestamp  author` row per
-//! revision.
+//! The manifest is deterministic and write-if-changed, and every blob and
+//! archive lands via tmp+rename — so a file's `(mtime, size)` drifting is
+//! exactly "this file's content changed", and untouched files keep their
+//! mtimes however often the daemon republishes.
 //!
 //! # Storage model
-//! The dataset materialises **every latest body exactly once**: the tree walk
-//! reads each page's blob out of the git object database, strips its
-//! frontmatter, normalises NBSPs, and keeps the text as an `Arc<str>` —
-//! content addressing means a changed body is simply a new oid, so nothing
-//! is ever invalidated, only added (and pruned when no page references it
-//! anymore). This whole-corpus snapshot ([`RepoSnapshot`]) is what the gears
-//! distribute; RAM is the cheaper currency — the lazy per-visit odb reads of
-//! the old lens layer measured as roughly half the CPU of a full render.
-//! Attachments (`files/`) stay lazy: `asset` reads them straight from the
-//! worktree's content-addressed `_files/` store on demand.
+//! The dataset materialises **every latest body exactly once**: for each
+//! manifest row the page's tar+zst is decompressed, every entry's
+//! frontmatter joins the revision table, and the highest revision's body
+//! (frontmatter stripped, NBSP-normalised) is kept as an `Arc<str>` keyed by
+//! its SHA-256 — content addressing means a changed body is simply a new id,
+//! so nothing is ever invalidated, only added (and pruned when no page
+//! references it anymore). This whole-corpus snapshot ([`RepoSnapshot`]) is
+//! what the gears distribute; RAM is the cheaper currency — the lazy
+//! per-visit archive reads of the old lens layer measured as roughly half
+//! the CPU of a full render. Attachments (`files_ca/`) stay lazy: `asset`
+//! reads them straight from the publication's content-addressed store on
+//! demand.
 //!
-//! libgit2 is synchronous and [`git2::Repository`] is `!Send`, so calling it
-//! straight from a gear would block the whole async core. Instead the
-//! `!Send` `Repository`, the reverse [`Index`], the current sites map, and
-//! the materialised-body store all live on one **dedicated worker thread**
-//! ([`GitWorker`]), created and pinned there — the `Repository` is never
-//! moved across a thread. The oracle gear talks to it over a
-//! [`GitMailbox`] (a `flume` channel) and `.await`s each reply, so every
-//! libgit2 call happens off the core. Memory tracks the corpus's live
-//! latest bodies, not the repository's history.
+//! Publication reading is synchronous filesystem work (manifest parsing,
+//! zstd decompression), so it lives on one **dedicated worker thread**
+//! ([`OutWorker`]); the oracle gear talks to it over an [`OutMailbox`] (a
+//! `flume` channel) and `.await`s each reply, so every read happens off the
+//! core. Memory tracks the corpus's live latest bodies, not its history.
 //!
 //! # Gears
-//! - [`repo`] (`local` oracle): on each timer tick asks the worker to fetch
-//!   + rebuild — incrementally, only the pages the `old_tip → new_tip` diff
-//!   touched (new bodies materialised into the persistent store, stale ones
-//!   pruned) — and adopts the worker's new [`RepoSnapshot`] (wrapped in
-//!   [`Rc`]). An unchanged tip yields `None`, so the prior `Rc` is kept and
-//!   dependents aren't re-run for nothing.
+//! - [`repo`] (`local` oracle): on each timer tick asks the worker to rescan
+//!   + rebuild — the site-level gate is the `(mtime, size)` stamp triple of
+//!   `pages.json`/`files.json`/`shell` (three `stat`s per site; an idle
+//!   daemon costs nothing), and inside a drifted site only the pages whose
+//!   manifest rows changed are re-read (row equality implies archive
+//!   equality — the publisher only rewrites an archive when its row drifts).
+//!   An unchanged publication yields `None`, so the prior `Rc` is kept and
+//!   dependents aren't re-run for nothing. Batching falls out of the timer:
+//!   a tick observes whatever landed since the last one.
 //! - [`repo_snap`] (the one `follow` lens over `repo`): publishes the
 //!   snapshot as a cross-core `shared` value — an O(1) structural clone, so
 //!   every consumer core holds the whole corpus by reference. This single
 //!   bridge replaced the whole `repo_l_*` lens family (one cross-core read
 //!   per consuming gear *run*, none per hop): page projections, slug→id
 //!   bridges, link-set queries, ListPages selections, and the `files/`
-//!   index are all local lookups off it ([`RepoSnapshot::latest`] et al.).
+//!   index are all local lookups off it ([`latest`] et al.).
 //! - [`article_latest_parsed`] (`event`, keyed canonically, living off the
 //!   `repo` core): parses the latest body — read out of the one
 //!   [`repo_snap`] dependency per run — into [`ArticleView`] with
@@ -61,12 +69,12 @@
 //!   out of the same snapshot and assembled textually (`[[include]]` cones
 //!   spliced into the raw text with their `{$vars}` substituted, Wikidot's
 //!   own order of operations, includes bridged through
-//!   [`RepoSnapshot::local_id`], data-level cycles broken by a path-based
+//!   [`local_id`], data-level cycles broken by a path-based
 //!   guard), then parsed as one page and resolved: `[[module ListPages]]`
 //!   instantiation, internal links, and mirrored resources — all local
 //!   snapshot reads — producing the final [`ArticleView`] with the tree of
 //!   every fetched page as its `deps`. Reactivity rides the single
-//!   `repo_snap` dependency: any repo change re-runs this gear, and the
+//!   `repo_snap` dependency: any dataset change re-runs this gear, and the
 //!   body/parse caches keep unchanged pages cheap.
 //! - [`shell`] (`follow` over `repo`): the whole site chrome in one shot —
 //!   the resolved `nav:top` / `nav:side` pages (declared as
@@ -78,7 +86,6 @@
 use crate::wikidot_parser::{parse, parse_link_target, wikidot_verbatim};
 use compio::fs;
 use dentrado::core::{core_ctx::GearCtx, gear::GearResult, storage::Storage};
-use git2::{ObjectType, Oid, Repository, Tree, TreeWalkMode};
 use imbl::HashMap as ImHashMap;
 use kolorinko_render::{http_refs, http_tail, rewrite_with};
 use kolorinko_rt::{
@@ -113,37 +120,36 @@ mod assets_gear;
 mod code_block;
 mod config;
 mod dataset;
-mod git_worker;
 mod iftags;
 mod includes;
 mod incremental;
 mod lenses;
 mod links;
 mod listpages;
+mod out_walk;
+mod out_worker;
 mod repo_gear;
 mod resources;
 #[cfg(test)]
 mod tests;
-mod tree_walk;
 mod vars;
 
 use article_latest::*;
 use dataset::*;
-use git_worker::*;
 use iftags::*;
 use includes::*;
 use incremental::*;
 use links::*;
 use listpages::*;
-use repo_gear::*;
+use out_walk::*;
+use out_worker::*;
 use resources::*;
-use tree_walk::*;
 use vars::*;
 
 pub(crate) use article_latest::{LatestCache, ParsedCache, article_latest, article_latest_parsed};
 pub(crate) use assets_gear::{AssetCache, asset, ca_url};
 pub(crate) use code_block::{CodeBlockCache, code_block};
-pub(crate) use config::RepoMeta;
+pub(crate) use config::OutMeta;
 pub(crate) use dataset::{article, latest, list_pages, local_id, query_pages, resource};
 pub(crate) use lenses::{RepoSnapCache, ShellCache, repo_snap, shell};
 pub(crate) use repo_gear::{RepoCache, repo};
@@ -154,7 +160,7 @@ pub(crate) use repo_gear::{RepoCache, repo};
 /// in the global config, or the site has no page with that id. This is one
 /// of the two bridges between the URL layer (`space`/`local`) and the
 /// slug-keyed dataset below (the other direction is
-/// [`RepoSnapshot::local_id`]).
+/// [`local_id`]).
 pub(crate) fn page_slug(
     data: &RepoSnapshot,
     space: SpaceId,

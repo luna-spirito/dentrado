@@ -19,7 +19,8 @@ pub(crate) struct AssetCache;
 /// immutable) sub-resource hash until evicted. Acceptable for now; revisit if
 /// stale stylesheets bite.
 ///
-/// Serve one content-addressed blob `<site>/_files/<xx>/<yy>/<hash>`: read it,
+/// Serve one content-addressed blob — the publication's
+/// `<site>/files_ca/<xx>/<yy>/<rest>` (rest = hash[4..]): read it,
 /// and for CSS rewrite every mirrored `url()`/`@import` to its CA URL, then
 /// compress. `None` when the blob is absent (the HTTP layer serves a 404).
 /// `shared` so the compressed bytes are cached + deduplicated across cores;
@@ -30,20 +31,19 @@ pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
     ext: &str,
     ctx: &mut GearCtx<KolorinkoRT, S>,
 ) -> Option<Body> {
-    // The blob store lives under the configured repo dir (a process global
-    // since the `RepoMeta` gear-field removal).
+    // The publication root lives under the configured evakuilo directory (a
+    // process global since the gear-field removal).
     let meta = crate::globals::repo();
     // A wire-constructed `GearId::Asset` could carry a malformed hash; only the
     // HTTP path (`serve` → `ca_parts`) pre-validates. Guard before slicing.
     if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    // The exporter shards the blob store `_files/<d1>/<d2>/<rest>` with
+    // The publisher shards the blob store `files_ca/<d1>/<d2>/<rest>` with
     // rest=key[4:] (the 60-char tail), so the leaf is NOT the full hash.
     let file = meta
-        .path()
-        .join(&**site)
-        .join("_files")
+        .site_dir(site)
+        .join("files_ca")
         .join(&hash[..2])
         .join(&hash[2..4])
         .join(&hash[4..]);
@@ -76,7 +76,7 @@ pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
 /// `<sub>.wikidot.com`, and any of the site's configured alias domains
 /// (case-insensitively — hosts are) rewrites to `<site>.wikidot.com`.
 /// `None` when the host is neither — including another site's alias domain.
-/// The retry itself lives in [`RepoSnapshot::resource`].
+/// The retry itself lives in [`dataset::resource`].
 pub(super) fn repo_alias(
     site: &SafePathComponent,
     domains: &[String],
@@ -96,12 +96,12 @@ pub(super) fn repo_alias(
 
 /// Serialize a [`CaRef`] to its served URL:
 /// `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>`, embedding the sha256
-/// (xx=key[0:2], yy=key[2:4], leaf=full hash) so the URL is self-describing
+/// (`xx=key[0:2]`, `yy=key[2:4]`, leaf=full hash) so the URL is self-describing
 /// and collision-free with real `files/<host>/<path>` paths (a 64-hex leaf
 /// never occurs naturally). The extension rides along so the server derives
 /// the MIME without a side table; an empty extension yields a bare `<hash>`
-/// leaf. The on-disk `_files/` layout (sharded rest-leaf) is reconstructed at
-/// read time.
+/// leaf. The on-disk `files_ca/` layout (sharded rest-leaf) is reconstructed
+/// at read time.
 pub(crate) fn ca_url(site: &SafePathComponent, ca: &CaRef) -> String {
     let site = &**site;
     let h = &ca.hash;

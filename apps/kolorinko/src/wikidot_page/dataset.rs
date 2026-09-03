@@ -96,21 +96,48 @@ pub(crate) fn list_pages(
 }
 
 /// Resolve one `files/<host>/<path>` attachment to its content-addressed
-/// [`CaRef`] — the body of the old `repo_resource` gear, CDN/alias-domain
-/// retry included ([`repo_alias`]). `None` when the URL is not mirrored (a
-/// hotlink).
+/// [`CaRef`] — the body of the old `repo_resource` gear. Three lookups, in
+/// order: the tail as named (absolute `files.json` rows keep their real
+/// external host); the bare site-relative key when the host is one of this
+/// site's own (the publication keys on-site files without a host — the DB's
+/// `local--…` path form; see [`own_file_host`]); and the CDN/alias-domain
+/// retry ([`repo_alias`]). `None` when the URL is not mirrored (a hotlink).
 pub(crate) fn resource(
     snap: &RepoSnapshot,
     site: &SafePathComponent,
     path: &RepoAssetPath,
 ) -> Option<CaRef> {
     let files = &snap.sites.get(site)?.files;
-    files.get(path).cloned().or_else(|| {
-        crate::globals::space_of(site)
-            .and_then(|space| crate::globals::domains_of(&space))
-            .and_then(|domains| repo_alias(site, domains, path))
-            .and_then(|alt| files.get(&alt).cloned())
-    })
+    files
+        .get(path)
+        .cloned()
+        .or_else(|| {
+            let (host, rel) = path.as_str().split_once('/')?;
+            if !own_file_host(site, host) {
+                return None;
+            }
+            files.get(&RepoAssetPath::new(rel.to_owned())?).cloned()
+        })
+        .or_else(|| {
+            crate::globals::space_of(site)
+                .and_then(|space| crate::globals::domains_of(&space))
+                .and_then(|domains| repo_alias(site, domains, path))
+                .and_then(|alt| files.get(&alt).cloned())
+        })
+}
+
+/// Does `host` name this site's own file space — one of the hosts a same-site
+/// file can be fetched or linked under? The canonical Wikidot pair plus each
+/// configured alias domain, bare and `files.`-prefixed (hosts are DNS names:
+/// compared case-insensitively). Decides when a missed `host/path` lookup
+/// retries the bare site-relative key ([`resource`]).
+fn own_file_host(site: &SafePathComponent, host: &str) -> bool {
+    let s: &str = site;
+    host.eq_ignore_ascii_case(format!("{s}.wikidot.com").as_str())
+        || host.eq_ignore_ascii_case(format!("{s}.wdfiles.com").as_str())
+        || crate::globals::domains_of_site(site).iter().any(|d| {
+            d.eq_ignore_ascii_case(host) || format!("files.{d}").eq_ignore_ascii_case(host)
+        })
 }
 
 /// The nested-map lookup underlying [`article`], factored out so the

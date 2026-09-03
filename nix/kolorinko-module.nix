@@ -68,9 +68,9 @@ in
       type = toml.type;
       default = { };
       example = {
-        repo = {
-          url = "https://github.com/luna-spirito/wikidot-kolorinko-export.git";
-          interval = 900;
+        evakuilo = {
+          dir = "/var/lib/wikidot-evakuilo/kolorinko/out";
+          interval = 60;
         };
         server = {
           bind = "[::]:443";

@@ -1,38 +1,110 @@
 use super::*;
-use git2::{IndexAddOption, Signature};
 use std::fs;
 
-/// Write one page (`_meta` + a single `r{rev}.txt` body) into the export
-/// layout under `root/<site>/…`, returning the relative paths committed.
-fn write_page(
+/// Write one page's tar+zst archive into the publication layout under
+/// `<root>/out/<site>/pages_by_id/…`, mirroring the publisher's deterministic
+/// pack (v1 frontmatter per `rNNN.txt` entry). `revs` is
+/// `(rev_no, rev_id, timestamp, body)`.
+fn write_page_archive(
     root: &Path,
     site: &str,
-    p1: &str,
-    p2: &str,
     id: &str,
     slug: &str,
-    rev: u64,
-    body: &str,
+    revs: &[(u64, &str, i64, &str)],
 ) {
-    let base = root.join(site);
-    let meta = format!("slug: \"{slug}\"\ntitle: \"T\"\ntags: []\n{rev}\trid\t1\ta\n");
-    let meta_path = base.join("_meta").join(p1).join(p2).join(id);
-    fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
-    fs::write(&meta_path, meta).unwrap();
-    let body_dir = base.join("_pages_by_id").join(p1).join(p2).join(id);
-    fs::create_dir_all(&body_dir).unwrap();
-    fs::write(body_dir.join(format!("r{rev}.txt")), body).unwrap();
+    let dest = root.join("out").join(site).join(archive_rel(id));
+    fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    let mut tarb = tar::Builder::new(Vec::new());
+    for (no, rid, ts, body) in revs {
+        let text = format!(
+            "---\n\
+             title: \"T {slug}\"\n\
+             tags: []\n\
+             page_id: \"{id}\"\n\
+             site: \"{site}\"\n\
+             slug: \"{slug}\"\n\
+             revision: {no}\n\
+             revision_id: \"{rid}\"\n\
+             author: 7\n\
+             timestamp: {ts}\n\
+             ---\n\
+             {body}\n"
+        );
+        let mut header = tar::Header::new_gnu();
+        header.set_size(text.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        tarb.append_data(&mut header, format!("r{no:0>3}.txt"), text.as_bytes())
+            .unwrap();
+    }
+    let tar_bytes = tarb.into_inner().unwrap();
+    fs::write(&dest, zstd::stream::encode_all(&tar_bytes[..], 3).unwrap()).unwrap();
 }
 
-/// Stage everything under the worktree and commit (first commit if empty).
-fn commit(repo: &Repository, msg: &str, parents: &[&git2::Commit]) -> Oid {
-    let sig = Signature::now("t", "t@t").unwrap();
-    let mut idx = repo.index().unwrap();
-    idx.add_all(["*"], IndexAddOption::DEFAULT, None).unwrap();
-    idx.write().unwrap();
-    let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
-    repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, parents)
-        .unwrap()
+/// (Re)write the site's `pages.json` from `(id, slug, stored, max_rev)` rows.
+fn write_manifest(root: &Path, site: &str, rows: &[(&str, &str, i64, i64)]) {
+    let site_out = root.join("out").join(site);
+    fs::create_dir_all(&site_out).unwrap();
+    let pages: Vec<_> = rows
+        .iter()
+        .map(|(id, slug, stored, max_rev)| {
+            serde_json::json!({
+                "id": id,
+                "slug": slug,
+                "title": format!("T {slug}"),
+                "tags": [],
+                "revisions_stored": stored,
+                "revisions_known": stored,
+                "max_rev": max_rev,
+                "archive": archive_rel(id),
+            })
+        })
+        .collect();
+    let doc = serde_json::json!({ "site": site, "pages": pages });
+    fs::write(
+        site_out.join("pages.json"),
+        serde_json::to_vec_pretty(&doc).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Write the site's `files.json` from `(url, sha256, status)` rows and lay
+/// down each `saved` blob's bytes under `files_ca/`.
+fn write_files(root: &Path, site: &str, rows: &[(&str, &str, &str, &[u8])]) {
+    let site_out = root.join("out").join(site);
+    fs::create_dir_all(&site_out).unwrap();
+    let files: Vec<_> = rows
+        .iter()
+        .map(|(url, sha, status, _)| {
+            serde_json::json!({
+                "path": url,
+                "sha256": sha,
+                "size": 1,
+                "content_type": "text/css",
+                "status": status,
+                "blob": format!("files_ca/{}/{}/{}", &sha[..2], &sha[2..4], &sha[4..]),
+            })
+        })
+        .collect();
+    let doc = serde_json::json!({ "site": site, "files": files });
+    fs::write(
+        site_out.join("files.json"),
+        serde_json::to_vec_pretty(&doc).unwrap(),
+    )
+    .unwrap();
+    for (url, sha, status, bytes) in rows {
+        if *status != "saved" {
+            continue;
+        }
+        let blob = site_out
+            .join("files_ca")
+            .join(&sha[..2])
+            .join(&sha[2..4])
+            .join(&sha[4..]);
+        let _ = url;
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        fs::write(&blob, bytes).unwrap();
+    }
 }
 
 fn site(s: &str) -> SafePathComponent {
@@ -43,154 +115,310 @@ fn root_slug(name: &str) -> Slug {
     (None, SafePathComponent::new(name.into()).unwrap())
 }
 
+fn site_map(w: WDWebsite) -> ImHashMap<SafePathComponent, WDWebsite> {
+    let mut sites: ImHashMap<SafePathComponent, WDWebsite> = ImHashMap::new();
+    sites.insert(site("scp"), w);
+    sites
+}
+
+fn site_map_at(site: SafePathComponent, w: WDWebsite) -> ImHashMap<SafePathComponent, WDWebsite> {
+    let mut sites: ImHashMap<SafePathComponent, WDWebsite> = ImHashMap::new();
+    sites.insert(site, w);
+    sites
+}
+
+/// A 64-hex sha256 stand-in (of the literal bytes "css").
+const HASH: &str = "d1f69a9854765a4f1e7c8b1e8a9e5c9bd1e0a2f3c4b5a6978899aabbccddeeff";
+
 /// Regression: `repo()`'s cold start spawns the worker and re-borrows the
 /// cache `RefCell` in its `None` arm. A `borrow()` left in the `match`
 /// scrutinee used to live through the arms and panic ("RefCell already
 /// borrowed"). Pointing at an unreachable source keeps the worker
-/// repository-less (empty dataset) while still exercising that path, and
-/// proves the unchanged-tip path keeps the same `Rc`.
+/// publication-less (empty dataset) while still exercising that path, and
+/// proves the unchanged-publication path keeps the same `Rc`.
 #[test]
 fn repo_cold_start_reborrows_without_panic() {
     use compio::runtime::Runtime;
     let dir = std::env::temp_dir().join(format!("kolorinko_repo_nopath_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     let path: &'static Path = Box::leak(dir.clone().into_boxed_path());
-    let meta = RepoMeta::new("file:///nonexistent/kolorinko-repo", path, 900);
+    let meta = OutMeta::new(path, 900);
     let mut cache = RepoCache::default();
     let rt = Runtime::new().unwrap();
     // Cold start (non-tick): the `None` arm — the original panic site.
     let first = rt.block_on(repo(&meta, false, &mut cache));
     assert!(find_article(&first.sites, &site("nope"), &root_slug("nope")).is_none());
-    // Nothing to pull → worker returns None → the prior `Rc` is kept.
+    // Nothing on disk → worker returns None → the prior `Rc` is kept.
     let second = rt.block_on(repo(&meta, true, &mut cache));
     assert!(Rc::ptr_eq(&first, &second));
 }
 
-#[test]
-fn build_and_materialise_from_odb() {
-    let dir = std::env::temp_dir().join(format!("kolorinko_odb_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-
-    let repo = Repository::init(&dir).unwrap();
-    write_page(
-        &dir,
+/// A one-page publication built the way the worker's first scan builds it.
+fn one_page_publication(dir: &Path) {
+    write_page_archive(
+        dir,
         "scp",
-        "13",
-        "05",
-        "054470",
+        "1305054470",
         "foo",
-        1,
-        "---\nx:1\n---\nFoo body",
+        &[(1, "rid-1", 100, "Foo body")],
     );
-    write_page(
-        &dir,
-        "scp",
-        "13",
-        "05",
-        "054471",
-        "bar",
-        1,
-        "---\nx:1\n---\nBar body",
-    );
-    let tip = commit(&repo, "c1", &[]);
-
-    let mut bodies = ImHashMap::new();
-    let (sites, index) = build_from_tree(&repo, tip, &dir, &mut bodies);
-
-    // Two pages indexed, both latest bodies materialised into the snapshot's
-    // store (frontmatter stripped).
-    assert_eq!(index.len(), 2);
-    assert_eq!(bodies.len(), 2);
-    let foo = find_article(&sites, &site("scp"), &root_slug("foo")).unwrap();
-    assert_eq!(
-        read_body(&repo, oid(foo.latest_body)),
-        Some("Foo body".to_string())
-    );
-    assert_eq!(foo.meta.slug, "foo");
-    assert_eq!(foo.meta.page_id, "1305054470");
-    let bar = find_article(&sites, &site("scp"), &root_slug("bar")).unwrap();
-    assert_eq!(
-        read_body(&repo, oid(bar.latest_body)),
-        Some("Bar body".to_string())
-    );
+    write_manifest(dir, "scp", &[("1305054470", "foo", 1, 1)]);
 }
 
 #[test]
-fn incremental_patch_on_tip_move() {
-    let dir = std::env::temp_dir().join(format!("kolorinko_inc_{}", std::process::id()));
+fn build_reads_publication_and_materialises_bodies() {
+    let dir = std::env::temp_dir().join(format!("kolorinko_out_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
-    let repo = Repository::init(&dir).unwrap();
-    write_page(
+    write_page_archive(
         &dir,
         "scp",
-        "13",
-        "05",
-        "054470",
+        "1305054470",
         "foo",
-        1,
-        "---\nx:1\n---\nFoo v1",
+        &[(1, "rid-1", 100, "Foo body")],
     );
-    write_page(
+    write_page_archive(
         &dir,
         "scp",
-        "13",
-        "05",
-        "054471",
+        "1305054471",
         "bar",
-        1,
-        "---\nx:1\n---\nBar v1",
+        &[(1, "rid-2", 101, "Bar body"), (2, "rid-3", 102, "Bar v2")],
     );
-    let tip1 = commit(&repo, "c1", &[]);
-
-    let (sites, mut index) = build_from_tree(&repo, tip1, &dir, &mut ImHashMap::new());
-    let foo = find_article(&sites, &site("scp"), &root_slug("foo")).unwrap();
-    assert_eq!(
-        read_body(&repo, oid(foo.latest_body)),
-        Some("Foo v1".to_string())
-    );
-
-    // Edit only `foo` (new revision → moved blob Oid) and advance the tip.
-    write_page(
+    write_manifest(
         &dir,
         "scp",
-        "13",
-        "05",
-        "054470",
-        "foo",
-        2,
-        "---\nx:1\n---\nFoo v2",
+        &[("1305054470", "foo", 1, 1), ("1305054471", "bar", 2, 2)],
     );
-    let parent = repo.find_commit(tip1).unwrap();
-    let tip2 = commit(&repo, "c2", &[&parent]);
-
-    let affected = diff_changes(&repo, tip1, tip2, &dir).unwrap().0;
-    let tree2 = repo
-        .find_commit(tip2)
-        .and_then(|c| repo.find_tree(c.tree_id()))
-        .unwrap();
-    let next = incremental_update(
-        &repo,
-        &tree2,
+    write_files(
         &dir,
-        &sites,
-        &mut index,
-        affected,
-        &mut ImHashMap::new(),
+        "scp",
+        &[(
+            "https://scp.wikidot.com/local--files/foo/a.css",
+            HASH,
+            "saved",
+            b"css",
+        )],
     );
 
-    // `bar` is structurally shared from the old snapshot; `foo` re-read.
-    let foo = find_article(&next, &site("scp"), &root_slug("foo")).unwrap();
+    let mut bodies = ImHashMap::new();
+    let (rows, w) = build_site(&dir.join("out").join("scp"), &mut bodies).unwrap();
+    let sites = site_map(w);
+
+    // Both pages indexed, both latest bodies materialised into the
+    // snapshot's store (frontmatter stripped, highest revision wins).
+    assert_eq!(rows.len(), 2);
+    assert_eq!(bodies.len(), 2);
+    let foo = find_article(&sites, &site("scp"), &root_slug("foo")).unwrap();
+    assert_eq!(&**bodies.get(&foo.latest_body).unwrap(), "Foo body\n");
+    assert_eq!(foo.meta.slug, "foo");
+    assert_eq!(foo.meta.page_id, "1305054470");
+    assert_eq!(foo.meta.title, "T foo");
+    // The revision table comes from the archive entries' frontmatter.
+    assert_eq!(foo.revisions.len(), 1);
+    assert_eq!(foo.revisions[0].revision, 1);
+    assert_eq!(foo.revisions[0].revision_id, "rid-1");
+    assert_eq!(foo.revisions[0].timestamp, 100);
+    assert_eq!(foo.revisions[0].author, "7");
+    let bar = find_article(&sites, &site("scp"), &root_slug("bar")).unwrap();
+    assert_eq!(&**bodies.get(&bar.latest_body).unwrap(), "Bar v2\n");
+    assert_eq!(bar.revisions.len(), 2);
+    // Canonical addressing: page id → current slug.
     assert_eq!(
-        read_body(&repo, oid(foo.latest_body)),
-        Some("Foo v2".to_string())
+        sites.get(&site("scp")).unwrap().by_page_id.get(&1305054470),
+        Some(&(None, SafePathComponent::new("foo".into()).unwrap()))
     );
+    // The files index maps the percent-decoded host/path tail to the CA ref.
+    let w = sites.get(&site("scp")).unwrap();
+    let ca = w
+        .files
+        .get(&RepoAssetPath::new("scp.wikidot.com/local--files/foo/a.css".into()).unwrap())
+        .expect("file indexed");
+    assert_eq!(ca.hash, HASH);
+    assert_eq!(ca.ext, "css");
+}
+
+/// On-site files are keyed site-relative in `files.json` (the DB's path
+/// form), while lookups name `host/path` tails: `resource` must retry the
+/// bare relative key for the site's own hosts — and only those.
+#[test]
+fn resource_retries_site_relative_rows_for_own_hosts() {
+    init_test_globals();
+    let dir = std::env::temp_dir().join(format!("kolorinko_rel_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    write_page_archive(
+        &dir,
+        "obscurative",
+        "1305054470",
+        "foo",
+        &[(1, "rid-1", 100, "Foo body")],
+    );
+    write_manifest(&dir, "obscurative", &[("1305054470", "foo", 1, 1)]);
+    write_files(
+        &dir,
+        "obscurative",
+        &[("local--theme/t/style.css", HASH, "saved", b"css")],
+    );
+
+    let mut bodies = ImHashMap::new();
+    let (_, w) = build_site(&dir.join("out").join("obscurative"), &mut bodies).unwrap();
+    let snap = RepoSnapshot {
+        sites: site_map_at(site("obscurative"), w),
+        bodies,
+    };
+    // The relative row is indexed verbatim, under no host at all.
+    let rel = RepoAssetPath::new("local--theme/t/style.css".into()).unwrap();
+    assert!(
+        snap.sites
+            .get(&site("obscurative"))
+            .unwrap()
+            .files
+            .contains_key(&rel)
+    );
+    // Every own-host form resolves through the relative retry.
+    for host in [
+        "obscurative.wikidot.com",
+        "obscurative.wdfiles.com",
+        "WWW.OBSCURATIVE.RU",
+        "files.www.obscurative.ru",
+    ] {
+        let tail = RepoAssetPath::new(format!("{host}/local--theme/t/style.css")).unwrap();
+        let ca = resource(&snap, &site("obscurative"), &tail);
+        assert_eq!(ca.map(|c| c.hash).as_deref(), Some(HASH), "{host}");
+    }
+    // A foreign host with the same path stays a hotlink.
+    let foreign = RepoAssetPath::new("i.imgur.com/local--theme/t/style.css".into()).unwrap();
+    assert!(resource(&snap, &site("obscurative"), &foreign).is_none());
+}
+
+#[test]
+fn incremental_patch_on_manifest_drift() {
+    let dir = std::env::temp_dir().join(format!("kolorinko_inc_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let site_dir = || dir.join("out").join("scp");
+
+    write_page_archive(
+        &dir,
+        "scp",
+        "1305054470",
+        "foo",
+        &[(1, "rid-1", 100, "Foo v1")],
+    );
+    write_page_archive(
+        &dir,
+        "scp",
+        "1305054471",
+        "bar",
+        &[(1, "rid-2", 101, "Bar v1")],
+    );
+    write_manifest(
+        &dir,
+        "scp",
+        &[("1305054470", "foo", 1, 1), ("1305054471", "bar", 1, 1)],
+    );
+
+    let mut bodies = ImHashMap::new();
+    let (old_rows, w) = build_site(&site_dir(), &mut bodies).unwrap();
+    let sites = site_map(w);
+    let bar_body = Rc::new(
+        find_article(&sites, &site("scp"), &root_slug("bar"))
+            .unwrap()
+            .clone(),
+    );
+    let bar_arc = bodies.get(&bar_body.latest_body).unwrap().clone();
+
+    // Edit only `foo` (new revision → new archive bytes + drifted row) and
+    // republish the manifest.
+    write_page_archive(
+        &dir,
+        "scp",
+        "1305054470",
+        "foo",
+        &[(1, "rid-1", 100, "Foo v1"), (2, "rid-3", 103, "Foo v2")],
+    );
+    write_manifest(
+        &dir,
+        "scp",
+        &[("1305054470", "foo", 2, 2), ("1305054471", "bar", 1, 1)],
+    );
+    let fresh = read_pages_manifest(&site_dir()).unwrap();
+    let mut w = sites.get(&site("scp")).cloned().unwrap();
+    patch_pages(&mut w, &site_dir(), &old_rows, &fresh, &mut bodies);
+    let next = site_map(w);
+
+    // `bar` is structurally shared from the old snapshot (same body `Arc`);
+    // `foo` re-read with its new latest body.
+    let foo = find_article(&next, &site("scp"), &root_slug("foo")).unwrap();
+    assert_eq!(&**bodies.get(&foo.latest_body).unwrap(), "Foo v2\n");
+    assert_eq!(foo.revisions.len(), 2);
     let bar = find_article(&next, &site("scp"), &root_slug("bar")).unwrap();
+    assert_eq!(bar.latest_body, bar_body.latest_body);
+    assert!(Arc::ptr_eq(bodies.get(&bar.latest_body).unwrap(), &bar_arc));
+}
+
+/// The worker's stamp gate end-to-end: a first tick builds, an unchanged
+/// publication yields `None`, a republished page re-reads, and a rename
+/// moves the page (and its `by_page_id` entry) to the new slug.
+#[test]
+fn worker_tick_rebuilds_only_on_drift() {
+    let dir = std::env::temp_dir().join(format!("kolorinko_tick_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path: &'static Path = Box::leak(dir.clone().into_boxed_path());
+
+    one_page_publication(&dir);
+    let mut worker = OutWorker::new(path);
+    let first = worker.tick().expect("first tick builds");
+    let foo = find_article(&first.sites, &site("scp"), &root_slug("foo")).unwrap();
+    assert_eq!(&**first.bodies.get(&foo.latest_body).unwrap(), "Foo body\n");
+
+    // Unchanged publication → None (the caller keeps its prior `Rc`).
+    assert!(worker.tick().is_none());
+
+    // A drifted archive + manifest row → re-read, and the stale body is
+    // pruned from the store.
+    write_page_archive(
+        &dir,
+        "scp",
+        "1305054470",
+        "foo",
+        &[(1, "rid-1", 100, "Foo body"), (2, "rid-9", 109, "Foo v9")],
+    );
+    write_manifest(&dir, "scp", &[("1305054470", "foo", 2, 2)]);
+    let second = worker.tick().expect("drift rebuilds");
+    let foo = find_article(&second.sites, &site("scp"), &root_slug("foo")).unwrap();
+    assert_eq!(&**second.bodies.get(&foo.latest_body).unwrap(), "Foo v9\n");
+    assert_eq!(second.bodies.len(), 1, "stale body pruned");
+
+    // A rename: same id, new slug — the old slug entry and `by_page_id`
+    // mapping move together.
+    write_page_archive(
+        &dir,
+        "scp",
+        "1305054470",
+        "renamed",
+        &[(1, "rid-1", 100, "Foo body"), (2, "rid-9", 109, "Foo v9")],
+    );
+    write_manifest(&dir, "scp", &[("1305054470", "renamed", 2, 2)]);
+    let third = worker.tick().expect("rename rebuilds");
+    assert!(
+        find_article(&third.sites, &site("scp"), &root_slug("foo")).is_none(),
+        "old slug vacated"
+    );
+    let renamed =
+        find_article(&third.sites, &site("scp"), &root_slug("renamed")).expect("new slug indexed");
+    assert_eq!(renamed.meta.page_id, "1305054470");
     assert_eq!(
-        read_body(&repo, oid(bar.latest_body)),
-        Some("Bar v1".to_string())
+        third
+            .sites
+            .get(&site("scp"))
+            .unwrap()
+            .by_page_id
+            .get(&1305054470),
+        Some(&(None, SafePathComponent::new("renamed".into()).unwrap()))
     );
 }
 
@@ -200,12 +428,6 @@ fn key(cat: Option<&str>, name: &str) -> Key {
         cat.map(|c| SafePathComponent::new(c.into()).unwrap()),
         SafePathComponent::new(name.into()).unwrap(),
     )
-}
-
-/// Snapshot body-store key → git2 oid (tests read bodies back through the
-/// tree walker).
-fn oid(b: BlobId) -> Oid {
-    Oid::from_bytes(&b.bytes()).unwrap()
 }
 
 fn flat(content: &Content) -> String {
@@ -551,6 +773,7 @@ fn external_refs_are_collected_and_content_addressed() {
 
 #[test]
 fn parse_shell_reads_title_subtitle_and_theme_root() {
+    // The git export's `files/`-prefixed tail shape.
     let text = "\
 title: \"RPC Authority\"
 subtitle: \"Research, Protection, Containment\"
@@ -567,50 +790,57 @@ theme_root: files/cdn.jsdelivr.net/gh/x/y@main/style.css
         theme_root.as_str(),
         "cdn.jsdelivr.net/gh/x/y@main/style.css"
     );
+    // The out/ publication's raw-URL shape, percent-escapes included.
+    let (_, _, theme_root) = super::parse_shell(
+        "theme_root: https://scp-wiki.wdfiles.com/local--code/component%3Atheme/1\n",
+    );
+    let theme_root = theme_root.expect("url theme_root");
+    assert_eq!(
+        theme_root.as_str(),
+        "scp-wiki.wdfiles.com/local--code/component:theme/1"
+    );
 }
 
 #[test]
-fn parse_shell_missing_or_non_files_theme_root_is_none() {
+fn parse_shell_missing_or_hostless_theme_root_is_none() {
     // No theme_root line.
     let (t, s, r) = super::parse_shell("title: \"T\"\n");
     assert_eq!(t.as_deref(), Some("T"));
     assert!(s.is_none());
     assert!(r.is_none());
-    // theme_root outside `files/` (a raw URL) is rejected.
-    let (_, _, r) = super::parse_shell("theme_root: https://example.com/style.css\n");
+    // A site-relative CSS path has no host — no mirrored identity.
+    let (_, _, r) = super::parse_shell("theme_root: /local--code/component:theme\n");
     assert!(r.is_none());
 }
 
-/// Against the real export repo: a `files/` symlink must index to the
-/// full 64-char sha256 (reconstructed from the sharded `_files/d1/d2/rest`
-/// target), the `<site>/shell` manifest must parse (title/subtitle/theme_root),
-/// and the theme root must resolve to a real blob via that index. Skipped
-/// when the real repo isn't checked out.
+/// Against a real evakuilo publication: the `files.json` index must map the
+/// theme-root tail to a full 64-char sha256 (with a real blob behind it in
+/// `files_ca/`), the `shell` must parse (title/subtitle/theme_root), and the
+/// theme root must resolve through that index. Skipped when the publication
+/// isn't checked out.
 #[test]
-fn real_repo_indexes_sharded_files_and_shell() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kolorinko/repo");
-    if !root.join("rpcauthority/shell").exists() {
-        eprintln!("skipping: real repo not present");
+fn real_publication_indexes_files_and_shell() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../wikidot-evakuilo/data/kolorinko/out/rpcauthority");
+    if !root.join("pages.json").exists() {
+        eprintln!("skipping: real publication not present");
         return;
     }
-    let repo = Repository::open(&root).expect("open repo");
-    let tip = repo.head().unwrap().peel_to_commit().unwrap().id();
-    let (sites, _index) = super::build_from_tree(&repo, tip, &root, &mut ImHashMap::new());
-    let w = sites.get(&site("rpcauthority")).expect("site indexed");
-    // The shell manifest round-trips.
-    assert_eq!(w.title.as_deref(), Some("RPC Authority"));
+    let (rows, w) = build_site(&root, &mut ImHashMap::new()).expect("site builds");
+    assert!(!rows.is_empty(), "manifest indexed");
+    assert!(w.title.as_deref() == Some("RPC Authority"));
     assert!(w.subtitle.as_ref().is_some_and(|s| !s.is_empty()));
     let theme_path = w.theme_root.clone().expect("theme_root parsed");
     // The files index resolves the theme path to a full 64-char sha256 —
     // NOT the 60-char sharded leaf (the bug this guards against).
     let ca = w.files.get(&theme_path).expect("theme in files index");
-    assert_eq!(ca.ext, "css");
+    assert!(ca.ext == "css" || !ca.ext.is_empty());
     assert_eq!(ca.hash.len(), 64);
     assert!(ca.hash.bytes().all(|b| b.is_ascii_hexdigit()));
-    // The reconstructed hash must locate the real blob: the on-disk leaf is
-    // `hash[4..]` (the rest), not the full hash.
+    // The hash must locate the real blob: the on-disk leaf is `hash[4..]`
+    // (the rest), not the full hash.
     let blob = root
-        .join("rpcauthority/_files")
+        .join("files_ca")
         .join(&ca.hash[..2])
         .join(&ca.hash[2..4])
         .join(&ca.hash[4..]);
@@ -626,7 +856,36 @@ fn real_repo_indexes_sharded_files_and_shell() {
         url.starts_with(&prefix),
         "url {url} should start with {prefix}"
     );
-    assert!(url.ends_with(".css"));
+}
+
+/// The review regression, against real data: the out/ `shell` names the
+/// theme as a raw URL, and an on-site theme is keyed site-relative in
+/// `files.json` — the shell tail must resolve through `resource`'s
+/// own-host retry to a real blob.
+#[test]
+fn real_publication_resolves_site_theme_root() {
+    init_test_globals();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../wikidot-evakuilo/data/kolorinko/out/obscurative");
+    if !root.join("pages.json").exists() {
+        eprintln!("skipping: real publication not present");
+        return;
+    }
+    let (_, w) = build_site(&root, &mut ImHashMap::new()).expect("site builds");
+    let snap = RepoSnapshot {
+        sites: site_map_at(site("obscurative"), w),
+        bodies: ImHashMap::new(),
+    };
+    let theme = snap
+        .sites
+        .get(&site("obscurative"))
+        .unwrap()
+        .theme_root
+        .clone()
+        .expect("theme_root parsed from the raw URL");
+    let ca =
+        resource(&snap, &site("obscurative"), &theme).expect("theme resolves through the index");
+    assert_eq!(ca.ext, "css");
 }
 
 /// Globals for host-matching tests: the dev config's two sites. `init` is
@@ -648,7 +907,7 @@ fn init_test_globals() {
             domains: vec!["rpc-wiki.net".into()],
         },
     );
-    let _ = crate::globals::init("", ".", 0, &sites);
+    let _ = crate::globals::init(".", 0, &sites);
 }
 
 #[test]

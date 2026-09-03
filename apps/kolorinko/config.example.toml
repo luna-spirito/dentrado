@@ -14,12 +14,12 @@
 "obscurative" = { landing = "main", domains = ["www.obscurative.ru"] }
 "rpcauthority" = { domains = ["rpc-wiki.net", "www.rpc-wiki.net"] }
 
-[repo]
-url = "https://github.com/luna-spirito/wikidot-kolorinko-export.git"
-# Auto-created on first page load if missing.
-dir = "/var/lib/kolorinko/repo"
-# Seconds between forced `git pull`s of the backup repository.
-interval = 900
+[evakuilo]
+# The evakuilo daemon's instance directory — the one holding the
+# `out/<site>/` publications kolorinko serves.
+dir = "/var/lib/evakuilo/kolorinko"
+# Seconds between publication rescans (mtime checks; cheap when idle).
+interval = 60
 
 [server]
 # HTTP/3: TCP *and* UDP must reach this port (QUIC rides UDP — remember the

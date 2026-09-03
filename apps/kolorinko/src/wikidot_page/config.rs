@@ -4,27 +4,23 @@ use super::*;
 // Configuration
 // =========================================================================
 
-/// The export-repo source configuration: where to clone and how often to
-/// re-pull. Held `&'static` (process-global via [`crate::globals`], leaked
-/// once at initialization) because the values name the repository the git
-/// worker thread owns for the whole process lifetime. No longer part of any
-/// [`GearId`](crate::runtime::…) identity — gear ids are purely content
-/// addressing since the globals refactor.
+/// The evakuilo publication source configuration: the daemon's instance
+/// directory (the one holding `out/<site>/` publications) and how often to
+/// rescan it. Held `&'static` (process-global via [`crate::globals`], leaked
+/// once at initialization) because the values name the directory the
+/// publication worker thread reads for the whole process lifetime. No longer
+/// part of any [`GearId`](crate::runtime::…) identity — gear ids are purely
+/// content addressing since the globals refactor.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct RepoMeta {
-    pub(super) url: &'static str,
-    pub(super) path: &'static Path,
+pub(crate) struct OutMeta {
+    pub(super) dir: &'static Path,
     pub(super) interval: u32,
 }
 
-impl RepoMeta {
+impl OutMeta {
     #[must_use]
-    pub(crate) const fn new(url: &'static str, path: &'static Path, interval: u32) -> Self {
-        Self {
-            url,
-            path,
-            interval,
-        }
+    pub(crate) const fn new(dir: &'static Path, interval: u32) -> Self {
+        Self { dir, interval }
     }
 
     #[must_use]
@@ -33,12 +29,14 @@ impl RepoMeta {
     }
 
     #[must_use]
-    pub(crate) const fn path(&self) -> &'static Path {
-        self.path
+    pub(crate) const fn dir(&self) -> &'static Path {
+        self.dir
     }
 
+    /// The published artifact of one site: `<dir>/out/<site>` (see the
+    /// `evakuilo` config module's layout).
     #[must_use]
-    pub(crate) const fn url(&self) -> &'static str {
-        self.url
+    pub(crate) fn site_dir(&self, site: &str) -> PathBuf {
+        self.dir.join("out").join(site)
     }
 }

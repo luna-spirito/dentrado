@@ -74,11 +74,14 @@ pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
         .sites
         .get(site)
         .map(|w| {
+            // Through the dataset resolver, not a bare index get: the shell
+            // names the theme as a `host/path` tail, while on-site themes are
+            // keyed site-relative in the index.
             let theme_root = w
                 .theme_root
                 .as_ref()
-                .and_then(|p| w.files.get(p))
-                .map(|ca| ca_url(site, ca));
+                .and_then(|p| resource(data, site, p))
+                .map(|ca| ca_url(site, &ca));
             (w.title.clone(), w.subtitle.clone(), theme_root)
         })
         .unwrap_or_default();

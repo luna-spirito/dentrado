@@ -8,7 +8,7 @@ use super::*;
 /// link targets, and `url()`/`@import` references inside `[[module css]]` — to
 /// its content-addressed `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` URL and
 /// substitute, each through a local snapshot lookup
-/// ([`RepoSnapshot::resource`]). A URL that isn't mirrored is retried as
+/// ([`dataset::resource`]). A URL that isn't mirrored is retried as
 /// Wikidot's `/code/N` endpoint ([`code_url_for_tail`]) and pointed at the
 /// local slug-family code route; anything else is left as its original
 /// absolute URL (a hotlink the client loads straight from the origin).

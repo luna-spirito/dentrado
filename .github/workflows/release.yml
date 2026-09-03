@@ -1,5 +1,6 @@
-# Release builds: a fully static musl server binary (libgit2 + OpenSSL
-# compiled in via the `portable` feature) plus the Trunk-built frontend and
+# Release builds: a fully static musl server binary (the `portable` feature
+# is kept as a no-op for compatibility — the git export source is gone) plus
+# the Trunk-built frontend and
 # the deploy files from packaging/, assembled into one tarball. Attached to a
 # GitHub Release on `v*` tags; `workflow_dispatch` produces the same artifact
 # without publishing. The binary carries no interpreter and no .so deps, so
@@ -23,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install musl C toolchain (jemalloc / libgit2 / OpenSSL builds)
+      - name: Install musl C toolchain (jemalloc build)
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Rust nightly (matches the flake's rust-bin.nightly.latest)

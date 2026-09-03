@@ -1,9 +1,9 @@
-//! Serve content-addressed site assets out of the export repository.
+//! Serve content-addressed site assets out of the evakuilo publication.
 //!
 //! One shape, one gear (both `shared` — cached + deduplicated across cores —
 //! and HTTP-only: never shipped over WebTransport):
 //! - **Content-addressed** `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` —
-//!   the [`Asset`] gear reads the `_files/…/<hash>` blob, rewrites CSS
+//!   the [`crate::wikidot_page::asset`] gear reads the `files_ca/…/<hash>` blob, rewrites CSS
 //!   `url()`/`@import` to CA URLs, and compresses. Immutable key, so the
 //!   client caches it forever.
 //!
@@ -15,8 +15,6 @@
 //! render time (mirrored) or left as its original absolute URL (a hotlink the
 //! browser fetches straight from the origin), so there is no path-based form
 //! to serve here.
-//!
-//! [`Asset`]: kolorinko_rt gear
 
 use std::rc::Rc;
 
@@ -52,11 +50,9 @@ pub(crate) fn parse_ca_request(full: &str) -> Option<(SafePathComponent, String,
     Some((site, hash, ext))
 }
 
-/// Resolve one CA request via the [`Asset`] gear, or `None` for anything
-/// outside the `/-/repo/` namespace or a missing blob (404). `full` is the raw
-/// request path (with query, if any).
-///
-/// [`Asset`]: kolorinko_rt gear
+/// Resolve one CA request via the [`crate::wikidot_page::asset`] gear, or
+/// `None` for anything outside the `/-/repo/` namespace or a missing blob
+/// (404). `full` is the raw request path (with query, if any).
 pub(crate) async fn serve(
     full: &str,
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
