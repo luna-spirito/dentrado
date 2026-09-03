@@ -15,9 +15,9 @@
 "rpcauthority" = { domains = ["rpc-wiki.net", "www.rpc-wiki.net"] }
 
 [evakuilo]
-# The evakuilo daemon's instance directory — the one holding the
-# `out/<site>/` publications kolorinko serves.
-dir = "/var/lib/evakuilo/kolorinko"
+# The evakuilo publication root — the daemon's `out/` directory, the one
+# holding the `<site>/` publications kolorinko serves.
+dir = "/var/lib/evakuilo/kolorinko/out"
 # Seconds between publication rescans (mtime checks; cheap when idle).
 interval = 60
 

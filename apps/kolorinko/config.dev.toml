@@ -30,10 +30,10 @@
 "scientific-alliance" = {}
 
 [evakuilo]
-# The evakuilo daemon's instance directory — kolorinko serves the
-# `out/<site>/` publications it writes (relative to the workspace root,
+# The evakuilo publication root — the daemon's `out/` directory holding the
+# `<site>/` publications kolorinko serves (relative to the workspace root,
 # cargo's CWD).
-dir = "../../wikidot-evakuilo/data/kolorinko"
+dir = "../../wikidot-evakuilo/data/kolorinko/out"
 # Seconds between publication rescans. Cheap when idle: per site, three
 # `stat`s (pages.json / files.json / shell mtimes+sizes); only drifted
 # sites — and inside them only drifted pages — are re-read.

@@ -367,7 +367,9 @@ fn worker_tick_rebuilds_only_on_drift() {
     let dir = std::env::temp_dir().join(format!("kolorinko_tick_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
-    let path: &'static Path = Box::leak(dir.clone().into_boxed_path());
+    // The fixtures live under `<dir>/out/`; the worker takes the publication
+    // root itself, as the config's `evakuilo.dir` names it.
+    let path: &'static Path = Box::leak(dir.join("out").into_boxed_path());
 
     one_page_publication(&dir);
     let mut worker = OutWorker::new(path);

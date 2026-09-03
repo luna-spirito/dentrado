@@ -1,20 +1,20 @@
 //! The Wikidot-evacuation data layer and the four gears built on top of it.
 //!
-//! The data source is an `evakuilo` daemon's publication (its instance
-//! directory, laid out one dir per site under `out/`):
+//! The data source is an `evakuilo` daemon's publication (its `out/`
+//! directory — the configured `evakuilo.dir` — laid out one dir per site):
 //! ```text
-//! <dir>/out/<site>/pages.json                    ← page manifest (id, slug,
-//!                                                    title, tags, revision
-//!                                                    counts, archive path)
-//! <dir>/out/<site>/pages_by_id/ab/cd/<id>.zst    ← one deterministic
-//!                                                    tar+zst per page, holding
-//!                                                    an rNNN.txt entry (v1
-//!                                                    frontmatter + text) per
-//!                                                    stored revision
-//! <dir>/out/<site>/files.json                    ← attachment manifest (URL,
-//!                                                    sha256, size, status)
-//! <dir>/out/<site>/files_ca/ab/cd/<sha[4..]>     ← content-addressed blobs
-//! <dir>/out/<site>/shell                         ← title/subtitle/theme_root
+//! <out>/<site>/pages.json                    ← page manifest (id, slug,
+//!                                                title, tags, revision
+//!                                                counts, archive path)
+//! <out>/<site>/pages_by_id/ab/cd/<id>.zst    ← one deterministic
+//!                                                tar+zst per page, holding
+//!                                                an rNNN.txt entry (v1
+//!                                                frontmatter + text) per
+//!                                                stored revision
+//! <out>/<site>/files.json                    ← attachment manifest (URL,
+//!                                                sha256, size, status)
+//! <out>/<site>/files_ca/ab/cd/<sha[4..]>     ← content-addressed blobs
+//! <out>/<site>/shell                         ← title/subtitle/theme_root
 //! ```
 //! The manifest is deterministic and write-if-changed, and every blob and
 //! archive lands via tmp+rename — so a file's `(mtime, size)` drifting is

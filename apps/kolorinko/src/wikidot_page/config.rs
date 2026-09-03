@@ -4,10 +4,10 @@ use super::*;
 // Configuration
 // =========================================================================
 
-/// The evakuilo publication source configuration: the daemon's instance
-/// directory (the one holding `out/<site>/` publications) and how often to
-/// rescan it. Held `&'static` (process-global via [`crate::globals`], leaked
-/// once at initialization) because the values name the directory the
+/// The evakuilo publication source configuration: the publication root (the
+/// daemon's `out/` directory — the one holding `<site>/` publications) and how
+/// often to rescan it. Held `&'static` (process-global via [`crate::globals`],
+/// leaked once at initialization) because the values name the directory the
 /// publication worker thread reads for the whole process lifetime. No longer
 /// part of any [`GearId`](crate::runtime::…) identity — gear ids are purely
 /// content addressing since the globals refactor.
@@ -33,10 +33,10 @@ impl OutMeta {
         self.dir
     }
 
-    /// The published artifact of one site: `<dir>/out/<site>` (see the
-    /// `evakuilo` config module's layout).
+    /// The published artifact of one site: `<dir>/<site>` (see the `evakuilo`
+    /// config module's layout).
     #[must_use]
     pub(crate) fn site_dir(&self, site: &str) -> PathBuf {
-        self.dir.join("out").join(site)
+        self.dir.join(site)
     }
 }

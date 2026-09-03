@@ -17,10 +17,11 @@ let
   credentialsDir = "/run/credentials/kolorinko.service";
   configFile =
     let
-      # Paths the module owns: mutable state, the dist inside the package,
-      # and TLS material exposed as systemd credentials (see LoadCredential).
+      # Paths the module owns: the dist inside the package and TLS material
+      # exposed as systemd credentials (see LoadCredential). `evakuilo.dir`
+      # (the daemon's `out/` publication root) is the operator's to set — the
+      # service reads it, never writes it.
       managed = {
-        repo.dir = "/var/lib/kolorinko/repo";
         server.web_dist = "${cfg.package}/share/web-dist";
         server.cert_file = "${credentialsDir}/cert";
         server.key_file = "${credentialsDir}/key";
@@ -84,10 +85,9 @@ in
         };
       };
       description = ''
-        Contents of kolorinko's TOML config. `repo.dir`, `server.web_dist`,
-        `server.cert_file` and `server.key_file` are derived from `package`,
-        the service's state directory and the loaded credentials; setting
-        them here has no effect.
+        Contents of kolorinko's TOML config. `server.web_dist`,
+        `server.cert_file` and `server.key_file` are derived from `package`
+        and the loaded credentials; setting them here has no effect.
       '';
     };
   };

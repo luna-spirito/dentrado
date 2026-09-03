@@ -126,16 +126,16 @@ impl OutWorker {
         }
     }
 
-    /// Rescan `out/` and rebuild what drifted. `Some(data)` when the dataset
-    /// changed (the caller adopts a fresh snapshot); `None` when nothing
-    /// changed (the caller keeps its prior `Rc`). The first tick always
-    /// builds. A site whose publication vanished mid-run is simply absent
-    /// from the listing — its entry is dropped, and it re-adopts when it
-    /// comes back.
+    /// Rescan the publication and rebuild what drifted. `Some(data)` when the
+    /// dataset changed (the caller adopts a fresh snapshot); `None` when
+    /// nothing changed (the caller keeps its prior `Rc`). The first tick
+    /// always builds. A site whose publication vanished mid-run is simply
+    /// absent from the listing — its entry is dropped, and it re-adopts when
+    /// it comes back.
     pub(super) fn tick(&mut self) -> Option<RepoSnapshot> {
         let first = !self.built;
         self.built = true;
-        let present = site_dirs(&self.dir.join("out"));
+        let present = site_dirs(self.dir);
         let mut changed = false;
         // Sites whose publication vanished: drop entry + state together.
         let gone: Vec<_> = self

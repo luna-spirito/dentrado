@@ -325,9 +325,9 @@ pub(super) fn read_stored_page(
     read_page(site_dir, &id.to_string(), row, bodies)
 }
 
-/// Every published site directory under `<dir>/out/` (site name → path).
-/// A missing or unreadable `out/` yields an empty map — an empty corpus,
-/// same as an absent clone before it.
+/// Every published site directory under the publication root (`<dir>/<site>/`
+/// — the daemon's `out/`); site name → path. A missing or unreadable root
+/// yields an empty map — an empty corpus, same as an absent clone before it.
 pub(super) fn site_dirs(out_dir: &Path) -> HashMap<String, PathBuf> {
     let Ok(rd) = std::fs::read_dir(out_dir) else {
         return HashMap::new();

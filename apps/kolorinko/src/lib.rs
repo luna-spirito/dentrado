@@ -59,8 +59,8 @@ struct Config {
 
 #[derive(Debug, Deserialize)]
 struct EvakuiloCfg {
-    /// The evakuilo daemon's instance directory — the one holding the
-    /// `out/<site>/` publications kolorinko serves.
+    /// The evakuilo publication root — the daemon's `out/` directory, the one
+    /// holding the `<site>/` publications kolorinko serves.
     dir: String,
     /// Seconds between publication rescans (mtime checks per site; a scan
     /// of an unchanged corpus is a few `stat`s).
