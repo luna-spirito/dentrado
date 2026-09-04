@@ -28,6 +28,13 @@ let
       };
     in
     toml.generate "kolorinko.toml" (lib.recursiveUpdate cfg.settings managed);
+
+  # eBPF QUIC steering (see apps/kolorinko/src/steer.rs) loads a BPF program
+  # at startup, which needs CAP_BPF; without it the server logs a warning and
+  # every core keeps the kernel's 4-tuple hash dispatch. The flag's default
+  # mirrors the TOML schema's (`serde(default = "default_true")`).
+  steer = (cfg.settings.server or { }).steer or true;
+  capabilities = [ "CAP_NET_BIND_SERVICE" ] ++ lib.optionals steer [ "CAP_BPF" ];
 in
 {
   options.services.kolorinko = {
@@ -76,6 +83,7 @@ in
         server = {
           bind = "[::]:443";
           inject_wt_hash = false;
+          steer = true;
           cert_file = "/etc/kolorinko/cert.pem";
           key_file = "/etc/kolorinko/key.pem";
         };
@@ -119,9 +127,9 @@ in
         StateDirectory = "kolorinko";
         WorkingDirectory = "/var/lib/kolorinko";
         DynamicUser = true;
-        # Binding 443.
-        AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
-        CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
+        # Binding 443; plus eBPF steering when `server.steer = true`.
+        AmbientCapabilities = capabilities;
+        CapabilityBoundingSet = capabilities;
         # io_uring buffer registration.
         LimitMEMLOCK = "infinity";
         RestrictAddressFamilies = [

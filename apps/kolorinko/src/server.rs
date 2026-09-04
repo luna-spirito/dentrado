@@ -17,14 +17,20 @@
 //! bootstrap already reuses the port. Gear work for a session still routes to
 //! the owning core by [`Core::db_run_gear`]'s inter-core routing.
 //!
-//! The cost is connection migration: a client that changes its source address
-//! (NAT rebinding, Wi-Fi → cellular) is re-hashed to a different core, where
-//! its connection state doesn't exist, so the connection drops. To make that
-//! drop fast instead of silent, every endpoint shares one stateless reset key
-//! (see [`stateless_reset_key`]): the foreign core answers the unknown DCID
-//! with a valid Stateless Reset, and the client tears down promptly rather
-//! than waiting out its retransmission budget. eBPF CID steering desired in
-//! long term.
+//! The kernel's default 4-tuple hash costs connection migration: a client
+//! that changes its source address (NAT rebinding, Wi-Fi → cellular) is
+//! re-hashed to a different core, where its connection state doesn't exist.
+//! [`crate::steer`] removes that cost where the platform allows: with
+//! `server.steer` on, every endpoint mints connection IDs encoding their
+//! owning core (obfuscated by a per-process secret), and an eBPF
+//! `SK_REUSEPORT` program decodes each 1-RTT packet's DCID straight to the
+//! owning core's socket — the client's new address just works, and quinn's
+//! path validation migrates the connection. To make the residual failure
+//! fast instead of silent (steering off or an unknown core), every endpoint
+//! shares one stateless reset key (see [`stateless_reset_key`]): the foreign
+//! core answers the unknown DCID with a valid Stateless Reset, and the
+//! client tears down promptly rather than waiting out its retransmission
+//! budget.
 //!
 //! # TLS — two modes, switched by `--inject-wt-hash`
 //! - **Pooling mode** (flag unset, the default): the QUIC endpoint presents the
@@ -75,8 +81,9 @@ pub(crate) async fn serve(
     bind: &str,
     assets: Arc<HashMap<String, Body>>,
     inject_wt_hash: bool,
+    steer: bool,
 ) -> io::Result<()> {
-    let endpoint = build_endpoint(bind, inject_wt_hash)?;
+    let endpoint = build_endpoint(bind, inject_wt_hash, steer, core.core_id())?;
     info!(
         "kolorinko H3 server listening on {bind} ({})",
         if inject_wt_hash {
@@ -112,7 +119,12 @@ pub(crate) async fn serve(
 /// - pooling mode → the CA-trusted (mkcert) cert, so the HTTP/3 upgrade
 ///   advertised by [`crate::web`] validates and WebTransport can pool with the
 ///   fetch connection pool.
-fn build_endpoint(bind: &str, inject_wt_hash: bool) -> io::Result<compio_quic::Endpoint> {
+fn build_endpoint(
+    bind: &str,
+    inject_wt_hash: bool,
+    steer: bool,
+    core: u32,
+) -> io::Result<compio_quic::Endpoint> {
     let (certs, key) = if inject_wt_hash {
         crate::tls::wt_cert()
     } else {
@@ -125,14 +137,18 @@ fn build_endpoint(bind: &str, inject_wt_hash: bool) -> io::Result<compio_quic::E
     // Build the UDP socket ourselves so we can set SO_REUSEPORT (compio-quic's
     // `bind` doesn't). With it every core binds the same port; the kernel hashes
     // incoming QUIC datagrams by 4-tuple to one core, so each connection lives
-    // entirely on the endpoint that received its Initial.
-    let socket = reuseport_udp_socket(bind)?;
-    compio_quic::Endpoint::new(
-        socket,
-        compio_quic::EndpointConfig::new(stateless_reset_key()),
-        Some(server_config),
-        None,
-    )
+    // entirely on the endpoint that received its Initial — unless `steer`
+    // decodes the owning core out of each packet's DCID instead.
+    let socket = reuseport_udp_socket(bind, core, steer)?;
+    let mut endpoint_config = compio_quic::EndpointConfig::new(stateless_reset_key());
+    if steer {
+        // Mint connection IDs that encode this endpoint's core, for the eBPF
+        // program enrolled through the socket above to dispatch on (see
+        // [`crate::steer`]). The factory runs per connection; each connection
+        // then carries only this core.
+        endpoint_config.cid_generator(move || Box::new(crate::steer::SteerCid::new(core)));
+    }
+    compio_quic::Endpoint::new(socket, endpoint_config, Some(server_config), None)
 }
 
 /// The process-wide QUIC stateless reset key, shared by every core's
@@ -160,10 +176,13 @@ fn stateless_reset_key() -> Arc<dyn compio_quic::crypto::HmacKey> {
 /// datagrams across them by client 4-tuple. Built via `socket2` (the only way
 /// to set `SO_REUSEPORT` before `bind`), then handed to compio through the safe
 /// `UdpSocket::from_std`, which attaches it to the current thread's runtime.
-/// There is no connection-migration support: a client that changes its source
-/// address is re-hashed to another core where its state is absent — fine for
-/// localhost/LAN, where no NAT sits between client and server.
-fn reuseport_udp_socket(bind: &str) -> io::Result<compio::net::UdpSocket> {
+/// Without `steer`, there is no connection-migration support: a client that
+/// changes its source address is re-hashed to another core where its state is
+/// absent, which is answered with a stateless reset. With `steer`, the socket
+/// is enrolled — as `core` — in the eBPF dispatch that routes each 1-RTT
+/// packet to its owning core regardless of the source address (see
+/// [`crate::steer`]).
+fn reuseport_udp_socket(bind: &str, core: u32, steer: bool) -> io::Result<compio::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let addr: std::net::SocketAddr = bind
         .parse()
@@ -173,6 +192,11 @@ fn reuseport_udp_socket(bind: &str) -> io::Result<compio::net::UdpSocket> {
     sock.set_reuse_address(true)?;
     sock.set_reuse_port(true)?;
     sock.bind(&addr.into())?;
+    if steer {
+        // Right after `bind`, while the fd is still a plain socket — the first
+        // enrollment loads and attaches the steering program through it.
+        crate::steer::enroll(&sock, core);
+    }
     compio::net::UdpSocket::from_std(sock.into())
 }
 
@@ -559,9 +583,9 @@ mod tests {
         // bind the same port. Catches a silent regression if set_reuse_port
         // were reordered after bind (it would no-op, second bind → EADDRINUSE).
         new_runtime().block_on(async {
-            let a = super::reuseport_udp_socket("127.0.0.1:0").unwrap();
+            let a = super::reuseport_udp_socket("127.0.0.1:0", 0, false).unwrap();
             let port = a.local_addr().unwrap().port();
-            let _b = super::reuseport_udp_socket(&format!("127.0.0.1:{port}")).unwrap();
+            let _b = super::reuseport_udp_socket(&format!("127.0.0.1:{port}"), 1, false).unwrap();
         });
     }
 }

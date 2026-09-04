@@ -1,0 +1,17 @@
+[package]
+name = "kolorinko-steer-bpf"
+version = "0.1.0"
+authors = ["Luna Spirito <guardspirit@protonmail.com>"]
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+# Built for `bpfel-unknown-none` by kolorinko's `build.rs` (aya-build), not by
+# ordinary host builds — the root workspace lists it outside `default-members`.
+
+[dependencies]
+# `macros` (the `#[sk_reuseport]`/`#[map]` attributes) is re-exported.
+aya-ebpf = "0.2.1"
+
+[[bin]]
+name = "kolorinko-steer"
+path = "src/main.rs"

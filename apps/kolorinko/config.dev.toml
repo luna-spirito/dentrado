@@ -43,6 +43,13 @@ interval = 60
 bind = "127.0.0.1:4433"
 web_dist = "apps/kolorinko-web/dist"
 inject_wt_hash = false
+# eBPF connection-ID steering (src/steer.rs): every minted QUIC connection ID
+# encodes its owning core, and an eBPF SK_REUSEPORT program routes each 1-RTT
+# packet there — a client whose NAT remaps its UDP flow then migrates the
+# session instead of being stateless-reset by a foreign core (the recurring
+# "wt session closed" killer over real networks). Needs root-ish capabilities
+# (CAP_BPF/CAP_NET_ADMIN); unavailable → plain kernel hash dispatch, logged.
+steer = true
 # Browser-trusted mkcert pair (shared by the TCP bootstrap and the H3/WT
 # endpoint in pooling mode). Generate once:
 #   mkdir -p .certs && cd .certs && mkcert localhost 127.0.0.1 ::1 \

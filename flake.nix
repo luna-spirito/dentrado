@@ -52,7 +52,13 @@
             overlays = [ rust-overlay.overlays.default ];
           };
 
-          rustToolchain = pkgs.rust-bin.nightly.latest.default.override {
+          # Pinned to the last nightly from LLVM main before the 23 branch cut:
+          # `nightly.latest` carries an LLVM snapshot newer than any release,
+          # and its bitcode can't be read back by the release-LLVM builds of
+          # bpf-linker ("ERROR llvm: Invalid record"). This date's LLVM is
+          # 22.x, which `llvmPackages_22` (22.1.8) reads fine. Bump the pin
+          # together with bpf-linker's LLVM below.
+          rustToolchain = pkgs.rust-bin.nightly."2026-07-15".default.override {
             extensions = [
               "rust-src"
               "rust-analyzer"
@@ -60,9 +66,38 @@
               "rustfmt"
             ];
             targets = [ "wasm32-unknown-unknown" ];
+            # `bpfel-unknown-none` (kolorinko's eBPF steering program) is
+            # deliberately absent: it has no rust-std component, and rustc
+            # knows the target spec built-in — kolorinko's build.rs compiles
+            # core from `rust-src` via `-Z build-std=core`.
           };
 
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+
+          # Built against the LLVM matching the pinned nightly (see above).
+          bpf-linker = pkgs.rustPlatform.buildRustPackage {
+            pname = "bpf-linker";
+            version = "0.11.0";
+            src = pkgs.fetchFromGitHub {
+              owner = "aya-rs";
+              repo = "bpf-linker";
+              tag = "v0.11.0";
+              hash = "sha256-uMpLQR2FAI96MYfWo8lR9pUeWhswY6wMUOxQwq3hCdw=";
+            };
+            cargoHash = "sha256-asCS4oLMXJ4y4vCDRsq2kuTOOPHebT0Dd+AE20GkZvI=";
+            buildNoDefaultFeatures = true;
+            buildFeatures = [ "llvm-22" ];
+            # llvm-config (dev output) for llvm-sys' build script; the shared
+            # library (lib output) for the link itself.
+            nativeBuildInputs = [ (pkgs.lib.getDev pkgs.llvmPackages_22.llvm) ];
+            buildInputs = [
+              pkgs.zlib
+              pkgs.libxml2
+              (pkgs.lib.getLib pkgs.llvmPackages_22.llvm)
+            ];
+            doCheck = false;
+            meta.mainProgram = "bpf-linker";
+          };
         in
         {
           pre-commit.settings.hooks = {
@@ -84,7 +119,7 @@
           };
 
           packages.kolorinko = pkgs.callPackage ./nix/kolorinko-package.nix {
-            inherit craneLib;
+            inherit craneLib bpf-linker rustToolchain;
           };
 
           devShells.default = pkgs.mkShell {
@@ -97,6 +132,9 @@
               pkgs.cargo-nextest
               pkgs.cargo-watch
               pkgs.cargo-deny
+
+              # Links the eBPF steering program kolorinko's build.rs compiles.
+              bpf-linker
 
               pkgs.typst
 
@@ -117,6 +155,9 @@
               pkgs.cargo-nextest
               pkgs.cargo-watch
               pkgs.cargo-deny
+
+              # Links the eBPF steering program kolorinko's build.rs compiles.
+              bpf-linker
 
               pkgs.trunk
               pkgs.just

@@ -9,6 +9,8 @@
   lib,
   craneLib,
   pkgs,
+  bpf-linker,
+  rustToolchain,
 }:
 
 let
@@ -31,11 +33,17 @@ let
 
   # `cargo metadata` for the web crate walks up into the root workspace via
   # the ../ path deps, so the vendored registry must cover BOTH lockfiles'
-  # closures (e.g. dentrado's blake3) — not just the web one.
+  # closures (e.g. dentrado's blake3) — not just the web one. The toolchain's
+  # rust-src lock covers a third closure: `build.rs` compiles the eBPF
+  # steering program with `-Z build-std=core`, and that resolution pulls the
+  # sysroot workspace's own registry deps (rustc-literal-escaper, hashbrown,
+  # …), which no project lockfile knows about — unreachable in the sandbox
+  # without them vendored.
   cargoVendorDir = craneLib.vendorMultipleCargoDeps {
     cargoLockList = [
       (root + "/Cargo.lock")
       (root + "/apps/kolorinko-web/Cargo.lock")
+      (rustToolchain + "/lib/rustlib/src/rust/library/Cargo.lock")
     ];
   };
 
@@ -51,10 +59,15 @@ let
     pname = "kolorinko";
     inherit version;
     src = srcServer;
+    inherit cargoVendorDir;
     # Only the server's dependency tree out of the workspace.
     cargoExtraArgs = "-p kolorinko";
-    # git2's `https` feature links against system OpenSSL via pkg-config.
-    nativeBuildInputs = [ pkgs.pkg-config ];
+    # git2's `https` feature links against system OpenSSL via pkg-config;
+    # bpf-linker links the eBPF steering program kolorinko's build.rs compiles.
+    nativeBuildInputs = [
+      pkgs.pkg-config
+      bpf-linker
+    ];
     buildInputs = [ pkgs.openssl ];
     doCheck = false;
   };

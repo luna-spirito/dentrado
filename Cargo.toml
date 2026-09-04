@@ -4,6 +4,19 @@ members = [
   "dentrado-macros",
   "dentrado-types",
   "apps/kolorinko",
+  "apps/kolorinko/steer-bpf",
+  "apps/kolorinko-render",
+  "apps/kolorinko-rt",
+  "apps/kolorinko-wikitext",
+]
+# `steer-bpf` builds only for `bpfel-unknown-none`, from kolorinko's `build.rs`
+# (which runs `cargo build -p` inside this workspace); ordinary host commands
+# (`cargo build`/`test`/`check` at the root) must not try to link it.
+default-members = [
+  "dentrado",
+  "dentrado-macros",
+  "dentrado-types",
+  "apps/kolorinko",
   "apps/kolorinko-render",
   "apps/kolorinko-rt",
   "apps/kolorinko-wikitext",

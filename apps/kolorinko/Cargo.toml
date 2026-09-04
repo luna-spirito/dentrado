@@ -57,6 +57,14 @@ clap_derive = { version = "4.6.4" }
 tar = "0.4"
 zstd = "0.13"
 
+# Loader for the `steer-bpf` QUIC steering program (see `src/steer.rs`).
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = "0.14"
+
+[build-dependencies]
+# Compiles `steer-bpf` into `OUT_DIR` for `src/steer.rs` to embed.
+aya-build = "0.2"
+
 [features]
 # Kept as an empty feature so release builds passing `--features portable`
 # keep working; nothing to vendor anymore since the git export source was

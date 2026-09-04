@@ -13,7 +13,7 @@ use dentrado::{
     types::NodeId,
 };
 use indexmap::IndexMap;
-use log::{error, info};
+use log::{error, info, warn};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -35,6 +35,7 @@ mod respond;
 mod runtime;
 mod server;
 mod ssr;
+mod steer;
 mod tls;
 mod web;
 mod wikidot_page;
@@ -76,6 +77,14 @@ struct ServerCfg {
     /// SHA-256 (`serverCertificateHashes`); `false` → CA-trusted cert with
     /// HTTP/3 upgrade via `Alt-Svc` and `allowPooling`.
     inject_wt_hash: bool,
+    /// eBPF connection-ID steering ([`steer`]): the owning core is encoded in
+    /// every minted QUIC connection ID and an eBPF `SK_REUSEPORT` program
+    /// routes each 1-RTT packet to it, so a client that changes its source
+    /// address (NAT rebinding) migrates instead of being stateless-reset. Off
+    /// → plain kernel 4-tuple hash dispatch. Needs `CAP_BPF`; unavailable →
+    /// hash dispatch stays, logged once at startup.
+    #[serde(default = "default_true")]
+    steer: bool,
     /// Optional browser-trusted (e.g. mkcert) cert+key for the TCP (HTTPS)
     /// bootstrap and, in CA-trust mode, the H3 endpoint. Omit to auto-discover
     /// `.certs/{localhost.pem,localhost-key.pem}` (then a self-signed cert as a
@@ -133,6 +142,10 @@ fn load_config(config_path: &Path) -> anyhow::Result<Config> {
         .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", config_path.display()))
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Initialize the process-global config from the parsed file — the single
 /// entry point shared by the server ([`run_server`]) and the render CLI
 /// ([`render_cli`]), so both derive the same space registry.
@@ -152,6 +165,7 @@ fn run_server(config: Config) -> anyhow::Result<()> {
     init_globals(&config)?;
     let bind = config.server.bind.clone();
     let inject_wt_hash = config.server.inject_wt_hash;
+    let steer = config.server.steer;
     tls::set_cert_paths(
         config.server.cert_file.map(PathBuf::from),
         config.server.key_file.map(PathBuf::from),
@@ -160,6 +174,13 @@ fn run_server(config: Config) -> anyhow::Result<()> {
         info!("inject_wt_hash: WebTransport will use serverCertificateHashes");
     } else {
         info!("no inject_wt_hash: WebTransport will use allowPooling + Alt-Svc upgrade");
+    }
+    if steer && cores.get() > steer::MAX_CORES {
+        warn!(
+            "{} cores exceed quic steering's {}-core map; the excess keep the kernel hash dispatch",
+            cores.get(),
+            steer::MAX_CORES
+        );
     }
 
     // Load the frontend once for the whole process (blocking `std::fs`: a
@@ -190,7 +211,9 @@ fn run_server(config: Config) -> anyhow::Result<()> {
             let bind_h3 = bind.clone();
             let assets_h3 = assets.clone();
             compio::runtime::spawn(async move {
-                if let Err(e) = server::serve(core_h3, &bind_h3, assets_h3, inject_wt_hash).await {
+                if let Err(e) =
+                    server::serve(core_h3, &bind_h3, assets_h3, inject_wt_hash, steer).await
+                {
                     error!("h3 server exited: {e}");
                 }
             })
