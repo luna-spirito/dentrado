@@ -50,12 +50,20 @@ let
   version =
     (builtins.fromTOML (builtins.readFile (root + "/apps/kolorinko/Cargo.toml"))).package.version;
 
+  # The `wasm-bindgen` version the web lockfile actually pins. The CLI must
+  # byte-match it: on mismatch it doesn't fail the build, it silently corrupts
+  # the wasm's import section (misaligned rewrite, doubled `__wbg_` prefixes),
+  # and the SPA only dies in the browser with "wasm validation error".
+  lockWasmBindgen =
+    let lock = builtins.fromTOML (builtins.readFile (root + "/apps/kolorinko-web/Cargo.lock"));
+    in (lib.findFirst (p: p.name == "wasm-bindgen") null lock.package).version;
+
   srcServer = lib.cleanSourceWith {
     src = craneLib.path root;
     filter = craneLib.filterCargoSources;
   };
 
-  server = craneLib.buildPackage {
+  server = (craneLib.buildPackage {
     pname = "kolorinko";
     inherit version;
     src = srcServer;
@@ -70,7 +78,31 @@ let
     ];
     buildInputs = [ pkgs.openssl ];
     doCheck = false;
-  };
+  }).overrideAttrs (old: {
+    # The placeholder fallback in build.rs is for toolchain-less cargo
+    # builds; this flake always passes bpf-linker, so a missing embed must
+    # fail the package here, not steering in production. In `overrideAttrs`
+    # (not the call attrs) so the check doesn't leak into crane's internal
+    # deps-only build, which has no `bin/`.
+    nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.python3 ];
+    doInstallCheck = true;
+    installCheckPhase = ''
+      runHook preInstallCheck
+      python3 - "$out/bin/kolorinko" <<'PY'
+      import struct, sys
+      data = open(sys.argv[1], "rb").read()
+      off = 0
+      while True:
+          i = data.find(b"\x7fELF", off)
+          if i < 0:
+              sys.exit("kolorinko carries no embedded BPF object (placeholder!)")
+          if i + 20 <= len(data) and struct.unpack_from("<H", data, i + 18)[0] == 247:
+              sys.exit(0)
+          off = i + 1
+      PY
+      runHook postInstallCheck
+    '';
+  });
 
   # crane's mkDummySrc keeps only the ROOT Cargo.lock — the web crate's own
   # lockfile gets dropped, cargo re-resolves to different versions and the
@@ -133,13 +165,28 @@ let
     '';
     # buildPhase's `cd` persists into installPhase, so dist is at ./dist.
     installPhaseCommand = "cp -r dist $out";
-    # `wasm-bindgen-cli` must byte-match the `wasm-bindgen` version in that
-    # lockfile.
-    wasm-bindgen-cli = pkgs.wasm-bindgen-cli_0_2_126;
+    # `wasm-bindgen-cli` must byte-match `wasm-bindgen` in the web lockfile
+    # (see `lockWasmBindgen`); refuse evaluation on drift instead of letting
+    # the CLI corrupt the wasm.
+    wasm-bindgen-cli = lib.throwIfNot (pkgs.wasm-bindgen-cli.version == lockWasmBindgen)
+      "wasm-bindgen-cli ${pkgs.wasm-bindgen-cli.version} != wasm-bindgen ${lockWasmBindgen} in apps/kolorinko-web/Cargo.lock — keep them byte-matched"
+      pkgs.wasm-bindgen-cli;
     # Deps (leptos, wasm-bindgen, the path crates' deps…) come from the
     # stubbed deps-only build above; Trunk then builds just the web crate.
     cargoArtifacts = webDeps;
     doCheck = false;
+    # Compiling the wasm with an engine is the only gate that catches a
+    # mis-wired web toolchain — the binaryen-132 corruption of the import
+    # section shipped silently otherwise.
+    nativeBuildInputs = [ pkgs.nodejs ];
+    doInstallCheck = true;
+    installCheckPhase = ''
+      runHook preInstallCheck
+      for wasm in "$out"/*.wasm; do
+        node -e 'try { new WebAssembly.Module(require("fs").readFileSync(process.argv[1])) } catch (e) { console.error(e.message); process.exit(1) }' "$wasm"
+      done
+      runHook postInstallCheck
+    '';
   };
 in
 pkgs.symlinkJoin {
