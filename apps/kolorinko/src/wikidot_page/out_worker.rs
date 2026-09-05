@@ -215,10 +215,11 @@ impl OutWorker {
             w.files = read_files_index(site_dir).into_iter().collect();
         }
         if old.stamps.shell != stamps.shell {
-            let (title, subtitle, theme_root) = read_shell(site_dir);
-            w.title = title;
-            w.subtitle = subtitle;
-            w.theme_root = theme_root;
+            let chrome = read_shell(site_dir);
+            w.title = chrome.title;
+            w.subtitle = chrome.subtitle;
+            w.theme_root = chrome.theme_root;
+            w.landing = chrome.landing;
         }
         self.states.insert(site.clone(), SiteState { stamps, rows });
         self.sites.insert(site.clone(), w);

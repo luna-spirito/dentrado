@@ -781,38 +781,60 @@ title: \"RPC Authority\"
 subtitle: \"Research, Protection, Containment\"
 theme_root: files/cdn.jsdelivr.net/gh/x/y@main/style.css
 ";
-    let (title, subtitle, theme_root) = super::parse_shell(text);
-    assert_eq!(title.as_deref(), Some("RPC Authority"));
+    let chrome = super::parse_shell(text);
+    assert_eq!(chrome.title.as_deref(), Some("RPC Authority"));
     assert_eq!(
-        subtitle.as_deref(),
+        chrome.subtitle.as_deref(),
         Some("Research, Protection, Containment")
     );
-    let theme_root = theme_root.expect("theme_root");
+    let theme_root = chrome.theme_root.expect("theme_root");
     assert_eq!(
         theme_root.as_str(),
         "cdn.jsdelivr.net/gh/x/y@main/style.css"
     );
     // The out/ publication's raw-URL shape, percent-escapes included.
-    let (_, _, theme_root) = super::parse_shell(
+    let chrome = super::parse_shell(
         "theme_root: https://scp-wiki.wdfiles.com/local--code/component%3Atheme/1\n",
     );
-    let theme_root = theme_root.expect("url theme_root");
     assert_eq!(
-        theme_root.as_str(),
+        chrome.theme_root.expect("url theme_root").as_str(),
         "scp-wiki.wdfiles.com/local--code/component:theme/1"
+    );
+}
+
+#[test]
+fn parse_shell_reads_landing_with_start_default() {
+    // A shell-carried landing: a quoted `cat:name` slug, category included
+    // (srddf names `deleted:blog:_start`); or a bare name.
+    assert_eq!(
+        super::parse_shell("landing: \"deleted:blog:_start\"\n").landing,
+        kolorinko_rt::parse_slug("deleted:blog:_start").unwrap()
+    );
+    assert_eq!(
+        super::parse_shell("landing: \"main\"\n").landing,
+        kolorinko_rt::parse_slug("main").unwrap()
+    );
+    // No landing line — and an unparsable one — fall back to `start`.
+    assert_eq!(
+        super::parse_shell("title: \"T\"\n").landing,
+        kolorinko_rt::start_slug()
+    );
+    assert_eq!(
+        super::parse_shell("landing: \"../escape\"\n").landing,
+        kolorinko_rt::start_slug()
     );
 }
 
 #[test]
 fn parse_shell_missing_or_hostless_theme_root_is_none() {
     // No theme_root line.
-    let (t, s, r) = super::parse_shell("title: \"T\"\n");
-    assert_eq!(t.as_deref(), Some("T"));
-    assert!(s.is_none());
-    assert!(r.is_none());
+    let chrome = super::parse_shell("title: \"T\"\n");
+    assert_eq!(chrome.title.as_deref(), Some("T"));
+    assert!(chrome.subtitle.is_none());
+    assert!(chrome.theme_root.is_none());
     // A site-relative CSS path has no host — no mirrored identity.
-    let (_, _, r) = super::parse_shell("theme_root: /local--code/component:theme\n");
-    assert!(r.is_none());
+    let chrome = super::parse_shell("theme_root: /local--code/component:theme\n");
+    assert!(chrome.theme_root.is_none());
 }
 
 /// Against a real evakuilo publication: the `files.json` index must map the
@@ -832,6 +854,8 @@ fn real_publication_indexes_files_and_shell() {
     assert!(!rows.is_empty(), "manifest indexed");
     assert!(w.title.as_deref() == Some("RPC Authority"));
     assert!(w.subtitle.as_ref().is_some_and(|s| !s.is_empty()));
+    // The publication shell names rpc's landing explicitly.
+    assert_eq!(w.landing, kolorinko_rt::parse_slug("start").unwrap());
     let theme_path = w.theme_root.clone().expect("theme_root parsed");
     // The files index resolves the theme path to a full 64-char sha256 —
     // NOT the 60-char sharded leaf (the bug this guards against).
@@ -898,14 +922,12 @@ fn init_test_globals() {
     sites.insert(
         "obscurative".to_string(),
         crate::globals::SiteCfg {
-            landing: "main".into(),
             domains: vec!["www.obscurative.ru".into()],
         },
     );
     sites.insert(
         "rpcauthority".to_string(),
         crate::globals::SiteCfg {
-            landing: kolorinko_rt::START_PAGE.into(),
             domains: vec!["rpc-wiki.net".into()],
         },
     );

@@ -97,7 +97,7 @@ pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
     let body = latest.map_or_else(|| Arc::from(""), |p| Arc::clone(p.body));
     let revisions = latest.map_or_else(Vec::new, |p| p.revisions.to_vec());
     // A missing page parses to an empty view (blank slug) — the 404 shape.
-    let Some(slug) = slug_to_key(&page_meta.slug) else {
+    let Some(slug) = parse_slug(&page_meta.slug) else {
         return ArticleView::default();
     };
     let host = HostCtx {

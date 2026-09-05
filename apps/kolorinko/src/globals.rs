@@ -34,30 +34,23 @@ use serde::Deserialize;
 
 use crate::wikidot_page::OutMeta;
 
-/// One `ensure-evakuilo-sites` table entry: the site's landing page (`start`,
-/// Wikidot's default, unless named otherwise — e.g. obscurative's `main`) and
-/// its alias domains.
+/// One `ensure-evakuilo-sites` table entry: the site's alias domains. (Its
+/// landing page is not configured — it travels with the publication, the
+/// `shell`'s `landing` key, `start` by default; see [`SpaceReg`].)
 #[derive(Debug, Deserialize)]
 pub(crate) struct SiteCfg {
-    #[serde(default = "default_landing")]
-    pub landing: String,
     /// The source site's custom domains (`www.obscurative.ru`, …). See
     /// [`SpaceReg::domains`].
     #[serde(default)]
     pub domains: Vec<String>,
 }
 
-fn default_landing() -> String {
-    kolorinko_rt::START_PAGE.to_owned()
-}
-
-/// One registered content space: the export dataset site that serves it, the
-/// slug its bare `/SPACE` (and `/`) resolve to (the site's landing page —
-/// Wikidot's default is `start`, but many wikis name it `main`), and the
-/// source site's alias domains.
+/// One registered content space: the export dataset site that serves it and
+/// the source site's alias domains. The landing page a bare `/SPACE` resolves
+/// to is not part of the registration — it lives in the site's publication
+/// ([`kolorinko_rt::WDWebsite::landing`]).
 pub(crate) struct SpaceReg {
     pub site: SafePathComponent,
-    pub landing: SafePathComponent,
     /// The source site's custom domains: URLs on these hosts (CSS `url()`,
     /// images, links) resolve to the site's mirrored attachments exactly like
     /// `<site>.wikidot.com` ones do, and `Host: <domain>` requests address
@@ -97,7 +90,7 @@ pub(crate) fn evakuilo_space_id(site: &str) -> SpaceId {
 }
 
 /// Initialize once from the parsed config. Fails (before anything starts) on
-/// an invalid site/landing/domain name, a domain claimed by two sites, or a
+/// an invalid site or domain name, a domain claimed by two sites, or a
 /// second initialization. A TOML table cannot repeat a key, so duplicate
 /// sites and duplicate space ids are unrepresentable by construction.
 pub(crate) fn init(
@@ -125,7 +118,6 @@ pub(crate) fn init(
     let mut seen_domains: HashSet<String> = HashSet::new();
     for (site_name, cfg) in sites {
         let site = spc(site_name, "space site")?;
-        let landing = spc(&cfg.landing, "landing page")?;
         for d in &cfg.domains {
             if d.is_empty()
                 || !d
@@ -145,7 +137,6 @@ pub(crate) fn init(
             space,
             SpaceReg {
                 site,
-                landing,
                 domains: cfg.domains.clone().into_boxed_slice(),
             },
         ));

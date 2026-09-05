@@ -5,13 +5,14 @@
 #   state in /var/lib/kolorinko (systemd StateDirectory),
 #   TLS material in /etc/kolorinko, exposed to the service by systemd as
 #   credentials under /run/credentials/kolorinko.service/.
-# Site-registration lore (space-id derivation, `landing`, `domains`) lives in
+# Site-registration lore (space-id derivation, `domains`) lives in
 # config.dev.toml.
 
 # Wikidot-export sites to register, in serving order (first entry's landing
-# page is what the bare `/` serves).
+# page is what the bare `/` serves — the landing itself comes from each
+# site's `shell` publication, not the config).
 [ensure-evakuilo-sites]
-"obscurative" = { landing = "main", domains = ["www.obscurative.ru"] }
+"obscurative" = { domains = ["www.obscurative.ru"] }
 "rpcauthority" = { domains = ["rpc-wiki.net", "www.rpc-wiki.net"] }
 
 [evakuilo]

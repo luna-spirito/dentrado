@@ -23,7 +23,7 @@ pub(super) fn patch_pages(
         if new_rows.get(id) == Some(old) {
             continue;
         }
-        if let Some((cat, name)) = slug_to_key(&old.slug) {
+        if let Some((cat, name)) = parse_slug(&old.slug) {
             remove_page(w, cat, &name, *id);
         }
     }
@@ -34,7 +34,7 @@ pub(super) fn patch_pages(
         let Some(article) = read_stored_page(site_dir, id, row, bodies) else {
             continue;
         };
-        let Some((cat, name)) = slug_to_key(&article.meta.slug) else {
+        let Some((cat, name)) = parse_slug(&article.meta.slug) else {
             continue;
         };
         w.by_page_id.insert(*id, (cat.clone(), name.clone()));
@@ -64,37 +64,53 @@ pub(super) fn remove_page(
     w.by_page_id.remove(&page_id);
 }
 
-/// Parse a `shell` file: `title`, `subtitle` (both quoted) and `theme_root`.
-/// Returns the title/subtitle verbatim and the theme root as the validated,
-/// percent-decoded `<host>/<path>` tail for resolution against the `files/`
-/// index. Two source shapes normalise to that tail: the raw URL the `out/`
-/// publication writes (`https://host/path`), and the `files/`-prefixed tail
-/// the older git export wrote. Unknown keys are ignored; a missing
-/// `theme_root` — or one with no mirrored identity (e.g. a site-relative CSS
-/// path, no host) — yields `None`.
-pub(super) fn parse_shell(text: &str) -> (Option<String>, Option<String>, Option<RepoAssetPath>) {
-    let mut title = None;
-    let mut subtitle = None;
-    let mut theme_root = None;
+/// The parsed `shell` file — one site's chrome. The `landing` slug is always
+/// present ([`start_slug`] unless the shell names one); everything else is
+/// `Option` because the shell may omit it.
+pub(super) struct SiteChrome {
+    pub(super) title: Option<String>,
+    pub(super) subtitle: Option<String>,
+    pub(super) theme_root: Option<RepoAssetPath>,
+    pub(super) landing: Slug,
+}
+
+/// Parse a `shell` file: `title`, `subtitle` (both quoted), `theme_root`, and
+/// `landing` (a quoted `cat:name` slug). Returns the title/subtitle verbatim
+/// and the theme root as the validated, percent-decoded `<host>/<path>` tail
+/// for resolution against the `files/` index. Two source shapes normalise to
+/// that tail: the raw URL the `out/` publication writes
+/// (`https://host/path`), and the `files/`-prefixed tail the older git
+/// export wrote. Unknown keys are ignored; a missing `theme_root` — or one
+/// with no mirrored identity (e.g. a site-relative CSS path, no host) —
+/// yields `None`; a missing or unparsable `landing` falls back to
+/// [`start_slug`].
+pub(super) fn parse_shell(text: &str) -> SiteChrome {
+    let mut chrome = SiteChrome {
+        title: None,
+        subtitle: None,
+        theme_root: None,
+        landing: start_slug(),
+    };
     for line in text.lines() {
         let Some((k, v)) = line.split_once(':') else {
             continue;
         };
         let v = v.trim();
         match k.trim() {
-            "title" => title = Some(strip_quotes(v).to_string()),
-            "subtitle" => subtitle = Some(strip_quotes(v).to_string()),
+            "title" => chrome.title = Some(strip_quotes(v).to_string()),
+            "subtitle" => chrome.subtitle = Some(strip_quotes(v).to_string()),
             "theme_root" => {
                 let tail = match v.strip_prefix("files/") {
                     Some(t) => Some(t.to_string()),
                     None => url_tail(v),
                 };
                 if let Some(tail) = tail {
-                    theme_root = RepoAssetPath::new(percent_decode(&tail));
+                    chrome.theme_root = RepoAssetPath::new(percent_decode(&tail));
                 }
             }
+            "landing" => chrome.landing = parse_slug(strip_quotes(v)).unwrap_or_else(start_slug),
             _ => {}
         }
     }
-    (title, subtitle, theme_root)
+    chrome
 }

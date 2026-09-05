@@ -271,14 +271,11 @@ pub(super) fn url_tail(url: &str) -> Option<String> {
 
 // ── shell ──
 
-/// Read the site chrome (`shell`) — see [`parse_shell`] for the format.
-pub(super) fn read_shell(
-    site_dir: &Path,
-) -> (Option<String>, Option<String>, Option<RepoAssetPath>) {
-    match std::fs::read_to_string(site_dir.join("shell")) {
-        Ok(text) => parse_shell(&text),
-        Err(_) => (None, None, None),
-    }
+/// Read the site chrome (`shell`) — see [`parse_shell`] for the format. A
+/// missing or unreadable file parses as the empty shell (all-`None` chrome,
+/// the default landing).
+pub(super) fn read_shell(site_dir: &Path) -> SiteChrome {
+    parse_shell(&std::fs::read_to_string(site_dir.join("shell")).unwrap_or_default())
 }
 
 // ── Whole-corpus build ──
@@ -297,17 +294,18 @@ pub(super) fn build_site(
         let Some(article) = read_stored_page(site_dir, id, row, bodies) else {
             continue;
         };
-        let Some((cat, name)) = slug_to_key(&article.meta.slug) else {
+        let Some((cat, name)) = parse_slug(&article.meta.slug) else {
             continue;
         };
         w.by_page_id.insert(*id, (cat.clone(), name.clone()));
         w.articles.entry(cat).or_default().insert(name, article);
     }
     w.files = read_files_index(site_dir).into_iter().collect();
-    let (title, subtitle, theme_root) = read_shell(site_dir);
-    w.title = title;
-    w.subtitle = subtitle;
-    w.theme_root = theme_root;
+    let chrome = read_shell(site_dir);
+    w.title = chrome.title;
+    w.subtitle = chrome.subtitle;
+    w.theme_root = chrome.theme_root;
+    w.landing = chrome.landing;
     Some((rows, w))
 }
 
@@ -395,27 +393,6 @@ pub(super) fn revision_body(text: &str) -> &str {
         return text;
     };
     &rest[end + "\n---\n".len()..]
-}
-
-/// Split a canonical slug into `(Option<category>, name)`: `help:foo` →
-/// `(Some("help"), "foo")`, `foo` → `(None, "foo")`.
-pub(super) fn slug_parts(slug: &str) -> (Option<String>, String) {
-    match slug.split_once(':') {
-        Some((cat, name)) => (Some(cat.to_string()), name.to_string()),
-        None => (None, slug.to_string()),
-    }
-}
-
-/// `(Option<category>, name)` as validated [`SafePathComponent`]s, or `None` if
-/// either segment is unsafe (the page is dropped, as in [`build_site`]).
-pub(super) fn slug_to_key(slug: &str) -> Option<(Option<SafePathComponent>, SafePathComponent)> {
-    let (cat, name) = slug_parts(slug);
-    let name = SafePathComponent::new(name)?;
-    let cat = match cat {
-        None => None,
-        Some(c) => Some(SafePathComponent::new(c)?),
-    };
-    Some((cat, name))
 }
 
 /// Strip one layer of surrounding double quotes, if present.

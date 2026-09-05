@@ -14,7 +14,8 @@
 //! <out>/<site>/files.json                    ← attachment manifest (URL,
 //!                                                sha256, size, status)
 //! <out>/<site>/files_ca/ab/cd/<sha[4..]>     ← content-addressed blobs
-//! <out>/<site>/shell                         ← title/subtitle/theme_root
+//! <out>/<site>/shell                         ← title/subtitle/theme_root/
+//!                                                landing
 //! ```
 //! The manifest is deterministic and write-if-changed, and every blob and
 //! archive lands via tmp+rename — so a file's `(mtime, size)` drifting is
@@ -91,7 +92,7 @@ use kolorinko_render::{http_refs, http_tail, rewrite_with};
 use kolorinko_rt::{
     Article, BlobId, Body, CaRef, CodeBlock, ListPagesQuery, ListPagesResult, ListedPage, LocalId,
     PageQuery, PageQueryResult, RepoAssetPath, RepoSnapshot, SafePathComponent, SiteShell, Slug,
-    SpaceId, WDWebsite,
+    SpaceId, WDWebsite, parse_slug, start_slug,
 };
 use kolorinko_wikitext::{
     ArticleMeta, ArticleView, BlockCell, BlockRow, BlockTable, ContainerKind, Content, Include,

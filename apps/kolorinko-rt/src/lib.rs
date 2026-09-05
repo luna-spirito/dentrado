@@ -25,7 +25,8 @@ pub use crate::ids::{
 /// A page slug: `(category, page)` — Wikidot's `category:name` flattened.
 pub type Slug = (Option<SafePathComponent>, SafePathComponent);
 
-/// The landing page a bare `/<site>/` resolves to.
+/// The landing page a bare site root resolves to when the site's `shell`
+/// names none — `start`, Wikidot's own default.
 pub const START_PAGE: &str = "start";
 
 /// The fetch-fallback gear endpoint (`POST`): one wire `ClientMsg::Subscribe`
@@ -37,11 +38,12 @@ pub const START_PAGE: &str = "start";
 /// and the client's fallback transport can never drift.
 pub const LEGACY_PATH: &str = "/-/legacy";
 
-/// `category:name` / `name` → a slug, mirroring how the dataset keys pages
-/// (the mirror's `slug_parts`): the colon form is Wikidot's canonical page
-/// URL and must resolve identically to the generated `/<site>/<cat>/<page>`
-/// links.
-fn slug_of(seg: &str) -> Option<Slug> {
+/// `category:name` / `name` → a slug, mirroring how the dataset keys pages:
+/// the colon form is Wikidot's canonical page URL and must resolve
+/// identically to the generated `/<site>/<cat>/<page>` links. `None` when
+/// either segment is not a single safe path component.
+#[must_use]
+pub fn parse_slug(seg: &str) -> Option<Slug> {
     match seg.split_once(':') {
         Some((cat, name)) => Some((
             Some(SafePathComponent::new(cat.to_string())?),
@@ -49,6 +51,15 @@ fn slug_of(seg: &str) -> Option<Slug> {
         )),
         None => Some((None, SafePathComponent::new(seg.to_string())?)),
     }
+}
+
+/// The default landing slug — [`START_PAGE`] as a bare (no-category) slug,
+/// what a site root resolves to when the site's `shell` names no landing of
+/// its own.
+#[must_use]
+pub fn start_slug() -> Slug {
+    let name = SafePathComponent::new(START_PAGE.to_owned());
+    (None, name.expect("\"start\" is one safe component"))
 }
 
 /// `/<site>[/<category>/<page>]` → `(site, slug)`. A bare `/<site>/` resolves
@@ -65,8 +76,8 @@ pub fn parse_route(path: &str) -> Option<(SafePathComponent, Slug)> {
         .collect();
     let spc = |s: &str| SafePathComponent::new(s.to_string());
     match segs.as_slice() {
-        [s] => Some((spc(s)?, (None, spc(START_PAGE)?))),
-        [s, p] => Some((spc(s)?, slug_of(p)?)),
+        [s] => Some((spc(s)?, start_slug())),
+        [s, p] => Some((spc(s)?, parse_slug(p)?)),
         [s, c, p] => Some((spc(s)?, (Some(spc(c)?), spc(p)?))),
         _ => None,
     }
@@ -246,10 +257,12 @@ pub struct RepoSnapshot {
 }
 
 /// One mirrored site: its pages nested by category; the site chrome from
-/// `<site>/shell` (title, subtitle, and the theme-root path into `files/`);
-/// and the content-addressed `files/` index — each mirrored attachment's
-/// `<host>/<path>` tail (percent-decoded) mapped to its [`CaRef`].
-#[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// `<site>/shell` (title, subtitle, the theme-root path into `files/`, and
+/// `landing` — the slug a bare site root resolves to, [`start_slug`] unless
+/// the shell names one); and the content-addressed `files/` index — each
+/// mirrored attachment's `<host>/<path>` tail (percent-decoded) mapped to its
+/// [`CaRef`].
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WDWebsite {
     pub articles:
         imbl::HashMap<Option<SafePathComponent>, imbl::HashMap<SafePathComponent, Article>>,
@@ -262,7 +275,24 @@ pub struct WDWebsite {
     /// The theme stylesheet's `<host>/<path>` tail (`files/` prefix stripped);
     /// resolved against [`WDWebsite::files`] to a CA URL by the `shell` gear.
     pub theme_root: Option<RepoAssetPath>,
+    /// The landing slug — the shell's `landing` key (`start` by default;
+    /// always present, like the landing itself).
+    pub landing: Slug,
     pub files: imbl::HashMap<RepoAssetPath, CaRef>,
+}
+
+impl Default for WDWebsite {
+    fn default() -> Self {
+        Self {
+            articles: imbl::HashMap::new(),
+            by_page_id: imbl::HashMap::new(),
+            title: None,
+            subtitle: None,
+            theme_root: None,
+            landing: start_slug(),
+            files: imbl::HashMap::new(),
+        }
+    }
 }
 
 /// One page: metadata, the full revision-history summary, and the

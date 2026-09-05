@@ -12,15 +12,16 @@
 # (Owned spaces, when they appear, will derive from an ed25519 pubkey+label
 # instead — see `SpaceId`'s docs in kolorinko-rt.)
 # Per site:
-# - `landing` (default `start`): the page its bare `/SPACE` resolves to.
-#   obscurative names it `main`, not Wikidot's default.
 # - `domains`: the source site's custom domains. URLs on these hosts (e.g.
 #   `www.obscurative.ru/local--files/…` in CSS `url()`) resolve to the site's
 #   mirrored attachments like `<site>.wikidot.com` ones do, and `Host:`
 #   requests on them address the space without a `SPACE_ID` URL segment —
 #   the wiki's own domain.
+# The landing page a bare `/SPACE` resolves to is not configured — it
+# travels with the publication: the site `shell`'s `landing` key, `start`
+# by default.
 [ensure-evakuilo-sites]
-"obscurative" = { landing = "main", domains = ["www.obscurative.ru"] }
+"obscurative" = { domains = ["www.obscurative.ru"] }
 "rpcauthority" = { domains = ["rpc-wiki.net", "www.rpc-wiki.net", "rpc.localhost" ] }
 "ru-backrooms" = {}
 "srddf" = {}

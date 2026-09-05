@@ -86,12 +86,13 @@ pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
         })
         .unwrap_or_default();
     // The landing page's canonical address — the same resolution the server's
-    // bare-root 301 performs (the registry's landing slug through the
-    // dataset), title included — so the client's site link skips the
-    // round-trip and lands on the same titled route the 301 would.
-    let root = crate::globals::reg_of(&space)
-        .map(|reg| (None, reg.landing.clone()))
-        .and_then(|slug| article(data, site, &slug))
+    // bare-root 301 performs (the shell's landing slug through the dataset),
+    // title included — so the client's site link skips the round-trip and
+    // lands on the same titled route the 301 would.
+    let root = data
+        .sites
+        .get(site)
+        .and_then(|w| article(data, site, &w.landing))
         .and_then(|a| {
             LocalId::from_page_id(&a.meta.page_id).map(|local| (space, local, a.meta.title.clone()))
         });

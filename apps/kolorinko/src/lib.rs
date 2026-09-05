@@ -50,8 +50,9 @@ struct Config {
     server: ServerCfg,
     /// Wikidot-export sites to register as content spaces, in serving order
     /// (the first entry's landing page is what the bare `/` serves): site →
-    /// [`globals::SiteCfg`] (`landing`, `domains`). The canonical space id is
-    /// derived as `SHA-256("wikidot-evakuilo/v1/<site>")[0..16]` — see
+    /// [`globals::SiteCfg`] (`domains`; the landing page travels with the
+    /// publication — the site `shell`'s `landing` key). The canonical space
+    /// id is derived as `SHA-256("wikidot-evakuilo/v1/<site>")[0..16]` — see
     /// [`globals::evakuilo_space_id`]. An `IndexMap` keeps the TOML document
     /// order, which defines `/`'s serving space.
     #[serde(rename = "ensure-evakuilo-sites", default)]

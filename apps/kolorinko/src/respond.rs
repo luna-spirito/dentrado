@@ -221,16 +221,16 @@ async fn route(
     // family addressed without the space segment, and `/` — the wiki's
     // homepage — permanently redirected to its landing page's canonical
     // address.
-    if let Some((space, reg)) = host.and_then(crate::globals::space_of_domain) {
+    if let Some((space, _)) = host.and_then(crate::globals::space_of_domain) {
         if segs.as_slice() == [""] {
-            return landing_redirect(core, &space, &reg.landing, host).await;
+            return landing_redirect(core, &space, host).await;
         }
         return tail_route(&segs, space, accept_zstd, assets, core, host).await;
     }
     // `/` — the first registered space's landing page, same redirect.
     if segs.as_slice() == [""] {
         return match crate::globals::first_space() {
-            Some((space, reg)) => landing_redirect(core, &space, &reg.landing, host).await,
+            Some((space, _)) => landing_redirect(core, &space, host).await,
             None => index_fallback(assets, accept_zstd, host),
         };
     }
@@ -245,10 +245,10 @@ async fn route(
 /// segment: `LOCAL[/TITLE]` — the canonical route, SSR'd (the title is
 /// decorative, never inspected); `[cat:]slug…` — a page named by its slug:
 /// resolved and permanently redirected to its titled canonical form; a bare
-/// tail — the space's landing page, same redirect. Redirect targets are the
-/// canonical route (valid on any origin) through the origin's `simplify`
-/// ([`Reply::moved`]) — a foreign space stays full, the origin's default
-/// drops its segment.
+/// tail — the space's landing page (read from the site's publication shell),
+/// same redirect. Redirect targets are the canonical route (valid on any
+/// origin) through the origin's `simplify` ([`Reply::moved`]) — a foreign
+/// space stays full, the origin's default drops its segment.
 async fn tail_route(
     tail: &[&str],
     space: SpaceId,
@@ -266,15 +266,23 @@ async fn tail_route(
     // `…/code/N` — Wikidot's code-block endpoint rides the slug family (on
     // either origin): the Nth `[[code]]` block served in place, never
     // redirected. Not on the canonical `L…` address above — a block has no
-    // permanent URL of its own.
-    if let Some((slug_tail, n)) = code_tail(tail)
-        && let Some(slug) = slug_of(slug_tail, &space)
-    {
-        return code_reply(space, slug, n, accept_zstd, core).await;
+    // permanent URL of its own. An empty slug tail is the landing page's
+    // block, like Wikidot's site-root `/code/N`.
+    if let Some((slug_tail, n)) = code_tail(tail) {
+        let slug = match slug_tail {
+            [] => landing_slug(core, &space).await,
+            _ => slug_of(slug_tail),
+        };
+        if let Some(slug) = slug {
+            return code_reply(space, slug, n, accept_zstd, core).await;
+        }
     }
-    let slug = match slug_of(tail, &space) {
-        Some(slug) => slug,
-        None => return Reply::not_found(),
+    // A bare tail names the landing page; anything else, a slug.
+    let Some(slug) = (match tail {
+        [] => landing_slug(core, &space).await,
+        _ => slug_of(tail),
+    }) else {
+        return Reply::not_found();
     };
     // A permanent redirect — the canonical route through the origin's
     // `simplify` ([`Reply::moved`]).
@@ -289,17 +297,19 @@ async fn tail_route(
     }
 }
 
-/// `/` — a space's landing page (`start`, `main`, …), permanently redirected
-/// to its canonical address, simplified against the origin's `Host` (the
-/// wiki's own domain lands on the short form, the main origin on the full
-/// one). `None` (unregistered space, unknown landing) is a 404.
+/// `/` — a space's landing page (the site shell's `landing`, `start` by
+/// default), permanently redirected to its canonical address, simplified
+/// against the origin's `Host` (the wiki's own domain lands on the short
+/// form, the main origin on the full one). `None` (unregistered space,
+/// unknown landing) is a 404.
 async fn landing_redirect(
     core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
     space: &SpaceId,
-    landing: &SafePathComponent,
     host: Option<&str>,
 ) -> Reply {
-    let slug = (None, landing.clone());
+    let Some(slug) = landing_slug(core, space).await else {
+        return Reply::not_found();
+    };
     match page_local(core, space, &slug).await {
         Some((local, title)) => Reply::moved(
             host_default(host),
@@ -307,6 +317,21 @@ async fn landing_redirect(
         ),
         None => Reply::not_found(),
     }
+}
+
+/// The space's landing slug — the site shell's `landing` key ([`start_slug`]
+/// when the shell carries none), read through the [`repo_snap`] gear.
+/// `None`: an unregistered space, or one whose publication carries no site
+/// entry (nothing for the landing redirect to resolve against).
+///
+/// [`repo_snap`]: crate::wikidot_page::repo_snap
+async fn landing_slug(
+    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    space: &SpaceId,
+) -> Option<Slug> {
+    let site = crate::globals::site_of(space)?;
+    let snap = repo_snap().subscribe(core).await;
+    Some(snap.current().sites.get(site)?.landing.clone())
 }
 
 /// The slug-family tail of a `…/code/N` request: the segments naming the
@@ -366,15 +391,12 @@ async fn code_reply(
 }
 
 /// The `(category, name)` slug named by the segments after the space id:
-/// `cat:name`, `name`, or the old flattened `cat/name`; no segments at all
-/// names the space's landing page.
-fn slug_of(tail: &[&str], space: &SpaceId) -> Option<Slug> {
+/// `cat:name`, `name`, or the old flattened `cat/name`. No segments at all
+/// — the landing page — is left to the caller: that slug lives in the site's
+/// publication shell ([`landing_slug`]), not the URL.
+fn slug_of(tail: &[&str]) -> Option<Slug> {
     let spc = |s: &str| SafePathComponent::new(s.to_string());
     match tail {
-        [] => {
-            let reg = crate::globals::reg_of(space)?;
-            Some((None, reg.landing.clone()))
-        }
         [x] => match x.split_once(':') {
             Some((cat, name)) => Some((Some(spc(cat)?), spc(name)?)),
             None => Some((None, spc(x)?)),
@@ -626,7 +648,6 @@ fn matches_etag(header: &str, etag: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{Slug, segments, slug_of};
-    use kolorinko_rt::SpaceId;
 
     #[test]
     fn segments_split() {
@@ -646,8 +667,7 @@ mod tests {
 
     #[test]
     fn slug_of_shapes() {
-        let space = SpaceId::parse("S70P6lbBZxbc-kcpGOCYmZA").unwrap();
-        let slug = |tail: &[&str]| strs(slug_of(tail, &space));
+        let slug = |tail: &[&str]| strs(slug_of(tail));
         // `name`, `cat:name`, and the old flattened `cat/name`.
         assert_eq!(slug(&["name"]), Some((None, "name".into())));
         assert_eq!(
@@ -658,11 +678,14 @@ mod tests {
             slug(&["cat", "name"]),
             Some((Some("cat".into()), "name".into()))
         );
-        // Deeper than any legacy form, or an empty name — never a slug.
+        // Deeper than any legacy form, an empty name, or no segments at all
+        // (the landing page — resolved from the site shell, not the URL) —
+        // never a slug here.
         assert_eq!(slug(&["a", "b", "c"]), None);
         assert_eq!(slug(&[""]), None);
         assert_eq!(slug(&["cat:"]), None);
         assert_eq!(slug(&[":name"]), None);
+        assert_eq!(slug(&[]), None);
     }
 
     #[test]
