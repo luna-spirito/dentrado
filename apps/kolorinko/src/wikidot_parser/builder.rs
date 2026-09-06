@@ -136,6 +136,10 @@ fn build_tag_node(open: OpenTag, children: Content) -> Node {
             },
             content: children,
         },
+        OpenTag::List { tag, params } => Node::Container {
+            kind: ContainerKind::List { tag, params },
+            content: children,
+        },
         // `[[a]]` is just a link that also carries a class: classify the
         // href like any other target (so it gets auto-rewritten), and thread
         // the class through to the renderer.
@@ -803,10 +807,14 @@ impl<'src> Builder<'src, '_> {
     // ── leaves ───────────────────────────────────────────────────────────
 
     fn leaf(&mut self, i: usize) {
+        // A block opener splits the inline frames above it, so a verbatim
+        // region (`[[module css]]`, `[[code]]`) can sit *under* a continuing
+        // inline frame; every frame still on the stack spans `i`, so any
+        // verbatim frame means this token is inside its raw span.
         if self
             .frames
-            .last()
-            .is_some_and(|f| matches!(f.kind, FrameKind::Verbatim(_)))
+            .iter()
+            .any(|f| matches!(f.kind, FrameKind::Verbatim(_)))
         {
             return;
         }
@@ -936,7 +944,10 @@ impl<'src> Builder<'src, '_> {
                 name: name.to_string(),
                 avatar: *avatar,
             }],
-            OpenTag::Footnoteblock => vec![Node::FootnoteBlock(Vec::new())],
+            OpenTag::Footnoteblock { params } => vec![Node::FootnoteBlock {
+                title: attr_value(&params, "title"),
+                bodies: Vec::new(),
+            }],
             OpenTag::Module { name, params } => vec![Node::Module {
                 name: name.clone(),
                 params: params.clone(),
@@ -954,10 +965,36 @@ impl<'src> Builder<'src, '_> {
                 source: source.clone(),
                 params: params.clone(),
             }],
+            OpenTag::Iframe { source, params } => vec![Node::Iframe {
+                source: source.clone(),
+                params: params.clone(),
+            }],
+            // Unclosed: the header leaf token right after carries the
+            // toggle link with the opener's raw source; the body parses
+            // on at this level.
             // Unclosed: the header leaf token right after carries the
             // toggle link with the opener's raw source; the body parses
             // on at this level.
             OpenTag::Collapsible { .. } => Vec::new(),
+            // Golden: `<a class="wiki-standalone-button" href="javascript:;"
+            // onclick="WIKIDOT.page.listeners.<action>Click(event)">label</a>`
+            // — a static mirror keeps the look and drops the dead handler.
+            // The label defaults to the capitalized action.
+            OpenTag::Button { action, params } => {
+                let label = attr_value(&params, "text").unwrap_or_else(|| {
+                    let mut c = action.chars();
+                    match c.next() {
+                        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                        None => String::new(),
+                    }
+                });
+                vec![Node::Link {
+                    target: LinkTarget::Url("javascript:;".to_string()),
+                    text: vec![txt(&label)],
+                    class: Some("wiki-standalone-button".to_string()),
+                    new_tab: false,
+                }]
+            }
             OpenTag::Section(slot) => {
                 let Some(f) = self
                     .frames
@@ -1043,6 +1080,29 @@ mod tests {
         container(ContainerKind::Style(style), content)
     }
 
+    fn list(tag: ListTag, content: Content) -> Node {
+        container(
+            ContainerKind::List {
+                tag,
+                params: Params::new(),
+            },
+            content,
+        )
+    }
+
+    fn list_class(class: &str, tag: ListTag, content: Content) -> Node {
+        container(
+            ContainerKind::List {
+                tag,
+                params: Params::from([(
+                    "class".to_string(),
+                    vec![TextObj::Plain(class.to_string())],
+                )]),
+            },
+            content,
+        )
+    }
+
     fn size(arg: &str, content: Content) -> Node {
         container(ContainerKind::Size(arg.to_string()), content)
     }
@@ -1056,6 +1116,55 @@ mod tests {
         }
     }
 
+    /// The explicit list containers — the navbar corpus shape (nav:top):
+    /// nestable `[[ul]]`/`[[li]]` with class params pairing like `[[div]]`
+    /// (corpus: backroomsarchiveunit nav:top, timeless-places).
+    #[test]
+    fn explicit_list_containers() {
+        assert_eq!(
+            parse(
+                "[[ul class=\"nav\"]]\n[[li]]Home\n[[ul]]\n[[li]]A[[/li]]\n[[/ul]]\n[[/li]]\n[[/ul]]"
+            ),
+            vec![list_class(
+                "nav",
+                ListTag::Ul,
+                vec![
+                    txt("\n"),
+                    list(
+                        ListTag::Li,
+                        vec![
+                            txt("Home\n"),
+                            list(
+                                ListTag::Ul,
+                                vec![txt("\n"), list(ListTag::Li, vec![txt("A")]), txt("\n")]
+                            ),
+                            txt("\n"),
+                        ],
+                    ),
+                    txt("\n"),
+                ],
+            )]
+        );
+    }
+
+    /// A wrapped image directive — URL on one line, attributes on the next —
+    /// spans the newline: golden Wikidot reads the directive up to its `]]`
+    /// across line breaks (corpus: backroomsarchiveunit level-list).
+    #[test]
+    fn image_directive_wraps_lines() {
+        assert_eq!(
+            parse("[[image https://x.io/a.jpg\n width=\"80px\" alt=\"L\"]]"),
+            vec![Node::Image {
+                align: None,
+                source: vec![TextObj::Plain("https://x.io/a.jpg".into())],
+                params: Params::from([
+                    ("width".to_string(), vec![TextObj::Plain("80px".into())]),
+                    ("alt".to_string(), vec![TextObj::Plain("L".into())]),
+                ]),
+            }]
+        );
+    }
+
     /// The user's reference case: a block opener splits the inline frames
     /// above it and re-opens them inside.
     #[test]
@@ -1066,6 +1175,24 @@ mod tests {
                 size("120%", vec![txt("h1")]),
                 div(vec![size("120%", vec![txt("h2")])]),
                 size("120%", vec![txt("h3")]),
+            ]
+        );
+    }
+
+    /// A strikethrough spanning a `[[module css]]` block: the css opener
+    /// splits the mark into halves under the reopened inline frame, so the
+    /// css body's `#`-led line (a list-mark token) is a leaf *inside* the
+    /// verbatim frame, not an opener. Both whitespace-rimmed halves degrade
+    /// to em-dashes; the body stays only in the stylesheet (corpus:
+    /// backroomsarchiveunit level-97).
+    #[test]
+    fn mark_split_across_css_verbatim() {
+        assert_eq!(
+            parse("x--a\n[[module css]]\n#t {\n[[/module]]\nb--y"),
+            vec![
+                txt("x—a\n—"),
+                Node::Stylesheet("#t {\n".into()),
+                txt("—\nb—y"),
             ]
         );
     }

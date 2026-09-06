@@ -69,6 +69,8 @@ pub enum ClosedTag {
     /// `[[cell …]]` / `[[hcell …]]` — both close with `[[/cell]]` or
     /// `[[/hcell]]`, so the closer keyword maps to this single variant.
     Cell,
+    /// `[[ul]]` / `[[ol]]` / `[[li]]` — the closer keyword mirrors the opener.
+    List(ListTag),
     Collapsible,
     /// `[[a href=…]] … [[/a]]` explicit anchor.
     Anchor,
@@ -98,6 +100,12 @@ impl ClosedTag {
             ClosedTag::Table => "table".into(),
             ClosedTag::Row => "row".into(),
             ClosedTag::Cell => "cell".into(),
+            ClosedTag::List(tag) => match tag {
+                ListTag::Ul => "ul",
+                ListTag::Ol => "ol",
+                ListTag::Li => "li",
+            }
+            .into(),
             ClosedTag::Collapsible => "collapsible".into(),
             ClosedTag::Anchor => "a".into(),
             ClosedTag::Code => "code".into(),

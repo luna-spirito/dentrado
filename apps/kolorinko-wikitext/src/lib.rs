@@ -120,6 +120,14 @@ pub enum AlignSide {
     Justify,
 }
 
+/// The explicit list-container tags: `[[ul …]]`, `[[ol …]]`, `[[li …]]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ListTag {
+    Ul,
+    Ol,
+    Li,
+}
+
 /// Character-level inline text style (`//`, `**`, `__`, `--`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TextStyle {
@@ -151,6 +159,15 @@ pub enum ContainerKind {
     Div {
         inline: bool,
         block: bool,
+        params: HashMap<String, Vec<TextObj>>,
+    },
+
+    /// `[[ul …]]` / `[[ol …]]` / `[[li …]]` — the explicit list containers,
+    /// nestable like `[[div]]` with the same `key="value"` attributes. An
+    /// `li` renders its inline body bare (no auto-`<p>`, like `[[div_]]`);
+    /// `ul`/`ol` auto-paragraph stray runs like `[[div]]`.
+    List {
+        tag: ListTag,
         params: HashMap<String, Vec<TextObj>>,
     },
 
@@ -270,6 +287,14 @@ pub enum Node {
         params: HashMap<String, Vec<TextObj>>,
     },
 
+    /// `[[iframe source attr="val" …]]` — an inline frame pointing at an
+    /// external document. The src stays third-party by nature (the embedded
+    /// page is not part of the wiki).
+    Iframe {
+        source: Vec<TextObj>,
+        params: HashMap<String, Vec<TextObj>>,
+    },
+
     /// `|| cell || cell ||` table. PureScript `Tabel`.
     Table(Vec<Vec<TableCell>>),
 
@@ -382,7 +407,12 @@ pub enum Node {
     /// A bare parse yields the empty marker; the page-assembly pass fills it
     /// with the page's collected bodies (or appends a filled block at the end
     /// of the content when no marker stands in the page).
-    FootnoteBlock(Vec<Content>),
+    /// `[[footnoteblock title="…"]]` — where the collected footnote bodies
+    /// render. `title` overrides the default "Footnotes" heading.
+    FootnoteBlock {
+        title: Option<String>,
+        bodies: Vec<Content>,
+    },
 
     /// `[[tabview]] … [[tab Name]] … [[/tab]] … [[/tabview]]`. Inlined from the
     /// old `Libro` / `subvoj` tables. `id` is the tabview's page-unique index

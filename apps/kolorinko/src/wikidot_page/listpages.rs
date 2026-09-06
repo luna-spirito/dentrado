@@ -125,10 +125,13 @@ fn collect_content_bodies(
     }
 }
 
-/// Does a template body reference `%%content%%` at its own level?
+/// Does a template body reference the listed page's body (`%%content%%`) or
+/// its `%%first_paragraph%%` at its own level? Either needs the body fetched.
 fn uses_content_var(content: &Content) -> bool {
     content.iter().any(|node| match node {
-        Node::Text(TextObj::ModuleVar { name, .. }) => name == "content",
+        Node::Text(TextObj::ModuleVar { name, .. }) => {
+            matches!(name.as_str(), "content" | "body" | "first_paragraph")
+        }
         // A nested module's `%%content%%` belongs to that module.
         Node::ListPages(_) => false,
         other => {

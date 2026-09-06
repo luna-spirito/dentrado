@@ -25,7 +25,7 @@ pub(super) fn resolve_resources(
     let mut resolved: HashMap<String, CaRef> = HashMap::new();
     let mut code: HashMap<String, String> = HashMap::new();
     for tail in &tails {
-        let Some(path) = RepoAssetPath::new(percent_decode(tail)) else {
+        let Some(path) = resource_path(tail) else {
             continue;
         };
         match resource(snap, site, &path) {
@@ -40,6 +40,18 @@ pub(super) fn resolve_resources(
         }
     }
     substitute_resources(content, site, &resolved, &code)
+}
+
+/// Normalise a collected `host/path` tail into a lookup key: percent-decode,
+/// drop any `?query` (Wikidot serves `…png?width=210` the same bytes as
+/// `…png`), and collapse `//` (the corpus's `local--files/widget-hub//x.png`)
+/// — [`RepoAssetPath::new`] rejects empty segments, and the publication never
+/// keys a file under either quirk.
+pub(super) fn resource_path(tail: &str) -> Option<RepoAssetPath> {
+    let decoded = percent_decode(tail);
+    let no_query = decoded.split('?').next().unwrap_or(&decoded);
+    let collapsed = no_query.replace("//", "/");
+    RepoAssetPath::new(collapsed)
 }
 
 /// Walk `content` and collect every mirrored-attachment `host/path` tail
@@ -60,11 +72,16 @@ pub(super) fn collect_external_refs(content: &Content, out: &mut Vec<String>) {
             }
             Node::Link {
                 target: LinkTarget::Url(u),
+                text,
                 ..
             } => {
                 if let Some(t) = http_tail(u, None) {
                     push(t, out);
                 }
+                // An image (or nested link) inside the label still references
+                // resources: `[[a href="#"]][[image …]][[/a]]` (the top-bar
+                // close overlay) must not fall out of resolution.
+                collect_external_refs(text, out);
             }
             Node::Stylesheet(css) => {
                 for t in http_refs(css) {

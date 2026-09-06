@@ -171,6 +171,7 @@ pub(super) fn resolve_full(
     let (content, listed) = resolve_listpages(parse(&assembled), state, &host);
     deps.extend(listed);
     let content = evaluate_iftags(content, &host.tags);
+    let content = rewrite_own_page_links(content, &state.site);
     let content = resolve_links(content, &state.site, &state.snap);
     let content = resolve_resources(content, &state.site, &state.snap);
     (content, deps)

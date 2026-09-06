@@ -183,6 +183,18 @@ pub(crate) enum OpenTag<'src> {
         header: bool,
         params: Params,
     },
+    /// `[[ul …]]` / `[[ol …]]` / `[[li …]]` — the explicit list containers.
+    List {
+        tag: ListTag,
+        params: Params,
+    },
+    /// `[[button action text="Label"]]` — a page-action button (edit, print,
+    /// source, …). The action only ever rode Wikidot's `onclick` handler,
+    /// which a static mirror drops; the label survives.
+    Button {
+        action: &'src str,
+        params: Params,
+    },
     Collapsible {
         params: Params,
     },
@@ -234,14 +246,22 @@ pub(crate) enum OpenTag<'src> {
         source: Vec<TextObj>,
         params: Params,
     },
+    /// `[[iframe source attr="val" …]]`.
+    Iframe {
+        source: Vec<TextObj>,
+        params: Params,
+    },
     /// `[[head]]` / `[[body]]` / `[[foot]]` (open, with the slot) and
     /// `[[/head]]`-style closes (`None`). Recognized only inside a listpages
     /// body — stray ones degrade to text.
     Section(Option<SectionSlot>),
     /// `[[footnote]] … [[/footnote]]`.
     Footnote,
-    /// `[[footnoteblock]]` — where the collected footnote bodies render.
-    Footnoteblock,
+    /// `[[footnoteblock title="…"]]` — where the collected footnote bodies
+    /// render; the `title` attribute overrides the default heading.
+    Footnoteblock {
+        params: Params,
+    },
 }
 
 // =========================================================================
@@ -905,6 +925,10 @@ fn is_url_char(c: u8) -> bool {
                 | b','
                 | b';'
                 | b'='
+                // Percent-escapes (`nav%3Aside`) are ordinary URI characters —
+                // golden Wikidot autolinks through them; stopping at `%` cut
+                // `…/local--files/component` mid-URL.
+                | b'%'
         )
 }
 
@@ -924,6 +948,9 @@ const CLOSERS: &[(&[u8], ClosedTag)] = &[
     (b"code", ClosedTag::Code),
     (b"row", ClosedTag::Row),
     (b"div", ClosedTag::Div),
+    (b"ul", ClosedTag::List(ListTag::Ul)),
+    (b"ol", ClosedTag::List(ListTag::Ol)),
+    (b"li", ClosedTag::List(ListTag::Li)),
     (b"tab", ClosedTag::Tab),
     (
         b"f<",
@@ -981,6 +1008,7 @@ type Tail = fn(&[u8], usize) -> Option<(usize, OpenTag)>;
 /// is only recognized when it opens the line.
 const OPENERS: &[(&[u8], Tail)] = &[
     (b"collapsible", collapsible_tail),
+    (b"button", button_tail),
     (b"tabview", tabview_tail),
     (b"footnoteblock", footnoteblock_tail),
     (b"footnote", footnote_tail),
@@ -989,6 +1017,7 @@ const OPENERS: &[(&[u8], Tail)] = &[
     (b"iftags", iftags_tail),
     (b"module", module_tail),
     (b"include", include_tail),
+    (b"iframe", iframe_tail),
     (b"image", image_tail),
     (b"*user", star_user_tail),
     (b"user", user_tail_str),
@@ -1000,6 +1029,9 @@ const OPENERS: &[(&[u8], Tail)] = &[
     (b"body", body_tail),
     (b"foot", foot_tail),
     (b"div", div_tail),
+    (b"ul", ul_tail),
+    (b"ol", ol_tail),
+    (b"li", li_tail),
     (b"tab", tab_top_tail),
     (b"row", row_tail),
     (b"a", anchor_tail),
@@ -1031,9 +1063,9 @@ fn footnote_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     marker_end(b, j).map(|end| (end, OpenTag::Footnote))
 }
 
-/// `[[footnoteblock]]`.
+/// `[[footnoteblock title="…"]]` — attributes (the heading override).
 fn footnoteblock_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
-    marker_end(b, j).map(|end| (end, OpenTag::Footnoteblock))
+    container_tail(b, j, |params| OpenTag::Footnoteblock { params })
 }
 
 /// Earliest of `delim` searching from `k`, not crossing a newline (the old
@@ -1304,6 +1336,27 @@ fn row_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     container_tail(b, j, |params| OpenTag::Row { params })
 }
 
+fn ul_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    container_tail(b, j, |params| OpenTag::List {
+        tag: ListTag::Ul,
+        params,
+    })
+}
+
+fn ol_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    container_tail(b, j, |params| OpenTag::List {
+        tag: ListTag::Ol,
+        params,
+    })
+}
+
+fn li_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    container_tail(b, j, |params| OpenTag::List {
+        tag: ListTag::Li,
+        params,
+    })
+}
+
 fn anchor_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     container_tail(b, j, |params| OpenTag::Anchor { params })
 }
@@ -1375,6 +1428,28 @@ fn iftags_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     let k = skip_spaces(b, j);
     let end = read_to(b, k, b"]]")?;
     Some((end + 2, OpenTag::IfTags(sub(b, k, end))))
+}
+
+/// `[[button action text="Label"]]` — action word, then attributes.
+fn button_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    if b.get(j) != Some(&b' ') {
+        return None;
+    }
+    let k = skip_spaces(b, j);
+    let action_end = k + b[k..]
+        .iter()
+        .position(|c| !c.is_ascii_alphanumeric())
+        .unwrap_or(b.len() - k);
+    if action_end == k {
+        return None;
+    }
+    let action = sub(b, k, action_end);
+    let mut params = Params::new();
+    let end = lex_params(b, action_end, &mut params);
+    let end = skip_spaces(b, end);
+    b.get(end..)
+        .is_some_and(|r| r.starts_with(b"]]"))
+        .then(|| (end + 2, OpenTag::Button { action, params }))
 }
 
 fn code_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
@@ -1571,10 +1646,12 @@ fn lex_image(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     // An include assembly that erased `{$name}` leaves the source empty
     // (`[[image  class=…]]`); a `key=`-shaped token right after the tag
     // then starts the parameters instead of being swallowed as the source.
+    // The newline stop hands a wrapped directive's second line (the
+    // attributes) to the lenient params scan, which crosses it.
     let (after_source, source) = if param_key_at(b, m) {
         (m, Vec::new())
     } else {
-        collect_text_objs(b, m, &[b" ", b"]]"])
+        collect_text_objs(b, m, &[b" ", b"\n", b"]]"])
     };
     let mut params = Params::new();
     let end = lex_params_with(b, after_source, &mut params, true);
@@ -1591,6 +1668,25 @@ fn lex_image(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     })
 }
 
+/// `[[iframe source attr="val" …]]` — an image-directive shape without the
+/// alignment forms.
+fn iframe_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    if b.get(j) != Some(&b' ') {
+        return None;
+    }
+    let k = skip_spaces(b, j);
+    if param_key_at(b, k) {
+        return None;
+    }
+    let (after_source, source) = collect_text_objs(b, k, &[b" ", b"]]"]);
+    let mut params = Params::new();
+    let end = lex_params(b, after_source, &mut params);
+    let end = skip_spaces(b, end);
+    b.get(end..)
+        .is_some_and(|r| r.starts_with(b"]]"))
+        .then(|| (end + 2, OpenTag::Iframe { source, params }))
+}
+
 /// `key="value"` / `key=value` attributes. Ports the old `params_block`
 /// byte-for-byte, including the quirk that a key without `=` consumes the one
 /// character that follows it before giving up.
@@ -1603,14 +1699,28 @@ fn lex_params(b: &[u8], k: usize, out: &mut Params) -> usize {
 /// source and the real attributes (`[[image 1899 rescue rangers.jpg
 /// class=…]]`); instead of aborting the scan (and degrading the whole
 /// directive to raw text) skip the junk, the way Wikidot's own attribute
-/// scanner drops unknown words.
+/// scanner drops unknown words. Lenient mode also crosses newlines: golden
+/// Wikidot reads an image directive up to its `]]` across line breaks
+/// (corpus: backroomsarchiveunit level-list — the URL on one line, the
+/// attributes on the next).
 fn lex_params_with(b: &[u8], mut k: usize, out: &mut Params, lenient: bool) -> usize {
     loop {
-        while k < b.len() && is_param_ws(b, k) {
+        while k < b.len() && (is_param_ws(b, k) || lenient && b[k] == b'\n') {
             k += char_len_at(b, k);
         }
         match b.get(k) {
-            None | Some(b']') | Some(b'\n') => return k,
+            None => return k,
+            Some(b'\n') if !lenient => return k,
+            // A lone `]` (not the directive-closing `]]`) is junk — e.g. the
+            // corpus's `[[image … style="…"] class="tooltip"]]`, whose stray
+            // `]` golden Wikidot silently drops while still applying the
+            // attributes before it. Only the lenient (image) scan skips it;
+            // elsewhere it still ends the attribute list.
+            Some(b']') if lenient && !b[k..].starts_with(b"]]") => {
+                k += 1;
+                continue;
+            }
+            Some(b']') => return k,
             _ => {}
         }
         let key_start = k;
@@ -1634,11 +1744,8 @@ fn lex_params_with(b: &[u8], mut k: usize, out: &mut Params, lenient: bool) -> u
         k += 1;
         let value = if b.get(k) == Some(&b'"') {
             k += 1;
-            let (nk, v) = collect_text_objs(b, k, &[b"\""]);
+            let (nk, v) = read_quoted_value(b, k);
             k = nk;
-            if b.get(k) == Some(&b'"') {
-                k += 1;
-            }
             v
         } else {
             let (nk, v) = collect_text_objs(b, k, &[b" ", b"\xc2\xa0", b"]"]);
@@ -1646,6 +1753,50 @@ fn lex_params_with(b: &[u8], mut k: usize, out: &mut Params, lenient: bool) -> u
             v
         };
         out.insert(key, value);
+    }
+}
+
+/// A quoted attribute value: like [`collect_text_objs`] up to a `"`, except
+/// the *closing* quote is the one followed (after optional spaces) by the
+/// directive end (`]]`, newline, EOF) or the next `key=`-shaped attribute.
+/// Any other quote belongs to the value itself — golden Wikidot's greedy
+/// attribute scan reads the corpus's `style="background: url("http://…")"`
+/// as one full value, inner quotes included.
+fn read_quoted_value(b: &[u8], mut k: usize) -> (usize, Vec<TextObj>) {
+    let mut objs: Vec<TextObj> = Vec::new();
+    loop {
+        let (nk, chunk) = collect_text_objs(b, k, &[b"\""]);
+        k = nk;
+        objs.extend(chunk);
+        if b.get(k) != Some(&b'"') {
+            return (k, objs); // unterminated value: consume as before
+        }
+        if quote_closes(b, k + 1) {
+            return (k + 1, objs);
+        }
+        k += 1;
+        push_plain(&mut objs, "\"");
+    }
+}
+
+/// Does the `"` at `k - 1` close its attribute value — is what follows
+/// (spaces and stray separators like the `";]]` corpus tail skipped) the
+/// directive end or another `key=`-shaped attribute?
+fn quote_closes(b: &[u8], mut j: usize) -> bool {
+    while matches!(b.get(j), Some(b' ') | Some(b'\t') | Some(b';')) {
+        j += 1;
+    }
+    match b.get(j) {
+        None | Some(b'\n') | Some(b']') => true,
+        _ => param_key_at(b, j),
+    }
+}
+
+/// Append a plain-text fragment, fusing with a trailing [`TextObj::Plain`].
+fn push_plain(objs: &mut Vec<TextObj>, s: &str) {
+    match objs.last_mut() {
+        Some(TextObj::Plain(last)) => last.push_str(s),
+        _ => objs.push(TextObj::Plain(s.to_string())),
     }
 }
 

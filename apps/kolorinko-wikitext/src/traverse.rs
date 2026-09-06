@@ -98,7 +98,10 @@ impl Node {
                 body: f(body),
             },
             Node::Footnote(c) => Node::Footnote(f(c)),
-            Node::FootnoteBlock(bodies) => Node::FootnoteBlock(bodies.into_iter().map(f).collect()),
+            Node::FootnoteBlock { title, bodies } => Node::FootnoteBlock {
+                title,
+                bodies: bodies.into_iter().map(f).collect(),
+            },
             Node::Tabview { id, tabs } => Node::Tabview {
                 id,
                 tabs: tabs
@@ -139,7 +142,7 @@ impl Node {
             Node::Footnote(content) => vec![content],
             Node::Link { text, .. } => vec![text],
             Node::Collapsible { header, body } => vec![header, body],
-            Node::FootnoteBlock(bodies) => bodies.iter().collect(),
+            Node::FootnoteBlock { bodies, .. } => bodies.iter().collect(),
             Node::Tabview { tabs, .. } => tabs.iter().flat_map(|t| [&t.name, &t.content]).collect(),
             Node::ListPages(lp) => vec![&lp.prepend, &lp.repeat, &lp.append],
             Node::List(list) => list_contents(list),

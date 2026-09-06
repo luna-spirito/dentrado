@@ -9,7 +9,7 @@
 use kolorinko_rt::{LocalId, format_page_route};
 use kolorinko_wikitext::{
     Align, AlignSide, BlockCell, BlockTable, ClearSide, ContainerKind, Content, LinkTarget, List,
-    Node, TableCell, TextObj, TextStyle, civil_from_days, days_from_civil,
+    ListTag, Node, TableCell, TextObj, TextStyle, civil_from_days, days_from_civil,
 };
 use leptos::prelude::*;
 use leptos::tachys::html::element::custom;
@@ -443,14 +443,16 @@ fn is_block(node: &Node) -> bool {
             | Node::BlockTable(_)
             | Node::BlockCell(_)
             | Node::Image { .. }
+            | Node::Iframe { .. }
             | Node::HorizontalRule
             | Node::Clearfloat(_)
             | Node::Tabview { .. }
-            | Node::FootnoteBlock(_)
+            | Node::FootnoteBlock { .. }
             | Node::Container {
                 kind: ContainerKind::Quote
                     | ContainerKind::Align(_)
                     | ContainerKind::Div { inline: false, .. }
+                    | ContainerKind::List { .. }
                     | ContainerKind::IfTags { .. },
                 ..
             }
@@ -496,6 +498,7 @@ fn render_node(ctx: &RenderCtx, node: &Node) -> AnyView {
             source,
             params,
         } => render_image(align, source, params),
+        Node::Iframe { source, params } => render_iframe(source, params),
         Node::Link {
             target,
             text,
@@ -512,7 +515,9 @@ fn render_node(ctx: &RenderCtx, node: &Node) -> AnyView {
         Node::HorizontalRule => view! { <hr /> }.into_any(),
         Node::Stylesheet(css) => view! { <style>{css.clone()}</style> }.into_any(),
         Node::Footnote(_) | Node::FootnoteRef(_) => render_footnote_ref(node),
-        Node::FootnoteBlock(bodies) => render_footnote_block(ctx, bodies),
+        Node::FootnoteBlock { title, bodies } => {
+            render_footnote_block(ctx, title.as_deref(), bodies)
+        }
         Node::Tabview { id, tabs } => render_tabview(ctx, *id, tabs),
         Node::ListPages(lp) => render_block_content(ctx, &lp.repeat).into_any(),
         Node::Include(_) => {
@@ -636,6 +641,28 @@ fn render_container(ctx: &RenderCtx, kind: &ContainerKind, content: &Content) ->
             // interior blank-line-separated inline runs still get `<p>`.
             let inner = render_block_div_(ctx, content);
             view! { <div id=id class=class style=style>{inner}</div> }.into_any()
+        }
+        ContainerKind::List { tag, params } => {
+            let (class, style) = params_to_class_style(params);
+            let id = params_id(params);
+            let class = (!class.is_empty()).then_some(class);
+            match tag {
+                // An `[[li]]` renders its inline body bare — no auto-`<p>`
+                // (the navbar corpus shape); `ul`/`ol` hold `[[li]]` children
+                // and auto-paragraph stray runs like `[[div]]`.
+                ListTag::Ul => view! {
+                    <ul id=id class=class style=style>{render_block_content(ctx, content)}</ul>
+                }
+                .into_any(),
+                ListTag::Ol => view! {
+                    <ol id=id class=class style=style>{render_block_content(ctx, content)}</ol>
+                }
+                .into_any(),
+                ListTag::Li => view! {
+                    <li id=id class=class style=style>{render_block_div_(ctx, content)}</li>
+                }
+                .into_any(),
+            }
         }
         ContainerKind::Color(c) => view! {
             <span style=format!("color: {c}")>{render_inline(ctx, content)}</span>
@@ -881,6 +908,28 @@ fn render_image(
     }
 }
 
+/// `[[iframe src attrs]]` — Wikidot's own element: every directive attribute
+/// becomes an iframe attribute, the missing canonical ones empty strings
+/// (`<iframe src="…" align="" frameborder="0" … class="" style="">`).
+fn render_iframe(
+    source: &[TextObj],
+    params: &std::collections::HashMap<String, Vec<TextObj>>,
+) -> AnyView {
+    use leptos::tachys::html::attribute::custom::custom_attribute;
+    let attr = |k: &'static str| custom_attribute(k, param_or(params, k, String::new));
+    custom("iframe")
+        .add_any_attr(custom_attribute("src", text_objs_to_string(source)))
+        .add_any_attr(attr("align"))
+        .add_any_attr(attr("frameborder"))
+        .add_any_attr(attr("height"))
+        .add_any_attr(attr("scrolling"))
+        .add_any_attr(attr("width"))
+        .add_any_attr(attr("class"))
+        .add_any_attr(attr("style"))
+        .child(Vec::<AnyView>::new())
+        .into_any()
+}
+
 /// Resolve `params[key]` to a string, falling back to `default` when absent or
 /// blank (so an explicit empty `alt=""` still yields the filename-derived alt).
 fn param_or(
@@ -1013,7 +1062,7 @@ fn render_footnote_ref(node: &Node) -> AnyView {
 }
 
 /// The collected footnote bodies, at `[[footnoteblock]]` (or the page foot).
-fn render_footnote_block(ctx: &RenderCtx, bodies: &[Content]) -> AnyView {
+fn render_footnote_block(ctx: &RenderCtx, title: Option<&str>, bodies: &[Content]) -> AnyView {
     if bodies.is_empty() {
         return empty_view();
     }
@@ -1033,7 +1082,7 @@ fn render_footnote_block(ctx: &RenderCtx, bodies: &[Content]) -> AnyView {
         .collect();
     view! {
         <div class="footnotes-footer">
-            <div class="title">"Footnotes"</div>
+            <div class="title">{title.unwrap_or("Footnotes")}</div>
             {items}
         </div>
     }

@@ -1198,7 +1198,7 @@ impl<'src> Merger<'src> {
         let arm: TagArm<'src> = match tag {
             OpenTag::Collapsible { .. } => Self::collapsible_arm,
             OpenTag::User { .. } => Self::user_arm,
-            OpenTag::Footnoteblock => Self::footnoteblock_arm,
+            OpenTag::Footnoteblock { .. } => Self::footnoteblock_arm,
             OpenTag::Code { .. } => Self::code_arm,
             OpenTag::Css => Self::css_arm,
             OpenTag::ListPages { .. } => Self::listpages_arm,
@@ -1267,7 +1267,13 @@ impl<'src> Merger<'src> {
         _opener: (usize, usize),
         _tag: OpenTag<'src>,
     ) -> (Content, Option<Stop<'src>>) {
-        (vec![Node::FootnoteBlock(Vec::new())], None)
+        (
+            vec![Node::FootnoteBlock {
+                title: None,
+                bodies: Vec::new(),
+            }],
+            None,
+        )
     }
 
     /// The old `raw_balanced`: the body is sliced verbatim from the source

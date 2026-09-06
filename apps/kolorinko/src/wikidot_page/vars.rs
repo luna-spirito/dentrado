@@ -77,12 +77,14 @@ impl ModuleVars<'_> {
             .or_else(|| self.resolve_reporting(name))
     }
 
-    /// The listed page's rendered body (`%%content%%`/`%%body%%`): available
-    /// only for templates that reference it, `None` (and so left verbatim)
-    /// otherwise — including in the once-rendered prepend/append.
+    /// The listed page's rendered body (`%%content%%`/`%%body%%`), or its
+    /// first paragraph (`%%first_paragraph%%`): available only for templates
+    /// that reference one of them, `None` (and so left verbatim) otherwise —
+    /// including in the once-rendered prepend/append.
     fn resolve_content(&self, name: &str) -> Option<Content> {
         match name {
             "content" | "body" => self.content.cloned(),
+            "first_paragraph" => self.content.map(first_paragraph),
             _ => None,
         }
     }
@@ -155,6 +157,7 @@ impl ModuleVars<'_> {
             // No vote data exists in the export; a zero rating is what Wikidot
             // itself shows for an unvoted page.
             "rating" | "rating_votes" | "rating_percent" => text("0".into()),
+            "rating_decimal" => text("0.00".into()),
             "revisions" => text(page.revisions.to_string()),
             "link" => text(match &page.category {
                 Some(c) => format!("/{}/{}:{}", **self.site, c, page.name),
@@ -225,6 +228,10 @@ fn subst_node(node: Node, vars: &Vars) -> Content {
             source: subst_textobjs(source, vars),
             params: subst_params(params, vars),
         }],
+        Node::Iframe { source, params } => vec![Node::Iframe {
+            source: subst_textobjs(source, vars),
+            params: subst_params(params, vars),
+        }],
         Node::BlockTable(t) => vec![Node::BlockTable(BlockTable {
             params: subst_params(t.params, vars),
             rows: t
@@ -260,8 +267,140 @@ fn subst_node(node: Node, vars: &Vars) -> Content {
                 .map(|(k, v)| (k, apply_vars(v, vars)))
                 .collect(),
         })],
+        // `[[user %%created_by%%]]` (the ListPages template idiom): the lexer
+        // keeps the name as plain text carrying the var, so resolve each
+        // `%%var%%` slice textually against the module vars.
+        Node::User { name, avatar } => vec![Node::User {
+            name: subst_user_name(&name, vars),
+            avatar,
+        }],
         other => vec![other.map_node(&mut |c| apply_vars(c, vars))],
     }
+}
+
+/// A module-var name character (the lexer's `is_prop_char`, mirrored — var
+/// names are `created_by`-shaped).
+fn is_var_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'#' | b'-')
+}
+
+/// The leading inline run of a resolved body — Wikidot's
+/// `%%first_paragraph%%`: everything up to the first block node or blank
+/// line, inline formatting intact.
+fn first_paragraph(content: &Content) -> Content {
+    let mut out = Content::new();
+    for node in content {
+        match node {
+            Node::Text(TextObj::Plain(s)) => match s.find("\n\n") {
+                Some(p) => {
+                    if !s[..p].trim().is_empty() {
+                        out.push(Node::Text(TextObj::Plain(s[..p].to_string())));
+                    }
+                    return out;
+                }
+                None => out.push(node.clone()),
+            },
+            // Block nodes (headings, tables, images, divs, lists, …) end the
+            // paragraph; anything else (links, styled spans, raw text) is
+            // inline and belongs to it.
+            Node::Heading { .. }
+            | Node::Table(_)
+            | Node::BlockTable(_)
+            | Node::BlockCell(_)
+            | Node::Image { .. }
+            | Node::HorizontalRule
+            | Node::Clearfloat(_)
+            | Node::Tabview { .. }
+            | Node::FootnoteBlock { .. }
+            | Node::ListPages(_)
+            | Node::Stylesheet(_)
+            | Node::Include(_)
+            | Node::Raw(_)
+            | Node::Code { .. }
+            | Node::ModuleBlock { .. }
+            | Node::Module { .. }
+            | Node::List(_)
+            | Node::Collapsible { .. }
+            | Node::Container {
+                kind:
+                    ContainerKind::Quote
+                    | ContainerKind::Align(_)
+                    | ContainerKind::Div { inline: false, .. }
+                    | ContainerKind::List { .. }
+                    | ContainerKind::IfTags { .. },
+                ..
+            } => return out,
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
+
+/// Textual `%%var%%` (± `|default`) substitution inside a `[[user …]]` name.
+/// Unresolvable slices stay verbatim for the render fallback.
+fn subst_user_name(name: &str, vars: &Vars) -> String {
+    if !name.contains("%%") {
+        return name.to_string();
+    }
+    let b = name.as_bytes();
+    let mut out = String::with_capacity(name.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i..].starts_with(b"%%") {
+            let n = i + 2;
+            let name_end = b[n..]
+                .iter()
+                .position(|c| !is_var_char(*c))
+                .map_or(b.len(), |p| n + p);
+            let var = &name[n..name_end];
+            let (default, after) = match b.get(name_end) == Some(&b'|') {
+                true => {
+                    let d_end = b[name_end + 1..]
+                        .windows(2)
+                        .position(|w| w == b"%%")
+                        .map_or(b.len(), |p| name_end + 1 + p);
+                    (
+                        Some(name[name_end + 1..d_end].to_string()),
+                        b.get(d_end..)
+                            .is_some_and(|r| r.starts_with(b"%%"))
+                            .then_some(2),
+                    )
+                }
+                false => (None, None),
+            };
+            let step = after.unwrap_or(0);
+            let resolved = vars
+                .module
+                .as_ref()
+                .and_then(|m| m.resolve(var, default.as_deref()));
+            match resolved.and_then(flatten_text) {
+                Some(text) => out.push_str(&text),
+                None => out.push_str(&name[i..name_end + step]),
+            }
+            i = name_end + step;
+        } else {
+            let n = b[i..]
+                .iter()
+                .position(|c| *c == b'%')
+                .map_or(b.len(), |p| i + p);
+            out.push_str(&name[i..n]);
+            i = n;
+        }
+    }
+    out
+}
+
+/// A resolved variable's content flattened to plain text, when it is nothing
+/// but plain text (the shape every user-name-producing var resolves to).
+fn flatten_text(content: Content) -> Option<String> {
+    let mut out = String::new();
+    for node in content {
+        match node {
+            Node::Text(TextObj::Plain(s)) => out.push_str(&s),
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// Resolve a link target under the visible [`Vars`]: an
@@ -287,6 +426,10 @@ fn subst_kind(kind: ContainerKind, vars: &Vars) -> ContainerKind {
         } => ContainerKind::Div {
             inline,
             block,
+            params: subst_params(params, vars),
+        },
+        ContainerKind::List { tag, params } => ContainerKind::List {
+            tag,
             params: subst_params(params, vars),
         },
         other => other,

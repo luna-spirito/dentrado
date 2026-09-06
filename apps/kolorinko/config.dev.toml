@@ -27,8 +27,14 @@
 "srddf" = {}
 "wci" = {}
 "backroomsarchiveunit" = {}
-"cea" = {}
+"it-cea-wiki" = {}
+"timeless-places" = {}
 "scientific-alliance" = {}
+"rulington" = {}
+"kumawa" = {}
+"irregularity" = {}
+"vrc-initiative" = {}
+
 
 [evakuilo]
 # The evakuilo publication root — the daemon's `out/` directory holding the

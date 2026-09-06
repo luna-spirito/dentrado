@@ -96,12 +96,14 @@ pub(crate) fn list_pages(
 }
 
 /// Resolve one `files/<host>/<path>` attachment to its content-addressed
-/// [`CaRef`] — the body of the old `repo_resource` gear. Three lookups, in
+/// [`CaRef`] — the body of the old `repo_resource` gear. Four lookups, in
 /// order: the tail as named (absolute `files.json` rows keep their real
 /// external host); the bare site-relative key when the host is one of this
 /// site's own (the publication keys on-site files without a host — the DB's
-/// `local--…` path form; see [`own_file_host`]); and the CDN/alias-domain
-/// retry ([`repo_alias`]). `None` when the URL is not mirrored (a hotlink).
+/// `local--…` path form; see [`own_file_host`]); the CDN/alias-domain
+/// retry ([`repo_alias`]); and, for a `local--resized-images/…` variant
+/// (which the export never saved), the original `local--files/…` file.
+/// `None` when the URL is not mirrored (a hotlink).
 pub(crate) fn resource(
     snap: &RepoSnapshot,
     site: &SafePathComponent,
@@ -124,6 +126,21 @@ pub(crate) fn resource(
                 .and_then(|domains| repo_alias(site, domains, path))
                 .and_then(|alt| files.get(&alt).cloned())
         })
+        .or_else(|| {
+            // `local--resized-images/<page>/<file…>/<variant>.<ext>` → the
+            // original `local--files/<page>/<file…>`: the export saved only
+            // originals, and Wikidot's resizer variants are derivations. The
+            // tail may carry a host — only this site's own maps; a foreign
+            // site's variant (a sandbox) stays a hotlink.
+            let (before, rest) = path.as_str().split_once("local--resized-images/")?;
+            if !before.is_empty() && !own_file_host(site, before) {
+                return None;
+            }
+            let (orig, _variant) = rest.rsplit_once('/')?;
+            files
+                .get(&RepoAssetPath::new(format!("local--files/{orig}"))?)
+                .cloned()
+        })
 }
 
 /// Does `host` name this site's own file space — one of the hosts a same-site
@@ -131,7 +148,7 @@ pub(crate) fn resource(
 /// configured alias domain, bare and `files.`-prefixed (hosts are DNS names:
 /// compared case-insensitively). Decides when a missed `host/path` lookup
 /// retries the bare site-relative key ([`resource`]).
-fn own_file_host(site: &SafePathComponent, host: &str) -> bool {
+pub(super) fn own_file_host(site: &SafePathComponent, host: &str) -> bool {
     let s: &str = site;
     host.eq_ignore_ascii_case(format!("{s}.wikidot.com").as_str())
         || host.eq_ignore_ascii_case(format!("{s}.wdfiles.com").as_str())

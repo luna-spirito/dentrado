@@ -66,6 +66,76 @@ pub(super) fn resolve_links(
     substitute_links(content, &resolved)
 }
 
+/// Rewrite absolute URLs addressing a *page on this very site* —
+/// `http://rpcauthority.wikidot.com/rpc-002`, `www.rpc-wiki.net/contest:x` —
+/// into [`LinkTarget::Page`] refs, so [`resolve_links`] and the renderer give
+/// them the same canonical internal treatment a `[[[rpc-002]]]` gets (the
+/// mirror's link-rewriting divergence). A URL with a query, a fragment, a
+/// multi-segment path (`forum/t-…`, `local--files/…` — attachments are the
+/// resource pass's business, and forums are not mirrored), or a foreign host
+/// passes through unchanged; the bare site root becomes the root page ref.
+pub(super) fn rewrite_own_page_links(content: Content, site: &SafePathComponent) -> Content {
+    let mut walk = |c: Content| rewrite_own_page_links(c, site);
+    content
+        .into_iter()
+        .map(|node| match node {
+            Node::Link {
+                target,
+                text,
+                class,
+                new_tab,
+            } => Node::Link {
+                new_tab,
+                class,
+                text: walk(text),
+                target: match target {
+                    LinkTarget::Url(u) => own_page_ref(site, &u)
+                        .map(LinkTarget::Page)
+                        .unwrap_or(LinkTarget::Url(u)),
+                    other => other,
+                },
+            },
+            other => other.map_node(&mut walk),
+        })
+        .collect()
+}
+
+/// The [`PageRef`] an own-host URL addresses, or `None` when it addresses no
+/// page (foreign host, query, multi-segment path, unusable slug). The path
+/// segment is percent-decoded; `SafePathComponent` rejects anything that is
+/// not a single normal path component (a `forum/…` multi-segment path).
+fn own_page_ref(site: &SafePathComponent, url: &str) -> Option<PageRef> {
+    let tail = http_tail(url, None)?;
+    if tail.contains('?') {
+        return None;
+    }
+    let (host, rest) = tail.split_once('/').unwrap_or((&tail, ""));
+    if !own_file_host(site, host) {
+        return None;
+    }
+    // The bare site root (or a trailing `/`): the `Page` ref with an empty
+    // path renders as the space root.
+    if rest.is_empty() {
+        return Some(PageRef {
+            space: None,
+            path: Vec::new(),
+        });
+    }
+    let decoded = percent_decode(rest);
+    let (cat, name) = match decoded.split_once(':') {
+        Some((cat, name)) if !cat.is_empty() => (Some(cat), name),
+        // No (usable) colon: the whole segment is the page name.
+        _ => (None, decoded.as_str()),
+    };
+    // Reject anything that is not a single normal path component (a
+    // `forum/…` multi-segment path) up front, before building the ref.
+    SafePathComponent::new(name.to_owned())?;
+    Some(PageRef {
+        space: cat.map(str::to_string),
+        path: vec![name.to_string()],
+    })
+}
+
 /// Canonical id form of a collected slug set: sorted by the (category, name)
 /// string pair and deduplicated, so the gear id is a pure function of the
 /// *set* of links — an edit that only reshuffles them reuses the instance.

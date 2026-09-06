@@ -447,6 +447,7 @@ fn opener_key(open: &OpenTag) -> Option<(Key, bool)> {
         OpenTag::Table { .. } => (ClosedTag::Table, false),
         OpenTag::Row { .. } => (ClosedTag::Row, false),
         OpenTag::Cell { .. } => (ClosedTag::Cell, false),
+        OpenTag::List { tag, .. } => (ClosedTag::List(*tag), false),
         OpenTag::Collapsible { .. } => (ClosedTag::Collapsible, false),
         OpenTag::Size(_) => (ClosedTag::Size, false),
         OpenTag::IfTags(_) => (ClosedTag::IfTags, false),
