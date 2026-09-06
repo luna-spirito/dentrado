@@ -468,6 +468,24 @@ fn include_assembly_splices_nested_cone_with_cascading_vars() {
 }
 
 #[test]
+fn absolute_self_site_include_splices() {
+    // `[[include :site:page]]` is absolute: the current site's own name is
+    // dropped, the tail is one slug (names may contain colons — bau's
+    // `fragment:theme:inverton`); another site's never splices.
+    let raws = raws(vec![
+        (key(None, "footer"), "F"),
+        (key(Some("fragment"), "theme:inverton"), "T"),
+    ]);
+    let out = assemble(
+        "[[include :scp:footer]]\n[[include :scp:fragment:theme:inverton]]",
+        &raws,
+    );
+    assert_eq!(flat(&out), "F\nT");
+    let out = assemble("[[include :other-site:x]]", &raws);
+    assert_eq!(flat(&out), ""); // never spliced — cross-site unsupported
+}
+
+#[test]
 fn include_diamond_splices_target_in_both_branches() {
     let raws = raws(vec![
         (key(None, "b"), "B\n[[include d]]"),

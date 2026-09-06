@@ -27,6 +27,7 @@ use super::*;
 #[derive(Clone)]
 enum Verb {
     Code(Option<String>),
+    Html,
     Css,
     Comment,
 }
@@ -391,6 +392,7 @@ impl<'src> Builder<'src, '_> {
             Tok::Open(OpenTag::Code { params }) => {
                 FrameKind::Verbatim(Verb::Code(code_type(params)))
             }
+            Tok::Open(OpenTag::Html) => FrameKind::Verbatim(Verb::Html),
             Tok::Open(OpenTag::Css) => FrameKind::Verbatim(Verb::Css),
             Tok::Open(tag) => FrameKind::Tag(tag.clone()),
             _ => unreachable!("open_of only marks pairable openers"),
@@ -720,6 +722,7 @@ impl<'src> Builder<'src, '_> {
                 let body = self.src[self.toks[open].end..self.toks[close].start].to_string();
                 match verb {
                     Verb::Code(ty) => vec![Node::Code { ty, raw: body }],
+                    Verb::Html => vec![Node::Html { raw: body }],
                     Verb::Css => vec![Node::Stylesheet(wikidot_verbatim(&body))],
                     // A comment discards everything it spanned.
                     Verb::Comment => Vec::new(),

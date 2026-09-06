@@ -464,6 +464,7 @@ fn opener_key(open: &OpenTag) -> Option<(Key, bool)> {
         // module, a ListPages, or the CSS region.
         OpenTag::ModuleBlock { .. } | OpenTag::ListPages { .. } => (ClosedTag::Module, false),
         OpenTag::Code { .. } => (ClosedTag::Code, true),
+        OpenTag::Html => (ClosedTag::Html, true),
         OpenTag::Css => (ClosedTag::Module, true),
         _ => return None,
     };

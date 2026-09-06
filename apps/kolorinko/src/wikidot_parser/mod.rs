@@ -76,6 +76,8 @@ pub enum ClosedTag {
     Anchor,
     /// `[[code]] … [[/code]]`.
     Code,
+    /// `[[html]] … [[/html]]`.
+    Html,
     /// `[[<]]`, `[[=]]`, `[[>]]`, `[[==]]`, `[[f<]]`, `[[f>]]`. The closer
     /// mirrors the opener exactly (`[[/f<]]`, `[[/==]]`, …).
     Align {
@@ -109,6 +111,7 @@ impl ClosedTag {
             ClosedTag::Collapsible => "collapsible".into(),
             ClosedTag::Anchor => "a".into(),
             ClosedTag::Code => "code".into(),
+            ClosedTag::Html => "html".into(),
             ClosedTag::Align { floating, side } => {
                 let f = if *floating { "f" } else { "" };
                 let s = match side {
@@ -673,6 +676,26 @@ mod tests {
                 ty: None,
                 raw: "\n> line one\n**not bold**\n".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn html_block_is_verbatim() {
+        // `[[html]]` takes no attributes; the interior is raw HTML, kept
+        // byte-faithful for the inline render. Wikidot-visible forms only.
+        let c = parse("[[html]]\n<style>.x { color: red }</style>\n[[/html]]");
+        assert_eq!(
+            c,
+            vec![Node::Html {
+                raw: "\n<style>.x { color: red }</style>\n".to_string(),
+            }]
+        );
+        // An attributed or unclosed opener degrades to literal text, like
+        // every other construct.
+        assert_eq!(parse("[[html foo]]x"), vec![txt("[[html foo]]x")]);
+        assert_eq!(
+            parse("[[html]]never closed"),
+            vec![Node::Raw("[[html]]".into()), txt("never closed")]
         );
     }
 

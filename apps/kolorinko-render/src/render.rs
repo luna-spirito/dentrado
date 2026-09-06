@@ -461,6 +461,7 @@ fn is_block(node: &Node) -> bool {
             | Node::Include(_)
             | Node::Raw(_)
             | Node::Code { .. }
+            | Node::Html { .. }
             | Node::ModuleBlock { .. }
             | Node::Module { .. }
             | Node::List(_)
@@ -546,8 +547,69 @@ fn render_node(ctx: &RenderCtx, node: &Node) -> AnyView {
             <div class="code"><pre><code>{raw.trim()}</code></pre></div>
         }
         .into_any(),
+        // A `[[html]]` block, served like WikiDot's: the authored interior
+        // rides a same-origin `srcdoc` iframe in WikiDot's own wrapper (see
+        // [`html_block_document`]) — isolation for the block's `body`/`:root`
+        // CSS and scripts, auto-resized like the live `/html/<hash>` docs.
+        // Width/border ride the element (WikiDot's base theme carries the
+        // `iframe.html-block-iframe` rule, but plain static dumps render
+        // without it); height starts at the browser default until the
+        // embedded resizer fits it.
+        Node::Html { raw } => view! {
+            <iframe
+                class="html-block-iframe"
+                style="width: 100%; border: none;"
+                srcdoc=html_block_document(raw)
+            ></iframe>
+        }
+        .into_any(),
         Node::List(list) => render_list(ctx, list),
     }
+}
+
+/// WikiDot's `common--theme/base/css/html-block.css` — the iframe-document
+/// reset (its `body { height: auto }` keeps the document hugging the
+/// content). Inlined verbatim rather than linked: the mirror serves no
+/// `/common--theme` route.
+const HTML_BLOCK_CSS: &str = "\
+html#html-block-html, html#html-block-html body {\
+padding: 0; margin: 0; overflow: hidden; background: transparent;\
+}\
+html#html-block-html body { height: auto; }";
+
+/// The auto-resize script for a `[[html]]` iframe document: WikiDot's
+/// measurement (`body.scrollHeight`) with a `ResizeObserver` driving it and
+/// the height written to `frameElement` directly — a `srcdoc` document is
+/// same-origin, where WikiDot (serving blocks from a separate file host)
+/// has to shuttle heights through `resize-iframe.html` URLs. The observer's
+/// initial notification performs the first fit; later ones track fonts,
+/// images and dynamic content. (Growth that stays clipped inside an
+/// `overflow: hidden` box — which WikiDot's 250 ms polling eventually
+/// catches — is not observed.)
+const HTML_BLOCK_RESIZE: &str = "\
+<script>(function() {\
+var h = 0;\
+new ResizeObserver(function() {\
+var n = document.body.scrollHeight;\
+if (n && n != h) window.frameElement.style.height = (h = n) + 'px';\
+}).observe(document.body);\
+})();</script>";
+
+/// The document a `[[html]]` block is served as: the authored interior
+/// verbatim inside WikiDot's own wrapper (shaped after the live
+/// `/html/<hash>` responses, stylesheet link inlined) plus the resizer.
+/// Authored `<!DOCTYPE html>` documents ride inside the wrapper body
+/// exactly as WikiDot ships them — the inner doctype/html tags normalize
+/// away when the browser parses the wrapper.
+fn html_block_document(raw: &str) -> String {
+    format!(
+        "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \
+\"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">\n\
+<html id=\"html-block-html\" xmlns=\"http://www.w3.org/1999/xhtml\" \
+xml:lang=\"en\" lang=\"en\"><head><meta http-equiv=\"Content-type\" \
+content=\"text/html; charset=utf-8\"/><style>{HTML_BLOCK_CSS}</style></head><body>\
+{raw}{HTML_BLOCK_RESIZE}</body></html>"
+    )
 }
 
 fn render_text_obj(t: &TextObj) -> AnyView {
@@ -1502,4 +1564,31 @@ fn format_date(ts: i64, fmt: Option<&str>) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::html_block_document;
+
+    /// The iframe document carries the authored interior verbatim inside
+    /// WikiDot's wrapper, reset stylesheet inlined, resizer appended.
+    #[test]
+    fn html_block_document_wraps_verbatim() {
+        let doc = html_block_document("\n<p>one &amp; <b>two</b></p>\n");
+        assert!(
+            doc.starts_with("<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\"")
+        );
+        assert!(doc.contains("<html id=\"html-block-html\""));
+        assert!(
+            doc.contains("<style>html#html-block-html, html#html-block-html body {"),
+            "reset stylesheet inlined"
+        );
+        assert!(doc.contains("<body>\n<p>one &amp; <b>two</b></p>\n"));
+        assert!(doc.ends_with(
+            "<script>(function() {var h = 0;new ResizeObserver(function() {\
+             var n = document.body.scrollHeight;if (n && n != h) \
+             window.frameElement.style.height = (h = n) + 'px';\
+             }).observe(document.body);})();</script></body></html>"
+        ));
+    }
 }

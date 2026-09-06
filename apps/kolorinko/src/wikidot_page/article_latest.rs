@@ -165,9 +165,14 @@ pub(super) fn resolve_full(
     host: HostCtx,
     state: &mut ResolveState,
 ) -> (Content, Vec<PageDep>) {
-    let origin = (state.site.clone(), slug.0, slug.1);
+    let origin = (state.site.clone(), slug.0.clone(), slug.1.clone());
     state.resolved.insert(origin.clone());
-    let (assembled, mut deps) = resolve_include(&body, &origin, state);
+    // A data-form page renders through its category's `_template` layout
+    // (the form fields substituted) — before anything textual runs, so the
+    // expansion's own includes and directives resolve like page text.
+    let (expanded, form_deps) = expand_form(&body, &origin, &slug, &state);
+    let (assembled, mut deps) = resolve_include(&expanded, &origin, state);
+    deps.extend(form_deps);
     let (content, listed) = resolve_listpages(parse(&assembled), state, &host);
     deps.extend(listed);
     let content = evaluate_iftags(content, &host.tags);

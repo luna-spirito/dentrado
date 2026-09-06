@@ -97,8 +97,8 @@ pub(super) fn parse_shell(text: &str) -> SiteChrome {
         };
         let v = v.trim();
         match k.trim() {
-            "title" => chrome.title = Some(strip_quotes(v).to_string()),
-            "subtitle" => chrome.subtitle = Some(strip_quotes(v).to_string()),
+            "title" => chrome.title = Some(quoted_scalar(v)),
+            "subtitle" => chrome.subtitle = Some(quoted_scalar(v)),
             "theme_root" => {
                 let tail = match v.strip_prefix("files/") {
                     Some(t) => Some(t.to_string()),
@@ -113,4 +113,60 @@ pub(super) fn parse_shell(text: &str) -> SiteChrome {
         }
     }
     chrome
+}
+
+/// Decode a YAML double-quoted scalar (the `shell` file quotes title and
+/// subtitle): the archiver escapes embedded quotes, and WikiDot serves the
+/// decoded text — `\"` is a literal quote, `\\` a backslash, `\n`/`\t` the
+/// control characters. Escapes beyond those don't occur in the corpus and
+/// pass through verbatim.
+fn quoted_scalar(s: &str) -> String {
+    let body = strip_quotes(s);
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_shell;
+
+    /// Quoted scalars decode their escapes: the BAU subtitle carries quoted
+    /// phrases (`"\"…\""` in the shell), served by WikiDot as plain quotes.
+    #[test]
+    fn shell_quoted_scalars_unescape() {
+        let shell = "title: \"Backrooms Archive Unit\"\n\
+                     subtitle: \"\\\"Documenting the Endless Maze — One Level at a Time.\\\"\"\n\
+                     landing: \"home:home\"\n";
+        let chrome = parse_shell(shell);
+        assert_eq!(chrome.title.as_deref(), Some("Backrooms Archive Unit"));
+        assert_eq!(
+            chrome.subtitle.as_deref(),
+            Some("\"Documenting the Endless Maze — One Level at a Time.\"")
+        );
+        let (cat, name) = chrome.landing;
+        assert_eq!(
+            cat.as_deref().map(String::as_str),
+            Some("home"),
+            "landing slug"
+        );
+        assert_eq!(name.as_str(), "home");
+    }
 }

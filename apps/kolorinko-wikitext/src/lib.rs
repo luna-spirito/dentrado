@@ -444,6 +444,13 @@ pub enum Node {
     /// (`type="css"` blocks are served as stylesheets).
     Code { ty: Option<String>, raw: String },
 
+    /// `[[html]] … [[/html]]` — a verbatim raw-HTML block, `raw` the exact
+    /// interior as stored. Wikidot serves it behind a same-origin iframe
+    /// (`/page/html/<hash>`, auto-resized by their JS); the mirror embeds it
+    /// the same way — a same-origin `srcdoc` iframe in Wikidot's wrapper
+    /// (see DIVERGENCE.md).
+    Html { raw: String },
+
     /// `* item` / `# item` bullet list, nestable by indentation. PureScript
     /// `Listo`.
     List(List),

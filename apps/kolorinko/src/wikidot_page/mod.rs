@@ -121,6 +121,7 @@ mod assets_gear;
 mod code_block;
 mod config;
 mod dataset;
+mod forms;
 mod iftags;
 mod includes;
 mod incremental;
@@ -137,6 +138,7 @@ mod vars;
 
 use article_latest::*;
 use dataset::*;
+use forms::*;
 use iftags::*;
 use includes::*;
 use incremental::*;

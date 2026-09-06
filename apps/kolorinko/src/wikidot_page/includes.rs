@@ -10,21 +10,38 @@ use std::ops::Range;
 // =========================================================================
 
 /// Resolve an include's [`PageRef`] to `(site, slug)` on the current site.
-/// The parser parks the first `:`-segment of the source in [`PageRef::space`];
-/// for same-site page refs that segment is the category, so `space` → category
-/// and the trailing path → name. Cross-site includes (`space` = another site)
-/// are not yet supported. Unresolvable targets (bad path component) return
-/// `None` and the directive is left in place.
+/// The parser parks the first `:`-segment of the source in [`PageRef::space`],
+/// so an absolute `[[include :site:page…]]` carries the site there with an
+/// empty marker (`Some("")`) and the site's own name as the first path
+/// segment: only the current site's pages splice (cross-site includes are
+/// not yet supported). Everything else is one relative slug — space plus
+/// path re-joined, split at the first colon, so page names that themselves
+/// contain colons (`fragment:theme:inverton`) keep their shape. An
+/// unresolvable target returns `None` and the directive is left in place.
 fn include_target(
     src: &PageRef,
     current_site: &SafePathComponent,
 ) -> Option<(SafePathComponent, Slug)> {
-    let name = SafePathComponent::new(src.path.last()?.clone())?;
-    let category = match &src.space {
-        Some(cat) => Some(SafePathComponent::new(cat.clone())?),
-        None => None,
+    let rest = match src.space.as_deref() {
+        Some("") => {
+            let (site, tail) = src.path.split_first()?;
+            if site != &**current_site {
+                return None;
+            }
+            tail.join(":")
+        }
+        _ => src
+            .path
+            .iter()
+            .fold(src.space.clone(), |acc: Option<String>, seg| {
+                Some(match acc {
+                    Some(a) => a + ":" + seg,
+                    None => seg.clone(),
+                })
+            })
+            .unwrap_or_default(),
     };
-    Some((current_site.clone(), (category, name)))
+    parse_slug(&rest).map(|slug| (current_site.clone(), slug))
 }
 
 /// One `[[include …]]` directive of a raw page body that the parser will
@@ -79,6 +96,7 @@ pub(super) fn live_directives(text: &str) -> Vec<LiveDirective> {
     enum Key {
         Comment,
         Code,
+        Html,
         Module,
     }
     let mut stack: Vec<(usize, Key, bool)> = Vec::new();
@@ -163,6 +181,9 @@ pub(super) fn live_directives(text: &str) -> Vec<LiveDirective> {
                         Tok::Open(OpenTag::Code { .. }) => {
                             stack.push((i, Key::Code, true));
                         }
+                        Tok::Open(OpenTag::Html) => {
+                            stack.push((i, Key::Html, true));
+                        }
                         Tok::Open(OpenTag::Css) => {
                             stack.push((i, Key::Module, true));
                         }
@@ -172,6 +193,9 @@ pub(super) fn live_directives(text: &str) -> Vec<LiveDirective> {
                         }
                         Tok::Close(ClosedTag::Code) => {
                             close(&mut stack, &mut closed, Key::Code, end);
+                        }
+                        Tok::Close(ClosedTag::Html) => {
+                            close(&mut stack, &mut closed, Key::Html, end);
                         }
                         Tok::Close(ClosedTag::Module) => {
                             close(&mut stack, &mut closed, Key::Module, end);

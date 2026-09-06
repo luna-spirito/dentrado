@@ -216,6 +216,8 @@ pub(crate) enum OpenTag<'src> {
     Code {
         params: Params,
     },
+    /// `[[html]]` — bare opener, the interior is verbatim raw HTML.
+    Html,
     /// `[[module css …]]`
     Css,
     ListPages {
@@ -944,6 +946,7 @@ const CLOSERS: &[(&[u8], ClosedTag)] = &[
     (b"hcell", ClosedTag::Cell),
     (b"size", ClosedTag::Size),
     (b"span", ClosedTag::Span),
+    (b"html", ClosedTag::Html),
     (b"cell", ClosedTag::Cell),
     (b"code", ClosedTag::Code),
     (b"row", ClosedTag::Row),
@@ -1024,6 +1027,7 @@ const OPENERS: &[(&[u8], Tail)] = &[
     (b"cell", cell_tail),
     (b"size", size_tail),
     (b"span", span_tail),
+    (b"html", html_tail),
     (b"code", code_tail),
     (b"head", head_tail),
     (b"body", body_tail),
@@ -1459,6 +1463,15 @@ fn code_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
     b.get(k..)
         .is_some_and(|r| r.starts_with(b"]]"))
         .then(|| (k + 2, OpenTag::Code { params }))
+}
+
+/// `[[html]]` — a bare opener (no attributes); anything between the keyword
+/// and `]]` but spaces rejects the tag.
+fn html_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
+    let k = skip_spaces(b, j);
+    b.get(k..)
+        .is_some_and(|r| r.starts_with(b"]]"))
+        .then_some((k + 2, OpenTag::Html))
 }
 
 fn head_tail(b: &[u8], j: usize) -> Option<(usize, OpenTag<'_>)> {
