@@ -75,8 +75,8 @@ pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
         .get(site)
         .map(|w| {
             // Through the dataset resolver, not a bare index get: the shell
-            // names the theme as a `host/path` tail, while on-site themes are
-            // keyed site-relative in the index.
+            // names the theme as a raw URL whose canonical key may differ
+            // from the index's (a custom-domain spelling).
             let theme_root = w
                 .theme_root
                 .as_ref()

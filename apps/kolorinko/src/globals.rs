@@ -206,7 +206,10 @@ pub(crate) fn domains_of(space: &SpaceId) -> Option<&'static [String]> {
 
 /// The configured alias domains of a dataset site — empty (not an error)
 /// when the site is unregistered or globals were never initialized (test
-/// fixtures index publication files without a registry).
+/// fixtures index publication files without a registry). The resource
+/// resolver (`wikidot_page::dataset::resource`) retries a lookup that names
+/// one of these hosts (± `www.` / `files.`) under the canonical
+/// `<site>.wikidot.com` spelling.
 pub(crate) fn domains_of_site(site: &SafePathComponent) -> &'static [String] {
     GLOBALS
         .get()

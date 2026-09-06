@@ -202,7 +202,7 @@ fn build_reads_publication_and_materialises_bodies() {
     );
 
     let mut bodies = ImHashMap::new();
-    let (rows, w) = build_site(&dir.join("out").join("scp"), &mut bodies).unwrap();
+    let (rows, w) = build_site(&site("scp"), &dir.join("out").join("scp"), &mut bodies).unwrap();
     let sites = site_map(w);
 
     // Both pages indexed, both latest bodies materialised into the
@@ -238,11 +238,13 @@ fn build_reads_publication_and_materialises_bodies() {
     assert_eq!(ca.ext, "css");
 }
 
-/// On-site files are keyed site-relative in `files.json` (the DB's path
-/// form), while lookups name `host/path` tails: `resource` must retry the
-/// bare relative key for the site's own hosts — and only those.
+/// A legacy site-relative row (`local--files/…` — the previous `files.json`
+/// format, still on disk for sites the daemon hasn't republished) lifts onto
+/// the site's canonical host, and every alias spelling of the URL — the
+/// wdfiles CDN, `%3A` escapes, a configured custom domain — resolves to it
+/// through [`canon_file_key`] + [`resource`]'s own-host retry.
 #[test]
-fn resource_retries_site_relative_rows_for_own_hosts() {
+fn legacy_rows_lift_and_alias_spellings_resolve() {
     init_test_globals();
     let dir = std::env::temp_dir().join(format!("kolorinko_rel_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -263,34 +265,133 @@ fn resource_retries_site_relative_rows_for_own_hosts() {
     );
 
     let mut bodies = ImHashMap::new();
-    let (_, w) = build_site(&dir.join("out").join("obscurative"), &mut bodies).unwrap();
+    let (_, w) = build_site(
+        &site("obscurative"),
+        &dir.join("out").join("obscurative"),
+        &mut bodies,
+    )
+    .unwrap();
     let snap = RepoSnapshot {
         sites: site_map_at(site("obscurative"), w),
         bodies,
     };
-    // The relative row is indexed verbatim, under no host at all.
-    let rel = RepoAssetPath::new("local--theme/t/style.css".into()).unwrap();
+    // The relative row is indexed under the site's canonical host.
+    let key =
+        RepoAssetPath::new("obscurative.wikidot.com/local--theme/t/style.css".into()).unwrap();
     assert!(
         snap.sites
             .get(&site("obscurative"))
             .unwrap()
             .files
-            .contains_key(&rel)
+            .contains_key(&key)
     );
-    // Every own-host form resolves through the relative retry.
-    for host in [
-        "obscurative.wikidot.com",
-        "obscurative.wdfiles.com",
-        "WWW.OBSCURATIVE.RU",
-        "files.www.obscurative.ru",
+    // Every alias spelling canonicalizes (or retries) to that one row.
+    for url in [
+        "http://obscurative.wikidot.com/local--theme/t/style.css",
+        "http://obscurative.wdfiles.com/local--theme/t/style.css",
+        "http://www.obscurative.wikidot.com/local--theme/t/style.css",
+        "https://files.www.obscurative.ru/local--theme/t/style.css",
     ] {
-        let tail = RepoAssetPath::new(format!("{host}/local--theme/t/style.css")).unwrap();
-        let ca = resource(&snap, &site("obscurative"), &tail);
-        assert_eq!(ca.map(|c| c.hash).as_deref(), Some(HASH), "{host}");
+        let path = canon_file_key(url).unwrap_or_else(|| panic!("canon {url}"));
+        let ca = resource(&snap, &site("obscurative"), &path);
+        assert_eq!(ca.map(|c| c.hash).as_deref(), Some(HASH), "{url}");
     }
     // A foreign host with the same path stays a hotlink.
     let foreign = RepoAssetPath::new("i.imgur.com/local--theme/t/style.css".into()).unwrap();
     assert!(resource(&snap, &site("obscurative"), &foreign).is_none());
+}
+
+/// A `local--resized-images/…` reference (a variant the export never saved)
+/// resolves to the original `local--files/…` file — same host, whatever its
+/// spelling.
+#[test]
+fn resized_variants_resolve_to_their_originals() {
+    init_test_globals();
+    let dir = std::env::temp_dir().join(format!("kolorinko_rsz_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    write_manifest(&dir, "rpcauthority", &[]);
+    write_files(
+        &dir,
+        "rpcauthority",
+        &[(
+            "http://rpcauthority.wikidot.com/local--files/foo/bar.png",
+            HASH,
+            "saved",
+            b"png",
+        )],
+    );
+    let (_, w) = build_site(
+        &site("rpcauthority"),
+        &dir.join("out").join("rpcauthority"),
+        &mut ImHashMap::new(),
+    )
+    .unwrap();
+    let snap = RepoSnapshot {
+        sites: site_map_at(site("rpcauthority"), w),
+        bodies: ImHashMap::new(),
+    };
+    let variant = canon_file_key(
+        "http://rpcauthority.wikidot.com/local--resized-images/foo/bar.png/small.png",
+    )
+    .unwrap();
+    assert_eq!(
+        resource(&snap, &site("rpcauthority"), &variant)
+            .map(|c| c.hash)
+            .as_deref(),
+        Some(HASH)
+    );
+}
+
+/// The publisher's canonicalization rules, verbatim from the format change:
+/// every spelling of one file meets at one key, custom hosts stay as
+/// written, garbage names no file.
+#[test]
+fn canon_file_key_matches_the_publisher_rules() {
+    let p = |s: &str| canon_file_key(s).map(|p| p.as_str().to_owned());
+    // The wikidot family (any mirrored site or a foreign sandbox) collapses
+    // onto `<sub>.wikidot.com`, `www.` dropped, scheme dropped, `%3A`
+    // decoded.
+    assert_eq!(
+        p("http://rpcsandbox.wdfiles.com/local--files/m/x.png").as_deref(),
+        Some("rpcsandbox.wikidot.com/local--files/m/x.png")
+    );
+    assert_eq!(
+        p("http://www.rpcauthority.wikidot.com/local--files/nav%3Aside/discord.png").as_deref(),
+        Some("rpcauthority.wikidot.com/local--files/nav:side/discord.png")
+    );
+    assert_eq!(
+        p("https://SCP-WIKI.Wikidot.Com/local--files/a%3ab/c%20d.png").as_deref(),
+        Some("scp-wiki.wikidot.com/local--files/a:b/c d.png")
+    );
+    // An already-`host/path` tail (what `http_tail` yields) canonicalizes
+    // identically.
+    assert_eq!(
+        p("rpcsandbox.wdfiles.com/local--files/m/x.png").as_deref(),
+        Some("rpcsandbox.wikidot.com/local--files/m/x.png")
+    );
+    // Every other host — custom domains, CDNs — is preserved as written,
+    // `www.` and `%3A` included; only the fragment drops.
+    assert_eq!(
+        p("https://www.rpc-wiki.net/local--files/forum/t-123/reply/32781.html#f").as_deref(),
+        Some("www.rpc-wiki.net/local--files/forum/t-123/reply/32781.html")
+    );
+    assert_eq!(
+        p("https://fonts.googleapis.com/css?family=Exo+2").as_deref(),
+        Some("fonts.googleapis.com/css")
+    );
+    // The query drops (Wikidot serves `…?width=…` with the same bytes), `//`
+    // collapses, and unusable shapes name no file.
+    assert_eq!(
+        p("http://s.wikidot.com/a.png?width=210&height=68").as_deref(),
+        Some("s.wikidot.com/a.png")
+    );
+    assert_eq!(
+        p("http://s.wikidot.com/local--files/widget-hub//x.png").as_deref(),
+        Some("s.wikidot.com/local--files/widget-hub/x.png")
+    );
+    assert_eq!(p("http://s.wikidot.com/../etc/passwd"), None);
+    assert_eq!(p("not a url"), None);
 }
 
 #[test]
@@ -321,7 +422,7 @@ fn incremental_patch_on_manifest_drift() {
     );
 
     let mut bodies = ImHashMap::new();
-    let (old_rows, w) = build_site(&site_dir(), &mut bodies).unwrap();
+    let (old_rows, w) = build_site(&site("scp"), &site_dir(), &mut bodies).unwrap();
     let sites = site_map(w);
     let bar_body = Rc::new(
         find_article(&sites, &site("scp"), &root_slug("bar"))
@@ -793,11 +894,10 @@ fn external_refs_are_collected_and_content_addressed() {
 
 #[test]
 fn parse_shell_reads_title_subtitle_and_theme_root() {
-    // The git export's `files/`-prefixed tail shape.
     let text = "\
 title: \"RPC Authority\"
 subtitle: \"Research, Protection, Containment\"
-theme_root: files/cdn.jsdelivr.net/gh/x/y@main/style.css
+theme_root: https://cdn.jsdelivr.net/gh/x/y@main/style.css
 ";
     let chrome = super::parse_shell(text);
     assert_eq!(chrome.title.as_deref(), Some("RPC Authority"));
@@ -810,13 +910,21 @@ theme_root: files/cdn.jsdelivr.net/gh/x/y@main/style.css
         theme_root.as_str(),
         "cdn.jsdelivr.net/gh/x/y@main/style.css"
     );
-    // The out/ publication's raw-URL shape, percent-escapes included.
+    // The publisher writes the raw archived URL — the `wdfiles` spelling and
+    // `%3A` escapes canonicalize to the same key the `files/` index builds.
+    let chrome = super::parse_shell(
+        "theme_root: http://obscurative.wdfiles.com/local--theme/obskura-h/style.css\n",
+    );
+    assert_eq!(
+        chrome.theme_root.expect("url theme_root").as_str(),
+        "obscurative.wikidot.com/local--theme/obskura-h/style.css"
+    );
     let chrome = super::parse_shell(
         "theme_root: https://scp-wiki.wdfiles.com/local--code/component%3Atheme/1\n",
     );
     assert_eq!(
-        chrome.theme_root.expect("url theme_root").as_str(),
-        "scp-wiki.wdfiles.com/local--code/component:theme/1"
+        chrome.theme_root.expect("escaped theme_root").as_str(),
+        "scp-wiki.wikidot.com/local--code/component:theme/1"
     );
 }
 
@@ -868,7 +976,8 @@ fn real_publication_indexes_files_and_shell() {
         eprintln!("skipping: real publication not present");
         return;
     }
-    let (rows, w) = build_site(&root, &mut ImHashMap::new()).expect("site builds");
+    let (rows, w) =
+        build_site(&site("rpcauthority"), &root, &mut ImHashMap::new()).expect("site builds");
     assert!(!rows.is_empty(), "manifest indexed");
     assert!(w.title.as_deref() == Some("RPC Authority"));
     assert!(w.subtitle.as_ref().is_some_and(|s| !s.is_empty()));
@@ -915,7 +1024,8 @@ fn real_publication_resolves_site_theme_root() {
         eprintln!("skipping: real publication not present");
         return;
     }
-    let (_, w) = build_site(&root, &mut ImHashMap::new()).expect("site builds");
+    let (_, w) =
+        build_site(&site("obscurative"), &root, &mut ImHashMap::new()).expect("site builds");
     let snap = RepoSnapshot {
         sites: site_map_at(site("obscurative"), w),
         bodies: ImHashMap::new(),

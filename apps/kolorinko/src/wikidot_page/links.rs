@@ -110,7 +110,7 @@ fn own_page_ref(site: &SafePathComponent, url: &str) -> Option<PageRef> {
         return None;
     }
     let (host, rest) = tail.split_once('/').unwrap_or((&tail, ""));
-    if !own_file_host(site, host) {
+    if !own_host(site, host) {
         return None;
     }
     // The bare site root (or a trailing `/`): the `Page` ref with an empty

@@ -8,10 +8,11 @@ use super::*;
 /// link targets, and `url()`/`@import` references inside `[[module css]]` — to
 /// its content-addressed `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` URL and
 /// substitute, each through a local snapshot lookup
-/// ([`dataset::resource`]). A URL that isn't mirrored is retried as
-/// Wikidot's `/code/N` endpoint ([`code_url_for_tail`]) and pointed at the
-/// local slug-family code route; anything else is left as its original
-/// absolute URL (a hotlink the client loads straight from the origin).
+/// ([`dataset::resource`], keyed by [`canon_file_key`]). A URL that isn't
+/// mirrored is retried as Wikidot's `/code/N` endpoint
+/// ([`code_url_for_tail`]) and pointed at the local slug-family code route;
+/// anything else is left as its original absolute URL (a hotlink the client
+/// loads straight from the origin).
 pub(super) fn resolve_resources(
     content: Content,
     site: &SafePathComponent,
@@ -25,7 +26,7 @@ pub(super) fn resolve_resources(
     let mut resolved: HashMap<String, CaRef> = HashMap::new();
     let mut code: HashMap<String, String> = HashMap::new();
     for tail in &tails {
-        let Some(path) = resource_path(tail) else {
+        let Some(path) = canon_file_key(tail) else {
             continue;
         };
         match resource(snap, site, &path) {
@@ -40,18 +41,6 @@ pub(super) fn resolve_resources(
         }
     }
     substitute_resources(content, site, &resolved, &code)
-}
-
-/// Normalise a collected `host/path` tail into a lookup key: percent-decode,
-/// drop any `?query` (Wikidot serves `…png?width=210` the same bytes as
-/// `…png`), and collapse `//` (the corpus's `local--files/widget-hub//x.png`)
-/// — [`RepoAssetPath::new`] rejects empty segments, and the publication never
-/// keys a file under either quirk.
-pub(super) fn resource_path(tail: &str) -> Option<RepoAssetPath> {
-    let decoded = percent_decode(tail);
-    let no_query = decoded.split('?').next().unwrap_or(&decoded);
-    let collapsed = no_query.replace("//", "/");
-    RepoAssetPath::new(collapsed)
 }
 
 /// Walk `content` and collect every mirrored-attachment `host/path` tail

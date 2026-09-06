@@ -53,7 +53,7 @@ pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
         let refs = http_refs(&text);
         let mut map: HashMap<String, String> = HashMap::new();
         for tail in &refs {
-            if let Some(path) = RepoAssetPath::new(percent_decode(tail))
+            if let Some(path) = canon_file_key(tail)
                 && let Some(ca) = get_ca(site, path, ctx).await
             {
                 map.insert(tail.clone(), ca_url(site, &ca));
@@ -69,29 +69,6 @@ pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
         crate::assets::compress(bytes)
     };
     Some(body)
-}
-
-/// The canonical-host form of a [`RepoAssetPath`] whose host is an alias of
-/// `site`: `<sub>.wdfiles.com` (Wikidot's file CDN) rewrites to
-/// `<sub>.wikidot.com`, and any of the site's configured alias domains
-/// (case-insensitively — hosts are) rewrites to `<site>.wikidot.com`.
-/// `None` when the host is neither — including another site's alias domain.
-/// The retry itself lives in [`dataset::resource`].
-pub(super) fn repo_alias(
-    site: &SafePathComponent,
-    domains: &[String],
-    path: &RepoAssetPath,
-) -> Option<RepoAssetPath> {
-    let s = path.as_str();
-    let (host, rest) = s.split_once('/')?;
-    let canonical = match host.strip_suffix(".wdfiles.com") {
-        Some(sub) => format!("{sub}.wikidot.com"),
-        None if domains.iter().any(|d| d.eq_ignore_ascii_case(host)) => {
-            format!("{}.wikidot.com", **site)
-        }
-        None => return None,
-    };
-    RepoAssetPath::new(format!("{canonical}/{rest}"))
 }
 
 /// Serialize a [`CaRef`] to its served URL:
@@ -132,46 +109,5 @@ pub(super) async fn get_ca<S: Storage<KolorinkoRT>>(
             _ => None,
         },
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn repo_alias_maps_wdfiles_to_wikidot() {
-        let site = SafePathComponent::new("rpcauthority".into()).unwrap();
-        let p = RepoAssetPath::new("rpcauthority.wdfiles.com/local--files/x/y.png".into()).unwrap();
-        assert_eq!(
-            repo_alias(&site, &[], &p).map(|a| a.as_str().to_owned()),
-            Some("rpcauthority.wikidot.com/local--files/x/y.png".to_owned()),
-        );
-    }
-
-    #[test]
-    fn repo_alias_maps_configured_domains_case_insensitively() {
-        let site = SafePathComponent::new("obscurative".into()).unwrap();
-        let domains = ["www.obscurative.ru".to_owned()];
-        let p = RepoAssetPath::new("WWW.OBSCURATIVE.RU/local--files/x/y.png".into()).unwrap();
-        assert_eq!(
-            repo_alias(&site, &domains, &p).map(|a| a.as_str().to_owned()),
-            Some("obscurative.wikidot.com/local--files/x/y.png".to_owned()),
-        );
-    }
-
-    #[test]
-    fn repo_alias_skips_non_alias_hosts() {
-        let site = SafePathComponent::new("rpcauthority".into()).unwrap();
-        let domains = ["rpc-wiki.net".to_owned()];
-        let canonical =
-            RepoAssetPath::new("rpcauthority.wikidot.com/local--files/x/y.png".into()).unwrap();
-        let foreign = RepoAssetPath::new("i.imgur.com/x.jpg".into()).unwrap();
-        let other_site =
-            RepoAssetPath::new("www.obscurative.ru/local--files/x/y.png".into()).unwrap();
-        assert_eq!(repo_alias(&site, &domains, &canonical), None);
-        assert_eq!(repo_alias(&site, &domains, &foreign), None);
-        // A domain of *another* site is not this site's alias.
-        assert_eq!(repo_alias(&site, &domains, &other_site), None);
     }
 }

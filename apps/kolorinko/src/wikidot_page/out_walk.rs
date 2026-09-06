@@ -217,22 +217,27 @@ struct FilesDoc {
 
 #[derive(serde::Deserialize)]
 struct FileRow {
-    /// The absolute URL the bytes came from (`https://host/path`).
+    /// The URL the bytes came from — the publisher's canonical absolute form
+    /// (`http://<sub>.wikidot.com/…` for the wikidot family, any other host
+    /// verbatim); the previous format also keyed a site's own files by their
+    /// site-relative path (`local--files/…`).
     path: String,
     sha256: Option<String>,
     status: String,
 }
 
-/// Parse `files.json` into the site's `files/` index — a faithful projection:
-/// each *saved* row keyed exactly as the DB names it, percent-decoded. The DB
-/// keys a file by its site-relative path (`local--files/…`) when it lives on
-/// this site, or its absolute URL when it doesn't; lookups that name a
-/// `host/path` tail (the form [`http_tail`] yields from an in-article URL,
-/// or [`parse_shell`] from `theme_root`) retry the bare relative key for the
-/// site's own hosts — see [`dataset::resource`]. Pending and missing entries
-/// stay unindexed (a request for them misses, then falls back to the source
-/// site — same as an unmirrored hotlink).
-pub(super) fn read_files_index(site_dir: &Path) -> HashMap<RepoAssetPath, CaRef> {
+/// Parse `files.json` into the site's `files/` index: each *saved* row keyed
+/// by [`canon_file_key`] — so the previous format's site-relative rows (still
+/// on disk for sites the daemon hasn't republished since the format change)
+/// lift onto the site's canonical host and its `wdfiles`/`www.`/`%3A`
+/// spellings collapse into the same key the canonical form writes, exactly
+/// like the publisher's own dedup. Pending and missing entries stay
+/// unindexed (a request for them misses, then falls back to the source site —
+/// same as an un-mirrored hotlink).
+pub(super) fn read_files_index(
+    site: &SafePathComponent,
+    site_dir: &Path,
+) -> HashMap<RepoAssetPath, CaRef> {
     let mut map = HashMap::new();
     let Ok(bytes) = std::fs::read(site_dir.join("files.json")) else {
         return map;
@@ -248,11 +253,18 @@ pub(super) fn read_files_index(site_dir: &Path) -> HashMap<RepoAssetPath, CaRef>
         if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue;
         }
-        let key = percent_decode(url_tail(&f.path).as_deref().unwrap_or(&f.path));
-        let Some(path) = RepoAssetPath::new(key) else {
+        // A scheme-less row is a legacy site-relative path (`local--…`) —
+        // the same file on its site's canonical host; anything else is the
+        // publisher's canonical absolute URL.
+        let url = if f.path.starts_with("http://") || f.path.starts_with("https://") {
+            f.path
+        } else {
+            format!("http://{}.wikidot.com/{}", &**site, f.path)
+        };
+        let Some(path) = canon_file_key(&url) else {
             continue;
         };
-        let ext = Path::new(&f.path)
+        let ext = Path::new(path.as_str())
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
@@ -262,11 +274,42 @@ pub(super) fn read_files_index(site_dir: &Path) -> HashMap<RepoAssetPath, CaRef>
     map
 }
 
-/// `https://host/path…` → `host/path…` (`None` for any non-URL shape).
-pub(super) fn url_tail(url: &str) -> Option<String> {
-    url.strip_prefix("https://")
+/// Canonicalise one file URL — a `files.json` row `path`, the shell's
+/// `theme_root`, or the `host/path` tail [`http_tail`] yields from an
+/// in-article reference — into the `files/` index key `host/path`:
+/// - the scheme drops (a key never carries it);
+/// - a `.wikidot.com` / `.wdfiles.com` host (± `www.`, this site or a foreign
+///   one — sandboxes) rewrites to `<sub>.wikidot.com` — the one host all of a
+///   file's wikidot spellings share;
+/// - every other host (custom domains, font/theme CDNs) keeps its `www.` and
+///   spelling as written;
+/// - the fragment and query drop (Wikidot serves `…?width=…` with the same
+///   bytes), `//` collapses (the corpus's `…//x.png` quirk), and percent
+///   escapes decode (`component%3Atheme` → `component:theme`, `%20` →
+///   space — the index and the lookup must agree, and decoding both sides
+///   collapses strictly more spellings of one URL).
+/// Both sides of every lookup run through this one function, so any two
+/// spellings of one file meet at one key. `None` for shapes that name no
+/// file (`..`, empty segments, non-URLs).
+///
+/// [`http_tail`]: kolorinko_render::http_tail
+pub(super) fn canon_file_key(url: &str) -> Option<RepoAssetPath> {
+    let url = url.split(['#', '?']).next().unwrap_or(url);
+    let tail = url
+        .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
-        .map(str::to_string)
+        .unwrap_or(url);
+    let (host, path) = tail.split_once('/')?;
+    let host = host.to_ascii_lowercase();
+    let no_www = host.strip_prefix("www.").unwrap_or(&host);
+    let sub = no_www
+        .strip_suffix(".wikidot.com")
+        .or_else(|| no_www.strip_suffix(".wdfiles.com"));
+    let key = match sub {
+        Some(sub) => format!("{sub}.wikidot.com/{}", percent_decode(path)),
+        None => format!("{host}/{}", percent_decode(path)),
+    };
+    RepoAssetPath::new(key.replace("//", "/"))
 }
 
 // ── shell ──
@@ -285,6 +328,7 @@ pub(super) fn read_shell(site_dir: &Path) -> SiteChrome {
 /// the adopted manifest rows alongside (the diff base for later ticks).
 /// `None` when `pages.json` is unreadable (nothing servable).
 pub(super) fn build_site(
+    site: &SafePathComponent,
     site_dir: &Path,
     bodies: &mut ImHashMap<BlobId, Arc<str>>,
 ) -> Option<(HashMap<u64, PageRow>, WDWebsite)> {
@@ -300,7 +344,7 @@ pub(super) fn build_site(
         w.by_page_id.insert(*id, (cat.clone(), name.clone()));
         w.articles.entry(cat).or_default().insert(name, article);
     }
-    w.files = read_files_index(site_dir).into_iter().collect();
+    w.files = read_files_index(site, site_dir).into_iter().collect();
     let chrome = read_shell(site_dir);
     w.title = chrome.title;
     w.subtitle = chrome.subtitle;

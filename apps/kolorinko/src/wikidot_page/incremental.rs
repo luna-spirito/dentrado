@@ -76,14 +76,12 @@ pub(super) struct SiteChrome {
 
 /// Parse a `shell` file: `title`, `subtitle` (both quoted), `theme_root`, and
 /// `landing` (a quoted `cat:name` slug). Returns the title/subtitle verbatim
-/// and the theme root as the validated, percent-decoded `<host>/<path>` tail
-/// for resolution against the `files/` index. Two source shapes normalise to
-/// that tail: the raw URL the `out/` publication writes
-/// (`https://host/path`), and the `files/`-prefixed tail the older git
-/// export wrote. Unknown keys are ignored; a missing `theme_root` — or one
-/// with no mirrored identity (e.g. a site-relative CSS path, no host) —
-/// yields `None`; a missing or unparsable `landing` falls back to
-/// [`start_slug`].
+/// and the theme root as the canonical [`canon_file_key`] index key — the
+/// publisher writes the raw URL it archived the theme under (`wdfiles`
+/// spelling, `%3A` escapes), the same key the `files/` index builds from it.
+/// Unknown keys are ignored; a missing `theme_root` — or one with no mirrored
+/// identity (e.g. a site-relative CSS path, no host) — yields `None`; a
+/// missing or unparsable `landing` falls back to [`start_slug`].
 pub(super) fn parse_shell(text: &str) -> SiteChrome {
     let mut chrome = SiteChrome {
         title: None,
@@ -99,15 +97,7 @@ pub(super) fn parse_shell(text: &str) -> SiteChrome {
         match k.trim() {
             "title" => chrome.title = Some(quoted_scalar(v)),
             "subtitle" => chrome.subtitle = Some(quoted_scalar(v)),
-            "theme_root" => {
-                let tail = match v.strip_prefix("files/") {
-                    Some(t) => Some(t.to_string()),
-                    None => url_tail(v),
-                };
-                if let Some(tail) = tail {
-                    chrome.theme_root = RepoAssetPath::new(percent_decode(&tail));
-                }
-            }
+            "theme_root" => chrome.theme_root = canon_file_key(v),
             "landing" => chrome.landing = parse_slug(strip_quotes(v)).unwrap_or_else(start_slug),
             _ => {}
         }

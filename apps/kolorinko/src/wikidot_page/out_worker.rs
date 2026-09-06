@@ -185,7 +185,7 @@ impl OutWorker {
         stamps: SiteStamps,
     ) -> bool {
         let Some(old) = self.states.get(site) else {
-            let Some((rows, w)) = build_site(site_dir, &mut self.bodies) else {
+            let Some((rows, w)) = build_site(site, site_dir, &mut self.bodies) else {
                 error!(
                     "Failed to read the publication of {}: {}",
                     &**site,
@@ -212,7 +212,7 @@ impl OutWorker {
             rows = fresh;
         }
         if old.stamps.files != stamps.files {
-            w.files = read_files_index(site_dir).into_iter().collect();
+            w.files = read_files_index(site, site_dir).into_iter().collect();
         }
         if old.stamps.shell != stamps.shell {
             let chrome = read_shell(site_dir);
