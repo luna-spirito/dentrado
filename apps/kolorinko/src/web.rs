@@ -166,7 +166,7 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         write_http(
             stream,
             reply.status,
-            reply.mime,
+            &reply.mime,
             reply.served.encoding,
             &reply.served.bytes,
             reply.cache_control,
@@ -201,7 +201,7 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
     write_http(
         stream,
         reply.status,
-        reply.mime,
+        &reply.mime,
         reply.served.encoding,
         &reply.served.bytes,
         reply.cache_control,

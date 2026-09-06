@@ -5,14 +5,14 @@ use super::*;
 // =========================================================================
 
 /// Resolve every mirrored external resource — `[[image source]]`, `[[[url]]]`
-/// link targets, and `url()`/`@import` references inside `[[module css]]` — to
-/// its content-addressed `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` URL and
-/// substitute, each through a local snapshot lookup
-/// ([`dataset::resource`], keyed by [`canon_file_key`]). A URL that isn't
-/// mirrored is retried as Wikidot's `/code/N` endpoint
-/// ([`code_url_for_tail`]) and pointed at the local slug-family code route;
-/// anything else is left as its original absolute URL (a hotlink the client
-/// loads straight from the origin).
+/// link targets, and `url()`/`@import` references inside `[[module css]]` and
+/// raw-HTML `[[html]]` blocks — to its content-addressed
+/// `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` URL and substitute, each
+/// through [`resolve_tails`] — the one substitution decision, shared with the
+/// CSS blobs the `asset` gear serves. A URL that isn't mirrored is retried as
+/// Wikidot's `/code/N` endpoint and pointed at the local slug-family code
+/// route; anything else is left as its original absolute URL (a hotlink the
+/// client loads straight from the origin).
 pub(super) fn resolve_resources(
     content: Content,
     site: &SafePathComponent,
@@ -23,29 +23,37 @@ pub(super) fn resolve_resources(
     if tails.is_empty() {
         return content;
     }
-    let mut resolved: HashMap<String, CaRef> = HashMap::new();
-    let mut code: HashMap<String, String> = HashMap::new();
-    for tail in &tails {
-        let Some(path) = canon_file_key(tail) else {
-            continue;
-        };
-        match resource(snap, site, &path) {
-            Some(ca_ref) => {
-                resolved.insert(tail.clone(), ca_ref);
-            }
-            None => {
-                if let Some(url) = code_url_for_tail(tail) {
-                    code.insert(tail.clone(), url);
-                }
-            }
-        }
-    }
-    substitute_resources(content, site, &resolved, &code)
+    let resolved = resolve_tails(site, &tails, |path| resource(snap, site, &path));
+    substitute_resources(content, site, &resolved)
+}
+
+/// The one substitution decision every mirrored reference goes through —
+/// page content here, served CSS blobs in [`crate::wikidot_page::asset`]:
+/// a `host/path` tail becomes its content-addressed URL when the file is
+/// mirrored (`lookup`, against a [`RepoSnapshot`]), else Wikidot's `/code/N`
+/// local route ([`code_url_for_tail`]); anything else stays absent (a
+/// hotlink the client loads straight from the origin).
+pub(super) fn resolve_tails(
+    site: &SafePathComponent,
+    tails: &[String],
+    mut lookup: impl FnMut(&RepoAssetPath) -> Option<CaRef>,
+) -> HashMap<String, String> {
+    tails
+        .iter()
+        .filter_map(|tail| {
+            let url = canon_file_key(tail)
+                .and_then(|path| lookup(&path))
+                .map(|ca| ca_url(site, &ca))
+                .or_else(|| code_url_for_tail(tail))?;
+            Some((tail.clone(), url))
+        })
+        .collect()
 }
 
 /// Walk `content` and collect every mirrored-attachment `host/path` tail
 /// reachable from an image source, a URL link target, or a stylesheet
-/// reference — deduplicated, in first-appearance order.
+/// reference — `[[module css]]` bodies and the styles raw-HTML blocks embed
+/// — deduplicated, in first-appearance order.
 pub(super) fn collect_external_refs(content: &Content, out: &mut Vec<String>) {
     let push = |t: String, out: &mut Vec<String>| {
         if !out.iter().any(|x| x == &t) {
@@ -72,7 +80,7 @@ pub(super) fn collect_external_refs(content: &Content, out: &mut Vec<String>) {
                 // close overlay) must not fall out of resolution.
                 collect_external_refs(text, out);
             }
-            Node::Stylesheet(css) => {
+            Node::Stylesheet(css) | Node::Html { raw: css } => {
                 for t in http_refs(css) {
                     push(t, out);
                 }
@@ -90,23 +98,16 @@ fn ref_tail_of(source: &[TextObj]) -> Option<String> {
 }
 
 /// Replace every mirrored-attachment reference in `content` with its
-/// content-addressed URL from `resolved` (`host/path` tail → [`CaRef`]), or
-/// its local code route from `code` (`host/path` tail → `/S…/<slug>/code/N`,
-/// the `/code/N` fallback of [`resolve_resources`]). References absent from
-/// both (un-mirrored hotlinks) pass through unchanged.
+/// resolved URL from `resolved` (`host/path` tail → final URL — a CA URL, or
+/// the `/code/N` fallback [`resolve_tails`] picked). References absent from
+/// the map (un-mirrored hotlinks) pass through unchanged.
 pub(super) fn substitute_resources(
     content: Content,
     site: &SafePathComponent,
-    resolved: &HashMap<String, CaRef>,
-    code: &HashMap<String, String>,
+    resolved: &HashMap<String, String>,
 ) -> Content {
-    let url_for = |tail: &str| {
-        resolved
-            .get(tail)
-            .map(|ca| ca_url(site, ca))
-            .or_else(|| code.get(tail).cloned())
-    };
-    let mut walk = |c: Content| substitute_resources(c, site, resolved, code);
+    let url_for = |tail: &str| resolved.get(tail).cloned();
+    let mut walk = |c: Content| substitute_resources(c, site, resolved);
     content
         .into_iter()
         .map(|node| match node {
@@ -136,7 +137,14 @@ pub(super) fn substitute_resources(
                 text: walk(text),
                 class,
             },
+            // The same textual rewriter everywhere CSS can appear: a
+            // `[[module css]]` stylesheet and the styles a raw-HTML block
+            // embeds (its `<style>` bodies and `style="…"` attributes) are
+            // one substitution surface.
             Node::Stylesheet(css) => Node::Stylesheet(rewrite_with(&css, None, url_for)),
+            Node::Html { raw } => Node::Html {
+                raw: rewrite_with(&raw, None, url_for),
+            },
             other => other.map_node(&mut walk),
         })
         .collect()

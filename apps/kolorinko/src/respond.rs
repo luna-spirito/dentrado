@@ -59,7 +59,7 @@
 //! segment that doesn't parse as a space id is just an unknown path (rule 6);
 //! on a custom domain that same shape is the wiki's slug family (rule 4).
 
-use std::{collections::HashMap, rc::Rc, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, rc::Rc, sync::Arc};
 
 use bytes::Bytes;
 use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
@@ -92,7 +92,9 @@ const NOSTORE: &str = "no-store";
 /// A resolved response: what to write, regardless of transport.
 pub(crate) struct Reply {
     pub status: u16,
-    pub mime: &'static str,
+    /// A borrowed static MIME, or a flattened-type one reversed at serve
+    /// time (`text.css` → `text/css`) — see [`crate::assets::mime_for_ext`].
+    pub mime: Cow<'static, str>,
     pub served: Served,
     pub cache_control: &'static str,
     /// `Location` for redirect replies (301); absent otherwise.
@@ -190,7 +192,7 @@ pub(crate) async fn legacy(
     .expect("ServerMsg serializes");
     Reply {
         status: 200,
-        mime: "application/json",
+        mime: "application/json".into(),
         served: Served {
             bytes: Bytes::from(json),
             encoding: None,
@@ -379,9 +381,9 @@ async fn code_reply(
     Reply {
         status: 200,
         mime: if block.css {
-            "text/css; charset=utf-8"
+            Cow::from("text/css; charset=utf-8")
         } else {
-            "text/plain; charset=utf-8"
+            Cow::from("text/plain; charset=utf-8")
         },
         served: serve_body(&block.body, accept_zstd),
         cache_control: NOCACHE,
@@ -508,10 +510,10 @@ fn shell_body(
 }
 
 impl Reply {
-    fn ok(mime: &'static str, served: Served, cache_control: &'static str) -> Self {
+    fn ok(mime: impl Into<Cow<'static, str>>, served: Served, cache_control: &'static str) -> Self {
         Self {
             status: 200,
-            mime,
+            mime: mime.into(),
             served,
             cache_control,
             location: None,
@@ -527,7 +529,7 @@ impl Reply {
     fn moved(default: Option<SpaceId>, location: &str) -> Self {
         Self {
             status: 301,
-            mime: "text/plain",
+            mime: "text/plain".into(),
             served: Served {
                 bytes: Bytes::from_static(b"moved\n"),
                 encoding: None,
@@ -541,7 +543,7 @@ impl Reply {
     fn not_found() -> Self {
         Self {
             status: 404,
-            mime: "text/plain",
+            mime: "text/plain".into(),
             served: Served {
                 bytes: Bytes::from_static(b"not found\n"),
                 encoding: None,
@@ -555,7 +557,7 @@ impl Reply {
     pub(crate) fn bad_request() -> Self {
         Self {
             status: 400,
-            mime: "text/plain",
+            mime: "text/plain".into(),
             served: Served {
                 bytes: Bytes::from_static(b"bad request\n"),
                 encoding: None,
@@ -569,7 +571,7 @@ impl Reply {
     pub(crate) fn method_not_allowed() -> Self {
         Self {
             status: 405,
-            mime: "text/plain",
+            mime: "text/plain".into(),
             served: Served {
                 bytes: Bytes::from_static(b"method not allowed\n"),
                 encoding: None,
@@ -583,7 +585,7 @@ impl Reply {
     pub(crate) fn payload_too_large() -> Self {
         Self {
             status: 413,
-            mime: "text/plain",
+            mime: "text/plain".into(),
             served: Served {
                 bytes: Bytes::from_static(b"payload too large\n"),
                 encoding: None,
@@ -599,7 +601,7 @@ impl Reply {
     fn no_content() -> Self {
         Self {
             status: 204,
-            mime: "text/plain",
+            mime: "text/plain".into(),
             served: Served {
                 bytes: Bytes::new(),
                 encoding: None,
@@ -621,7 +623,7 @@ impl Reply {
         if if_none_match.is_some_and(|h| matches_etag(h, &etag)) {
             return Self {
                 status: 304,
-                mime: "text/plain",
+                mime: "text/plain".into(),
                 served: Served {
                     bytes: Bytes::new(),
                     encoding: None,

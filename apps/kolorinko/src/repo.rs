@@ -16,7 +16,7 @@
 //! browser fetches straight from the origin), so there is no path-based form
 //! to serve here.
 
-use std::rc::Rc;
+use std::{borrow::Cow, rc::Rc};
 
 use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
 use kolorinko_rt::{Body, RepoAssetPath, SafePathComponent};
@@ -28,7 +28,7 @@ const PREFIX: &str = "/-/repo/";
 
 /// Result of a repo-asset request.
 pub(crate) enum RepoResp {
-    Ok { mime: &'static str, body: Body },
+    Ok { mime: Cow<'static, str>, body: Body },
 }
 
 /// The validated pieces of a `/-/repo/<site>/files/<xx>/<yy>/<hash>[.<ext>]`
@@ -66,9 +66,11 @@ pub(crate) async fn serve(
     })
 }
 
-/// Split a CA request path `<xx>/<yy>/<hash>.<ext>` into its shards, or `None`
-/// if it isn't the content-addressed shape (two 2-hex dir shards + a 64-hex
-/// hash leaf, with an optional extension).
+/// Split a CA request path `<xx>/<yy>/<hash>[.<ext>]` into its shards, or
+/// `None` if it isn't the content-addressed shape (two 2-hex dir shards + a
+/// 64-hex hash leaf, with an optional extension — everything after the
+/// hash's first `.`: a plain `png`, or a flattened type like `text.css`
+/// which itself carries dots).
 fn ca_parts(path: &RepoAssetPath) -> Option<(String, String, String, String)> {
     let mut segs = path.as_str().split('/');
     let (xx, yy, leaf) = (segs.next()?, segs.next()?, segs.next()?);
@@ -78,7 +80,7 @@ fn ca_parts(path: &RepoAssetPath) -> Option<(String, String, String, String)> {
     if !xx.bytes().all(|b| b.is_ascii_hexdigit()) || !yy.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let (hash, ext) = match leaf.rsplit_once('.') {
+    let (hash, ext) = match leaf.split_once('.') {
         Some((h, e)) => (h, e),
         None => (leaf, ""),
     };
@@ -118,6 +120,13 @@ mod tests {
         assert_eq!((*site).clone(), "rpcauthority");
         assert_eq!(hash, h);
         assert_eq!(ext, "jpg");
+        // A flattened-type extension carries its own dots — the ext is
+        // everything past the hash's first `.`.
+        let (_site, hash, ext) =
+            parse_ca_request(&format!("/-/repo/rpcauthority/files/d8/4a/{h}.text.css"))
+                .expect("CA request");
+        assert_eq!(hash, h);
+        assert_eq!(ext, "text.css");
     }
 
     #[test]

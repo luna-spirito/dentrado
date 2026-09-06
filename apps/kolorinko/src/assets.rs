@@ -14,7 +14,7 @@
 //! hash into the cached `index.html` **once** here (before compression) so the
 //! wasm client can pin the self-signed QUIC cert via `serverCertificateHashes`.
 
-use std::{collections::HashMap, path::Path};
+use std::{borrow::Cow, collections::HashMap, path::Path};
 
 use bytes::Bytes;
 use kolorinko_rt::Body;
@@ -157,8 +157,18 @@ fn walk(root: &Path, dir: &Path, wt_hash: Option<&[u8]>, map: &mut HashMap<Strin
     }
 }
 
-pub(crate) fn mime_for_ext(ext: &str) -> &'static str {
-    match ext {
+/// The MIME an extension names. Two spellings of extension, by origin:
+/// - a URL's own file extension (`css`, `png`, …) — the static table;
+/// - a flattened content type (`text.css`, `image.png`, …) —
+///   [`ca_ext`]'s encoding of a publisher-recorded type, reversed by
+///   putting the `/` back where the first `.` sits (`text.svg+xml` →
+///   `text/svg+xml`). No URL file extension contains a `.`, so the two
+///   spaces cannot collide.
+pub(crate) fn mime_for_ext(ext: &str) -> Cow<'static, str> {
+    if let Some((type_, sub)) = ext.split_once('.') {
+        return Cow::Owned(format!("{type_}/{sub}"));
+    }
+    Cow::Borrowed(match ext {
         "html" | "htm" => "text/html; charset=utf-8",
         "js" | "mjs" => "text/javascript",
         "wasm" => "application/wasm",
@@ -166,28 +176,61 @@ pub(crate) fn mime_for_ext(ext: &str) -> &'static str {
         "json" => "application/json",
         "svg" => "image/svg+xml",
         "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
+        "jpg" | "jpeg" | "jfif" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
         "ico" => "image/x-icon",
+        "bmp" => "image/bmp",
         "ttf" => "font/ttf",
         "otf" => "font/otf",
         "woff" => "font/woff",
         "woff2" => "font/woff2",
         "eot" => "application/vnd.ms-fontobject",
         "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "wav" => "audio/x-wav",
         "mp4" => "video/mp4",
         "webm" => "video/webm",
         "pdf" => "application/pdf",
+        "zip" => "application/zip",
         _ => "application/octet-stream",
+    })
+}
+
+/// The extension a mirrored file's CA URL carries — the token the serving
+/// path derives its `Content-Type` from ([`mime_for_ext`]). The
+/// publisher-recorded `content_type` **is** the extension, flattened
+/// (`text/css` → `text.css`, the `/` can't live in a path segment) — any
+/// type serves as itself, with no format table to lag behind. Types that
+/// assert nothing (`application/octet-stream` — wdfiles' answer for
+/// everything — `text/plain`, and XML serialization of structured content)
+/// and absent or malformed answers defer to the URL's own extension.
+pub(crate) fn ca_ext(url_ext: &str, content_type: Option<&str>) -> String {
+    match content_type
+        .and_then(|ct| ct.split(';').next())
+        .map(|ct| ct.trim().to_ascii_lowercase())
+    {
+        Some(ct)
+            if !matches!(
+                ct.as_str(),
+                "" | "application/octet-stream" | "text/plain" | "text/xml" | "application/xml"
+            ) && ct.bytes().all(|b| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'.' | b'+' | b'-' | b'/')
+            }) =>
+        {
+            ct.replace('/', ".")
+        }
+        _ => url_ext.to_owned(),
     }
 }
 
 /// Map a request path to a MIME type by extension.
-pub(crate) fn mime_for(path: &str) -> &'static str {
+pub(crate) fn mime_for(path: &str) -> Cow<'static, str> {
     match path.rsplit('.').next() {
         Some(x) => mime_for_ext(x),
-        _ => "application/octet-stream",
+        None => Cow::Borrowed("application/octet-stream"),
     }
 }
 

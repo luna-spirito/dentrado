@@ -310,7 +310,7 @@ async fn handle_conn(
             };
             let mut b = http::Response::builder()
                 .status(reply.status)
-                .header("content-type", reply.mime)
+                .header("content-type", reply.mime.as_ref())
                 .header("cache-control", reply.cache_control)
                 .header("vary", "Accept-Encoding");
             // 204 carries no body, so no `Content-Length` either (RFC 9110).

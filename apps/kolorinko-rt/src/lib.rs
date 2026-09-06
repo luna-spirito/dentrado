@@ -201,10 +201,13 @@ pub enum Body {
 }
 
 /// A resolved content-addressed asset reference: the SHA-256 (lowercase hex)
-/// of its bytes plus the original filename extension. The extension rides in
-/// the *reference* (not in the CA blob's name, which is the bare hash) so the
-/// MIME is derivable without a side table — [`crate::wire`] never needs the
-/// blob's type, only this pair.
+/// of its bytes plus the extension its URL carries — the URL's own when the
+/// file has one and the origin's recorded type says nothing contrary, else
+/// the canonical extension of that type (an extensionless or mislabeled URL
+/// must not drive the served MIME). The extension rides in the *reference*
+/// (not in the CA blob's name, which is the bare hash) so the MIME is
+/// derivable without a side table — [`crate::wire`] never needs the blob's
+/// type, only this pair.
 ///
 /// Serialized onto `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` by the resolver.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

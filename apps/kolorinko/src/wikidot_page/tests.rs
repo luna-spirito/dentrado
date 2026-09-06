@@ -70,17 +70,17 @@ fn write_manifest(root: &Path, site: &str, rows: &[(&str, &str, i64, i64)]) {
 
 /// Write the site's `files.json` from `(url, sha256, status)` rows and lay
 /// down each `saved` blob's bytes under `files_ca/`.
-fn write_files(root: &Path, site: &str, rows: &[(&str, &str, &str, &[u8])]) {
+fn write_files(root: &Path, site: &str, rows: &[(&str, &str, &str, &str, &[u8])]) {
     let site_out = root.join("out").join(site);
     fs::create_dir_all(&site_out).unwrap();
     let files: Vec<_> = rows
         .iter()
-        .map(|(url, sha, status, _)| {
+        .map(|(url, sha, status, ct, _)| {
             serde_json::json!({
                 "path": url,
                 "sha256": sha,
                 "size": 1,
-                "content_type": "text/css",
+                "content_type": ct,
                 "status": status,
                 "blob": format!("files_ca/{}/{}/{}", &sha[..2], &sha[2..4], &sha[4..]),
             })
@@ -92,7 +92,7 @@ fn write_files(root: &Path, site: &str, rows: &[(&str, &str, &str, &[u8])]) {
         serde_json::to_vec_pretty(&doc).unwrap(),
     )
     .unwrap();
-    for (url, sha, status, bytes) in rows {
+    for (url, sha, status, _ct, bytes) in rows {
         if *status != "saved" {
             continue;
         }
@@ -129,6 +129,7 @@ fn site_map_at(site: SafePathComponent, w: WDWebsite) -> ImHashMap<SafePathCompo
 
 /// A 64-hex sha256 stand-in (of the literal bytes "css").
 const HASH: &str = "d1f69a9854765a4f1e7c8b1e8a9e5c9bd1e0a2f3c4b5a6978899aabbccddeeff";
+const HASH2: &str = "e2f69a9854765a4f1e7c8b1e8a9e5c9bd1e0a2f3c4b5a6978899aabbccddeef0";
 
 /// Regression: `repo()`'s cold start spawns the worker and re-borrows the
 /// cache `RefCell` in its `None` arm. A `borrow()` left in the `match`
@@ -197,6 +198,7 @@ fn build_reads_publication_and_materialises_bodies() {
             "https://scp.wikidot.com/local--files/foo/a.css",
             HASH,
             "saved",
+            "text/css",
             b"css",
         )],
     );
@@ -235,7 +237,8 @@ fn build_reads_publication_and_materialises_bodies() {
         .get(&RepoAssetPath::new("scp.wikidot.com/local--files/foo/a.css".into()).unwrap())
         .expect("file indexed");
     assert_eq!(ca.hash, HASH);
-    assert_eq!(ca.ext, "css");
+    // The recorded `text/css` IS the extension, flattened.
+    assert_eq!(ca.ext, "text.css");
 }
 
 /// A legacy site-relative row (`local--files/…` — the previous `files.json`
@@ -261,7 +264,24 @@ fn legacy_rows_lift_and_alias_spellings_resolve() {
     write_files(
         &dir,
         "obscurative",
-        &[("local--theme/t/style.css", HASH, "saved", b"css")],
+        &[
+            (
+                "local--theme/t/style.css",
+                HASH,
+                "saved",
+                "text/css",
+                b"css",
+            ),
+            // Extensionless URL + recorded type: the CA URL gains the
+            // type's extension (end-to-end `ca_ext`).
+            (
+                "local--files/front-page:css/sublimity",
+                HASH2,
+                "saved",
+                "text/css",
+                b"css",
+            ),
+        ],
     );
 
     let mut bodies = ImHashMap::new();
@@ -285,6 +305,21 @@ fn legacy_rows_lift_and_alias_spellings_resolve() {
             .files
             .contains_key(&key)
     );
+    // The extensionless row lifts the same way, carrying the type-decided
+    // extension.
+    let sublimity_key =
+        RepoAssetPath::new("obscurative.wikidot.com/local--files/front-page:css/sublimity".into())
+            .unwrap();
+    let sublimity = snap
+        .sites
+        .get(&site("obscurative"))
+        .unwrap()
+        .files
+        .get(&sublimity_key)
+        .unwrap()
+        .clone();
+    assert_eq!(sublimity.hash, HASH2);
+    assert_eq!(sublimity.ext, "text.css");
     // Every alias spelling canonicalizes (or retries) to that one row.
     for url in [
         "http://obscurative.wikidot.com/local--theme/t/style.css",
@@ -318,6 +353,7 @@ fn resized_variants_resolve_to_their_originals() {
             "http://rpcauthority.wikidot.com/local--files/foo/bar.png",
             HASH,
             "saved",
+            "image/png",
             b"png",
         )],
     );
@@ -341,6 +377,46 @@ fn resized_variants_resolve_to_their_originals() {
             .as_deref(),
         Some(HASH)
     );
+}
+
+/// The recorded `content_type` **is** the CA URL's extension, flattened
+/// (`text/css` → `text.css` — the `/` can't live in a path segment), so any
+/// type serves as itself with no format table to lag behind; non-statements
+/// (`application/octet-stream` — wdfiles' answer for everything —
+/// `text/plain`, XML serializations) and absent or malformed answers defer
+/// to the URL's own extension.
+#[test]
+fn content_type_flattens_into_the_ca_extension() {
+    let ca = |url_ext: &str, ct: Option<&str>| crate::assets::ca_ext(url_ext, ct);
+    assert_eq!(ca("", Some("text/css")), "text.css");
+    assert_eq!(ca("png", Some("image/webp")), "image.webp");
+    assert_eq!(ca("jpg", Some("image/png; charset=binary")), "image.png");
+    assert_eq!(ca("svg", Some("image/svg+xml")), "image.svg+xml");
+    assert_eq!(ca("ttf", Some("font/ttf;unlikely;params")), "font.ttf");
+    // Non-statements, absence, and malformed answers defer to the URL's
+    // own extension.
+    assert_eq!(ca("png", Some("application/octet-stream")), "png");
+    assert_eq!(ca("svg", Some("text/xml")), "svg");
+    assert_eq!(ca("webp", None), "webp");
+    assert_eq!(ca("", Some("")), "");
+    assert_eq!(ca("ttf", Some("malformed type")), "ttf");
+    // Round-trip: the flattened extension names the recorded type back —
+    // the `/` returns where the first `.` sat, and a subtype's own dots
+    // survive it.
+    assert_eq!(
+        crate::assets::mime_for_ext(&ca("", Some("text/css"))),
+        "text/css"
+    );
+    assert_eq!(
+        crate::assets::mime_for_ext(&ca("png", Some("image/webp"))),
+        "image/webp"
+    );
+    assert_eq!(
+        crate::assets::mime_for_ext("application.vnd.ms-fontobject"),
+        "application/vnd.ms-fontobject"
+    );
+    // Plain file extensions keep the static table.
+    assert_eq!(crate::assets::mime_for_ext("png"), "image/png");
 }
 
 /// The publisher's canonicalization rules, verbatim from the format change:
@@ -826,6 +902,7 @@ fn external_refs_are_collected_and_content_addressed() {
     let img_url = "https://scp.wikidot.com/local--files/foo/a.png";
     let hot = "https://i.imgur.com/x.jpg";
     let css = "a{background:url(https://scp.wikidot.com/local--files/foo/bg.png)}";
+    let html = "<style>@import url('https://scp.wikidot.com/local--files/foo/a.css');</style>";
     let content: Content = vec![
         Node::Image {
             align: None,
@@ -839,9 +916,11 @@ fn external_refs_are_collected_and_content_addressed() {
             new_tab: false,
         },
         Node::Stylesheet(css.into()),
+        Node::Html { raw: html.into() },
     ];
-    // All three external refs are collected (the hotlink too); resolution
-    // later keeps only the mirrored ones.
+    // All four external refs are collected (the hotlink too, and the styles
+    // a raw-HTML block embeds); resolution later keeps only the mirrored
+    // ones.
     let mut tails = Vec::new();
     super::collect_external_refs(&content, &mut tails);
     assert_eq!(
@@ -850,21 +929,29 @@ fn external_refs_are_collected_and_content_addressed() {
             "scp.wikidot.com/local--files/foo/a.png".to_string(),
             "i.imgur.com/x.jpg".to_string(),
             "scp.wikidot.com/local--files/foo/bg.png".to_string(),
+            "scp.wikidot.com/local--files/foo/a.css".to_string(),
         ]
     );
-    // Only the mirrored scp tails resolve to CA refs; the hotlink doesn't.
+    // Only the mirrored scp tails resolve — through `resolve_tails`, the one
+    // substitution decision; the hotlink doesn't.
     let ca = CaRef {
         hash: "d84a29109fe0e70c7a5c22c39bda120fdbc56bd192f5927af95b9af8d0f87c27".into(),
         ext: "png".into(),
     };
-    let resolved: HashMap<String, CaRef> = [
-        "scp.wikidot.com/local--files/foo/a.png",
-        "scp.wikidot.com/local--files/foo/bg.png",
-    ]
-    .iter()
-    .map(|t| (t.to_string(), ca.clone()))
-    .collect();
-    let out = super::substitute_resources(content, &site, &resolved, &HashMap::new());
+    let css_ca = CaRef {
+        hash: "d84a29109fe0e70c7a5c22c39bda120fdbc56bd192f5927af95b9af8d0f87c27".into(),
+        ext: "css".into(),
+    };
+    let mirror = |path: &RepoAssetPath| match path.as_str() {
+        "scp.wikidot.com/local--files/foo/a.png" | "scp.wikidot.com/local--files/foo/bg.png" => {
+            Some(ca.clone())
+        }
+        "scp.wikidot.com/local--files/foo/a.css" => Some(css_ca.clone()),
+        _ => None,
+    };
+    let resolved = super::resolve_tails(&site, &tails, mirror);
+    assert!(!resolved.contains_key("i.imgur.com/x.jpg"));
+    let out = super::substitute_resources(content, &site, &resolved);
     // Image source → CA url.
     let Node::Image { source, .. } = &out[0] else {
         panic!("expected image")
@@ -890,6 +977,12 @@ fn external_refs_are_collected_and_content_addressed() {
     };
     assert!(css.contains("/-/repo/scp/files/d8/4a/"));
     assert!(!css.contains("https://scp.wikidot.com"));
+    // The same textual rewriter covers the styles a raw-HTML block embeds.
+    let Node::Html { raw } = &out[3] else {
+        panic!("expected html block")
+    };
+    assert!(raw.contains("/-/repo/scp/files/d8/4a/"));
+    assert!(!raw.contains("https://scp.wikidot.com"));
 }
 
 #[test]
@@ -1039,7 +1132,7 @@ fn real_publication_resolves_site_theme_root() {
         .expect("theme_root parsed from the raw URL");
     let ca =
         resource(&snap, &site("obscurative"), &theme).expect("theme resolves through the index");
-    assert_eq!(ca.ext, "css");
+    assert_eq!(ca.ext, "text.css");
 }
 
 /// Globals for host-matching tests: the dev config's two sites. `init` is
@@ -1104,11 +1197,9 @@ fn code_endpoint_imports_fall_back_to_local_routes() {
     let content: Content = vec![Node::Stylesheet(
         format!("@import url(http://{tail});").into(),
     )];
-    let code = HashMap::from([(
-        tail.to_string(),
-        super::code_url_for_tail(tail).expect("code url"),
-    )]);
-    let out = super::substitute_resources(content, &site, &HashMap::new(), &code);
+    // Nothing is mirrored — `resolve_tails` falls back to the code route.
+    let resolved = super::resolve_tails(&site, &[tail.to_string()], |_| None);
+    let out = super::substitute_resources(content, &site, &resolved);
     let Node::Stylesheet(rewritten) = &out[0] else {
         panic!("expected stylesheet")
     };

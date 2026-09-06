@@ -222,6 +222,12 @@ struct FileRow {
     /// verbatim); the previous format also keyed a site's own files by their
     /// site-relative path (`local--files/…`).
     path: String,
+    /// What the origin server answered for the bytes (`text/css`,
+    /// `image/png`, …; `application/octet-stream` when it answered nothing
+    /// specific). Decides the CA URL's extension via
+    /// [`crate::assets::ca_ext`] — see its doc for the precedence.
+    #[serde(default)]
+    content_type: Option<String>,
     sha256: Option<String>,
     status: String,
 }
@@ -231,9 +237,10 @@ struct FileRow {
 /// on disk for sites the daemon hasn't republished since the format change)
 /// lift onto the site's canonical host and its `wdfiles`/`www.`/`%3A`
 /// spellings collapse into the same key the canonical form writes, exactly
-/// like the publisher's own dedup. Pending and missing entries stay
-/// unindexed (a request for them misses, then falls back to the source site —
-/// same as an un-mirrored hotlink).
+/// like the publisher's own dedup — and its recorded `content_type` decides
+/// the [`CaRef`] extension ([`crate::assets::ca_ext`]). Pending and missing
+/// entries stay unindexed (a request for them misses, then falls back to the
+/// source site — same as an un-mirrored hotlink).
 pub(super) fn read_files_index(
     site: &SafePathComponent,
     site_dir: &Path,
@@ -264,11 +271,11 @@ pub(super) fn read_files_index(
         let Some(path) = canon_file_key(&url) else {
             continue;
         };
-        let ext = Path::new(path.as_str())
+        let url_ext = Path::new(path.as_str())
             .extension()
             .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_string();
+            .unwrap_or("");
+        let ext = crate::assets::ca_ext(url_ext, f.content_type.as_deref());
         map.insert(path, CaRef { hash, ext });
     }
     map
