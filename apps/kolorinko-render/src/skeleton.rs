@@ -185,6 +185,6 @@ pub fn render_page_document(
          {style}\
          {theme}\
          </head>\n\
-         <body>\n{body}\n</body>\n</html>\n"
+         <body id=\"html-body\">\n{body}\n</body>\n</html>\n"
     )
 }

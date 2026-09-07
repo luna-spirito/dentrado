@@ -125,6 +125,9 @@ pub fn layout(
         </div>
         <div id="container-wrap-wrap">
         <div id="container-wrap">
+            // Erased to one `AnyView`: the whole tree in a single `view!`
+            // type trips rustc's release-profile layout depth limit.
+            {view! {
             <div id="container">
                 <div id="header">
                     <h1>
@@ -134,10 +137,16 @@ pub fn layout(
                     </h1>
                     <h2><span>{move || shell_subtitle().unwrap_or_default()}</span></h2>
                     <div id="top-bar">{move || view_nav(site_top(), nav_top(), true)}</div>
+                    // Wikidot closes its header with the three numbered
+                    // catch-alls, after every visible chrome element.
+                    {catch_all_divs("header-extra-div-", 3)}
                 </div>
                 <div id="content-wrap">
                     <div id="side-bar">{move || view_nav(site_side(), nav_side(), false)}</div>
                     <div id="main-content">
+                        // Wikidot parks its (JS-driven) page-action host here
+                        // before the title; themes spacing off it expect it.
+                        <div id="action-area-top"></div>
                         <div id="page-title">
                             {move || page_title().unwrap_or_default()}
                         </div>
@@ -148,6 +157,10 @@ pub fn layout(
                             }
                             None => view! { <p class="kolorinko-status">"loading…"</p> }.into_any(),
                         }}</div>
+                        // Wikidot's (hidden) separator between the content and
+                        // the options bar — the anchor its JS pins the
+                        // page-info line to.
+                        <div id="page-info-break"></div>
                         // The page-options bar (Wikidot's Edit / Rate / Tags /
                         // … section) — ours carries the dependency-tree toggle.
                         <div id="page-options-bottom" class="page-options-bottom">
@@ -174,10 +187,26 @@ pub fn layout(
                     </div>
                 </div>
             </div>
+            }.into_any()}
+            // The container-level catch-alls: six more, siblings after
+            // `#container` inside `#container-wrap`, per Wikidot's own layout.
+            {catch_all_divs("extra-div-", 6)}
         </div>
         </div>
     }
     .into_any()
+}
+
+/// Wikidot's numbered catch-all divs — `#extra-div-1..6` under
+/// `#container-wrap` (after `#container`) and `#header-extra-div-1..3`
+/// closing `#header` — each wrapping an empty `<span>`. Contentless by
+/// design ("these extra divs/spans may be used as catch-alls to add extra
+/// imagery", in Wikidot's template's own words): themes hang positioned
+/// background imagery on them by id, so mirroring the ids is the whole point.
+fn catch_all_divs(prefix: &str, last: u32) -> Vec<AnyView> {
+    (1..=last)
+        .map(|i| view! { <div id=format!("{prefix}{i}")><span></span></div> }.into_any())
+        .collect()
 }
 
 /// A page's dependency tree as nested lists: each fetched include target
@@ -319,5 +348,27 @@ mod tests {
             html(None, root, "").contains(r#"href="/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0/main""#)
         );
         assert!(html(None, None, "").contains(r#"href="/""#));
+    }
+
+    /// The invisible Wikidot scaffold — the numbered catch-alls with their
+    /// empty `<span>`s, plus `#action-area-top` and `#page-info-break` — must
+    /// survive serialization: themes hang positioned imagery on those ids, so
+    /// a dropped div is broken user CSS, not a lost feature.
+    #[test]
+    fn wikidot_scaffold_survives() {
+        let html = html(None, None, "");
+        for id in [
+            "extra-div-1",
+            "extra-div-6",
+            "header-extra-div-1",
+            "header-extra-div-3",
+        ] {
+            assert!(
+                html.contains(&format!(r#"<div id="{id}"><span></span></div>"#)),
+                "missing catch-all #{id}"
+            );
+        }
+        assert!(html.contains(r#"<div id="action-area-top"></div>"#));
+        assert!(html.contains(r#"<div id="page-info-break"></div>"#));
     }
 }
