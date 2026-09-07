@@ -134,7 +134,7 @@ pub(super) struct ResolveState {
 }
 
 impl ResolveState {
-    fn new(space: SpaceId, site: SafePathComponent, snap: RepoSnapshot) -> Self {
+    pub(super) fn new(space: SpaceId, site: SafePathComponent, snap: RepoSnapshot) -> Self {
         Self {
             space,
             site,
@@ -191,11 +191,11 @@ pub(super) fn resolve_full(
 /// assembled text with the dependency tree: one node per fetched page,
 /// nested under the page whose body first included it.
 ///
-/// Includes are slug-addressed while the snapshot's canonical projection
-/// is keyed by page id, so each hop bridges through
-/// [`RepoSnapshot::local_id`] (includes are always same-site, hence the
-/// same space); a page the site doesn't have splices empty — the same
-/// blank a canonical miss produced before the re-keying.
+/// Includes are slug-addressed, and the snapshot indexes articles by
+/// `(site, slug)`, so each hop reads the target straight out of it — the
+/// site the directive names, current or cross-site (`[[include
+/// :site:page]]`): a mirrored site's pages splice exactly like the current
+/// site's, and a page no mirrored site has splices empty.
 pub(super) fn resolve_include(
     body: &str,
     origin: &Key,
@@ -212,11 +212,9 @@ pub(super) fn resolve_include(
             if key == *origin || state.raws.contains_key(&key) {
                 continue;
             }
-            let content = match local_id(&state.snap, &state.site, &inc_slug) {
-                Some((inc_local, _)) => latest(&state.snap, state.space, inc_local)
-                    .map_or_else(|| Arc::from(""), |p| Arc::clone(p.body)),
-                None => Arc::from(""),
-            };
+            let content = article(&state.snap, &key.0, &inc_slug)
+                .and_then(|a| state.snap.bodies.get(&a.latest_body))
+                .map_or_else(|| Arc::from(""), Arc::clone);
             edges.push((includer.clone(), key.clone()));
             state.raws.insert(key.clone(), Arc::clone(&content));
             queue.push_back((key, content));

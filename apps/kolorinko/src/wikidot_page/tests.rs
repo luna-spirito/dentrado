@@ -601,12 +601,16 @@ fn worker_tick_rebuilds_only_on_drift() {
     );
 }
 
-fn key(cat: Option<&str>, name: &str) -> Key {
+fn key_at(site_name: &str, cat: Option<&str>, name: &str) -> Key {
     (
-        site("scp"),
+        site(site_name),
         cat.map(|c| SafePathComponent::new(c.into()).unwrap()),
         SafePathComponent::new(name.into()).unwrap(),
     )
+}
+
+fn key(cat: Option<&str>, name: &str) -> Key {
+    key_at("scp", cat, name)
 }
 
 fn flat(content: &Content) -> String {
@@ -648,7 +652,8 @@ fn include_assembly_splices_nested_cone_with_cascading_vars() {
 fn absolute_self_site_include_splices() {
     // `[[include :site:page]]` is absolute: the current site's own name is
     // dropped, the tail is one slug (names may contain colons — bau's
-    // `fragment:theme:inverton`); another site's never splices.
+    // `fragment:theme:inverton`); another site's resolves against that
+    // site's dataset (the cross-site tests below).
     let raws = raws(vec![
         (key(None, "footer"), "F"),
         (key(Some("fragment"), "theme:inverton"), "T"),
@@ -659,7 +664,76 @@ fn absolute_self_site_include_splices() {
     );
     assert_eq!(flat(&out), "F\nT");
     let out = assemble("[[include :other-site:x]]", &raws);
-    assert_eq!(flat(&out), ""); // never spliced — cross-site unsupported
+    assert_eq!(flat(&out), ""); // other-site has no bodies here — unspliced
+}
+
+#[test]
+fn cross_site_include_splices_from_the_named_site() {
+    // `[[include :insurgency:theme:fasa]]` names the *insurgency* dataset:
+    // the slug is that site's, category included — fasa's nav sidebar
+    // pulling its theme page off another site.
+    let raws = raws(vec![
+        (
+            key_at("insurgency", Some("theme"), "fasa"),
+            "FASA({$accent})",
+        ),
+        (key_at("insurgency", Some("nav"), "side"), "SIDE"),
+    ]);
+    let out = assemble(
+        "[[include :insurgency:theme:fasa | accent=blue]]\n[[include :insurgency:nav:side]]",
+        &raws,
+    );
+    assert_eq!(flat(&out), "FASA(blue)\nSIDE");
+}
+
+#[test]
+fn cross_site_include_fetches_the_named_site() {
+    // The fetching half: fasa's nav sidebar on scp pulls its theme page off
+    // the mirrored insurgency site in the same snapshot — spliced, and the
+    // dep tree records the foreign page.
+    let dir = std::env::temp_dir().join(format!("kolorinko_xinc_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    write_page_archive(
+        &dir,
+        "scp",
+        "1",
+        "fasa:nav:side",
+        &[(1, "r1", 100, "[[include :insurgency:theme:fasa]]\n")],
+    );
+    write_manifest(&dir, "scp", &[("1", "fasa:nav:side", 1, 1)]);
+    write_page_archive(
+        &dir,
+        "insurgency",
+        "2",
+        "theme:fasa",
+        &[(1, "r2", 200, "FASA")],
+    );
+    write_manifest(&dir, "insurgency", &[("2", "theme:fasa", 1, 1)]);
+    let mut bodies = ImHashMap::new();
+    let mut sites = ImHashMap::new();
+    for name in ["scp", "insurgency"] {
+        let (_, w) = build_site(&site(name), &dir.join("out").join(name), &mut bodies).unwrap();
+        sites.insert(site(name), w);
+    }
+    let mut state = ResolveState::new(
+        crate::globals::evakuilo_space_id("scp"),
+        site("scp"),
+        RepoSnapshot { sites, bodies },
+    );
+    let (assembled, deps) = resolve_include(
+        "[[include :insurgency:theme:fasa]]\n",
+        &key(Some("fasa"), "nav:side"),
+        &mut state,
+    );
+    // The stored body keeps its trailing newline; the origin's own line
+    // break follows the splice.
+    assert_eq!(flat(&parse(&assembled)), "FASA\n\n");
+    let [dep] = &deps[..] else {
+        panic!("one dep: {deps:?}")
+    };
+    assert_eq!(dep.site, "insurgency");
+    assert_eq!(dep.category.as_deref(), Some("theme"));
+    assert_eq!(dep.page, "fasa");
 }
 
 #[test]

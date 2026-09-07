@@ -69,9 +69,10 @@
 //!   with it): runs the full resolution pipeline — the page's raw body read
 //!   out of the same snapshot and assembled textually (`[[include]]` cones
 //!   spliced into the raw text with their `{$vars}` substituted, Wikidot's
-//!   own order of operations, includes bridged through
-//!   [`local_id`], data-level cycles broken by a path-based
-//!   guard), then parsed as one page and resolved: `[[module ListPages]]`
+//!   own order of operations, include bodies fetched straight off the
+//!   snapshot's `(site, slug)` projection — cross-site includes
+//!   (`[[include :site:page]]`) off the named site — data-level cycles
+//!   broken by a path-based guard), then parsed as one page and resolved: `[[module ListPages]]`
 //!   instantiation, internal links, and mirrored resources — all local
 //!   snapshot reads — producing the final [`ArticleView`] with the tree of
 //!   every fetched page as its `deps`. Reactivity rides the single

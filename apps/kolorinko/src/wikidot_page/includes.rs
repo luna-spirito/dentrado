@@ -9,39 +9,47 @@ use std::ops::Range;
 // dependency tree
 // =========================================================================
 
-/// Resolve an include's [`PageRef`] to `(site, slug)` on the current site.
-/// The parser parks the first `:`-segment of the source in [`PageRef::space`],
-/// so an absolute `[[include :site:page…]]` carries the site there with an
-/// empty marker (`Some("")`) and the site's own name as the first path
-/// segment: only the current site's pages splice (cross-site includes are
-/// not yet supported). Everything else is one relative slug — space plus
-/// path re-joined, split at the first colon, so page names that themselves
+/// Resolve an include's [`PageRef`] to `(site, slug)`. The parser parks the
+/// first `:`-segment of the source in [`PageRef::space`], so an absolute
+/// `[[include :site:page…]]` carries the site there with an empty marker
+/// (`Some("")`) and the rest as the path: the *named* site, current or not —
+/// a cross-site include resolves against that site's dataset (an unmirrored
+/// site simply has no bodies, and the directive splices empty like any
+/// missing target), while the current site's own name drops. Everything
+/// else is one relative slug on the current site — space plus path
+/// re-joined, split at the first colon, so page names that themselves
 /// contain colons (`fragment:theme:inverton`) keep their shape. An
 /// unresolvable target returns `None` and the directive is left in place.
 fn include_target(
     src: &PageRef,
     current_site: &SafePathComponent,
 ) -> Option<(SafePathComponent, Slug)> {
-    let rest = match src.space.as_deref() {
+    let (site, rest) = match src.space.as_deref() {
         Some("") => {
             let (site, tail) = src.path.split_first()?;
-            if site != &**current_site {
-                return None;
-            }
-            tail.join(":")
+            (
+                if site == &**current_site {
+                    current_site.clone()
+                } else {
+                    SafePathComponent::new(site.clone())?
+                },
+                tail.join(":"),
+            )
         }
-        _ => src
-            .path
-            .iter()
-            .fold(src.space.clone(), |acc: Option<String>, seg| {
-                Some(match acc {
-                    Some(a) => a + ":" + seg,
-                    None => seg.clone(),
+        _ => (
+            current_site.clone(),
+            src.path
+                .iter()
+                .fold(src.space.clone(), |acc: Option<String>, seg| {
+                    Some(match acc {
+                        Some(a) => a + ":" + seg,
+                        None => seg.clone(),
+                    })
                 })
-            })
-            .unwrap_or_default(),
+                .unwrap_or_default(),
+        ),
     };
-    parse_slug(&rest).map(|slug| (current_site.clone(), slug))
+    parse_slug(&rest).map(|slug| (site, slug))
 }
 
 /// One `[[include …]]` directive of a raw page body that the parser will
