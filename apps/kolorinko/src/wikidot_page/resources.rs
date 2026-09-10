@@ -23,8 +23,8 @@ pub(super) fn resolve_resources(
     if tails.is_empty() {
         return content;
     }
-    let resolved = resolve_tails(site, &tails, |path| resource(snap, site, &path));
-    substitute_resources(content, site, &resolved)
+    let resolved = resolve_tails(&tails, |path| resource_url(snap, site, path));
+    substitute_resources(content, &resolved)
 }
 
 /// The one substitution decision every mirrored reference goes through —
@@ -34,16 +34,14 @@ pub(super) fn resolve_resources(
 /// local route ([`code_url_for_tail`]); anything else stays absent (a
 /// hotlink the client loads straight from the origin).
 pub(super) fn resolve_tails(
-    site: &SafePathComponent,
     tails: &[String],
-    mut lookup: impl FnMut(&RepoAssetPath) -> Option<CaRef>,
+    mut lookup: impl FnMut(&RepoAssetPath) -> Option<String>,
 ) -> HashMap<String, String> {
     tails
         .iter()
         .filter_map(|tail| {
             let url = canon_file_key(tail)
                 .and_then(|path| lookup(&path))
-                .map(|ca| ca_url(site, &ca))
                 .or_else(|| code_url_for_tail(tail))?;
             Some((tail.clone(), url))
         })
@@ -81,7 +79,7 @@ pub(super) fn collect_external_refs(content: &Content, out: &mut Vec<String>) {
                 collect_external_refs(text, out);
             }
             Node::Stylesheet(css) | Node::Html { raw: css } => {
-                for t in http_refs(css) {
+                for t in http_refs(css, None) {
                     push(t, out);
                 }
             }
@@ -103,11 +101,10 @@ fn ref_tail_of(source: &[TextObj]) -> Option<String> {
 /// the map (un-mirrored hotlinks) pass through unchanged.
 pub(super) fn substitute_resources(
     content: Content,
-    site: &SafePathComponent,
     resolved: &HashMap<String, String>,
 ) -> Content {
     let url_for = |tail: &str| resolved.get(tail).cloned();
-    let mut walk = |c: Content| substitute_resources(c, site, resolved);
+    let mut walk = |c: Content| substitute_resources(c, resolved);
     content
         .into_iter()
         .map(|node| match node {

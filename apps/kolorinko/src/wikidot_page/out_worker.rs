@@ -212,7 +212,9 @@ impl OutWorker {
             rows = fresh;
         }
         if old.stamps.files != stamps.files {
-            w.files = read_files_index(site, site_dir).into_iter().collect();
+            let (files, files_ca) = read_files_index(site, site_dir);
+            w.files = files.into_iter().collect();
+            w.files_ca = files_ca.into_iter().collect();
         }
         if old.stamps.shell != stamps.shell {
             let chrome = read_shell(site_dir);

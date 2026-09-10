@@ -36,8 +36,10 @@
 //          whole include/ListPages/link/resource resolution is local)
 //        → code_block (follows the same parse: a lens over its output)
 //
-// `asset` stays site/hash-keyed and reads blobs lazily from the worktree's
-// content-addressed `_files/` store. Wire exposure is an explicit
+// `asset` stays site/hash-keyed and reads blobs lazily from the
+// publication's content-addressed `files_ca/` store; the reverse index's
+// recorded type decides the served MIME and the CSS-rewrite branch (the
+// request URL's extension is decorative). Wire exposure is an explicit
 // **allowlist**: only `#[gear(exposed)]` gears appear in the wire `GearId`
 // and can be pushed to a client — everything else is server-internal by
 // default (unnamed on the wire, and its output variants gated by the
@@ -69,11 +71,10 @@ pub(crate) fn repo_snap(
 pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
     site: SafePathComponent,
     hash: String,
-    ext: String,
     ctx: &mut GearCtx<KolorinkoRT, S>,
     _cache: &mut AssetCache,
-) -> Option<Body> {
-    crate::wikidot_page::asset(&site, &hash, &ext, ctx).await
+) -> Option<ServedBlob> {
+    crate::wikidot_page::asset(&site, &hash, ctx).await
 }
 
 // A lens over the shared parse: statically bound to the `(space, local)`

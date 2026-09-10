@@ -4,7 +4,9 @@ use crate::wikidot_page::{
     AssetCache, CodeBlockCache, LatestCache, ParsedCache, RepoCache, RepoSnapCache, ShellCache,
 };
 use dentrado::core::{core_ctx::GearCtx, storage::Storage};
-use kolorinko_rt::{Body, CodeBlock, LocalId, RepoSnapshot, SafePathComponent, SiteShell, SpaceId};
+use kolorinko_rt::{
+    CodeBlock, LocalId, RepoSnapshot, SafePathComponent, ServedBlob, SiteShell, SpaceId,
+};
 use kolorinko_wikitext::ArticleView;
 
 /// The Kolorinko runtime.

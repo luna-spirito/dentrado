@@ -17,7 +17,7 @@
 use std::{borrow::Cow, collections::HashMap, path::Path};
 
 use bytes::Bytes;
-use kolorinko_rt::Body;
+use kolorinko_rt::{Body, CaFile, RepoAssetPath};
 use log::{error, warn};
 
 /// Minimal placeholder served when no built frontend is present, so the server
@@ -197,10 +197,28 @@ pub(crate) fn mime_for_ext(ext: &str) -> Cow<'static, str> {
     })
 }
 
-/// The extension a mirrored file's CA URL carries — the token the serving
-/// path derives its `Content-Type` from ([`mime_for_ext`]). The
-/// publisher-recorded `content_type` **is** the extension, flattened
-/// (`text/css` → `text.css`, the `/` can't live in a path segment) — any
+/// The extension a mirrored file's CA URL carries — [`ca_ext`] applied to
+/// its reverse-index entry: the recorded type decides, the original URL's
+/// own extension is the fallback. One derivation shared by the URL the
+/// substitution mints ([`crate::wikidot_page::ca_url`]) and the MIME the
+/// serving path answers with, so a blob's URL spelling and its headers can
+/// never disagree.
+pub(crate) fn ca_file_ext(file: &CaFile) -> String {
+    ca_ext(url_ext(&file.path), file.content_type.as_deref())
+}
+
+/// The extension of a URL path's final segment (`…/style.css` → `css`),
+/// `""` when it carries none.
+fn url_ext(path: &RepoAssetPath) -> &str {
+    Path::new(path.as_str())
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+}
+
+/// The extension a mirrored file's CA URL carries — the flattened
+/// publisher-recorded content type (`text/css` → `text.css`, the `/` can't
+/// live in a path segment) with the URL's own extension as the fallback: any
 /// type serves as itself, with no format table to lag behind. Types that
 /// assert nothing (`application/octet-stream` — wdfiles' answer for
 /// everything — `text/plain`, and XML serialization of structured content)

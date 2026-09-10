@@ -95,12 +95,14 @@ pub fn rewrite_with<F: Fn(&str) -> Option<String>>(
     out
 }
 
-/// Every absolute HTTP `host/path` tail referenced by `@import`/`url()` in
-/// `css` (base-less, so only absolute refs — relative refs in inline CSS have
-/// no base to resolve against). Deduplicated, in first-appearance order. Used
-/// by `article_latest` to pre-resolve the resource set before rewriting.
+/// Every HTTP `host/path` tail referenced by `@import`/`url()` in `css`,
+/// relative refs resolved against `base` when given (a served blob's
+/// original URL); base-less (inline `[[module css]]`) only absolute refs
+/// collect — relative ones have no base to resolve against. Deduplicated, in
+/// first-appearance order. Used by `article_latest` to pre-resolve the
+/// resource set before rewriting.
 #[must_use]
-pub fn http_refs(css: &str) -> Vec<String> {
+pub fn http_refs(css: &str, base: Option<&str>) -> Vec<String> {
     let bytes = css.as_bytes();
     let n = bytes.len();
     let mut i = 0usize;
@@ -127,7 +129,7 @@ pub fn http_refs(css: &str) -> Vec<String> {
             i = skip_ws(bytes, i, n);
             if i < n && (bytes[i] == b'"' || bytes[i] == b'\'') {
                 let (s, used) = read_string(css, i, n);
-                if let Some(t) = http_tail(unquote(s.trim()), None) {
+                if let Some(t) = http_tail(unquote(s.trim()), base) {
                     push(t, &mut out);
                 }
                 i += used;
@@ -141,7 +143,7 @@ pub fn http_refs(css: &str) -> Vec<String> {
             let j = skip_ws(bytes, i + 3, n);
             if j < n && bytes[j] == b'(' {
                 let (inner, end) = read_url_inner(css, j + 1, n);
-                if let Some(t) = http_tail(unquote(inner.trim()), None) {
+                if let Some(t) = http_tail(unquote(inner.trim()), base) {
                     push(t, &mut out);
                 }
                 i = end;
@@ -306,13 +308,24 @@ mod tests {
                    @import \"https://fonts.x/y.css\" screen;\
                    x{fill:url(#g);y:url(data:image/png;base64,AA==)}";
         assert_eq!(
-            super::http_refs(css),
+            super::http_refs(css, None),
             vec![
                 "h/a.png".to_string(),
                 "h/b.css".to_string(),
                 "fonts.x/y.css".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn http_refs_resolves_relative_refs_against_base() {
+        let css = "@import './a.css';\nb{background:url(\"./x/1.png\")}";
+        assert_eq!(
+            super::http_refs(css, Some("http://h/dir/theme.css")),
+            vec!["h/dir/a.css".to_string(), "h/dir/x/1.png".to_string()]
+        );
+        // Base-less (inline CSS): relative refs collect nothing.
+        assert!(super::http_refs(css, None).is_empty());
     }
 
     #[test]

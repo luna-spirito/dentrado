@@ -96,41 +96,63 @@ pub(crate) fn list_pages(
 
 /// Resolve one mirrored attachment — the canonical `host/path` key
 /// ([`canon_file_key`]) of an in-article URL or the shell's `theme_root` —
-/// to its content-addressed [`CaRef`]. Three lookups, in order: the key as
-/// named (the index preserves custom hosts verbatim); the canonical
-/// `<site>.wikidot.com` spelling when the host is one of the site's alias
-/// domains (the two hosts name one file space, and the publisher collapses
-/// only the wikidot spellings); and, for a `local--resized-images/…`
-/// variant (which the export never saved), the original `local--files/…`
-/// file under the same host. `None` when the URL is not mirrored (a
-/// hotlink).
-pub(crate) fn resource(
-    snap: &RepoSnapshot,
+/// to its CA hash and reverse-index entry (the recorded `content_type` plus
+/// the original URL). Three lookups, in order: the key as named (the index
+/// preserves custom hosts verbatim); the canonical `<site>.wikidot.com`
+/// spelling when the host is one of the site's alias domains (the two hosts
+/// name one file space, and the publisher collapses only the wikidot
+/// spellings); and, for a `local--resized-images/…` variant (which the
+/// export never saved), the original `local--files/…` file under the same
+/// host. `None` when the URL is not mirrored (a hotlink).
+pub(crate) fn resource<'a>(
+    snap: &'a RepoSnapshot,
     site: &SafePathComponent,
     path: &RepoAssetPath,
-) -> Option<CaRef> {
-    let files = &snap.sites.get(site)?.files;
-    keyed(files, site, path).or_else(|| {
+) -> Option<(&'a str, &'a CaFile)> {
+    let w = snap.sites.get(site)?;
+    ca_of(w, site, path).or_else(|| {
         let (host, rest) = path.as_str().split_once("local--resized-images/")?;
         let (orig, _variant) = rest.rsplit_once('/')?;
-        keyed(
-            files,
+        ca_of(
+            w,
             site,
             &RepoAssetPath::new(format!("{host}local--files/{orig}"))?,
         )
     })
 }
 
-/// One key against the index: the direct lookup, then the alias retry — a
-/// configured custom domain (± `www.` / `files.`, matched by
-/// [`same_file_host`]) names the same files `<site>.wikidot.com` does, and
-/// the publisher collapses only the wikidot spellings.
-fn keyed(
-    files: &ImHashMap<RepoAssetPath, CaRef>,
+/// The served CA URL of one mirrored attachment — [`resource`] serialized
+/// through [`ca_url`]. The one lookup the page pipeline's resource
+/// substitution and the served CSS blobs' ref rewriting share.
+pub(crate) fn resource_url(
+    snap: &RepoSnapshot,
     site: &SafePathComponent,
     path: &RepoAssetPath,
-) -> Option<CaRef> {
-    files.get(path).cloned().or_else(|| {
+) -> Option<String> {
+    resource(snap, site, path).map(|(hash, file)| ca_url(site, hash, file))
+}
+
+/// The reverse-index entry a forward-index hit names (every forward value
+/// keys the reverse map by construction).
+fn ca_of<'a>(
+    w: &'a WDWebsite,
+    site: &SafePathComponent,
+    path: &RepoAssetPath,
+) -> Option<(&'a str, &'a CaFile)> {
+    keyed(&w.files, site, path)
+        .and_then(|hash| w.files_ca.get(hash).map(|file| (hash.as_str(), file)))
+}
+
+/// One key against the forward index: the direct lookup, then the alias
+/// retry — a configured custom domain (± `www.` / `files.`, matched by
+/// [`same_file_host`]) names the same files `<site>.wikidot.com` does, and
+/// the publisher collapses only the wikidot spellings.
+fn keyed<'a>(
+    files: &'a ImHashMap<RepoAssetPath, String>,
+    site: &SafePathComponent,
+    path: &RepoAssetPath,
+) -> Option<&'a String> {
+    files.get(path).or_else(|| {
         let (host, rel) = path.as_str().split_once('/')?;
         if !crate::globals::domains_of_site(site)
             .iter()
@@ -138,12 +160,10 @@ fn keyed(
         {
             return None;
         }
-        files
-            .get(&RepoAssetPath::new(format!(
-                "{}.wikidot.com/{rel}",
-                &**site
-            ))?)
-            .cloned()
+        files.get(&RepoAssetPath::new(format!(
+            "{}.wikidot.com/{rel}",
+            &**site
+        ))?)
     })
 }
 

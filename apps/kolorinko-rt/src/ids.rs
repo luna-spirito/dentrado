@@ -25,8 +25,8 @@
 //! Every id's canonical form is `'S'/'L' ‖ base64url(payload)`: one literal
 //! uppercase prefix character, then the raw payload at its full width. The
 //! prefix is chosen from **outside the slug alphabet**: slugs are lowercase
-//! by construction (Wikidot normalizes imported page names to lowercase,
-//! [`title_slug`] lowercases, and native spaces mint lowercase), and URL
+//! by construction (Wikidot normalizes imported page names to lowercase, and
+//! native spaces mint lowercase), and URL
 //! path matching is case-sensitive — so a segment starting with an
 //! uppercase letter can *never* be a slug, and a slug can *never* parse as
 //! an id. This is what makes URL dispatch purely syntactic: no page name —
@@ -381,10 +381,12 @@ pub fn simplify(default: Option<SpaceId>, path: &str) -> String {
 // ── title shaping ───────────────────────────────────────────────────────────
 
 /// Shape a page title into the decorative third URL segment: whitespace →
-/// `-`, alphanumeric characters kept (lowercased, Unicode-aware), `-`/`_`
-/// kept, everything else dropped, leading/trailing `-` trimmed. Empty results
-/// (an untitled page) fall back to `page`. Never parses back into anything —
-/// the segment exists for humans, redirects regenerate it.
+/// `-`, alphanumeric characters kept in their original case (the URL echoes
+/// the title it came from), `-`/`_` kept, everything else dropped,
+/// leading/trailing `-` trimmed. A title with nothing shapable yields the
+/// empty segment — the route's trailing slash, which the parsers treat as
+/// insignificant. Never parses back into anything — the segment exists for
+/// humans, redirects regenerate it.
 #[must_use]
 pub fn title_slug(title: &str) -> String {
     let mut out = String::with_capacity(title.len());
@@ -449,13 +451,13 @@ mod tests {
         // not this test's own formatting echoed back.
         let local = LocalId::parse("LAAAAADXVfyo").unwrap();
         let url = format_page_route(Some(space()), local, "A-109/108");
-        assert_eq!(url, "/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADXVfyo/a-109108");
+        assert_eq!(url, "/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADXVfyo/A-109108");
         assert_eq!(parse_page_route(&url), Some((space(), local)));
         // The space-less form (a wiki's own domain) carries no segment to
         // parse back — only the titled shape is shared.
         assert_eq!(
             format_page_route(None, local, "Затерянные"),
-            "/LAAAAADXVfyo/%D0%B7%D0%B0%D1%82%D0%B5%D1%80%D1%8F%D0%BD%D0%BD%D1%8B%D0%B5"
+            "/LAAAAADXVfyo/%D0%97%D0%B0%D1%82%D0%B5%D1%80%D1%8F%D0%BD%D0%BD%D1%8B%D0%B5"
         );
     }
 
@@ -587,10 +589,12 @@ mod tests {
 
     #[test]
     fn titles_shape_into_segments() {
-        assert_eq!(title_slug("Тень подъезда"), "тень-подъезда");
-        assert_eq!(title_slug("Hello, World!"), "hello-world");
+        assert_eq!(title_slug("Тень подъезда"), "Тень-подъезда");
+        assert_eq!(title_slug("Hello, World!"), "Hello-World");
         assert_eq!(title_slug("  spaced  out  "), "spaced-out");
-        assert_eq!(title_slug("???"), "page");
+        // Nothing shapable — the untitled page: the empty segment rides a
+        // trailing slash, which the route parsers treat as insignificant.
+        assert_eq!(title_slug("???"), "");
         assert_eq!(
             encode_path_segment("тень-подъезда"),
             "%D1%82%D0%B5%D0%BD%D1%8C-%D0%BF%D0%BE%D0%B4%D1%8A%D0%B5%D0%B7%D0%B4%D0%B0"

@@ -345,7 +345,7 @@ mod tests {
         let local = LocalId::parse("LAAAAADrF7w0").unwrap();
         let root = Some((space, local, "Main".to_string()));
         assert!(
-            html(None, root, "").contains(r#"href="/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0/main""#)
+            html(None, root, "").contains(r#"href="/S70P6lbBZxbc-kcpGOCYmZA/LAAAAADrF7w0/Main""#)
         );
         assert!(html(None, None, "").contains(r#"href="/""#));
     }

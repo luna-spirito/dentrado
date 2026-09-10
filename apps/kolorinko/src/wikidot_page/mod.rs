@@ -91,9 +91,9 @@ use dentrado::core::{core_ctx::GearCtx, gear::GearResult, storage::Storage};
 use imbl::HashMap as ImHashMap;
 use kolorinko_render::{http_refs, http_tail, rewrite_with};
 use kolorinko_rt::{
-    Article, BlobId, Body, CaRef, CodeBlock, ListPagesQuery, ListPagesResult, ListedPage, LocalId,
-    PageQuery, PageQueryResult, RepoAssetPath, RepoSnapshot, SafePathComponent, SiteShell, Slug,
-    SpaceId, WDWebsite, parse_slug, start_slug,
+    Article, BlobId, CaFile, CodeBlock, ListPagesQuery, ListPagesResult, ListedPage, LocalId,
+    PageQuery, PageQueryResult, RepoAssetPath, RepoSnapshot, SafePathComponent, ServedBlob,
+    SiteShell, Slug, SpaceId, WDWebsite, parse_slug, start_slug,
 };
 use kolorinko_wikitext::{
     ArticleMeta, ArticleView, BlockCell, BlockRow, BlockTable, ContainerKind, Content, Include,
@@ -154,7 +154,7 @@ pub(crate) use article_latest::{LatestCache, ParsedCache, article_latest, articl
 pub(crate) use assets_gear::{AssetCache, asset, ca_url};
 pub(crate) use code_block::{CodeBlockCache, code_block};
 pub(crate) use config::OutMeta;
-pub(crate) use dataset::{article, latest, list_pages, local_id, query_pages, resource};
+pub(crate) use dataset::{article, latest, list_pages, local_id, query_pages};
 pub(crate) use lenses::{RepoSnapCache, ShellCache, repo_snap, shell};
 pub(crate) use repo_gear::{RepoCache, repo};
 

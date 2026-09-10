@@ -130,6 +130,7 @@ fn site_map_at(site: SafePathComponent, w: WDWebsite) -> ImHashMap<SafePathCompo
 /// A 64-hex sha256 stand-in (of the literal bytes "css").
 const HASH: &str = "d1f69a9854765a4f1e7c8b1e8a9e5c9bd1e0a2f3c4b5a6978899aabbccddeeff";
 const HASH2: &str = "e2f69a9854765a4f1e7c8b1e8a9e5c9bd1e0a2f3c4b5a6978899aabbccddeef0";
+const HASH3: &str = "f3f69a9854765a4f1e7c8b1e8a9e5c9bd1e0a2f3c4b5a6978899aabbccddee11";
 
 /// Regression: `repo()`'s cold start spawns the worker and re-borrows the
 /// cache `RefCell` in its `None` arm. A `borrow()` left in the `match`
@@ -230,15 +231,14 @@ fn build_reads_publication_and_materialises_bodies() {
         sites.get(&site("scp")).unwrap().by_page_id.get(&1305054470),
         Some(&(None, SafePathComponent::new("foo".into()).unwrap()))
     );
-    // The files index maps the percent-decoded host/path tail to the CA ref.
+    // The files index maps the percent-decoded host/path tail to the CA
+    // hash; the reverse half carries the recorded type + original URL.
     let w = sites.get(&site("scp")).unwrap();
-    let ca = w
-        .files
-        .get(&RepoAssetPath::new("scp.wikidot.com/local--files/foo/a.css".into()).unwrap())
-        .expect("file indexed");
-    assert_eq!(ca.hash, HASH);
-    // The recorded `text/css` IS the extension, flattened.
-    assert_eq!(ca.ext, "text.css");
+    let key = RepoAssetPath::new("scp.wikidot.com/local--files/foo/a.css".into()).unwrap();
+    assert_eq!(w.files.get(&key).map(String::as_str), Some(HASH));
+    let file = w.files_ca.get(HASH).expect("reverse row");
+    assert_eq!(file.content_type.as_deref(), Some("text/css"));
+    assert_eq!(file.path, key);
 }
 
 /// A legacy site-relative row (`local--files/…` — the previous `files.json`
@@ -305,21 +305,15 @@ fn legacy_rows_lift_and_alias_spellings_resolve() {
             .files
             .contains_key(&key)
     );
-    // The extensionless row lifts the same way, carrying the type-decided
-    // extension.
+    // The extensionless row lifts the same way; the reverse entry keeps the
+    // raw type, and the effective extension derives from it.
     let sublimity_key =
         RepoAssetPath::new("obscurative.wikidot.com/local--files/front-page:css/sublimity".into())
             .unwrap();
-    let sublimity = snap
-        .sites
-        .get(&site("obscurative"))
-        .unwrap()
-        .files
-        .get(&sublimity_key)
-        .unwrap()
-        .clone();
-    assert_eq!(sublimity.hash, HASH2);
-    assert_eq!(sublimity.ext, "text.css");
+    let (hash, file) = resource(&snap, &site("obscurative"), &sublimity_key)
+        .expect("sublimity resolves through the index");
+    assert_eq!(hash, HASH2);
+    assert_eq!(crate::assets::ca_file_ext(file), "text.css");
     // Every alias spelling canonicalizes (or retries) to that one row.
     for url in [
         "http://obscurative.wikidot.com/local--theme/t/style.css",
@@ -329,7 +323,7 @@ fn legacy_rows_lift_and_alias_spellings_resolve() {
     ] {
         let path = canon_file_key(url).unwrap_or_else(|| panic!("canon {url}"));
         let ca = resource(&snap, &site("obscurative"), &path);
-        assert_eq!(ca.map(|c| c.hash).as_deref(), Some(HASH), "{url}");
+        assert_eq!(ca.map(|(h, _)| h), Some(HASH), "{url}");
     }
     // A foreign host with the same path stays a hotlink.
     let foreign = RepoAssetPath::new("i.imgur.com/local--theme/t/style.css".into()).unwrap();
@@ -372,9 +366,7 @@ fn resized_variants_resolve_to_their_originals() {
     )
     .unwrap();
     assert_eq!(
-        resource(&snap, &site("rpcauthority"), &variant)
-            .map(|c| c.hash)
-            .as_deref(),
+        resource(&snap, &site("rpcauthority"), &variant).map(|(h, _)| h),
         Some(HASH)
     );
 }
@@ -1008,24 +1000,19 @@ fn external_refs_are_collected_and_content_addressed() {
     );
     // Only the mirrored scp tails resolve — through `resolve_tails`, the one
     // substitution decision; the hotlink doesn't.
-    let ca = CaRef {
-        hash: "d84a29109fe0e70c7a5c22c39bda120fdbc56bd192f5927af95b9af8d0f87c27".into(),
-        ext: "png".into(),
-    };
-    let css_ca = CaRef {
-        hash: "d84a29109fe0e70c7a5c22c39bda120fdbc56bd192f5927af95b9af8d0f87c27".into(),
-        ext: "css".into(),
-    };
+    let h = "d84a29109fe0e70c7a5c22c39bda120fdbc56bd192f5927af95b9af8d0f87c27";
     let mirror = |path: &RepoAssetPath| match path.as_str() {
         "scp.wikidot.com/local--files/foo/a.png" | "scp.wikidot.com/local--files/foo/bg.png" => {
-            Some(ca.clone())
+            Some(format!("/-/repo/scp/files/d8/4a/{h}.png"))
         }
-        "scp.wikidot.com/local--files/foo/a.css" => Some(css_ca.clone()),
+        "scp.wikidot.com/local--files/foo/a.css" => {
+            Some(format!("/-/repo/scp/files/d8/4a/{h}.text.css"))
+        }
         _ => None,
     };
-    let resolved = super::resolve_tails(&site, &tails, mirror);
+    let resolved = super::resolve_tails(&tails, mirror);
     assert!(!resolved.contains_key("i.imgur.com/x.jpg"));
-    let out = super::substitute_resources(content, &site, &resolved);
+    let out = super::substitute_resources(content, &resolved);
     // Image source → CA url.
     let Node::Image { source, .. } = &out[0] else {
         panic!("expected image")
@@ -1057,6 +1044,81 @@ fn external_refs_are_collected_and_content_addressed() {
     };
     assert!(raw.contains("/-/repo/scp/files/d8/4a/"));
     assert!(!raw.contains("https://scp.wikidot.com"));
+}
+
+/// A served CSS blob's relative refs — the backrooms theme's
+/// `liminal-impact.css` is nothing but `@import url("./liminal.css")` —
+/// resolve against the blob's *original* URL (the reverse index's path) and
+/// localize to CA URLs, instead of breaking against the `/-/repo/…` path
+/// the blob is actually served from.
+#[test]
+fn relative_css_refs_localize_against_the_original_url() {
+    init_test_globals();
+    let dir = std::env::temp_dir().join(format!("kolorinko_relcss_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    write_manifest(&dir, "backrooms-wiki-cn", &[]);
+    let css = "@import url(\"./liminal.css\");\n@import \"./sidebar.css\";\n";
+    write_files(
+        &dir,
+        "backrooms-wiki-cn",
+        &[
+            (
+                "https://github.backroomswiki.cn/Old_BHL/css/liminal-impact.css",
+                HASH,
+                "saved",
+                "text/css",
+                css.as_bytes(),
+            ),
+            (
+                "https://github.backroomswiki.cn/Old_BHL/css/liminal.css",
+                HASH2,
+                "saved",
+                "text/css",
+                b"liminal",
+            ),
+            (
+                "https://github.backroomswiki.cn/Old_BHL/css/sidebar.css",
+                HASH3,
+                "saved",
+                "text/css",
+                b"sidebar",
+            ),
+        ],
+    );
+    let site = site("backrooms-wiki-cn");
+    let (_, w) = build_site(
+        &site,
+        &dir.join("out").join("backrooms-wiki-cn"),
+        &mut ImHashMap::new(),
+    )
+    .unwrap();
+    let snap = RepoSnapshot {
+        sites: site_map_at(site.clone(), w),
+        bodies: ImHashMap::new(),
+    };
+    let out = super::assets_gear::localize_css(
+        css,
+        "http://github.backroomswiki.cn/Old_BHL/css/liminal-impact.css",
+        &site,
+        &snap,
+    );
+    let ca = |h: &str| {
+        format!(
+            "/-/repo/backrooms-wiki-cn/files/{}/{}/{}.text.css",
+            &h[..2],
+            &h[2..4],
+            h
+        )
+    };
+    assert_eq!(
+        out,
+        format!(
+            "@import url(\"{}\");\n@import url(\"{}\");\n",
+            ca(HASH2),
+            ca(HASH3)
+        )
+    );
 }
 
 #[test]
@@ -1152,26 +1214,24 @@ fn real_publication_indexes_files_and_shell() {
     assert_eq!(w.landing, kolorinko_rt::parse_slug("start").unwrap());
     let theme_path = w.theme_root.clone().expect("theme_root parsed");
     // The files index resolves the theme path to a full 64-char sha256 —
-    // NOT the 60-char sharded leaf (the bug this guards against).
-    let ca = w.files.get(&theme_path).expect("theme in files index");
-    assert!(ca.ext == "css" || !ca.ext.is_empty());
-    assert_eq!(ca.hash.len(), 64);
-    assert!(ca.hash.bytes().all(|b| b.is_ascii_hexdigit()));
+    // NOT the 60-char sharded leaf (the bug this guards against) — and the
+    // reverse half names its recorded entry.
+    let hash = w.files.get(&theme_path).expect("theme in files index");
+    let file = &w.files_ca[hash];
+    assert!(!crate::assets::ca_file_ext(file).is_empty());
+    assert_eq!(hash.len(), 64);
+    assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
     // The hash must locate the real blob: the on-disk leaf is `hash[4..]`
     // (the rest), not the full hash.
     let blob = root
         .join("files_ca")
-        .join(&ca.hash[..2])
-        .join(&ca.hash[2..4])
-        .join(&ca.hash[4..]);
+        .join(&hash[..2])
+        .join(&hash[2..4])
+        .join(&hash[4..]);
     assert!(blob.exists(), "blob {blob:?} should exist");
     // And ca_url embeds the full hash under the matching shards.
-    let url = super::ca_url(&site("rpcauthority"), ca);
-    let prefix = format!(
-        "/-/repo/rpcauthority/files/{}/{}",
-        &ca.hash[..2],
-        &ca.hash[2..4]
-    );
+    let url = super::ca_url(&site("rpcauthority"), hash, file);
+    let prefix = format!("/-/repo/rpcauthority/files/{}/{}", &hash[..2], &hash[2..4]);
     assert!(
         url.starts_with(&prefix),
         "url {url} should start with {prefix}"
@@ -1204,9 +1264,66 @@ fn real_publication_resolves_site_theme_root() {
         .theme_root
         .clone()
         .expect("theme_root parsed from the raw URL");
-    let ca =
+    let (_hash, file) =
         resource(&snap, &site("obscurative"), &theme).expect("theme resolves through the index");
-    assert_eq!(ca.ext, "text.css");
+    assert_eq!(crate::assets::ca_file_ext(file), "text.css");
+}
+
+/// The reported regression, against real data: a served theme blob whose
+/// `@import`s are *relative* (`url("./icon-masks.css")`, the shape the
+/// backrooms `liminal-impact.css` theme uses) must resolve them against its
+/// original URL (the reverse index's path) and localize them to CA URLs —
+/// not break against the `/-/repo/…` path it is served from. Skipped when
+/// the publication isn't checked out.
+#[test]
+fn real_publication_localizes_relative_theme_imports() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../wikidot-evakuilo/data/kolorinko/out/backrooms-exploration");
+    if !root.join("files_ca").is_dir() {
+        eprintln!("skipping: real publication not present");
+        return;
+    }
+    let site = site("backrooms-exploration");
+    let (_, w) = build_site(&site, &root, &mut ImHashMap::new()).expect("site builds");
+    let snap = RepoSnapshot {
+        sites: site_map_at(site.clone(), w),
+        bodies: ImHashMap::new(),
+    };
+    let key =
+        canon_file_key("http://backrooms-exploration.wikidot.com/local--theme/nuliminal/style.css")
+            .unwrap();
+    let (hash, file) = resource(&snap, &site, &key).expect("theme row in the index");
+    assert_eq!(file.content_type.as_deref(), Some("text/css"));
+    // The real blob (raw on disk, sharded rest-leaf), localized exactly the
+    // way the `asset` gear serves it.
+    let blob = std::fs::read(
+        root.join("files_ca")
+            .join(&hash[..2])
+            .join(&hash[2..4])
+            .join(&hash[4..]),
+    )
+    .expect("theme blob");
+    let text = std::str::from_utf8(&blob).expect("utf8 css");
+    assert!(
+        text.contains("./icon-masks.css"),
+        "fixture drifted: no relative import in the theme"
+    );
+    let out = super::assets_gear::localize_css(
+        text,
+        &format!("http://{}", file.path.as_str()),
+        &site,
+        &snap,
+    );
+    for line in out.lines().filter(|l| l.contains("@import")) {
+        assert!(
+            line.contains("/-/repo/backrooms-exploration/files/"),
+            "import not localized: {line}"
+        );
+    }
+    assert!(
+        !out.contains("./icon-masks.css"),
+        "the relative import survived: {out}"
+    );
 }
 
 /// Globals for host-matching tests: the dev config's two sites. `init` is
@@ -1272,8 +1389,8 @@ fn code_endpoint_imports_fall_back_to_local_routes() {
         format!("@import url(http://{tail});").into(),
     )];
     // Nothing is mirrored — `resolve_tails` falls back to the code route.
-    let resolved = super::resolve_tails(&site, &[tail.to_string()], |_| None);
-    let out = super::substitute_resources(content, &site, &resolved);
+    let resolved = super::resolve_tails(&[tail.to_string()], |_| None);
+    let out = super::substitute_resources(content, &resolved);
     let Node::Stylesheet(rewritten) = &out[0] else {
         panic!("expected stylesheet")
     };

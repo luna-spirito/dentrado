@@ -80,8 +80,7 @@ pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
             let theme_root = w
                 .theme_root
                 .as_ref()
-                .and_then(|p| resource(data, site, p))
-                .map(|ca| ca_url(site, &ca));
+                .and_then(|p| resource_url(data, site, p));
             (w.title.clone(), w.subtitle.clone(), theme_root)
         })
         .unwrap_or_default();

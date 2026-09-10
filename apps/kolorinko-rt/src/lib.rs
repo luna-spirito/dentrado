@@ -132,8 +132,8 @@ impl Deref for SafePathComponent {
 
 /// A validated relative path: no `..`, no empty/`.` segments, not absolute.
 /// The `host/path…` tail of a mirrored attachment, keyed this way in the
-/// `files/` index so [`repo_resource`] can resolve it to a content-addressed
-/// [`CaRef`].
+/// `files/` index so [`repo_resource`] can resolve it to its content-addressed
+/// hash.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado_types::Localizable)]
 pub struct RepoAssetPath(String);
 
@@ -200,22 +200,35 @@ pub enum Body {
     Zstd(bytes::Bytes),
 }
 
-/// A resolved content-addressed asset reference: the SHA-256 (lowercase hex)
-/// of its bytes plus the extension its URL carries — the URL's own when the
-/// file has one and the origin's recorded type says nothing contrary, else
-/// the canonical extension of that type (an extensionless or mislabeled URL
-/// must not drive the served MIME). The extension rides in the *reference*
-/// (not in the CA blob's name, which is the bare hash) so the MIME is
-/// derivable without a side table — [`crate::wire`] never needs the blob's
-/// type, only this pair.
+/// One mirrored file's reverse-index entry, keyed by its CA hash: the
+/// publisher-recorded `content_type` (what the origin server answered, raw)
+/// and one original `host/path` URL key. Both the served MIME and the CA
+/// URL's extension derive from this pair (the recorded type decides, the
+/// URL's own extension is the fallback — the server's `ca_ext` precedence),
+/// and the original URL is the base a CSS blob's relative `url()`/`@import`
+/// refs resolve against — the reason the reverse half of the index exists.
 ///
 /// Serialized onto `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` by the resolver.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct CaRef {
-    /// 64-char lowercase hex SHA-256.
-    pub hash: String,
-    /// Extension without the dot (`"jpg"`, `"png"`, …).
-    pub ext: String,
+pub struct CaFile {
+    /// What the origin answered for the bytes (`text/css`, `image/png`, …;
+    /// `application/octet-stream` when it answered nothing specific) — raw,
+    /// so uninformative answers can defer to the URL's own extension.
+    pub content_type: Option<String>,
+    /// One original URL key (`host/path…`, percent-decoded). The same bytes
+    /// under several URLs keep one entry (the publisher manifest's last row).
+    pub path: RepoAssetPath,
+}
+
+/// One served mirrored blob: its (already compressed) body plus the MIME the
+/// reverse index's recorded type decides — one decision shared by the `asset`
+/// gear's CSS-rewrite branch and the HTTP layer's `Content-Type` header, so
+/// the treatment and the header can never disagree. HTTP-only: the `asset`
+/// gear's output is never shipped over WebTransport.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ServedBlob {
+    pub mime: String,
+    pub body: Body,
 }
 
 /// A content-addressed body id: the SHA-256 of the materialised body text,
@@ -262,9 +275,11 @@ pub struct RepoSnapshot {
 /// One mirrored site: its pages nested by category; the site chrome from
 /// `<site>/shell` (title, subtitle, the theme-root path into `files/`, and
 /// `landing` — the slug a bare site root resolves to, [`start_slug`] unless
-/// the shell names one); and the content-addressed `files/` index — each
-/// mirrored attachment's `<host>/<path>` tail (percent-decoded) mapped to its
-/// [`CaRef`].
+/// the shell names one); and the content-addressed `files/` index in both
+/// halves — the forward map (each mirrored attachment's `<host>/<path>` tail,
+/// percent-decoded → its CA hash) that substitution walks, and the reverse
+/// (each hash → the file's recorded type + original URL) that a
+/// `/-/repo/…/<hash>` request walks.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WDWebsite {
     pub articles:
@@ -281,7 +296,8 @@ pub struct WDWebsite {
     /// The landing slug — the shell's `landing` key (`start` by default;
     /// always present, like the landing itself).
     pub landing: Slug,
-    pub files: imbl::HashMap<RepoAssetPath, CaRef>,
+    pub files: imbl::HashMap<RepoAssetPath, String>,
+    pub files_ca: imbl::HashMap<String, CaFile>,
 }
 
 impl Default for WDWebsite {
@@ -294,6 +310,7 @@ impl Default for WDWebsite {
             theme_root: None,
             landing: start_slug(),
             files: imbl::HashMap::new(),
+            files_ca: imbl::HashMap::new(),
         }
     }
 }
@@ -437,8 +454,8 @@ pub struct SiteShell {
     /// loads, for a space the registry doesn't know, or when the dataset
     /// lacks the landing page.
     pub root: Option<(SpaceId, LocalId, String)>,
-    /// CA URL `/-/repo/<site>/files/<xx>/<yy>/<hash>.css`, or `None` if the site
-    /// has no theme root mirrored into `files/`.
+    /// CA URL `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>`, or `None` if the
+    /// site has no theme root mirrored into `files/`.
     pub theme_root: Option<String>,
     pub nav_top: ArticleView,
     pub nav_side: ArticleView,
@@ -521,7 +538,7 @@ impl SsrState {
 /// in `Subscribe`, and the server pushes only when the output's hash differs.
 #[dentrado_macros::gears_schema(file = "gears.def.rs")]
 pub mod wire {
-    use crate::{Body, CodeBlock, LocalId, RepoSnapshot, SiteShell, SpaceId};
+    use crate::{CodeBlock, LocalId, RepoSnapshot, ServedBlob, SiteShell, SpaceId};
     use kolorinko_wikitext::ArticleView;
 
     /// Client → server: subscribe to a gear. This is the stream's only

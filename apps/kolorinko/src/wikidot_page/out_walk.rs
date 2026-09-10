@@ -224,33 +224,37 @@ struct FileRow {
     path: String,
     /// What the origin server answered for the bytes (`text/css`,
     /// `image/png`, …; `application/octet-stream` when it answered nothing
-    /// specific). Decides the CA URL's extension via
-    /// [`crate::assets::ca_ext`] — see its doc for the precedence.
+    /// specific). Lands raw in the reverse index, from which both the CA
+    /// URL's extension and the served MIME derive — see
+    /// [`crate::assets::ca_ext`] for the precedence.
     #[serde(default)]
     content_type: Option<String>,
     sha256: Option<String>,
     status: String,
 }
 
-/// Parse `files.json` into the site's `files/` index: each *saved* row keyed
-/// by [`canon_file_key`] — so the previous format's site-relative rows (still
-/// on disk for sites the daemon hasn't republished since the format change)
-/// lift onto the site's canonical host and its `wdfiles`/`www.`/`%3A`
-/// spellings collapse into the same key the canonical form writes, exactly
-/// like the publisher's own dedup — and its recorded `content_type` decides
-/// the [`CaRef`] extension ([`crate::assets::ca_ext`]). Pending and missing
-/// entries stay unindexed (a request for them misses, then falls back to the
-/// source site — same as an un-mirrored hotlink).
+/// Parse `files.json` into the site's `files/` index, both halves: the
+/// forward map (each *saved* row keyed by [`canon_file_key`] — so the
+/// previous format's site-relative rows (still on disk for sites the daemon
+/// hasn't republished since the format change) lift onto the site's
+/// canonical host, and its `wdfiles`/`www.`/`%3A` spellings collapse into
+/// the same key the canonical form writes, exactly like the publisher's own
+/// dedup) and the reverse map (each CA hash → the row's recorded
+/// `content_type` and original URL — the last row wins when several URLs
+/// name one hash). Pending and missing entries stay unindexed (a request
+/// for them misses, then falls back to the source site — same as an
+/// un-mirrored hotlink).
 pub(super) fn read_files_index(
     site: &SafePathComponent,
     site_dir: &Path,
-) -> HashMap<RepoAssetPath, CaRef> {
-    let mut map = HashMap::new();
+) -> (HashMap<RepoAssetPath, String>, HashMap<String, CaFile>) {
+    let mut files = HashMap::new();
+    let mut files_ca = HashMap::new();
     let Ok(bytes) = std::fs::read(site_dir.join("files.json")) else {
-        return map;
+        return (files, files_ca);
     };
     let Ok(doc) = serde_json::from_slice::<FilesDoc>(&bytes) else {
-        return map;
+        return (files, files_ca);
     };
     for f in doc.files {
         if f.status != "saved" {
@@ -271,14 +275,16 @@ pub(super) fn read_files_index(
         let Some(path) = canon_file_key(&url) else {
             continue;
         };
-        let url_ext = Path::new(path.as_str())
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let ext = crate::assets::ca_ext(url_ext, f.content_type.as_deref());
-        map.insert(path, CaRef { hash, ext });
+        files.insert(path.clone(), hash.clone());
+        files_ca.insert(
+            hash,
+            CaFile {
+                content_type: f.content_type,
+                path,
+            },
+        );
     }
-    map
+    (files, files_ca)
 }
 
 /// Canonicalise one file URL — a `files.json` row `path`, the shell's
@@ -351,7 +357,9 @@ pub(super) fn build_site(
         w.by_page_id.insert(*id, (cat.clone(), name.clone()));
         w.articles.entry(cat).or_default().insert(name, article);
     }
-    w.files = read_files_index(site, site_dir).into_iter().collect();
+    let (files, files_ca) = read_files_index(site, site_dir);
+    w.files = files.into_iter().collect();
+    w.files_ca = files_ca.into_iter().collect();
     let chrome = read_shell(site_dir);
     w.title = chrome.title;
     w.subtitle = chrome.subtitle;
