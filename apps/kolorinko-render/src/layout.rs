@@ -31,8 +31,14 @@ pub const TITLE_FALLBACK: &str = "dntrd";
 /// literally). Kept free of `<`, `>`, `&`, and quotes by construction:
 /// escaped text inside `<style>` is spelled as entities and would break the
 /// rules (asserted by `banner_css_survives_raw`).
+///
+/// The banner overlays the page (`position: absolute`, semi-transparent)
+/// rather than sitting in flow: in flow it shifts the document down and
+/// desynchronizes themes that paint chrome at pixel offsets from the
+/// document top (BHL-style `body` gradients behind the top-bar), which
+/// makes their top bars vanish.
 const BANNER_CSS: &str = "\
-#dentrado-banner{display:flex;flex-wrap:wrap;gap:.25em 1.5em;align-items:baseline;justify-content:space-between;padding:.55em 1.25em;background:#0e1116;color:#a7b0bf;font:500 12.5px/1.45 ui-sans-serif,system-ui,sans-serif;text-align:left}\
+#dentrado-banner{position:absolute;top:0;left:0;right:0;z-index:2147483647;display:flex;flex-wrap:wrap;gap:.25em 1.5em;align-items:baseline;justify-content:space-between;padding:.55em 1.25em;background:rgba(14,17,22,.85);color:#a7b0bf;font:500 12.5px/1.45 ui-sans-serif,system-ui,sans-serif;text-align:left}\
 #dentrado-banner a{color:#e6965a;text-decoration:none;border-bottom:1px solid rgba(230,150,90,.35)}\
 #dentrado-banner a:hover{border-bottom-color:#e6965a}\
 #dentrado-banner .dentrado-brand{color:#f4f6f9;font-weight:700;letter-spacing:.02em}\
