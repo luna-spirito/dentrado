@@ -1,6 +1,7 @@
 .*
 !.cargo
 !.github
+!.envrc
 target
 dist
 *.png
