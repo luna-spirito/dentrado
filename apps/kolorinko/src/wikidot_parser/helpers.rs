@@ -342,11 +342,11 @@ fn parse_space_vars<V>(remainder: &str, map: &impl Fn(&str) -> V) -> Vec<(String
 /// case-insensitively at serve time). `None` when absent or non-literal
 /// (a `%%var%%` value can never name a type here — the endpoint serves
 /// templates un-substituted too).
-pub(crate) fn code_type(attrs: &HashMap<String, Vec<TextObj>>) -> Option<String> {
+pub(crate) fn code_type(attrs: &kolorinko_wikitext::Params) -> Option<String> {
     TextObj::plain_concat(attrs.get("type")?)
 }
 
-pub(crate) fn listpages_params(attrs: &HashMap<String, Vec<TextObj>>) -> ListPagesParams {
+pub(crate) fn listpages_params(attrs: &kolorinko_wikitext::Params) -> ListPagesParams {
     let sel = |key: &str| attr_value(attrs, key);
     ListPagesParams {
         category: sel("category").or_else(|| sel("categories")),
@@ -380,7 +380,7 @@ pub(crate) fn listpages_params(attrs: &HashMap<String, Vec<TextObj>>) -> ListPag
 /// Whitespace is kept as written (`hide=" "` stays a real label).
 /// Attribute names match case-insensitively on a miss of the exact key
 /// (Wikidot's `perPage` and `perpage` are the same parameter).
-pub(crate) fn attr_value_raw(attrs: &HashMap<String, Vec<TextObj>>, key: &str) -> Option<String> {
+pub(crate) fn attr_value_raw(attrs: &kolorinko_wikitext::Params, key: &str) -> Option<String> {
     let objs = attrs.get(key).or_else(|| {
         attrs
             .iter()
@@ -404,7 +404,7 @@ pub(crate) fn attr_value_raw(attrs: &HashMap<String, Vec<TextObj>>, key: &str) -
 
 /// [`attr_value_raw`] trimmed, with empty values — and `@URL` refs without a
 /// default — treated as absent.
-pub(crate) fn attr_value(attrs: &HashMap<String, Vec<TextObj>>, key: &str) -> Option<String> {
+pub(crate) fn attr_value(attrs: &kolorinko_wikitext::Params, key: &str) -> Option<String> {
     let s = attr_value_raw(attrs, key)?.trim().to_string();
     if s.is_empty() {
         return None;

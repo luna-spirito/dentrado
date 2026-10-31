@@ -973,7 +973,7 @@ fn external_refs_are_collected_and_content_addressed() {
         Node::Image {
             align: None,
             source: vec![TextObj::Plain(img_url.into())],
-            params: HashMap::new(),
+            params: Default::default(),
         },
         Node::Link {
             target: LinkTarget::Url(hot.into()),
@@ -1422,7 +1422,7 @@ fn page_refs_are_collected_and_query_canonicalized() {
             kind: ContainerKind::Div {
                 inline: false,
                 block: true,
-                params: HashMap::new(),
+                params: Default::default(),
             },
             content: vec![Node::Link {
                 target: page(Some("database"), &["vika-owl"]),
@@ -1521,7 +1521,7 @@ fn link_substitution_rewrites_hits_and_keeps_misses() {
             kind: ContainerKind::Div {
                 inline: false,
                 block: true,
-                params: HashMap::new(),
+                params: Default::default(),
             },
             content: vec![Node::Link {
                 target: page(Some("database"), "vika-owl"),

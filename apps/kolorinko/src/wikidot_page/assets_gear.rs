@@ -9,6 +9,9 @@ use super::*;
 #[derive(Default, Clone, Debug)]
 pub(crate) struct AssetCache;
 
+// No persisted image: the MIME sniff + CSS rewrite re-run from disk.
+impl dentrado::core::storage::CacheSer for AssetCache {}
+
 /// **PURE-FUNCTION ASSUMPTION (known to be wrong).** The gear's output — the
 /// MIME, and the CSS rewrite, which resolves each `url()`/`@import` (relative
 /// ones against the blob's original URL) through a **non-tracking** (stale)

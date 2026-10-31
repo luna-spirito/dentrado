@@ -34,7 +34,7 @@ use compio::{
 };
 use log::{info, warn};
 
-use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
+use dentrado::core::{core_ctx::Core, storage::PagedStorage};
 use kolorinko_rt::Body;
 
 use crate::respond;
@@ -53,7 +53,7 @@ use crate::tls::https_server_config;
 pub(crate) async fn serve(
     addr: &str,
     assets: Arc<HashMap<String, Body>>,
-    core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     inject_wt_hash: bool,
 ) -> io::Result<()> {
     let acceptor = TlsAcceptor::from(https_server_config()?);
@@ -129,7 +129,7 @@ async fn bind_reuseport(addr: &str) -> io::Result<TcpListener> {
 async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     assets: &Arc<HashMap<String, Body>>,
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     alt_svc: Option<&str>,
 ) -> io::Result<()> {
     let (head, rest) = read_request_head(stream).await?;

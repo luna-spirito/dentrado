@@ -931,7 +931,7 @@ fn render_grid_cell(ctx: &RenderCtx, cell: &BlockCell) -> AnyView {
 fn render_image(
     align: &Option<Align>,
     source: &[TextObj],
-    params: &std::collections::HashMap<String, Vec<TextObj>>,
+    params: &kolorinko_wikitext::Params,
 ) -> AnyView {
     let src = text_objs_to_string(source);
     let alt = param_or(params, "alt", || filename_of(&src));
@@ -973,10 +973,7 @@ fn render_image(
 /// `[[iframe src attrs]]` — Wikidot's own element: every directive attribute
 /// becomes an iframe attribute, the missing canonical ones empty strings
 /// (`<iframe src="…" align="" frameborder="0" … class="" style="">`).
-fn render_iframe(
-    source: &[TextObj],
-    params: &std::collections::HashMap<String, Vec<TextObj>>,
-) -> AnyView {
+fn render_iframe(source: &[TextObj], params: &kolorinko_wikitext::Params) -> AnyView {
     use leptos::tachys::html::attribute::custom::custom_attribute;
     let attr = |k: &'static str| custom_attribute(k, param_or(params, k, String::new));
     custom("iframe")
@@ -995,7 +992,7 @@ fn render_iframe(
 /// Resolve `params[key]` to a string, falling back to `default` when absent or
 /// blank (so an explicit empty `alt=""` still yields the filename-derived alt).
 fn param_or(
-    params: &std::collections::HashMap<String, Vec<TextObj>>,
+    params: &kolorinko_wikitext::Params,
     key: &str,
     default: impl FnOnce() -> String,
 ) -> String {
@@ -1155,7 +1152,7 @@ fn render_footnote_block(ctx: &RenderCtx, title: Option<&str>, bodies: &[Content
 fn render_module_block(
     ctx: &RenderCtx,
     name: &str,
-    _params: &std::collections::HashMap<String, Vec<TextObj>>,
+    _params: &kolorinko_wikitext::Params,
     body: &Content,
 ) -> AnyView {
     match name.to_ascii_lowercase().as_str() {
@@ -1175,7 +1172,7 @@ fn render_module_block(
     }
 }
 
-fn render_new_page_form(params: &std::collections::HashMap<String, Vec<TextObj>>) -> AnyView {
+fn render_new_page_form(params: &kolorinko_wikitext::Params) -> AnyView {
     let size = params
         .get("size")
         .map(|v| text_objs_to_string(v))
@@ -1355,9 +1352,7 @@ fn render_tabview(ctx: &RenderCtx, id: u32, tabs: &[kolorinko_wikitext::Tab]) ->
     .into_any()
 }
 
-fn params_to_class_style(
-    params: &std::collections::HashMap<String, Vec<TextObj>>,
-) -> (String, Option<String>) {
+fn params_to_class_style(params: &kolorinko_wikitext::Params) -> (String, Option<String>) {
     let class = params
         .get("class")
         .map(|v| text_objs_to_string(v))
@@ -1393,7 +1388,7 @@ fn params_to_class_style(
 
 /// `[[div id="X" …]]` → Wikidot's `u-`-prefixed element id (a namespace the
 /// site's own CSS cannot collide with).
-fn params_id(params: &std::collections::HashMap<String, Vec<TextObj>>) -> Option<String> {
+fn params_id(params: &kolorinko_wikitext::Params) -> Option<String> {
     params
         .get("id")
         .map(|v| {

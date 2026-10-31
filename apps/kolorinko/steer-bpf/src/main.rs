@@ -20,8 +20,13 @@
 //! handshake packets have no owning core yet) and undecodable cores get the
 //! default 4-tuple-hash dispatch, exactly as without this program.
 
-#![no_std]
+// `cargo check --workspace` typechecks every member for the host, but this
+// no_std program only ever builds for `bpfel-unknown-none` (a `panic=abort`
+// target) — unwinding hosts reject its panic handling. Everything below the
+// cfg is stripped for non-BPF targets, so keep `no_main` above it.
 #![no_main]
+#![cfg(target_arch = "bpf")]
+#![no_std]
 
 use aya_ebpf::{
     macros::{map, sk_reuseport},

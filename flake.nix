@@ -172,28 +172,7 @@
               pkgs.cargo-watch
               pkgs.cargo-deny
 
-              # Links the eBPF steering program kolorinko's build.rs compiles.
-              bpf-linker
-
-              pkgs.typst
-
-              # libgit2 TLS backend: `git2`'s `https` feature links against
-              # system OpenSSL, which it finds via pkg-config.
-              pkgs.openssl
-              pkgs.pkg-config
-            ];
-          };
-
-          devShells.kolorinko = pkgs.mkShell {
-            name = "rust-nightly";
-
-            shellHook = config.pre-commit.shellHook;
-
-            packages = config.pre-commit.settings.enabledPackages ++ [
-              rustToolchain
-              pkgs.cargo-nextest
-              pkgs.cargo-watch
-              pkgs.cargo-deny
+              # pkgs.lean4
 
               # Links the eBPF steering program kolorinko's build.rs compiles.
               bpf-linker

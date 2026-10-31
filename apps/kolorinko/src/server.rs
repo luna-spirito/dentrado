@@ -59,7 +59,7 @@ use futures::{
 };
 use log::{error, info, warn};
 
-use dentrado::core::{core_ctx::Core, gear::GearResult, storage::InMemoryStorage};
+use dentrado::core::{core_ctx::Core, gear::GearResult, storage::PagedStorage};
 use kolorinko_rt::{
     Body,
     wire::{self, ClientMsg, ServerMsg},
@@ -77,7 +77,7 @@ const MAX_WT_SESSIONS: u64 = 16;
 /// Bind `bind` with TLS and run the QUIC accept loop. Runs forever; only
 /// returns on a fatal endpoint error.
 pub(crate) async fn serve(
-    core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     bind: &str,
     assets: Arc<HashMap<String, Body>>,
     inject_wt_hash: bool,
@@ -204,7 +204,7 @@ fn reuseport_udp_socket(bind: &str, core: u32, steer: bool) -> io::Result<compio
 /// WebTransport CONNECT arrives, hand the connection to a session.
 async fn handle_conn(
     incoming: compio_quic::Incoming,
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     assets: &Arc<HashMap<String, Body>>,
 ) -> io::Result<()> {
     let conn = incoming
@@ -386,7 +386,7 @@ where
 /// session closes. Each stream is one subscription ([`subscription_stream`]).
 async fn run_session(
     session: h3_webtransport::server::WebTransportSession<compio_quic::Connection, Bytes>,
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
 ) {
     while let Ok(Some(accepted)) = session.accept_bi().await {
         match accepted {
@@ -407,7 +407,7 @@ async fn run_session(
 /// `Dropped`. One detached task per stream.
 async fn subscription_stream<S>(
     bidi: h3_webtransport::stream::BidiStream<S, Bytes>,
-    core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
 ) where
     h3_webtransport::stream::BidiStream<S, Bytes>: AsyncRead + AsyncWrite + Unpin,
 {

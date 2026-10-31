@@ -13,6 +13,9 @@ use super::*;
 #[derive(Default, Clone)]
 pub(crate) struct RepoCache(Rc<RefCell<RepoOracleState>>);
 
+// No persisted image: the oracle re-scans the publication at startup.
+impl dentrado::core::storage::CacheSer for RepoCache {}
+
 #[derive(Default)]
 pub(super) struct RepoOracleState {
     pub(super) mailbox: Option<OutMailbox>,

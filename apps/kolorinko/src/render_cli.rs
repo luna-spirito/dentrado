@@ -36,7 +36,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
+use dentrado::core::{core_ctx::Core, storage::PagedStorage};
 use futures::{FutureExt, StreamExt, stream};
 use kolorinko_render::render_page_document;
 use kolorinko_rt::{
@@ -86,7 +86,7 @@ fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
     let cores = std::num::NonZero::new(1).unwrap();
 
     let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<(ArticleView, SiteShell)>>();
-    let worker = move |core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>| {
+    let worker = move |core: Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>| {
         let tx = tx.clone();
         // Clone the captures into fresh locals here (not inside the async
         // block) so the worker closure itself stays `Fn`.
@@ -116,12 +116,13 @@ fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
         }
     };
 
-    let db = dentrado::core::db::Db::start_with_worker(db_config(cores), worker)?;
+    let dir = config.storage.dir.clone().map(PathBuf::from);
+    let db = dentrado::core::db::Db::start_with_worker(db_config(cores, dir)?, worker)?;
     let rendered = rx
         .recv()
         .map_err(|_| anyhow::anyhow!("gear worker died before producing output"))?;
     let (page_view, shell) = rendered?;
-    drop(db); // shut the cores down cleanly
+    drop(db); // shut the cores down cleanly (final flush persists the caches)
 
     let base_css = if inject {
         read_base_css(&config.server.web_dist)
@@ -207,7 +208,7 @@ fn run_mass(
         base_css,
         tx,
     };
-    let worker = move |core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>| {
+    let worker = move |core: Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>| {
         let shared = shared.clone();
         async move {
             // A panicking render (bad page data) must not hang the CLI waiting
@@ -230,9 +231,10 @@ fn run_mass(
     };
 
     let started = Instant::now();
-    let db = dentrado::core::db::Db::start_with_worker(db_config(cores), worker)?;
+    let dir = config.storage.dir.clone().map(PathBuf::from);
+    let db = dentrado::core::db::Db::start_with_worker(db_config(cores, dir)?, worker)?;
     let (rendered, listing, site_title) = coordinate(&rx, &out, cores)?;
-    drop(db); // shut the cores down cleanly
+    drop(db); // shut the cores down cleanly (final flush persists the caches)
 
     if rendered == 0 {
         anyhow::bail!("site {site_str:?} has no pages in the repository (unknown site?)");
@@ -308,7 +310,7 @@ fn coordinate(
 /// subscription is dropped after reading, so per-page state never outlives
 /// the current page over a long run.
 async fn render_owned(
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     shared: &Shared,
 ) -> anyhow::Result<()> {
     let shell_q = crate::runtime::shell(shared.space);

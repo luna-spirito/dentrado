@@ -1,0 +1,12 @@
+[package]
+name = "dentrado-storage"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "!Sync on-disk cache store for Dentrado, best-effort reliability"
+
+[dependencies]
+compio = { version = "0.19.2", features = ["fs", "io"] }
+futures = "0.3.31"
+imbl = "7.0"
+synchrony = { version = "0.1", features = ["event"] }

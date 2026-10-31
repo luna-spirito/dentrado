@@ -62,7 +62,7 @@
 use std::{borrow::Cow, collections::HashMap, rc::Rc, sync::Arc};
 
 use bytes::Bytes;
-use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
+use dentrado::core::{core_ctx::Core, storage::PagedStorage};
 use kolorinko_rt::wire::{ClientMsg, ServerMsg};
 use kolorinko_rt::{
     Body, LocalId, SYSTEM_PREFIX, SafePathComponent, SpaceId, format_page_route, simplify,
@@ -112,7 +112,7 @@ pub(crate) async fn resolve(
     full: &str,
     accept_zstd: bool,
     assets: &Arc<HashMap<String, Body>>,
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     host: Option<&str>,
 ) -> Reply {
     let path = full.split('?').next().unwrap_or(full);
@@ -172,7 +172,7 @@ pub(crate) async fn resolve(
 /// stream's silence encodes).
 pub(crate) async fn legacy(
     body: &[u8],
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
 ) -> Reply {
     let Ok(ClientMsg::Subscribe { id, hash }) = serde_json::from_slice(body) else {
         return Reply::bad_request();
@@ -209,7 +209,7 @@ async fn route(
     path: &str,
     accept_zstd: bool,
     assets: &Arc<HashMap<String, Body>>,
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     host: Option<&str>,
 ) -> Reply {
     let segs = segments(path);
@@ -256,7 +256,7 @@ async fn tail_route(
     space: SpaceId,
     accept_zstd: bool,
     assets: &Arc<HashMap<String, Body>>,
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     host: Option<&str>,
 ) -> Reply {
     if let Some(local) = tail.first().and_then(|s| LocalId::parse(s)) {
@@ -305,7 +305,7 @@ async fn tail_route(
 /// form, the main origin on the full one). `None` (unregistered space,
 /// unknown landing) is a 404.
 async fn landing_redirect(
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     space: &SpaceId,
     host: Option<&str>,
 ) -> Reply {
@@ -328,7 +328,7 @@ async fn landing_redirect(
 ///
 /// [`repo_snap`]: crate::wikidot_page::repo_snap
 async fn landing_slug(
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     space: &SpaceId,
 ) -> Option<Slug> {
     let site = crate::globals::site_of(space)?;
@@ -361,7 +361,7 @@ async fn code_reply(
     slug: Slug,
     n: u32,
     accept_zstd: bool,
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
 ) -> Reply {
     let Some(site) = crate::globals::site_of(&space) else {
         return Reply::not_found();
@@ -412,7 +412,7 @@ fn slug_of(tail: &[&str]) -> Option<Slug> {
 /// page's title (for the redirect's title segment). `None` when the space is
 /// unregistered or the site has no such page.
 async fn page_local(
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     space: &SpaceId,
     slug: &Slug,
 ) -> Option<(LocalId, String)> {
@@ -428,7 +428,7 @@ async fn page_local(
 async fn ssr(
     accept_zstd: bool,
     assets: &Arc<HashMap<String, Body>>,
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     host: Option<&str>,
     space: SpaceId,
     local: LocalId,

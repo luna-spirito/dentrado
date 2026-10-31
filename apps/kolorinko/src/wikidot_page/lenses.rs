@@ -9,6 +9,9 @@ use super::*;
 #[derive(Default, Clone, Debug)]
 pub(crate) struct RepoSnapCache;
 
+// No carried state, nothing to persist.
+impl dentrado::core::storage::CacheSer for RepoSnapCache {}
+
 /// The `repo` core's snapshot as a cross-core `shared` value: an O(1)
 /// clone of the followed `Rc`, so every consumer core holds the whole
 /// corpus by reference and reads pages, slugs, selections, and bodies
@@ -27,6 +30,9 @@ pub(crate) fn repo_snap(data: &RepoSnapshot) -> RepoSnapshot {
 /// carries no state between runs.
 #[derive(Default, Clone, Debug)]
 pub(crate) struct ShellCache;
+
+// No carried state, nothing to persist.
+impl dentrado::core::storage::CacheSer for ShellCache {}
 
 /// The space's whole chrome in one shot: the fully include-resolved `nav:top`
 /// and `nav:side` pages, the theme-root URLs, and the landing page's

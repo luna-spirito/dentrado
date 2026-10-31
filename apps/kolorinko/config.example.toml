@@ -31,3 +31,10 @@ inject_wt_hash = false
 # Served from systemd LoadCredential (see kolorinko.service).
 cert_file = "/run/credentials/kolorinko.service/cert"
 key_file = "/run/credentials/kolorinko.service/key"
+
+# Restart-surviving gear caches (dentrado-storage pages): parsed-article
+# views survive a restart, so a cold start skips re-parsing unchanged pages.
+# One page-store file per core lands in this directory. Omit the section
+# for RAM-only mode (every cache recomputed at startup).
+[storage]
+dir = "/var/lib/kolorinko/store"

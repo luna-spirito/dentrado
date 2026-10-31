@@ -8,7 +8,7 @@ use dentrado::{
     core::{
         core_ctx::Core,
         db::{Db, DbConfig, Doorbell},
-        storage::InMemoryStorage,
+        storage::PagedStorage,
     },
     types::NodeId,
 };
@@ -57,6 +57,16 @@ struct Config {
     /// order, which defines `/`'s serving space.
     #[serde(rename = "ensure-evakuilo-sites", default)]
     ensure_evakuilo_sites: IndexMap<String, globals::SiteCfg>,
+    /// Restart-surviving gear-cache store. Absent → everything lives in RAM
+    /// only (each cache recomputed at startup).
+    #[serde(default)]
+    storage: StorageCfg,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StorageCfg {
+    /// Directory for the per-core page-store files, created if missing.
+    dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,7 +209,7 @@ fn run_server(config: Config) -> anyhow::Result<()> {
         wt_hash,
     ));
 
-    let worker = move |core: Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>| {
+    let worker = move |core: Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>| {
         let bind = bind.clone();
         let assets = assets.clone();
         async move {
@@ -229,7 +239,8 @@ fn run_server(config: Config) -> anyhow::Result<()> {
     // core dies, the tasks are cancelled — and `park` returns, letting the
     // process exit so the supervisor can restart it. Without this the process
     // would linger as a zombie serving nothing.
-    let mut db = Db::start_with_worker(db_config(cores), worker)?;
+    let dir = config.storage.dir.clone().map(PathBuf::from);
+    let mut db = Db::start_with_worker(db_config(cores, dir)?, worker)?;
     db.park();
     anyhow::bail!("all core threads exited, the Db died (core panic)");
 }
@@ -251,10 +262,27 @@ pub(crate) fn core_count() -> NonZero<u32> {
     .unwrap()
 }
 
-/// Build a single-node [`DbConfig`] for `cores` cores. Shared by the server
-/// ([`run_server`]) and the one-shot render CLI ([`render_cli`]).
-fn db_config(cores: NonZero<u32>) -> DbConfig<KolorinkoRT, InMemoryStorage<KolorinkoRT>> {
-    DbConfig {
+/// Build a single-node [`DbConfig`] for `cores` cores, persisting gear caches
+/// under `storage_dir` (one page-store file per core) or RAM-only when
+/// `None`. Shared by the server ([`run_server`]) and the render CLI
+/// ([`render_cli`]).
+fn db_config(
+    cores: NonZero<u32>,
+    storage_dir: Option<PathBuf>,
+) -> anyhow::Result<DbConfig<KolorinkoRT, PagedStorage<KolorinkoRT>>> {
+    let make_storage: Arc<dyn Fn(u32) -> PagedStorage<KolorinkoRT> + Send + Sync> =
+        match storage_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| anyhow::anyhow!("create storage dir {}: {e}", dir.display()))?;
+                // One page-store file per core, named by the core's id — routing
+                // is deterministic, so run N's core k reads exactly what run N-1's
+                // core k wrote.
+                Arc::new(move |core| PagedStorage::on_disk(dir.join(format!("core-{core}.dstore"))))
+            }
+            None => Arc::new(|_| PagedStorage::<KolorinkoRT>::ram()),
+        };
+    Ok(DbConfig {
         num_cores: cores,
         node_id: NodeId(0),
         module: std::sync::Arc::new(()),
@@ -262,6 +290,6 @@ fn db_config(cores: NonZero<u32>) -> DbConfig<KolorinkoRT, InMemoryStorage<Kolor
         doorbells: iter::repeat_with(Doorbell::new)
             .take(cores.get() as usize)
             .collect(),
-        make_storage: std::sync::Arc::new(InMemoryStorage::<KolorinkoRT>::default),
-    }
+        make_storage,
+    })
 }

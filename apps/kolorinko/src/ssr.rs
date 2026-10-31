@@ -5,7 +5,7 @@
 
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 
-use dentrado::core::{core_ctx::Core, storage::InMemoryStorage};
+use dentrado::core::{core_ctx::Core, storage::PagedStorage};
 use kolorinko_rt::{Body, LocalId, SiteShell, SpaceId, SsrState, format_page_route, wire::GearOut};
 use kolorinko_wikitext::ArticleView;
 
@@ -22,7 +22,7 @@ use crate::runtime::{KolorinkoRT, article_latest, shell};
 /// [`kolorinko_rt::DEFAULT_SPACE_GLOBAL`]).
 pub(crate) async fn document(
     assets: &Arc<HashMap<String, Body>>,
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     space: SpaceId,
     local: LocalId,
     host: Option<&str>,
@@ -59,7 +59,7 @@ pub(crate) async fn document(
 /// encodings — exactly what a push would carry — so a hydrating client can
 /// skip re-fetching what the document already shows.
 pub(crate) async fn state(
-    core: &Rc<Core<KolorinkoRT, InMemoryStorage<KolorinkoRT>>>,
+    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     space: SpaceId,
     local: LocalId,
 ) -> SsrState {

@@ -141,7 +141,7 @@ where
                 module: module.clone(),
                 peers: std::mem::take(&mut all_peers[i]),
                 doorbells,
-                make_storage: Arc::new(|| S::default()),
+                make_storage: Arc::new(|_| S::default()),
             };
             let db = Db::start_with_worker(config, worker_fn.clone()).expect("Db::start failed");
             nodes.push(Node { db });

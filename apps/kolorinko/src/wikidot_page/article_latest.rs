@@ -15,6 +15,43 @@ pub(crate) struct ParsedCache {
     pub(super) view: Option<ArticleView>,
 }
 
+/// The persisted image of [`ParsedCache`] for `CacheSer`: `Arc` sharing
+/// flattens to plain strings (serde's `rc` support stays off).
+#[derive(serde::Serialize)]
+struct ParsedImageRef<'a> {
+    body: Option<&'a str>,
+    view: Option<&'a ArticleView>,
+}
+
+#[derive(serde::Deserialize)]
+struct ParsedImageOwned {
+    body: Option<String>,
+    view: Option<ArticleView>,
+}
+
+impl dentrado::core::storage::CacheSer for ParsedCache {
+    fn ser_image(&self) -> Option<Vec<u8>> {
+        serde_json::to_vec(&ParsedImageRef {
+            body: self.body.as_deref(),
+            view: self.view.as_ref(),
+        })
+        .ok()
+    }
+
+    fn de_image(&mut self, bytes: &[u8]) -> bool {
+        match serde_json::from_slice::<ParsedImageOwned>(bytes) {
+            Ok(img) => {
+                *self = ParsedCache {
+                    body: img.body.map(Arc::from),
+                    view: img.view,
+                };
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 /// Parse a page's latest body into an [`ArticleView`] **without** resolving
 /// `[[include]]` directives. Keyed canonically and living off the `repo`
 /// core, it reads the page out of the one [`repo_snap`] dependency per run
@@ -62,6 +99,9 @@ pub(crate) async fn article_latest_parsed<S: Storage<KolorinkoRT>>(
 /// any change).
 #[derive(Default, Clone, Debug)]
 pub(crate) struct LatestCache;
+
+// No carried state, nothing to persist.
+impl dentrado::core::storage::CacheSer for LatestCache {}
 
 /// Render a page's final [`ArticleView`] by running [`resolve_full`] — the
 /// `[[include]]` / `[[module ListPages]]` / `[[iftags]]` / link / resource

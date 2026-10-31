@@ -78,8 +78,10 @@
 //! No new sync↔async boundary is introduced.
 
 pub mod in_memory;
+pub mod paged;
 
 pub use in_memory::InMemoryStorage;
+pub use paged::PagedStorage;
 
 use std::{fmt::Debug, future::Future, io, marker::PhantomData};
 
@@ -139,21 +141,38 @@ pub struct AlignedPage(pub [u8; PAGE_SIZE]);
 /// implements so a [`Storage`] backend can persist it and track the pages it
 /// roots.
 ///
-/// `page_roots` is the only member the storage layer calls today: a cache
-/// declares the pages it directly roots, and storage reference-counts them
-/// (incref on [`Storage::put_cache`] **before** decref of the superseded
-/// cache's roots, so a shared root never dips to zero mid-swap).
+/// `page_roots` is what an in-process backend calls to reference-count the
+/// pages a cache directly roots (incref on [`Storage::put_cache`] **before**
+/// decref of the superseded cache's roots, so a shared root never dips to zero
+/// mid-swap). `ser_image`/`de_image` are what a restart-surviving backend
+/// ([`PagedStorage`](crate::core::storage::PagedStorage)) calls to spill the
+/// cache itself into pages; a cache that leaves them at the default simply
+/// cold-starts after a restart — correct, only slower (the cache is
+/// recomputable from the event log).
+///
 /// TODO: Add <GearId> parameter to make key-aware deserialization
 pub trait CacheSer {
     /// The pages this cache directly roots.
-    fn page_roots(&self) -> &[PageId];
-}
-
-impl CacheSer for () {
     fn page_roots(&self) -> &[PageId] {
         &[]
     }
+
+    /// The cache as one self-contained byte image, or `None` if this cache
+    /// does not persist. The image must round-trip through [`de_image`] into
+    /// an equivalent cache.
+    fn ser_image(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Rebuild in place from a prior [`ser_image`](Self::ser_image) of this
+    /// same cache type; `false` marks the image unusable (version skew,
+    /// corruption) — the caller starts from a fresh cache instead.
+    fn de_image(&mut self, _bytes: &[u8]) -> bool {
+        false
+    }
 }
+
+impl CacheSer for () {}
 
 /// Typed physical storage for one core. `Watermark::default()` means
 /// "from the beginning".

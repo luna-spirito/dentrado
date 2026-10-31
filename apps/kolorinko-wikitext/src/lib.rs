@@ -16,8 +16,6 @@
 //! Syntax reference:
 //! <https://www.wikidot.com/doc-wiki-syntax:inline-formatting>
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 mod dates;
@@ -90,7 +88,11 @@ fn assign_toc_anchors_inner(content: &mut Content, n: &mut u32) {
 pub type Content = Vec<Node>;
 
 /// `key="value"` attributes of bracket constructs (`[[div …]]`, modules, …).
-pub type Params = HashMap<String, Vec<TextObj>>;
+/// Attribute map of a directive. A `BTreeMap` (not `HashMap`): the parse
+/// tree is serialized as the persisted gear-cache image, and only a
+/// deterministic iteration order makes that image byte-stable across
+/// processes (an unstable image would defeat the unchanged-write skip).
+pub type Params = std::collections::BTreeMap<String, Vec<TextObj>>;
 
 /// Horizontal alignment, optionally floating (text wraps around it).
 ///
@@ -159,17 +161,14 @@ pub enum ContainerKind {
     Div {
         inline: bool,
         block: bool,
-        params: HashMap<String, Vec<TextObj>>,
+        params: Params,
     },
 
     /// `[[ul …]]` / `[[ol …]]` / `[[li …]]` — the explicit list containers,
     /// nestable like `[[div]]` with the same `key="value"` attributes. An
     /// `li` renders its inline body bare (no auto-`<p>`, like `[[div_]]`);
     /// `ul`/`ol` auto-paragraph stray runs like `[[div]]`.
-    List {
-        tag: ListTag,
-        params: HashMap<String, Vec<TextObj>>,
-    },
+    List { tag: ListTag, params: Params },
 
     /// `> quote` blockquote lines (adjacent lines merged). PureScript `Cit`.
     Quote,
@@ -284,7 +283,7 @@ pub enum Node {
     Image {
         align: Option<Align>,
         source: Vec<TextObj>,
-        params: HashMap<String, Vec<TextObj>>,
+        params: Params,
     },
 
     /// `[[iframe source attr="val" …]]` — an inline frame pointing at an
@@ -292,7 +291,7 @@ pub enum Node {
     /// page is not part of the wiki).
     Iframe {
         source: Vec<TextObj>,
-        params: HashMap<String, Vec<TextObj>>,
+        params: Params,
     },
 
     /// `|| cell || cell ||` table. PureScript `Tabel`.
@@ -490,13 +489,13 @@ pub struct TableCell {
 /// or header (`[[hcell]]` → `<th>`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockTable {
-    pub params: HashMap<String, Vec<TextObj>>,
+    pub params: Params,
     pub rows: Vec<BlockRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockRow {
-    pub params: HashMap<String, Vec<TextObj>>,
+    pub params: Params,
     /// Row body: cells ([`Node::BlockCell`]) possibly wrapped in `[[iftags]]`
     /// or other containers, plus inter-cell whitespace.
     pub content: Content,
@@ -506,7 +505,7 @@ pub struct BlockRow {
 pub struct BlockCell {
     /// `true` for `[[hcell]]` (renders `<th>`), `false` for `[[cell]]` (`<td>`).
     pub header: bool,
-    pub params: HashMap<String, Vec<TextObj>>,
+    pub params: Params,
     pub content: Content,
 }
 

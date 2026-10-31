@@ -17,7 +17,7 @@
 use super::*;
 use chumsky::{input::InputRef, prelude::*};
 
-pub(crate) type Params = HashMap<String, Vec<TextObj>>;
+pub(crate) type Params = kolorinko_wikitext::Params;
 
 type In<'a> = &'a [u8];
 type E<'a> = extra::Err<Rich<'a, u8>>;

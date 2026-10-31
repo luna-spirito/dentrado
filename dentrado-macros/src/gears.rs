@@ -876,6 +876,21 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         quote! { #v(#t) }
     });
 
+    // CacheSer (de)serialization: per-variant delegation to the gear's cache
+    // type (fully-qualified — the expansion site need not import CacheSer).
+    let cache_ser_arms = specs.iter().map(|g| {
+        let v = &g.name;
+        quote! {
+            Self::#v(c) => ::dentrado::core::storage::CacheSer::ser_image(c)
+        }
+    });
+    let cache_de_arms = specs.iter().map(|g| {
+        let v = &g.name;
+        quote! {
+            Self::#v(c) => ::dentrado::core::storage::CacheSer::de_image(c, bytes)
+        }
+    });
+
     // meta() arms.
     let meta_arms = specs.iter().map(|g| {
         let id_variant = &g.name;
@@ -1176,8 +1191,18 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         // callers can never name it — gear ids are constructed only through the
         // per-gear `GearQuery` builders below. It stays `pub(crate)`-declared
         // because `IsRuntime`'s associated type is reached through pub(crate)
-        // APIs (`Core::subscribe_gear`, `GearResult`, …).
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado_types::Localizable)]
+        // APIs (`Core::subscribe_gear`, `GearResult`, …). `Serialize` keys
+        // `PagedStorage`'s cache entries — every id field type must implement
+        // it, and the invoking crate must depend on `serde`.
+        #[derive(
+            Debug,
+            Clone,
+            PartialEq,
+            Eq,
+            Hash,
+            dentrado_types::Localizable,
+            ::serde::Serialize,
+        )]
         pub(crate) enum GearId {
             #( #id_variants, )*
         }
@@ -1222,6 +1247,18 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         impl ::dentrado::core::storage::CacheSer for GearCache {
             fn page_roots(&self) -> &[::dentrado::core::storage::PageId] {
                 &[]
+            }
+
+            fn ser_image(&self) -> ::core::option::Option<::std::vec::Vec<u8>> {
+                match self {
+                    #( #cache_ser_arms, )*
+                }
+            }
+
+            fn de_image(&mut self, bytes: &[u8]) -> bool {
+                match self {
+                    #( #cache_de_arms, )*
+                }
             }
         }
 

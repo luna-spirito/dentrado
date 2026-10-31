@@ -436,10 +436,7 @@ fn subst_kind(kind: ContainerKind, vars: &Vars) -> ContainerKind {
     }
 }
 
-fn subst_params(
-    params: HashMap<String, Vec<TextObj>>,
-    vars: &Vars,
-) -> HashMap<String, Vec<TextObj>> {
+fn subst_params(params: kolorinko_wikitext::Params, vars: &Vars) -> kolorinko_wikitext::Params {
     params
         .into_iter()
         .map(|(k, v)| (k, subst_textobjs(v, vars)))

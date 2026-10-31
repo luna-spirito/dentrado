@@ -27,6 +27,9 @@ use super::*;
 #[derive(Default, Clone, Debug)]
 pub(crate) struct CodeBlockCache;
 
+// No carried state, nothing to persist.
+impl dentrado::core::storage::CacheSer for CodeBlockCache {}
+
 /// Extract the Nth (1-indexed) `[[code]]` block of the page's latest
 /// revision, straight from the shared parse: the gear is a `follow` lens
 /// over [`article_latest_parsed`](crate::wikidot_page::article_latest_parsed)

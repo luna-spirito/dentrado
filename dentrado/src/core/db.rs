@@ -40,7 +40,9 @@ pub struct DbConfig<R: IsRuntime, S: Storage<R>> {
     /// thread**. Building on-thread (rather than moving a pre-built backend
     /// in from the caller) means `Storage` need not be `Send` — backends are
     /// free to hold `!Send` single-threaded types like `Rc`/`RefCell`.
-    pub make_storage: Arc<dyn Fn() -> S + Send + Sync>,
+    /// Per-core storage constructor, given the core's id (so a disk backend
+    /// can name its per-core files deterministically, not by startup order).
+    pub make_storage: Arc<dyn Fn(u32) -> S + Send + Sync>,
 }
 
 pub struct PeerChannels<R: IsRuntime> {
@@ -281,7 +283,7 @@ impl<R: IsRuntime> Db<R> {
                     let body = AssertUnwindSafe(|| {
                         // Build the storage backend on this thread so that
                         // `!Send` single-threaded backends stay valid.
-                        let storage = make_storage();
+                        let storage = make_storage(core_id);
 
                         let runtime = build_core_runtime(core_id);
 
@@ -573,7 +575,15 @@ async fn core_event_loop<R: IsRuntime, S: Storage<R>>(
                     state.handle_client_op(op).await;
                     did_work = true;
                 }
-                Ok(CoordCmd::Shutdown) => return,
+                Ok(CoordCmd::Shutdown) => {
+                    // Graceful stop: best-effort final durability point for
+                    // restart-surviving gear caches. A crash (or a dead peer
+                    // below) falls back to the last throttled epoch flush.
+                    if let Err(e) = state.storage().flush().await {
+                        log::warn!("core {} final storage flush: {e}", state.core_id());
+                    }
+                    return;
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return,
             }

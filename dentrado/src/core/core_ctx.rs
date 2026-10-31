@@ -198,6 +198,12 @@ const LIMBO_CAPACITY: usize = 64;
 /// `N * EPOCH_INTERVAL` of real time while it has interest.
 const EPOCH_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Epochs between throttled storage flushes (so `N * EPOCH_INTERVAL` of real
+/// time between durability points). `PagedStorage` gates internally on its
+/// own dirty flag; `InMemoryStorage`'s flush is a no-op — the call is free
+/// for a clean backend.
+const FLUSH_EPOCHS: u32 = 15;
+
 /// Lifecycle of a gear's background computation task.
 ///
 /// `Running`/`RunningQueued` own the spawned task's [`JoinHandle`]. Dropping
@@ -579,10 +585,22 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
     /// lives for the core's lifetime (dropping the core's runtime drops this
     /// task). `compio::time::sleep` is `!Send`, but compio spawns this task
     /// locally on the core's own thread, so it never crosses runtimes.
+    ///
+    /// Every [`FLUSH_EPOCHS`] ticks it also drives a (throttled, dirty-gated
+    /// by the backend) storage flush — the periodic durability point for
+    /// restart-surviving gear caches.
     pub(crate) async fn epoch_ticker_task(self: Rc<Self>) {
+        let mut ticks_since_flush = 0u32;
         loop {
             compio::time::sleep(EPOCH_INTERVAL).await;
             self.epoch_tick();
+            ticks_since_flush += 1;
+            if ticks_since_flush >= FLUSH_EPOCHS {
+                ticks_since_flush = 0;
+                if let Err(e) = self.storage.flush().await {
+                    log::warn!("core {} storage flush: {e}", self.core_id);
+                }
+            }
         }
     }
 
