@@ -55,7 +55,7 @@ toml = "0.8"
 clap = { version = "4.6.6", features = ["derive"] }
 clap_derive = { version = "4.6.4" }
 tar = "0.4"
-zstd = "0.13"
+zstd = "0.14"
 
 # Loader for the `steer-bpf` QUIC steering program (see `src/steer.rs`).
 [target.'cfg(target_os = "linux")'.dependencies]
