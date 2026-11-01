@@ -21,7 +21,7 @@ use crate::page::{PAGE_SIZE, Page, PageId, TORN_BYTE};
 /// thread-per-core): the store and its tasks live on one runtime
 /// thread, like the model's scheduler. `'static` — the pool's flights
 /// outlive operations and live in the driver's detached task.
-pub trait Storage: 'static {
+pub trait IsFilesystem: 'static {
     /// The positional-io handle — cloneable by nature (it carries no
     /// state): the pool's flights take a copy whole — the future owns
     /// the file, borrowing it is not an option (a flight lives in the
@@ -164,7 +164,7 @@ impl MemDisk {
     }
 }
 
-impl Storage for MemDisk {
+impl IsFilesystem for MemDisk {
     type File = MemFile;
     type Read<B: IoBufMut> = impl Future<Output = (io::Result<()>, B)>;
     type Write<B: IoBuf> = impl Future<Output = (io::Result<()>, B)>;
@@ -235,7 +235,7 @@ impl Storage for MemDisk {
 #[derive(Clone, Copy, Default)]
 pub struct FsDisk;
 
-impl Storage for FsDisk {
+impl IsFilesystem for FsDisk {
     type File = compio::fs::File;
     type Read<B: IoBufMut> = impl Future<Output = (io::Result<()>, B)>;
     type Write<B: IoBuf> = impl Future<Output = (io::Result<()>, B)>;

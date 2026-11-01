@@ -236,3 +236,34 @@ image-директивы через строку, quote_closes `;`); остал�
   первый параграф) — фильтр Raw-узлов при сборе описания.
 * Косметика (невидимо): tachys SSR ставит `<!>`-маркеры гидрации (~1 на конец абзаца,
   браузер игнорирует); `class=""` печатается и без класса у div/span/li/… (CSS-эквивалентно).
+
+  ```
+  
+
+Nov 01 05:00:28 dentrado kolorinko[238178]: [2026-11-01T05:00:28Z INFO  kolorinko::metrics] subs_active=0 gear_running=0 sub_first n=0 p50=- p99=- max=-
+Nov 01 05:01:28 dentrado kolorinko[238178]: [2026-11-01T05:01:28Z INFO  kolorinko::metrics] subs_active=0 gear_running=0 sub_first n=0 p50=- p99=- max=-
+Nov 01 05:02:28 dentrado kolorinko[238178]: [2026-11-01T05:02:28Z INFO  kolorinko::metrics] subs_active=0 gear_running=0 sub_first n=0 p50=- p99=- max=-
+Nov 01 05:03:28 dentrado kolorinko[238178]: [2026-11-01T05:03:28Z INFO  kolorinko::metrics] subs_active=0 gear_running=1 sub_first n=0 p50=- p99=- max=-
+Nov 01 05:04:28 dentrado kolorinko[238178]: [2026-11-01T05:04:28Z INFO  kolorinko::metrics] subs_active=0 gear_running=0 sub_first n=0 p50=- p99=- max=-
+Nov 01 05:05:28 dentrado kolorinko[238178]: [2026-11-01T05:05:28Z INFO  kolorinko::metrics] subs_active=0 gear_running=0 sub_first n=0 p50=- p99=- max=-
+Nov 01 05:06:28 dentrado kolorinko[238178]: [2026-11-01T05:06:28Z INFO  kolorinko::metrics] subs_active=0 gear_running=0 sub_first n=0 p50=- p99=- max=-
+Nov 01 05:07:28 dentrado kolorinko[238178]: [2026-11-01T05:07:28Z INFO  kolorinko::metrics] subs_active=0 gear_running=0 sub_first n=0 p50=- p99=- max=-
+Nov 01 05:07:39 dentrado kolorinko[238178]: thread 'dentrado-core-1' (238266) panicked at apps/kolorinko/src/wikidot_parser/pairer.rs:273:18:
+Nov 01 05:07:39 dentrado kolorinko[238178]: quote depth without a frame
+Nov 01 05:07:39 dentrado kolorinko[238178]: note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Nov 01 05:07:39 dentrado kolorinko[238178]: [2026-11-01T05:07:39Z ERROR dentrado::core] core 1: task panicked — stopping the node's cores
+Nov 01 05:07:39 dentrado kolorinko[238178]: dentrado: warning: a Shared handle outlived its Core — leaking its allocation (i'm not dealing with it rn)
+Nov 01 05:07:39 dentrado kolorinko[238178]: dentrado: warning: a Shared handle outlived its Core — leaking its allocation (i'm not dealing with it rn)
+Nov 01 05:07:39 dentrado kolorinko[238178]: dentrado: warning: a Shared handle outlived its Core — leaking its allocation (i'm not dealing with it rn)
+Nov 01 05:07:39 dentrado kolorinko[238178]: dentrado: warning: a Shared handle outlived its Core — leaking its allocation (i'm not dealing with it rn)
+Nov 01 05:07:39 dentrado kolorinko[238178]: dentrado: warning: a Shared handle outlived its Core — leaking its allocation (i'm not dealing with it rn)
+Nov 01 05:07:39 dentrado kolorinko[238178]: dentrado: warning: a Shared handle outlived its Core — leaking its allocation (i'm not dealing with it rn)
+Nov 01 05:07:39 dentrado kolorinko[238178]: dentrado: warning: a Shared handle outlived its Core — leaking its allocation (i'm not dealing with it rn)
+Nov 01 05:07:39 dentrado kolorinko[238178]: dentrado: warning: a Shared handle outlived its Core — leaking its allocation (i'm not dealing with it rn)
+Nov 01 05:07:39 dentrado kolorinko[238178]: dentrado: warning: a Shared handle outlived its Core — leaking its allocation (i'm not dealing with it rn)
+Nov 01 05:07:39 dentrado kolorinko[238178]: dentrado: warning: a Shared handle outlived its Core — leaking its allocation (i'm not dealing with it rn)
+Nov 01 05:07:39 dentrado kolorinko[238178]: dentrado: warning: a Shared handle outlived its Core — leaking its allocation (i'm not dealing with it rn)
+Nov 01 05:07:39 dentrado kolorinko[238178]: dentrado: warning: a Shared handle outlived its Core — leaking its allocation (i'm not dealing with it rn)
+Nov 01 05:07:39 dentrado kolorinko[238178]: dentrado: warning: a Shared handle outlived its Core — leaking its allocation (i'm not dealing with it rn)
+  
+  ```

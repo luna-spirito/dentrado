@@ -2,7 +2,7 @@ use imbl::OrdMap;
 use std::ops::Bound;
 
 use crate::core::gear::IsRuntime;
-use crate::core::storage::{GroupStore, Storage};
+use crate::core::storage::{GroupStore, IsStorage};
 use crate::types::{GroupEventId, Localizable, Remapper};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -80,7 +80,7 @@ impl<X> SgDiffItem<X> {
     }
 }
 
-async fn cmp_tx_sender<R: IsRuntime, S: Storage<R>>(
+async fn cmp_tx_sender<R: IsRuntime, S: IsStorage<R>>(
     store: &GroupStore<'_, R, S>,
     a: GroupEventId,
     b: GroupEventId,
@@ -111,7 +111,7 @@ async fn cmp_tx_sender<R: IsRuntime, S: Storage<R>>(
     }
 }
 
-async fn bucket_binary_search<E, R: IsRuntime, S: Storage<R>>(
+async fn bucket_binary_search<E, R: IsRuntime, S: IsStorage<R>>(
     entries: &[E],
     target_lid: GroupEventId,
     store: &GroupStore<'_, R, S>,
@@ -130,7 +130,7 @@ async fn bucket_binary_search<E, R: IsRuntime, S: Storage<R>>(
     Err(left)
 }
 
-async fn bucket_upper_bound<E, R: IsRuntime, S: Storage<R>>(
+async fn bucket_upper_bound<E, R: IsRuntime, S: IsStorage<R>>(
     entries: &[E],
     target_lid: GroupEventId,
     store: &GroupStore<'_, R, S>,
@@ -142,7 +142,7 @@ async fn bucket_upper_bound<E, R: IsRuntime, S: Storage<R>>(
     }
 }
 
-async fn bucket_lower_bound_inclusive<E, R: IsRuntime, S: Storage<R>>(
+async fn bucket_lower_bound_inclusive<E, R: IsRuntime, S: IsStorage<R>>(
     entries: &[E],
     target_lid: GroupEventId,
     store: &GroupStore<'_, R, S>,
@@ -154,7 +154,7 @@ async fn bucket_lower_bound_inclusive<E, R: IsRuntime, S: Storage<R>>(
     }
 }
 
-async fn bucket_lower_bound_exclusive<E, R: IsRuntime, S: Storage<R>>(
+async fn bucket_lower_bound_exclusive<E, R: IsRuntime, S: IsStorage<R>>(
     entries: &[E],
     target_lid: GroupEventId,
     store: &GroupStore<'_, R, S>,
@@ -211,7 +211,7 @@ impl<X: Clone> SgOrdMap<X> {
         self.buckets.iter().map(|(_, v)| v.len()).sum()
     }
 
-    pub async fn insert<R: IsRuntime, S: Storage<R>>(
+    pub async fn insert<R: IsRuntime, S: IsStorage<R>>(
         &mut self,
         key: SGEventId,
         value: X,
@@ -273,7 +273,7 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub async fn latest_at<'a, R: IsRuntime, S: Storage<R>>(
+    pub async fn latest_at<'a, R: IsRuntime, S: IsStorage<R>>(
         &'a self,
         at: &SGEventId,
         store: &GroupStore<'_, R, S>,
@@ -299,7 +299,7 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub async fn latest_before<'a, R: IsRuntime, S: Storage<R>>(
+    pub async fn latest_before<'a, R: IsRuntime, S: IsStorage<R>>(
         &'a self,
         at: &SGEventId,
         store: &GroupStore<'_, R, S>,
@@ -325,7 +325,7 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub async fn next_after<R: IsRuntime, S: Storage<R>>(
+    pub async fn next_after<R: IsRuntime, S: IsStorage<R>>(
         &self,
         at: &SGEventId,
         store: &GroupStore<'_, R, S>,
@@ -371,7 +371,7 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub async fn range_between<R: IsRuntime, S: Storage<R>>(
+    pub async fn range_between<R: IsRuntime, S: IsStorage<R>>(
         &self,
         at: &SGEventId,
         upper: &SGEventId,
@@ -425,7 +425,7 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub async fn range_after<R: IsRuntime, S: Storage<R>>(
+    pub async fn range_after<R: IsRuntime, S: IsStorage<R>>(
         &self,
         at: &SGEventId,
         store: &GroupStore<'_, R, S>,
@@ -553,7 +553,7 @@ impl<X: Clone + Ord> Ord for SgOrdMap<X> {
 
 impl<X: Clone + PartialEq> SgOrdMap<X> {
     #[must_use]
-    pub async fn diff_cloned<R: IsRuntime, S: Storage<R>>(
+    pub async fn diff_cloned<R: IsRuntime, S: IsStorage<R>>(
         &self,
         other: &Self,
         store: &GroupStore<'_, R, S>,
@@ -667,7 +667,7 @@ impl SgOrdSet {
         self.0.is_empty()
     }
 
-    pub async fn insert<R: IsRuntime, S: Storage<R>>(
+    pub async fn insert<R: IsRuntime, S: IsStorage<R>>(
         &mut self,
         key: SGEventId,
         store: &GroupStore<'_, R, S>,
@@ -689,7 +689,7 @@ impl SgOrdSet {
     }
 
     #[must_use]
-    pub async fn range_between<R: IsRuntime, S: Storage<R>>(
+    pub async fn range_between<R: IsRuntime, S: IsStorage<R>>(
         &self,
         at: &SGEventId,
         upper: &SGEventId,
@@ -699,7 +699,7 @@ impl SgOrdSet {
     }
 
     #[must_use]
-    pub async fn range_after<R: IsRuntime, S: Storage<R>>(
+    pub async fn range_after<R: IsRuntime, S: IsStorage<R>>(
         &self,
         at: &SGEventId,
         store: &GroupStore<'_, R, S>,
@@ -720,7 +720,7 @@ mod tests {
     use super::*;
     use crate::core::gear::EmptyRuntime;
     use crate::core::loc_ctx::StoredEvent;
-    use crate::core::storage::{GroupStore, InMemoryStorage, Storage};
+    use crate::core::storage::{GroupStore, InMemoryStorage, IsStorage};
     use crate::types::{LocGroupId, SenderPk};
 
     const PK_A: SenderPk = SenderPk([0u8; 32]);

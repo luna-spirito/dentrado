@@ -41,12 +41,12 @@ pub mod disk;
 mod error;
 pub mod page;
 mod persist;
-pub mod store;
+pub mod storage;
 
 pub use crate::core::freelist::ChainEntry;
 pub use crate::core::sb::Sb;
 pub use crate::core::{CacheValue, DraftId};
-pub use disk::{Fault, FsDisk, MemDisk, MemFile, Storage};
+pub use disk::{Fault, FsDisk, IsFilesystem, MemDisk, MemFile};
 pub use error::StoreError;
 pub use page::{Page, PageId};
-pub use store::{DebugState, Guard, Store, Violation};
+pub use storage::{DebugState, Guard, Storage, Violation};

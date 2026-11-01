@@ -24,7 +24,7 @@ base64 = "0.22"
 similar = { version = "3", default-features = false, features = ["std"] }
 dentrado-macros = { path = "../dentrado-macros" }
 dentrado-types = { path = "../dentrado-types" }
-dentrado-storage = { path = "../dentrado-storage" }
+dentrado-cache = { path = "../dentrado-cache" }
 
 [dev-dependencies]
 tempfile = "3"

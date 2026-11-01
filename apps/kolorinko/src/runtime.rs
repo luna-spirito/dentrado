@@ -3,7 +3,7 @@ use std::rc::Rc;
 use crate::wikidot_page::{
     AssetCache, CodeBlockCache, LatestCache, ParsedCache, RepoCache, RepoSnapCache, ShellCache,
 };
-use dentrado::core::{core_ctx::GearCtx, storage::Storage};
+use dentrado::core::{core_ctx::GearCtx, storage::IsStorage};
 use kolorinko_rt::{
     CodeBlock, LocalId, RepoSnapshot, SafePathComponent, ServedBlob, SiteShell, SpaceId,
 };

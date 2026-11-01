@@ -1052,8 +1052,8 @@ dependencies = [
  "blake3",
  "compio",
  "crc32fast",
+ "dentrado-cache",
  "dentrado-macros",
- "dentrado-storage",
  "dentrado-types",
  "flume 0.11.1",
  "futures",
@@ -1071,22 +1071,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "dentrado-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "dentrado-storage"
+name = "dentrado-cache"
 version = "0.1.0"
 dependencies = [
  "compio",
  "futures",
  "imbl",
  "synchrony",
+]
+
+[[package]]
+name = "dentrado-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

@@ -30,7 +30,7 @@ impl dentrado::core::storage::CacheSer for AssetCache {}
 /// (the HTTP layer serves a 404). `shared` so the compressed bytes are
 /// cached + deduplicated across cores; HTTP-only — never shipped over
 /// WebTransport (`to_wire_out` drops it).
-pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
+pub(crate) async fn asset<S: IsStorage<KolorinkoRT>>(
     site: &SafePathComponent,
     hash: &str,
     ctx: &mut GearCtx<KolorinkoRT, S>,

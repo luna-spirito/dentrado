@@ -30,7 +30,7 @@ use self::sb::Sb;
 pub(crate) use self::tables::Delta;
 use self::tables::Tables;
 use crate::blockcache::{BlockCache, Reply, Submit};
-use crate::disk::Storage;
+use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{Page, PageId};
 
@@ -64,7 +64,7 @@ pub(crate) enum AllocAct {
 // ([`crate::persist::PersistentCore`]). The machines are closed
 // behind the core's verbs below.
 /// The store's core — the flush-agnostic half of the lock's content.
-pub(crate) struct Core<D: Storage> {
+pub(crate) struct Core<D: IsFilesystem> {
     // REVIEW 9: Оно чем-то кроме BlockCache используется вообще? Может, перевести в BlockCache?
     // ANSWER: by no one — the flush's `sync` was the last consumer; the
     // handle now lives in the cache's disk arena, `BlockCache::file()`
@@ -189,7 +189,7 @@ impl Drafts {
     }
 }
 
-impl<D: Storage> Core<D> {
+impl<D: IsFilesystem> Core<D> {
     pub(crate) fn fresh(file: D::File, cap: usize, n_tables: usize) -> Self {
         // The arena's pages, born here at the top and shared downward: a
         // flight's lease is an `Rc` to these very pages, so the bytes

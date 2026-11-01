@@ -11,12 +11,12 @@ use crate::blockcache;
 use crate::core::freelist::{ChainEntry, chunk_cells, chunk_next};
 use crate::core::sb::{Sb, parse_sb};
 use crate::core::tree::{Item, parse_node};
-use crate::disk::Storage;
+use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{PageId, fnv_id};
-use crate::store::{Store, Violation};
+use crate::storage::{Storage, Violation};
 
-impl<D: Storage> Store<D> {
+impl<D: IsFilesystem> Storage<D> {
     /// Recovery: the newest valid SB (both chains walk through, counts
     /// and sums agree) — its table set must equal the opener's; both
     /// eof — a fresh store; content without a valid image — death.
@@ -26,7 +26,7 @@ impl<D: Storage> Store<D> {
         path: &str,
         cap: usize,
         n_tables: usize,
-    ) -> Result<Store<D>, StoreError>
+    ) -> Result<Storage<D>, StoreError>
     where
         D: 'static,
     {
@@ -56,7 +56,7 @@ impl<D: Storage> Store<D> {
             None if ra || rb => return Err(StoreError::CorruptImage),
             None => {}
         }
-        Ok(Store {
+        Ok(Storage {
             inner,
             _driver: driver,
             _flusher: flusher,
@@ -305,7 +305,7 @@ impl<D: Storage> Store<D> {
 
 /// Walk a table's tree breadth-first: its records in key order (the
 /// leaves come out left to right) and all its pages.
-pub(super) async fn walk_tree<D: Storage>(
+pub(super) async fn walk_tree<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     root: PageId,
     fuel0: u64,
@@ -335,7 +335,7 @@ pub(super) async fn walk_tree<D: Storage>(
 
 /// Walk a tail chain, collecting each chunk page with its live cells —
 /// the chain's occupancy in walk order, from the entry down.
-async fn walk_parts<D: Storage>(
+async fn walk_parts<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     e0: ChainEntry,
     fuel0: u64,
@@ -361,7 +361,7 @@ async fn walk_parts<D: Storage>(
 }
 
 /// Walk a tail chain: the cells in issue order.
-pub(super) async fn walk_chain_raw<D: Storage>(
+pub(super) async fn walk_chain_raw<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     e0: ChainEntry,
     fuel0: u64,
@@ -395,7 +395,7 @@ fn legal_roles(rs: &[&'static str]) -> bool {
 }
 
 /// An SB slot: readability (eof/failure — none) and the parse.
-async fn sb_slot<D: Storage>(
+async fn sb_slot<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     id: PageId,
 ) -> (bool, Option<Sb>) {
@@ -407,7 +407,7 @@ async fn sb_slot<D: Storage>(
 
 /// A slot is valid if the counters carry their parities, both chains
 /// walk through, and the counts and sums agree.
-async fn sb_valid<D: Storage>(inner: &Rc<RefCell<PersistentCore<D>>>, sb: &Sb) -> bool {
+async fn sb_valid<D: IsFilesystem>(inner: &Rc<RefCell<PersistentCore<D>>>, sb: &Sb) -> bool {
     let fuel = sb.next0.max(sb.next1) + 1;
     let Ok(c0) = walk_chain_raw::<D>(inner, sb.e0, fuel).await else {
         return false;

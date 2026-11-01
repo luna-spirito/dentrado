@@ -13,7 +13,7 @@ use futures::future::poll_fn;
 
 use super::arena::{LoadPage, SavePage};
 use super::{BlockCache, SlotId};
-use crate::disk::Storage;
+use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::PageId;
 use crate::persist::PersistentCore;
@@ -51,7 +51,7 @@ pub(super) struct FlDone {
 /// a pointer to the buffer from submission, it cannot move), which makes
 /// the flight itself `Unpin` — the registry grows and moves flights
 /// freely, with no `dyn`.
-enum Flight<D: Storage> {
+enum Flight<D: IsFilesystem> {
     Load {
         s: SlotId,
         id: PageId,
@@ -64,7 +64,7 @@ enum Flight<D: Storage> {
     },
 }
 
-impl<D: Storage> Future for Flight<D> {
+impl<D: IsFilesystem> Future for Flight<D> {
     type Output = FlDone;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<FlDone> {
@@ -92,12 +92,12 @@ impl<D: Storage> Future for Flight<D> {
 /// sections — a borrow never lives across an await, so single-threaded
 /// no wakeup is ever lost: a push is either seen by a poll or wakes the
 /// sleeper.
-pub(super) struct Flights<D: Storage> {
+pub(super) struct Flights<D: IsFilesystem> {
     futs: Vec<Flight<D>>,
     waker: Option<Waker>,
 }
 
-impl<D: Storage> Flights<D> {
+impl<D: IsFilesystem> Flights<D> {
     pub(super) fn new() -> Self {
         Self {
             futs: Vec::new(),
@@ -140,7 +140,7 @@ impl<D: Storage> Flights<D> {
     }
 }
 
-impl<D: Storage> BlockCache<D> {
+impl<D: IsFilesystem> BlockCache<D> {
     /// Start a flight over a slot: the lease goes to the registry (any
     /// section can push), the driver wakes and polls.
     pub(super) fn launch(&mut self, s: SlotId, page: PageId, wings: Wings) {
@@ -172,7 +172,7 @@ impl<D: Storage> BlockCache<D> {
 /// in-flight ops die cancelled, and each of their buffers stays
 /// compio's until its op is reaped, so no page is ever torn from under
 /// the kernel.
-async fn drive<D: Storage>(inner: Rc<RefCell<PersistentCore<D>>>) -> ! {
+async fn drive<D: IsFilesystem>(inner: Rc<RefCell<PersistentCore<D>>>) -> ! {
     loop {
         poll_fn(|cx| match inner.borrow_mut().core.reap(cx) {
             0 => Poll::Pending,
@@ -185,6 +185,8 @@ async fn drive<D: Storage>(inner: Rc<RefCell<PersistentCore<D>>>) -> ! {
 /// Spawn the driver task at store birth: the handle goes to `Store` —
 /// its drop is the driver's death sentence. Only the spawn needs a
 /// runtime context, hence this lives here and not in the constructor.
-pub(crate) fn spawn_driver<D: Storage>(inner: &Rc<RefCell<PersistentCore<D>>>) -> JoinHandle<!> {
+pub(crate) fn spawn_driver<D: IsFilesystem>(
+    inner: &Rc<RefCell<PersistentCore<D>>>,
+) -> JoinHandle<!> {
     compio::runtime::spawn(drive(Rc::clone(inner)))
 }

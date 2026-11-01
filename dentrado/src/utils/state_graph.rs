@@ -2,7 +2,7 @@ use imbl::OrdMap;
 use std::{collections::BTreeSet, hash::Hash};
 
 use crate::core::gear::IsRuntime;
-use crate::core::storage::{GroupStore, Storage};
+use crate::core::storage::{GroupStore, IsStorage};
 use crate::types::{GroupEventId, Localizable, Remapper};
 use crate::utils::sg_ord_map::{SgOrdMap, SgOrdSet};
 
@@ -30,7 +30,7 @@ where
         }
     }
 
-    pub(crate) async fn query_at<R: IsRuntime, S: Storage<R>>(
+    pub(crate) async fn query_at<R: IsRuntime, S: IsStorage<R>>(
         &self,
         key: &DepK,
         at: SGEventId,
@@ -131,7 +131,7 @@ pub struct HandlerCtx<
     DepK: Ord + Clone + Hash,
     DepV: Clone + PartialEq + Hash + Ord,
     R: IsRuntime,
-    S: Storage<R>,
+    S: IsStorage<R>,
     K: Ord + Clone + Hash,
     V: Clone + Hash,
     D: ?Sized,
@@ -145,7 +145,7 @@ pub struct HandlerCtx<
     store: &'a GroupStore<'a, R, S>,
 }
 
-impl<Dep, DepK, DepV, R: IsRuntime, S: Storage<R>, K, V, D>
+impl<Dep, DepK, DepV, R: IsRuntime, S: IsStorage<R>, K, V, D>
     HandlerCtx<'_, Dep, DepK, DepV, R, S, K, V, D>
 where
     Dep: Ord + Clone + Hash,
@@ -244,7 +244,7 @@ where
         }
     }
 
-    pub async fn apply<R: IsRuntime, S: Storage<R>, E, H, D>(
+    pub async fn apply<R: IsRuntime, S: IsStorage<R>, E, H, D>(
         &mut self,
         handler: &mut H,
         event_resolver: &impl async Fn(GroupEventId) -> (SGEventId, E),
@@ -305,7 +305,7 @@ where
             .map(|(_, v)| v)
     }
 
-    pub(crate) async fn query_at<'a, R: IsRuntime, S: Storage<R>>(
+    pub(crate) async fn query_at<'a, R: IsRuntime, S: IsStorage<R>>(
         &'a self,
         k: &K,
         event_id: SGEventId,
@@ -328,7 +328,7 @@ where
         self.writes.get(k).into_iter().flat_map(SgOrdMap::iter)
     }
 
-    async fn detect_dep_changes<R: IsRuntime, S: Storage<R>, D>(
+    async fn detect_dep_changes<R: IsRuntime, S: IsStorage<R>, D>(
         &mut self,
         dep_resolver: &mut D,
         store: &GroupStore<'_, R, S>,
@@ -401,7 +401,7 @@ where
         affected
     }
 
-    async fn add_affected_readers<R: IsRuntime, S: Storage<R>>(
+    async fn add_affected_readers<R: IsRuntime, S: IsStorage<R>>(
         new_timeline: &SgOrdMap<DepV>,
         changed_at: SGEventId,
         readers: &SgOrdSet,
@@ -434,7 +434,7 @@ where
         }
     }
 
-    async fn add_to_reads<R: IsRuntime, S: Storage<R>>(
+    async fn add_to_reads<R: IsRuntime, S: IsStorage<R>>(
         reads: &mut OrdMap<K, SgOrdSet>,
         k: K,
         event_id: SGEventId,
@@ -481,7 +481,7 @@ where
         }
     }
 
-    async fn propagate_key_change<R: IsRuntime, S: Storage<R>>(
+    async fn propagate_key_change<R: IsRuntime, S: IsStorage<R>>(
         reads: &OrdMap<K, SgOrdSet>,
         writes: &OrdMap<K, SgOrdMap<V>>,
         k: &K,
@@ -513,7 +513,7 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn process_queue<R: IsRuntime, S: Storage<R>, E, H, D>(
+    async fn process_queue<R: IsRuntime, S: IsStorage<R>, E, H, D>(
         &mut self,
         handler: &mut H,
         event_resolver: &impl async Fn(GroupEventId) -> (SGEventId, E),

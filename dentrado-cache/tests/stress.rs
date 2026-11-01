@@ -7,11 +7,11 @@
 
 use std::collections::HashMap;
 
-use dentrado_storage::core::freelist::{ChainEntry, write_chunk};
-use dentrado_storage::core::sb::write_sb;
-use dentrado_storage::core::val::val_split;
-use dentrado_storage::page::{Page, PageId, fnv_id};
-use dentrado_storage::{Guard, MemDisk, Storage, Store};
+use dentrado_cache::core::freelist::{ChainEntry, write_chunk};
+use dentrado_cache::core::sb::write_sb;
+use dentrado_cache::core::val::val_split;
+use dentrado_cache::page::{Page, PageId, fnv_id};
+use dentrado_cache::{Guard, IsFilesystem, MemDisk, Storage};
 
 fn run<F: Future>(f: F) -> F::Output {
     compio::runtime::Runtime::new().unwrap().block_on(f)
@@ -24,16 +24,16 @@ fn run<F: Future>(f: F) -> F::Output {
 /// чётные слоты [8, 10, 12]; мёртвые [4, 6] впереди не выдаются и в
 /// счётчики не попадают.
 async fn offset_image(disk: &MemDisk) {
-    let f = <MemDisk as Storage>::open(disk, "db").await.unwrap();
+    let f = <MemDisk as IsFilesystem>::open(disk, "db").await.unwrap();
     let mut ch = Page::zeroed();
     write_chunk(&mut ch, 0, &[4, 6, 8, 10, 12]);
-    <MemDisk as Storage>::write_page(f.clone(), 2, ch.0.to_vec())
+    <MemDisk as IsFilesystem>::write_page(f.clone(), 2, ch.0.to_vec())
         .await
         .0
         .unwrap();
     let z = Page::zeroed().0.to_vec();
     for id in 3..14 {
-        <MemDisk as Storage>::write_page(f.clone(), id, z.clone())
+        <MemDisk as IsFilesystem>::write_page(f.clone(), id, z.clone())
             .await
             .0
             .unwrap();
@@ -54,7 +54,7 @@ async fn offset_image(disk: &MemDisk) {
         fnv_id(&[8, 10, 12]),
         fnv_id(&[]),
     );
-    <MemDisk as Storage>::write_page(f.clone(), 0, sbp.0.to_vec())
+    <MemDisk as IsFilesystem>::write_page(f.clone(), 0, sbp.0.to_vec())
         .await
         .0
         .unwrap();
@@ -68,7 +68,7 @@ fn image_entry_offset() {
         let disk = MemDisk::default();
         offset_image(&disk).await;
 
-        let st = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
         assert_eq!(st.debug_state().free_nexts, [14, 15], "мир читан из SB");
         let mut ks = Vec::new();
         for _ in 0..3 {
@@ -99,7 +99,7 @@ fn image_entry_offset() {
 fn multi_chunk_flush() {
     run(async {
         let disk = MemDisk::default();
-        let st = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
         let key = b"big";
         let mut ks = Vec::new();
         for _ in 0..1100 {
@@ -143,7 +143,7 @@ fn multi_chunk_flush() {
         st.partition_exact().await.expect("смерти — клетки цепей");
         drop(st);
         // восстановление: запас живёт в цепочках, головы пусты
-        let st2 = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st2 = Storage::open(&disk, "db", 4, 1).await.unwrap();
         let (g, cv2) = st2.get_cache(0, key).await.unwrap().expect("ключ");
         assert_eq!(cv2.pages.len(), 1);
         drop(g);
@@ -188,7 +188,7 @@ fn random_ops_smoke() {
             seed
         };
         let disk = MemDisk::default();
-        let st = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
         let mut shadow: HashMap<u8, (u8, Vec<u8>)> = HashMap::new();
         let mut held: Vec<Guard<MemDisk>> = Vec::new();
         for op in 0..260u32 {
@@ -278,7 +278,7 @@ fn random_ops_smoke() {
         st.partition_exact().await.expect("биекция финала");
         drop(st);
 
-        let st2 = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st2 = Storage::open(&disk, "db", 4, 1).await.unwrap();
         for key in 0..8u8 {
             match st2.get_cache(0, &[key]).await.unwrap() {
                 Some((g, cv)) => {
@@ -319,7 +319,7 @@ fn random_ops_smoke() {
 fn tiny_pool_stress() {
     run(async {
         let disk = MemDisk::default();
-        let st = Store::open(&disk, "db", 2, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 2, 1).await.unwrap();
         for r in 0..40u8 {
             let k = st.alloc_draft_page().await.unwrap();
             st.write_draft_page(k, move |_| (vec![r; 100], ()))
@@ -339,7 +339,7 @@ fn tiny_pool_stress() {
             assert_eq!(b, vec![r; 3]);
         }
         drop(st);
-        let st2 = Store::open(&disk, "db", 2, 1).await.unwrap();
+        let st2 = Storage::open(&disk, "db", 2, 1).await.unwrap();
         let (g, cv) = st2.get_cache(0, &[7]).await.unwrap().expect("ключ");
         let b = st2
             .read_page_guarded(&g, cv.pages[0], |p| val_split(p).1[..3].to_vec())
@@ -369,7 +369,7 @@ fn tiny_pool_stress() {
 fn death_pending_bucket() {
     run(async {
         let disk = MemDisk::default();
-        let st = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
         let key = b"big";
         let mut ks = Vec::new();
         for i in 0..6u8 {
@@ -425,7 +425,7 @@ fn death_pending_bucket() {
 fn pending_deaths_survive_crash() {
     run(async {
         let disk = MemDisk::default();
-        let st = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
         let key = b"k";
         let mut ks = Vec::new();
         for i in 0..4u8 {
@@ -445,7 +445,7 @@ fn pending_deaths_survive_crash() {
         st.flush().await.unwrap(); // смерти — под гвардом: pending
         drop(g);
         drop(st); // краш: гварды и арена исчезли, образ — как закоммичен
-        let st2 = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st2 = Storage::open(&disk, "db", 4, 1).await.unwrap();
         st2.partition_exact()
             .await
             .expect("pending-смерти упакованы клетками");
@@ -460,7 +460,7 @@ fn pending_deaths_survive_crash() {
 fn live_drafts_survive_crash() {
     run(async {
         let disk = MemDisk::default();
-        let st = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
         let mut ks = Vec::new();
         for i in 0..6u8 {
             let k = st.alloc_draft_page().await.unwrap();
@@ -471,7 +471,7 @@ fn live_drafts_survive_crash() {
         }
         st.flush().await.unwrap(); // черновики живы на печати
         drop(st); // краш
-        let st2 = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st2 = Storage::open(&disk, "db", 4, 1).await.unwrap();
         st2.partition_exact()
             .await
             .expect("страницы черновиков — клетки");
@@ -486,7 +486,7 @@ fn live_drafts_survive_crash() {
 fn page_partition() {
     run(async {
         let disk = MemDisk::default();
-        let st = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
         let key = b"big";
         let mut old: Vec<PageId> = Vec::new();
         for r in 0..3u8 {
@@ -525,7 +525,7 @@ fn page_partition() {
 fn eaten_container_survives_two_rounds() {
     run(async {
         let disk = MemDisk::default();
-        let st = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
         let key = b"big";
         let mut ks = Vec::new();
         for _ in 0..8 {
@@ -576,7 +576,7 @@ fn recovered_tail_behind_new_chunk() {
     run(async {
         let disk = MemDisk::default();
         offset_image(&disk).await;
-        let st = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
         st.put_cache(0, b"k", &[0], &[], &[8]).await.unwrap();
         {
             let (g, _) = st.get_cache(0, b"k").await.unwrap().expect("ключ");
@@ -585,7 +585,7 @@ fn recovered_tail_behind_new_chunk() {
         st.flush().await.unwrap(); // здесь паника
         assert!(st.ok_store().await);
         drop(st);
-        let st2 = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st2 = Storage::open(&disk, "db", 4, 1).await.unwrap();
         let (g, cv) = st2.get_cache(0, b"k").await.unwrap().expect("ключ");
         drop(g);
         assert_eq!(cv.mt, vec![0]);
@@ -601,7 +601,7 @@ fn recovered_tail_behind_new_chunk() {
 #[test]
 fn tree_holds_many_keys() {
     run(async {
-        async fn put(st: &Store<MemDisk>, key: &[u8], mt: &[u8]) {
+        async fn put(st: &Storage<MemDisk>, key: &[u8], mt: &[u8]) {
             let p = st.alloc_draft_page().await.unwrap();
             let k = key.to_vec();
             st.write_draft_page(p, move |_| (k.clone(), ()))
@@ -611,7 +611,7 @@ fn tree_holds_many_keys() {
             st.put_cache(0, &k, &m, &[p], &[]).await.unwrap();
         }
         let disk = MemDisk::default();
-        let st = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
         // круг 1 — нечётные 1..599: сплошная укладка полного дерева
         for r in 0..300u16 {
             let mut k = vec![1u8];
@@ -643,7 +643,7 @@ fn tree_holds_many_keys() {
         }
         st.flush().await.unwrap();
         drop(st);
-        let st2 = Store::open(&disk, "db", 4, 1).await.unwrap();
+        let st2 = Storage::open(&disk, "db", 4, 1).await.unwrap();
         let mut expect: Vec<Vec<u8>> = (0..50u16)
             .map(|r| [0u8, r.to_le_bytes()[0], r.to_le_bytes()[1]].to_vec())
             .chain((0..600u16).map(|r| [1u8, r.to_le_bytes()[0], r.to_le_bytes()[1]].to_vec()))

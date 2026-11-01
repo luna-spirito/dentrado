@@ -10,7 +10,7 @@ use dentrado::{
     core::{
         core_ctx::{Core, GearCtx},
         gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime},
-        storage::{CacheSer, InMemoryStorage, PageId, Storage},
+        storage::{CacheSer, InMemoryStorage, IsStorage, PageId},
     },
     types::*,
 };
@@ -93,7 +93,7 @@ impl IsRuntime for SharedRuntime {
         SharedCache(core::marker::PhantomData)
     }
 
-    async fn run_step<S: Storage<Self>>(
+    async fn run_step<S: IsStorage<Self>>(
         ctx: &mut GearCtx<Self, S>,
         _input: GearInput<Self>,
         _cache: &mut Self::GearCache<S::Watermark>,

@@ -182,7 +182,7 @@ impl CacheSer for () {}
 /// reverse lookup its sibling getter reads. Allocation of a fresh id uses an
 /// internal monotonic counter (NOT a row count) so that future sender eviction
 /// cannot alias a live id.
-pub trait Storage<R: IsRuntime>: GlobalResolver /* TODO: Remove this, unviable. */ + 'static {
+pub trait IsStorage<R: IsRuntime>: GlobalResolver /* TODO: Remove this, unviable. */ + 'static {
     type Watermark: Clone + Debug + Default + 'static;
 
     // ── Layer 1: localization, идемпотентные аллокаторы ──────────────────
@@ -279,13 +279,13 @@ pub trait Storage<R: IsRuntime>: GlobalResolver /* TODO: Remove this, unviable. 
 /// Методы `async` и делегируют unboxed в [`Storage`] (без аллокаций сверх тех,
 /// что делает сам бекенд). Заменяет прежнюю синхронную пару
 /// `loc_ctx::GroupStore`/`EventStore`, теперь когда бекенд — `async`.
-pub struct GroupStore<'a, R: IsRuntime, S: Storage<R>> {
+pub struct GroupStore<'a, R: IsRuntime, S: IsStorage<R>> {
     storage: &'a S,
     group: LocGroupId,
     _r: PhantomData<fn() -> R>,
 }
 
-impl<'a, R: IsRuntime, S: Storage<R>> GroupStore<'a, R, S> {
+impl<'a, R: IsRuntime, S: IsStorage<R>> GroupStore<'a, R, S> {
     #[must_use]
     pub fn new(storage: &'a S, group: LocGroupId) -> Self {
         Self {

@@ -58,7 +58,7 @@ impl dentrado::core::storage::CacheSer for ParsedCache {
 /// ([`secondary_get`](dentrado::core::gear::GearQuery::secondary_get) — a
 /// local lookup thereafter; never depending on another parse gear), so the
 /// parse layer is acyclic.
-pub(crate) async fn article_latest_parsed<S: Storage<KolorinkoRT>>(
+pub(crate) async fn article_latest_parsed<S: IsStorage<KolorinkoRT>>(
     space: SpaceId,
     local: LocalId,
     ctx: &mut GearCtx<KolorinkoRT, S>,
@@ -120,7 +120,7 @@ impl dentrado::core::storage::CacheSer for LatestCache {}
 /// 99% cheap. The tree of every page fetched along the way rides along as
 /// the view's `deps`. An unregistered space or unknown local id yields an
 /// empty view (the HTTP layer turns that into a 404).
-pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
+pub(crate) async fn article_latest<S: IsStorage<KolorinkoRT>>(
     space: SpaceId,
     local: LocalId,
     _parsed: &ArticleView,

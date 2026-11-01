@@ -4,7 +4,7 @@ use dentrado::{
     core::{
         core_ctx::{Core, GearCtx},
         gear::{GearInput, GearMeta, GearProduce, IsRuntime},
-        storage::{CacheSer, InMemoryStorage, PageId, Storage},
+        storage::{CacheSer, InMemoryStorage, IsStorage, PageId},
     },
     types::*,
     wire::WireEventBody,
@@ -85,7 +85,7 @@ impl IsRuntime for MulSumRuntime {
         }
     }
 
-    async fn run_step<S: Storage<Self>>(
+    async fn run_step<S: IsStorage<Self>>(
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
         cache: &mut Self::GearCache<S::Watermark>,

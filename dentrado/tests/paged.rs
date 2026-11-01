@@ -8,7 +8,7 @@ use dentrado::{
     core::{
         core_ctx::GearCtx,
         gear::{GearInput, GearMeta, GearProduce, IsRuntime},
-        storage::{CacheSer, PageId, PagedStorage, Storage},
+        storage::{CacheSer, IsStorage, PageId, PagedStorage},
     },
     types::*,
 };
@@ -87,7 +87,7 @@ impl IsRuntime for BlobRuntime {
         }
     }
 
-    async fn run_step<S: Storage<Self>>(
+    async fn run_step<S: IsStorage<Self>>(
         _ctx: &mut GearCtx<Self, S>,
         _input: GearInput<Self>,
         _cache: &mut Self::GearCache<S::Watermark>,

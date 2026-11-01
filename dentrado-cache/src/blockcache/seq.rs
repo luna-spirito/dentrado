@@ -13,7 +13,7 @@ use futures::channel::oneshot;
 use super::arena::{LoadPage, SavePage, SlotSt, Victim};
 use super::disk_arena::DiskArena;
 use super::{PostFn, Reply, SlotId};
-use crate::disk::Storage;
+use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{Page, PageId};
 
@@ -117,7 +117,7 @@ struct Q {
 /// entry and all), and only its head is ever in motion (one flight per
 /// page at most). It knows nothing of the driving: no flights, no
 /// waiting line — those live one level up, in the driver.
-pub(super) struct SeqArena<D: Storage> {
+pub(super) struct SeqArena<D: IsFilesystem> {
     /// The disk arena below — the machine's own; the layers above reach
     /// the pages only through the machine's verbs.
     disk: DiskArena<D>,
@@ -137,7 +137,7 @@ enum Where {
     Gone,
 }
 
-impl<D: Storage> SeqArena<D> {
+impl<D: IsFilesystem> SeqArena<D> {
     pub(super) fn new(file: D::File, pages: Rc<[std::cell::UnsafeCell<Page>]>) -> Self {
         Self {
             disk: DiskArena::new(file, pages),

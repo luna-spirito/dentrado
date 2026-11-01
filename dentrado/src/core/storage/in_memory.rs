@@ -22,7 +22,7 @@ use crate::{
     core::{
         gear::IsRuntime,
         loc_ctx::{EventGroup, StoreResultSuccess, StoredEvent},
-        storage::{AlignedPage, CacheSer, GroupDiff, PageHandle, PageId, Storage},
+        storage::{AlignedPage, CacheSer, GroupDiff, IsStorage, PageHandle, PageId},
     },
     types::{
         DataId, DataVerifyError, GlobalHash, GlobalResolver, GroupEventId, GroupRouteError,
@@ -147,7 +147,7 @@ impl<R: IsRuntime> GlobalResolver for InMemoryStorage<R> {
     }
 }
 
-impl<R: IsRuntime> Storage<R> for InMemoryStorage<R>
+impl<R: IsRuntime> IsStorage<R> for InMemoryStorage<R>
 where
     R::GearCache<(usize, usize)>: CacheSer,
 {

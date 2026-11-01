@@ -2,7 +2,7 @@
 members = [
   "dentrado",
   "dentrado-macros",
-  "dentrado-storage",
+  "dentrado-cache",
   "dentrado-types",
   "apps/kolorinko",
   "apps/kolorinko/steer-bpf",
@@ -16,7 +16,7 @@ members = [
 default-members = [
   "dentrado",
   "dentrado-macros",
-  "dentrado-storage",
+  "dentrado-cache",
   "dentrado-types",
   "apps/kolorinko",
   "apps/kolorinko-render",

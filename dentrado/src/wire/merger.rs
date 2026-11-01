@@ -2,13 +2,13 @@ use crate::{
     core::{
         gear::IsRuntime,
         loc_ctx::{StoreResultSuccess, StoredEvent},
-        storage::Storage,
+        storage::IsStorage,
     },
     types::{LocDataId, LocGroupId, LocSenderId, LocUserId, Localizable, NodeId, Remapper},
     wire::format::{MergeError, WireEventBody, WireLocCtx},
 };
 
-pub(crate) struct WireLocCtxMerger<'a, R: IsRuntime, S: Storage<R>> {
+pub(crate) struct WireLocCtxMerger<'a, R: IsRuntime, S: IsStorage<R>> {
     source: &'a WireLocCtx<R>,
     target: &'a S,
     user_map: Vec<Option<LocUserId>>,
@@ -16,12 +16,12 @@ pub(crate) struct WireLocCtxMerger<'a, R: IsRuntime, S: Storage<R>> {
     data_map: Vec<Option<LocDataId>>,
 }
 
-struct MergerRemapper<'a, 'b, R: IsRuntime, S: Storage<R>> {
+struct MergerRemapper<'a, 'b, R: IsRuntime, S: IsStorage<R>> {
     merger: &'b mut WireLocCtxMerger<'a, R, S>,
     allowed_before: usize,
 }
 
-impl<'a, R: IsRuntime, S: Storage<R>> WireLocCtxMerger<'a, R, S> {
+impl<'a, R: IsRuntime, S: IsStorage<R>> WireLocCtxMerger<'a, R, S> {
     pub(crate) fn new(source: &'a WireLocCtx<R>, target: &'a S) -> Self {
         Self {
             source,
@@ -69,7 +69,7 @@ impl<'a, R: IsRuntime, S: Storage<R>> WireLocCtxMerger<'a, R, S> {
     }
 }
 
-impl<R: IsRuntime, S: Storage<R>> Remapper for MergerRemapper<'_, '_, R, S> {
+impl<R: IsRuntime, S: IsStorage<R>> Remapper for MergerRemapper<'_, '_, R, S> {
     type Err = MergeError;
     async fn remap_user(&mut self, lid: LocUserId) -> Result<LocUserId, MergeError> {
         let idx = lid.0 as usize;

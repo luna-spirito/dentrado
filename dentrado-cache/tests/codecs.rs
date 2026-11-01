@@ -1,12 +1,12 @@
 //! Раунд-трипы кодеков и зажимы против шума.
 
-use dentrado_storage::core::freelist::{
+use dentrado_cache::core::freelist::{
     CHUNK_SLOTS, ChainEntry, chunk_cells, chunk_next, write_chunk,
 };
-use dentrado_storage::core::sb::{MAX_ROOTS, parse_sb, write_sb};
-use dentrado_storage::core::tree::{build, leaf_find, parse_node, plan, route, write_node};
-use dentrado_storage::core::val::{link_val, val_split, write_val};
-use dentrado_storage::page::{PAGE_SIZE, Page, PageId, TORN_BYTE, fnv_id};
+use dentrado_cache::core::sb::{MAX_ROOTS, parse_sb, write_sb};
+use dentrado_cache::core::tree::{build, leaf_find, parse_node, plan, route, write_node};
+use dentrado_cache::core::val::{link_val, val_split, write_val};
+use dentrado_cache::page::{PAGE_SIZE, Page, PageId, TORN_BYTE, fnv_id};
 
 #[test]
 fn val_roundtrip() {

@@ -17,14 +17,14 @@ use crate::blockcache;
 use crate::core::freelist::{CHUNK_SLOTS, ChainEntry, chunk_cells, chunk_next, write_chunk};
 use crate::core::sb::write_sb;
 use crate::core::tree;
-use crate::disk::Storage;
+use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{Page, PageId, fnv_id};
-use crate::store::Store;
+use crate::storage::Storage;
 
 // ## The agent
 
-impl<D: Storage> Store<D> {
+impl<D: IsFilesystem> Storage<D> {
     /// The flush is total: the request lands in the round agent's
     /// mailbox, the reply carries the round's verdict — everyone
     /// drained into one batch shares one round. A dropped caller
@@ -58,7 +58,7 @@ impl<D: Storage> Store<D> {
 /// listener: a letter's push and ring are one section of the single
 /// lock, and a letter landing anywhere else sits in the mailbox for
 /// the next look — a wake can be spurious, never lost.
-async fn agent<D: Storage>(inner: Rc<RefCell<PersistentCore<D>>>) -> ! {
+async fn agent<D: IsFilesystem>(inner: Rc<RefCell<PersistentCore<D>>>) -> ! {
     loop {
         let ln = inner.borrow().mail_ev.listen();
         let batch = std::mem::take(&mut inner.borrow_mut().mail);
@@ -76,14 +76,16 @@ async fn agent<D: Storage>(inner: Rc<RefCell<PersistentCore<D>>>) -> ! {
 
 /// Spawn the round agent at store birth — the driver's own pattern:
 /// the handle goes to `Store`, its drop is the agent's death sentence.
-pub(super) fn spawn_agent<D: Storage>(inner: &Rc<RefCell<PersistentCore<D>>>) -> JoinHandle<!> {
+pub(super) fn spawn_agent<D: IsFilesystem>(
+    inner: &Rc<RefCell<PersistentCore<D>>>,
+) -> JoinHandle<!> {
     compio::runtime::spawn(agent(Rc::clone(inner)))
 }
 
 /// Take `n` pages from the flight: the head's remainder → the tail's
 /// chunks → growing the round's own counter. The flight is the
 /// accumulator (the round's locals).
-async fn take_flight<D: Storage>(
+async fn take_flight<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     fl: &mut Flight,
     fuel0: u64,
@@ -123,7 +125,7 @@ async fn take_flight<D: Storage>(
 /// resnapshot). The snapshot's one live read is the husk — the
 /// mid-round retires into the taken pool, whose listings retire
 /// with this round's fronts.
-async fn flip_loop<D: Storage>(
+async fn flip_loop<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     mut fl: Flight,
     need_pages: usize,
@@ -180,7 +182,7 @@ async fn flip_loop<D: Storage>(
 /// RAM commit in one borrow. The retired pages — the grafted paths'
 /// old pages — ride the round's limbo cells (crash safety) and die at
 /// the commit (EBR — the readers mid-descent).
-async fn round<D: Storage>(inner: &Rc<RefCell<PersistentCore<D>>>) -> Result<(), StoreError> {
+async fn round<D: IsFilesystem>(inner: &Rc<RefCell<PersistentCore<D>>>) -> Result<(), StoreError> {
     // The seal: everything the round starts with leaves for the
     // flight — the round's locals; the core's flush pool stays
     // empty until the commit.
@@ -416,7 +418,7 @@ async fn round<D: Storage>(inner: &Rc<RefCell<PersistentCore<D>>>) -> Result<(),
 /// pointers, the last one — onto the continuation page. Every page
 /// is assembled right in the pool's slot — no value pages are in
 /// flight.
-async fn init_chain<D: Storage>(
+async fn init_chain<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     pages: &[PageId],
     entry: ChainEntry,
@@ -443,7 +445,7 @@ async fn init_chain<D: Storage>(
 
 /// Sync the file — the handle clones out of the cache's disk arena, the
 /// await stays outside every borrow.
-async fn sync<D: Storage>(inner: &Rc<RefCell<PersistentCore<D>>>) -> Result<(), StoreError> {
+async fn sync<D: IsFilesystem>(inner: &Rc<RefCell<PersistentCore<D>>>) -> Result<(), StoreError> {
     let file = inner.borrow().core.file();
     D::sync(file)
         .await

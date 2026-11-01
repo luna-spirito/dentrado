@@ -12,7 +12,7 @@ use std::rc::Rc;
 use super::PersistentCore;
 use crate::blockcache;
 use crate::core::tree::{self, Item};
-use crate::disk::Storage;
+use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::PageId;
 
@@ -38,7 +38,7 @@ struct Up {
 /// children before parents, the new root last, `tree::build`'s order —
 /// and the old pages the dirty paths retired. `fuel0` bounds the
 /// reads: more nodes than the file holds can only be corruption.
-pub(super) async fn run<D: Storage>(
+pub(super) async fn run<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     root: PageId,
     mut batch: Vec<Item>,
@@ -217,7 +217,7 @@ fn repoint(node: &tree::Node, ups: &HashMap<PageId, Up>) -> Vec<Item> {
     out
 }
 
-async fn read<D: Storage>(
+async fn read<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     p: PageId,
     fuel: &mut u64,

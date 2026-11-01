@@ -80,7 +80,7 @@ use futures::channel::oneshot;
 
 use self::flights::{FlDone, Flights, Wings};
 use self::seq::{Claim, Room, SeqArena, Step};
-use crate::disk::Storage;
+use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{Page, PageId};
 
@@ -102,7 +102,7 @@ pub(crate) type Reply = oneshot::Sender<Result<(), StoreError>>;
 /// pages' queues) and the driver over it — the waiting line for room
 /// and the flights. Every short section over the store's `RefCell` runs
 /// through here.
-pub(crate) struct BlockCache<D: Storage> {
+pub(crate) struct BlockCache<D: IsFilesystem> {
     seq: SeqArena<D>,
     /// Pages waiting for a slot, front first: each has a live queue and
     /// no page in the cache; every landing passes freed rooms down
@@ -113,7 +113,7 @@ pub(crate) struct BlockCache<D: Storage> {
 
 // ## The driver
 
-impl<D: Storage> BlockCache<D> {
+impl<D: IsFilesystem> BlockCache<D> {
     /// The pages come ready-made from the store's top — born in
     /// `PersistentCore::fresh` and shared with flights from their first
     /// breath (see the arena's docs).

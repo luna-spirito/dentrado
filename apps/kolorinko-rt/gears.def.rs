@@ -60,15 +60,12 @@ pub(crate) async fn repo(tick: bool, cache: &mut RepoCache) -> Rc<RepoSnapshot> 
     shared,
     name = RepoSnap,
 )]
-pub(crate) fn repo_snap(
-    repo_data: Rc<RepoSnapshot>,
-    _cache: &mut RepoSnapCache,
-) -> RepoSnapshot {
+pub(crate) fn repo_snap(repo_data: Rc<RepoSnapshot>, _cache: &mut RepoSnapCache) -> RepoSnapshot {
     crate::wikidot_page::repo_snap(&repo_data)
 }
 
 #[dentrado::gear(event, shared, name = Asset)]
-pub(crate) async fn asset<S: Storage<KolorinkoRT>>(
+pub(crate) async fn asset<S: IsStorage<KolorinkoRT>>(
     site: SafePathComponent,
     hash: String,
     ctx: &mut GearCtx<KolorinkoRT, S>,
@@ -104,7 +101,7 @@ pub(crate) fn code_block(
     exposed,
     name = Shell,
 )]
-pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
+pub(crate) async fn shell<S: IsStorage<KolorinkoRT>>(
     space: SpaceId,
     repo_data: Rc<RepoSnapshot>,
     ctx: &mut GearCtx<KolorinkoRT, S>,
@@ -118,7 +115,7 @@ pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
 // canonical address, so it lives on its own core — off `repo`'s — and its
 // output is what `article_latest` / `code_block` statically follow.
 #[dentrado::gear(event, shared, name = ArticleLatestParsed)]
-pub(crate) async fn article_latest_parsed<S: Storage<KolorinkoRT>>(
+pub(crate) async fn article_latest_parsed<S: IsStorage<KolorinkoRT>>(
     space: SpaceId,
     local: LocalId,
     ctx: &mut GearCtx<KolorinkoRT, S>,
@@ -133,7 +130,7 @@ pub(crate) async fn article_latest_parsed<S: Storage<KolorinkoRT>>(
     exposed,
     name = ArticleLatest,
 )]
-pub(crate) async fn article_latest<S: Storage<KolorinkoRT>>(
+pub(crate) async fn article_latest<S: IsStorage<KolorinkoRT>>(
     space: SpaceId,
     local: LocalId,
     parsed: &ArticleView,

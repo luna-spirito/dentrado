@@ -17,13 +17,13 @@ use synchrony::unsync::event::Event;
 use crate::blockcache::Reply;
 use crate::core::Core;
 use crate::core::sb::Sb;
-use crate::disk::Storage;
+use crate::disk::IsFilesystem;
 
 /// The single lock's full content: the core plus the round agent's
 /// mailbox and the commit generation. Everything else a round carries
 /// is the flight's own locals — these are all the overlay owns
 /// between rounds.
-pub(crate) struct PersistentCore<D: Storage> {
+pub(crate) struct PersistentCore<D: IsFilesystem> {
     /// The flush-agnostic core — the machines by concern.
     pub(crate) core: Core<D>,
     /// The round agent's mailbox: the reply addresses of everyone
@@ -39,7 +39,7 @@ pub(crate) struct PersistentCore<D: Storage> {
     pub(super) r#gen: u64,
 }
 
-impl<D: Storage> PersistentCore<D> {
+impl<D: IsFilesystem> PersistentCore<D> {
     pub(super) fn fresh(file: D::File, cap: usize, n_tables: usize) -> Self {
         Self {
             core: Core::fresh(file, cap, n_tables),

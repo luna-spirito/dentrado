@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use crate::{
     core::{
         gear::IsRuntime,
-        storage::{GroupStore, Storage},
+        storage::{GroupStore, IsStorage},
     },
     types::{LocSenderEventId, LocSenderId, Localizable, Remapper},
 };
@@ -107,7 +107,7 @@ impl ChildEntry {
         Self { child_id, offset }
     }
 
-    async fn cmp_rga<R: IsRuntime, S: Storage<R>>(
+    async fn cmp_rga<R: IsRuntime, S: IsStorage<R>>(
         &self,
         other: &Self,
         store: &GroupStore<'_, R, S>,
@@ -165,7 +165,7 @@ impl AnchorAgg {
     }
 
     #[must_use]
-    pub async fn apply<R: IsRuntime, S: Storage<R>>(
+    pub async fn apply<R: IsRuntime, S: IsStorage<R>>(
         mut self,
         event_id: LocSenderEventId,
         upd: &TextUpd,

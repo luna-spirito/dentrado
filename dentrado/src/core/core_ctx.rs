@@ -24,7 +24,7 @@ use crate::{
         gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime},
         shared::{RemoteShared, Shared, SharedArena, SharedBus, SharedData, SharedKey},
         stats::CoreStats,
-        storage::{GroupStore, Storage},
+        storage::{GroupStore, IsStorage},
         subscription::Epoch,
     },
     types::{GlobalCoreId, GlobalHash, LocGroupId, NodeId},
@@ -334,7 +334,7 @@ pub(crate) fn broadcast_core_death<R: IsRuntime>(
 }
 
 #[derive(Debug)]
-pub struct Core<R: IsRuntime, S: Storage<R>> {
+pub struct Core<R: IsRuntime, S: IsStorage<R>> {
     num_cores: NonZero<u32>,
     core_id: u32,
     node_id: NodeId,
@@ -372,7 +372,7 @@ pub(crate) enum HandleMsgResult {
     Die,
 }
 
-impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
+impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
     pub(crate) fn new(
         num_cores: NonZero<u32>,
         core_id: u32,
@@ -1796,7 +1796,7 @@ impl<R: IsRuntime, S: Storage<R>> Core<R, S> {
 /// working unchanged), and the per-run `deps` set
 /// accumulated by `secondary_get` calls (reconciled against the gear's stored
 /// `dep_set` at run end).
-pub struct GearCtx<R: IsRuntime, S: Storage<R>> {
+pub struct GearCtx<R: IsRuntime, S: IsStorage<R>> {
     pub(crate) core: Rc<Core<R, S>>,
     pub(crate) gear: R::GearId,
     /// Deps accumulated by `secondary_get`. Interior-mutable so `secondary_get`
@@ -1805,14 +1805,14 @@ pub struct GearCtx<R: IsRuntime, S: Storage<R>> {
     pub(crate) deps: RefCell<HashSet<R::GearId>>,
 }
 
-impl<R: IsRuntime, S: Storage<R>> Deref for GearCtx<R, S> {
+impl<R: IsRuntime, S: IsStorage<R>> Deref for GearCtx<R, S> {
     type Target = Core<R, S>;
     fn deref(&self) -> &Self::Target {
         &self.core
     }
 }
 
-impl<R: IsRuntime, S: Storage<R>> GearCtx<R, S> {
+impl<R: IsRuntime, S: IsStorage<R>> GearCtx<R, S> {
     /// The id of the gear currently running.
     pub fn gear(&self) -> &R::GearId {
         &self.gear
@@ -1856,7 +1856,7 @@ struct StopCtx<'a, R: IsRuntime> {
 /// the arena directly; a **foreign** handle forwards a `SharedUnref` over the
 /// inter-core channel (FIFO per core-pair ⇒ unrefs from one core land in order,
 /// so the owner's `xcount` never goes negative).
-impl<R: IsRuntime, S: Storage<R>> SharedBus for Core<R, S> {
+impl<R: IsRuntime, S: IsStorage<R>> SharedBus for Core<R, S> {
     fn shared_local_unref(&self, key: SharedKey) {
         let data = self.shared_arena.borrow_mut().dec(key);
         if let Some(data) = data {

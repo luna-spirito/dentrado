@@ -14,7 +14,7 @@ use std::task::{Context, Waker};
 
 use crate::core::core_ctx::{Core, GearKey};
 use crate::core::gear::{GearResult, IsRuntime};
-use crate::core::storage::Storage;
+use crate::core::storage::IsStorage;
 
 /// A minimal single-threaded change signal: a monotonic epoch plus the wakers of
 /// everyone parked waiting for the next change. Lives inside `ActiveGear` and is
@@ -64,7 +64,7 @@ impl Epoch {
 /// gear (demoting it to limbo, or evicting it under pressure). Naturally
 /// `!Sync` via `Rc<Core>`: it must live on the owning core's thread.
 #[must_use]
-pub struct Subscription<R: IsRuntime, S: Storage<R>> {
+pub struct Subscription<R: IsRuntime, S: IsStorage<R>> {
     pub(crate) core: Rc<Core<R, S>>,
     /// The arena key, stored directly (not the `R::GearId`) so `current`/`next`/
     /// `Drop` skip the `gear_index` lookup. Safe because a live `Subscription`
@@ -74,7 +74,7 @@ pub struct Subscription<R: IsRuntime, S: Storage<R>> {
     pub(crate) key: GearKey,
 }
 
-impl<R: IsRuntime, S: Storage<R>> Subscription<R, S> {
+impl<R: IsRuntime, S: IsStorage<R>> Subscription<R, S> {
     /// Read the gear's currently-cached output. The value is guaranteed to be
     /// present (subscribe awaits the first computation).
     #[must_use]
@@ -96,7 +96,7 @@ impl<R: IsRuntime, S: Storage<R>> Subscription<R, S> {
     }
 }
 
-impl<R: IsRuntime, S: Storage<R>> Drop for Subscription<R, S> {
+impl<R: IsRuntime, S: IsStorage<R>> Drop for Subscription<R, S> {
     fn drop(&mut self) {
         if self.core.release_direct_subscriber(self.key) {
             self.core.rebalance_key(self.key);

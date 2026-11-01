@@ -18,7 +18,7 @@ use crate::{
             broadcast_core_death,
         },
         gear::IsRuntime,
-        storage::Storage,
+        storage::IsStorage,
     },
     types::{GlobalCoreId, GlobalHash, NodeId},
     wire::{MergeError, RunGearError, WireEventBody, WireLocCtx},
@@ -28,7 +28,7 @@ use futures::future::select_all;
 
 pub use crate::core::doorbell::{Doorbell, DoorbellHandle};
 
-pub struct DbConfig<R: IsRuntime, S: Storage<R>> {
+pub struct DbConfig<R: IsRuntime, S: IsStorage<R>> {
     pub num_cores: NonZero<u32>,
     pub node_id: NodeId,
     pub module: Arc<R::Module>,
@@ -148,7 +148,7 @@ impl<R: IsRuntime> Db<R> {
     /// Start the database with no user worker function.
     /// Cores run only the core event loop.
     #[must_use]
-    pub fn start<S: Storage<R>>(config: DbConfig<R, S>) -> io::Result<Self> {
+    pub fn start<S: IsStorage<R>>(config: DbConfig<R, S>) -> io::Result<Self> {
         Self::start_with_worker::<S, _, _>(config, |_| std::future::pending::<()>())
     }
 
@@ -168,7 +168,7 @@ impl<R: IsRuntime> Db<R> {
     /// serving with a hole would only strand work routed through the
     /// dead core.
     #[must_use]
-    pub fn start_with_worker<S: Storage<R>, W, F>(
+    pub fn start_with_worker<S: IsStorage<R>, W, F>(
         mut config: DbConfig<R, S>,
         worker_fn: W,
     ) -> io::Result<Self>
@@ -506,7 +506,7 @@ fn build_core_runtime(core_id: u32) -> compio::runtime::Runtime {
     unreachable!()
 }
 
-async fn core_event_loop<R: IsRuntime, S: Storage<R>>(
+async fn core_event_loop<R: IsRuntime, S: IsStorage<R>>(
     state: Rc<Core<R, S>>,
     doorbell: Doorbell,
     cmd_rx: mpsc::Receiver<CoordCmd<R>>,

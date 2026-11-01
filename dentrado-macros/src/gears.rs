@@ -10,7 +10,7 @@
 //! #[gears(runtime = KolorinkoRT)]
 //! pub(crate) mod gears {
 //!     #[gear(timer(period = secs(900)), local, name = Repo)]
-//!     pub(crate) async fn repo<S: Storage<KolorinkoRT>>(
+//!     pub(crate) async fn repo<S: IsStorage<KolorinkoRT>>(
 //!         repo_meta: RepoMeta,   // id field → GearId::Repo(RepoMeta)
 //!         tick: bool,            // timer tick
 //!         cache: &mut RepoCache, // → GearCache::Repo(RepoCache)
@@ -1290,7 +1290,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
                 }
             }
 
-            async fn run_step<S: ::dentrado::core::storage::Storage<Self>>(
+            async fn run_step<S: ::dentrado::core::storage::IsStorage<Self>>(
                 ctx: &mut ::dentrado::core::core_ctx::GearCtx<Self, S>,
                 input: ::dentrado::core::gear::GearInput<Self>,
                 cache: &mut Self::GearCache<S::Watermark>,

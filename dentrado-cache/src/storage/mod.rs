@@ -29,7 +29,7 @@ use crate::core::freelist::{chunk_cells, chunk_next};
 use crate::core::tree::{leaf_find, parse_node, route};
 use crate::core::val::{link_val, val_split, write_val};
 use crate::core::{AllocAct, CacheValue, DraftId};
-use crate::disk::Storage;
+use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{Page, PageId};
 use crate::persist::PersistentCore;
@@ -38,12 +38,12 @@ use crate::persist::PersistentCore;
 
 /// The `get_cache` guard — an EBR pin (the subscription bucket). Death
 /// is RAII: dropping it unsubscribes and advances the emptied bucket.
-pub struct Guard<D: Storage> {
+pub struct Guard<D: IsFilesystem> {
     inner: Rc<RefCell<PersistentCore<D>>>,
     bucket: usize,
 }
 
-impl<D: Storage> Drop for Guard<D> {
+impl<D: IsFilesystem> Drop for Guard<D> {
     fn drop(&mut self) {
         self.inner.borrow_mut().core.drop_step(self.bucket);
     }
@@ -57,7 +57,7 @@ impl<D: Storage> Drop for Guard<D> {
 /// cancels on drop, it does not detach) — and their `Rc`s are the
 /// store's last references, so the store dies with them, not before
 /// them.
-pub struct Store<D: Storage> {
+pub struct Storage<D: IsFilesystem> {
     pub(crate) inner: Rc<RefCell<PersistentCore<D>>>,
     pub(crate) _driver: JoinHandle<!>,
     pub(crate) _flusher: JoinHandle<!>,
@@ -88,7 +88,7 @@ pub enum Violation {
     Broken(&'static str),
 }
 
-impl<D: Storage> Store<D> {
+impl<D: IsFilesystem> Storage<D> {
     pub fn debug_state(&self) -> DebugState {
         let (r#gen, flush_busy, ram) = {
             let inner = self.inner.borrow();

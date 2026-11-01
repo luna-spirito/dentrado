@@ -67,7 +67,7 @@ cert_file = ".certs/localhost.pem"
 key_file = ".certs/localhost-key.pem"
 
 [storage]
-# Restart-surviving gear caches (dentrado-storage pages): parsed-article
+# Restart-surviving gear caches (dentrado-cache pages): parsed-article
 # views survive a restart, so a re-render skips re-parsing unchanged pages.
 # One page-store file per core lands in this directory. Remove the section
 # for RAM-only mode (every cache recomputed at startup).

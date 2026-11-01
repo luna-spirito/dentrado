@@ -87,7 +87,7 @@
 
 use crate::wikidot_parser::{parse, parse_link_target, wikidot_verbatim};
 use compio::fs;
-use dentrado::core::{core_ctx::GearCtx, gear::GearResult, storage::Storage};
+use dentrado::core::{core_ctx::GearCtx, gear::GearResult, storage::IsStorage};
 use imbl::HashMap as ImHashMap;
 use kolorinko_render::{http_refs, http_tail, rewrite_with};
 use kolorinko_rt::{

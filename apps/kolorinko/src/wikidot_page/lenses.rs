@@ -46,7 +46,7 @@ impl dentrado::core::storage::CacheSer for ShellCache {}
 /// straight out of the followed snapshot. The client fetches the entire site
 /// frame under one subscription that survives page navigation within the
 /// space.
-pub(crate) async fn shell<S: Storage<KolorinkoRT>>(
+pub(crate) async fn shell<S: IsStorage<KolorinkoRT>>(
     data: &RepoSnapshot,
     space: SpaceId,
     ctx: &mut GearCtx<KolorinkoRT, S>,

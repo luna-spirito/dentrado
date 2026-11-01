@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use super::SlotId;
 use super::arena::{Arena, LoadPage, SavePage, SlotSt, Victim};
-use crate::disk::Storage;
+use crate::disk::IsFilesystem;
 use crate::page::{OptionPageId, Page, PageId};
 
 /// The disk side of the cache: an [`Arena`] of slots, the mirrors tying
@@ -19,14 +19,14 @@ use crate::page::{OptionPageId, Page, PageId};
 /// themselves are the arena's; every verb here is an arena transition
 /// plus the mirror half of the same move, or a plain question passed
 /// down — never a field held out.
-pub(super) struct DiskArena<D: Storage> {
+pub(super) struct DiskArena<D: IsFilesystem> {
     arena: Arena,
     map: HashMap<PageId, SlotId>,
     backward: Vec<OptionPageId>,
     file: D::File,
 }
 
-impl<D: Storage> DiskArena<D> {
+impl<D: IsFilesystem> DiskArena<D> {
     pub(super) fn new(file: D::File, pages: Rc<[UnsafeCell<Page>]>) -> Self {
         let arena = Arena::new(pages);
         Self {

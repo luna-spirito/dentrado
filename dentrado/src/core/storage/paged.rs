@@ -1,4 +1,4 @@
-//! Gear-cache persistence over [`dentrado_storage`] pages.
+//! Gear-cache persistence over [`dentrado_cache`] pages.
 //!
 //! [`PagedStorage`] wraps [`InMemoryStorage`]: localization, the event log,
 //! and the dormant page substrate stay in RAM and are delegated verbatim;
@@ -38,8 +38,8 @@ use std::{
     rc::Rc,
 };
 
-use dentrado_storage::{
-    Store, StoreError,
+use dentrado_cache::{
+    Storage, StoreError,
     core::val::{VAL_PAYLOAD, val_split},
     disk::FsDisk,
 };
@@ -50,7 +50,7 @@ use crate::{
         gear::IsRuntime,
         loc_ctx::{StoreResultSuccess, StoredEvent},
         storage::{
-            AlignedPage, CacheSer, GroupDiff, PageHandle, PageId, Storage,
+            AlignedPage, CacheSer, GroupDiff, IsStorage, PageHandle, PageId,
             in_memory::InMemoryStorage,
         },
     },
@@ -69,12 +69,12 @@ const BLOCK_CACHE: usize = 1024;
 enum Disk {
     Closed,
     Opening(Vec<oneshot::Sender<()>>),
-    Ready(Rc<Store<FsDisk>>),
+    Ready(Rc<Storage<FsDisk>>),
     /// Open failed — RAM-only for the rest of the process.
     Failed,
 }
 
-/// [`Storage`] that persists gear caches into dentrado-storage pages.
+/// [`Storage`] that persists gear caches into dentrado-cache pages.
 /// `ram()` behaves exactly like [`InMemoryStorage`] — the toggle.
 pub struct PagedStorage<R: IsRuntime> {
     ram: InMemoryStorage<R>,
@@ -130,9 +130,9 @@ impl<R: IsRuntime> PagedStorage<R> {
     }
 
     /// The opened store, or `None` in RAM-only mode (`ram()`, failed open).
-    async fn ensure(&self) -> Option<Rc<Store<FsDisk>>> {
+    async fn ensure(&self) -> Option<Rc<Storage<FsDisk>>> {
         enum Step {
-            Ready(Rc<Store<FsDisk>>),
+            Ready(Rc<Storage<FsDisk>>),
             Open,
             Wait(oneshot::Receiver<()>),
             Gone,
@@ -166,7 +166,8 @@ impl<R: IsRuntime> PagedStorage<R> {
             Step::Open => {
                 let file = self.file.as_ref().expect("disk mode has a file");
                 let opened =
-                    Store::open(&FsDisk, &file.display().to_string(), BLOCK_CACHE, TABLE + 1).await;
+                    Storage::open(&FsDisk, &file.display().to_string(), BLOCK_CACHE, TABLE + 1)
+                        .await;
                 let mut disk = self.disk.borrow_mut();
                 match opened {
                     Ok(store) => {
@@ -192,7 +193,7 @@ impl<R: IsRuntime> PagedStorage<R> {
     }
 
     /// Pages a key's live entry occupies (chain order); empty when absent.
-    async fn old_pages(store: &Store<FsDisk>, key: &[u8; 32]) -> Result<Vec<u64>, StoreError> {
+    async fn old_pages(store: &Storage<FsDisk>, key: &[u8; 32]) -> Result<Vec<u64>, StoreError> {
         match store.get_cache(TABLE, key).await? {
             Some((guard, cv)) => {
                 drop(guard);
@@ -205,7 +206,7 @@ impl<R: IsRuntime> PagedStorage<R> {
     /// Write `image` as a fresh value chain, freeing the pages it supersedes.
     async fn publish(
         &self,
-        store: &Store<FsDisk>,
+        store: &Storage<FsDisk>,
         key: &[u8; 32],
         image: &[u8],
     ) -> Result<(), StoreError> {
@@ -230,7 +231,7 @@ impl<R: IsRuntime> PagedStorage<R> {
     }
 
     /// Tombstone the key and free its pages.
-    async fn erase(&self, store: &Store<FsDisk>, key: &[u8; 32]) -> Result<(), StoreError> {
+    async fn erase(&self, store: &Storage<FsDisk>, key: &[u8; 32]) -> Result<(), StoreError> {
         let old = Self::old_pages(store, key).await?;
         store.put_cache(TABLE, key, &[], &[], &old).await
     }
@@ -251,8 +252,8 @@ fn wake(waiters: Vec<oneshot::Sender<()>>) {
 
 /// Return allocated drafts to the pool, then surface the original error.
 async fn undraft(
-    store: &Store<FsDisk>,
-    drafts: Vec<dentrado_storage::DraftId>,
+    store: &Storage<FsDisk>,
+    drafts: Vec<dentrado_cache::DraftId>,
     e: StoreError,
 ) -> Result<(), StoreError> {
     for k in drafts {
@@ -271,7 +272,7 @@ impl<R: IsRuntime> GlobalResolver for PagedStorage<R> {
     }
 }
 
-impl<R> Storage<R> for PagedStorage<R>
+impl<R> IsStorage<R> for PagedStorage<R>
 where
     R: IsRuntime,
     R::GearId: serde::Serialize,

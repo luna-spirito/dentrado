@@ -5,7 +5,7 @@ use dentrado::{
         core_ctx::Core,
         db::{Db, DbConfig, Doorbell, DoorbellHandle, PeerChannels, create_peer_channel_pair},
         gear::IsRuntime,
-        storage::Storage,
+        storage::IsStorage,
     },
     types::*,
     wire::{WireEventBody, WireLocCtx, WireLocCtxBuilder},
@@ -36,7 +36,7 @@ struct Node<R: IsRuntime> {
     db: Db<R>,
 }
 
-pub(crate) struct TestCluster<R: IsRuntime, S: Storage<R>> {
+pub(crate) struct TestCluster<R: IsRuntime, S: IsStorage<R>> {
     module: Arc<R::Module>,
     nodes: Vec<Node<R>>,
     /// Client-side context for building wire events: allocates local ids and
@@ -70,7 +70,7 @@ pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-impl<R: IsRuntime, S: Storage<R>> TestCluster<R, S>
+impl<R: IsRuntime, S: IsStorage<R>> TestCluster<R, S>
 where
     S: Default,
 {

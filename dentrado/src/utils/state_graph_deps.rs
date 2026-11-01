@@ -1,7 +1,7 @@
 use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, Timeline};
 use crate::core::gear::EmptyRuntime;
 use crate::core::loc_ctx::StoredEvent;
-use crate::core::storage::{GroupStore, InMemoryStorage, Storage};
+use crate::core::storage::{GroupStore, InMemoryStorage, IsStorage};
 use crate::types::{GroupEventId, LocGroupId, LocMsgTypeId, NodeId, SenderPk};
 use imbl::OrdMap;
 use std::collections::BTreeMap;
