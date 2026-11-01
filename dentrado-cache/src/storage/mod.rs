@@ -25,7 +25,7 @@ use std::rc::Rc;
 use compio::runtime::JoinHandle;
 
 use crate::blockcache;
-use crate::core::freelist::{chunk_cells, chunk_next};
+use crate::core::freelist::{ChainEntry, chunk_cells, chunk_next};
 use crate::core::tree::{leaf_find, parse_node, route};
 use crate::core::val::{link_val, val_split, write_val};
 use crate::core::{AllocAct, CacheValue, DraftId};
@@ -46,6 +46,42 @@ pub struct Guard<D: IsFilesystem> {
 impl<D: IsFilesystem> Drop for Guard<D> {
     fn drop(&mut self) {
         self.inner.borrow_mut().core.drop_step(self.bucket);
+    }
+}
+
+/// A tail-read's rollback, RAII: a Busy tail without its reader bricks
+/// the pool — every later alloc parks on a splice that never comes.
+/// Defused once the read lands and the splice follows in the same
+/// section; drops otherwise (an io failure's `?` or the caller's
+/// cancellation between the section and the splice).
+struct ReadRollback<D: IsFilesystem> {
+    inner: Rc<RefCell<PersistentCore<D>>>,
+    ep: usize,
+    e: ChainEntry,
+    armed: bool,
+}
+
+impl<D: IsFilesystem> ReadRollback<D> {
+    fn new(inner: Rc<RefCell<PersistentCore<D>>>, ep: usize, e: ChainEntry) -> Self {
+        Self {
+            inner,
+            ep,
+            e,
+            armed: true,
+        }
+    }
+
+    /// The read landed — the splice follows in the same section.
+    fn defuse(mut self) {
+        self.armed = false;
+    }
+}
+
+impl<D: IsFilesystem> Drop for ReadRollback<D> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.inner.borrow_mut().core.abort_read(self.ep, self.e);
+        }
     }
 }
 
@@ -129,12 +165,17 @@ impl<D: IsFilesystem> Storage<D> {
                 AllocAct::Got(k) => return Ok(k),
                 AllocAct::Park(ln) => ln.await,
                 AllocAct::Read { ep, e } => {
-                    // The pool waits out foreign loads of the same chunk
-                    // on its own.
+                    // The read may die (an io failure's `?`) or be
+                    // cancelled (the caller's future dropped mid-await);
+                    // either way the Busy tail must not outlive its
+                    // reader — the guard rolls it back and wakes the
+                    // parked, unless defused at the splice.
+                    let rb = ReadRollback::new(self.inner.clone(), ep, e);
                     let (cells, nx) = blockcache::read::<D, _>(&self.inner, e.page, move |b| {
                         (chunk_cells(b, e.off as usize), chunk_next(b))
                     })
                     .await?;
+                    rb.defuse();
                     let mut inner = self.inner.borrow_mut();
                     inner.core.splice(ep, e, cells, nx);
                 }
@@ -233,7 +274,9 @@ impl<D: IsFilesystem> Storage<D> {
     ) -> Result<Option<(Guard<D>, CacheValue)>, StoreError> {
         let (g, dv, root, bound) = {
             let mut inner = self.inner.borrow_mut();
-            let (g, dv, root) = inner.core.get_step(table, key);
+            let Some((g, dv, root)) = inner.core.get_step(table, key) else {
+                return Err(StoreError::NoTable);
+            };
             (g, dv, root, inner.core.bound())
         };
         let guard = Guard {
@@ -308,7 +351,9 @@ impl<D: IsFilesystem> Storage<D> {
     }
 
     /// Publication: stitch the value's pages, then the seal — the delta
-    /// and the deaths in one borrow (a two-step death = corruption).
+    /// and the deaths in one borrow (a two-step death = corruption). A
+    /// refused seal (a disagreed freed list, an unknown table) registers
+    /// nothing; the drafts stay held.
     pub async fn put_cache(
         &self,
         table: usize,
@@ -325,17 +370,8 @@ impl<D: IsFilesystem> Storage<D> {
                 .ok_or(StoreError::UnknownDraft)?
         };
         self.link_all(&pages).await?;
-        let ok = {
-            let mut inner = self.inner.borrow_mut();
-            inner
-                .core
-                .seal_step(table, key, mt, &pages, consumed, freed)
-        };
-        if ok {
-            Ok(())
-        } else {
-            Err(StoreError::ConsumedVanished)
-        }
+        let mut inner = self.inner.borrow_mut();
+        inner.core.seal_step(table, key, mt, consumed, freed)
     }
 
     /// Stitch a value's chain: the pages' next headers in consumed

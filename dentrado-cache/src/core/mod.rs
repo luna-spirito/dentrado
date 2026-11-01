@@ -17,6 +17,9 @@ pub mod tables;
 pub mod tree;
 pub mod val;
 
+#[cfg(test)]
+mod tests;
+
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -163,10 +166,6 @@ impl Drafts {
         }
     }
 
-    fn owns_all(&self, cs: &[DraftId]) -> bool {
-        cs.iter().all(|c| self.map.contains_key(c))
-    }
-
     /// Does the arena still hold this page?
     fn has_page(&self, p: PageId) -> bool {
         self.map.values().any(|&(q, _)| q == p)
@@ -236,6 +235,13 @@ impl<D: IsFilesystem> Core<D> {
         self.frees.splice(ep, e, cells, nx)
     }
 
+    /// An abandoned tail-read's rollback (the reader's io failed or the
+    /// reader itself was cancelled): the Busy tail is Free again — see
+    /// [`Frees::unbusy`].
+    pub(crate) fn abort_read(&mut self, ep: usize, e: ChainEntry) {
+        self.frees.unbusy(ep, e)
+    }
+
     /// A draft's death: unpublished — no gate needed, back into its own
     /// pool's head. An unknown key — an honest refusal.
     pub(crate) fn dealloc_step(&mut self, k: DraftId) -> bool {
@@ -249,53 +255,71 @@ impl<D: IsFilesystem> Core<D> {
     }
 
     /// The `put_cache` seal: the delta + death registration — one
-    /// section.
+    /// section. The published pages are the consumed drafts' own (no
+    /// way to declare a page the caller does not hold), and the freed
+    /// list is checked whole before anything registers — a page both
+    /// consumed and freed, a freed page still held (a draft, dying,
+    /// back in a pool) or outside the issued range (the SB slots, a
+    /// never-issued id — conjured from nothing), a duplicate: each
+    /// would list one page twice or forge a free cell. A refusal
+    /// registers nothing; the drafts stay held.
     pub(crate) fn seal_step(
         &mut self,
         t: usize,
         k: &[u8],
         mt: &[u8],
-        pages: &[PageId],
         consumed: &[DraftId],
         freed: &[PageId],
-    ) -> bool {
-        if !self.drafts.owns_all(consumed) {
-            return false;
+    ) -> Result<(), StoreError> {
+        if t >= self.tables.roots.len() {
+            return Err(StoreError::NoTable);
         }
-        // The double-registration family: a page both consumed and
-        // freed is simultaneously sealed into the tree and registered
-        // as a death — freelist corruption.
-        debug_assert!(
-            pages.iter().all(|p| !freed.contains(p)),
-            "a page both consumed and freed"
-        );
-        debug_assert!(
-            freed.iter().all(|p| !self.drafts.has_page(*p)),
-            "a freed page still held as a draft"
-        );
+        let Some(pages) = self.drafts.pages_of(consumed) else {
+            return Err(StoreError::ConsumedVanished);
+        };
+        let bound = self.frees.bound();
+        for (i, p) in freed.iter().enumerate() {
+            let why = if pages.contains(p) {
+                "a page both consumed and freed"
+            } else if self.drafts.has_page(*p) {
+                "a freed page still held as a draft"
+            } else if freed[..i].contains(p) {
+                "a page freed twice"
+            } else if self.deaths.holds(*p) {
+                "a freed page already dying"
+            } else if self.frees.holds(*p) {
+                "a freed page back in a pool"
+            } else if *p < 2 || *p >= bound {
+                "a freed page outside the issued range"
+            } else {
+                continue;
+            };
+            return Err(StoreError::BadSeal(why));
+        }
         self.deaths.reg(freed);
         self.tables.put(
             t,
             k,
             CacheValue {
                 mt: mt.to_vec(),
-                pages: pages.to_vec(),
+                pages,
             },
         );
         for c in consumed {
             self.drafts.remove(c);
         }
-        true
+        Ok(())
     }
 
     /// The pin + the `get_cache` decision: the guard — the subscription
-    /// bucket; the delta before the tree.
-    pub(crate) fn get_step(&mut self, t: usize, k: &[u8]) -> (usize, Option<CacheValue>, PageId) {
-        (
-            self.deaths.pin(),
-            self.tables.get(t, k),
-            self.tables.roots[t],
-        )
+    /// bucket; the delta before the tree. `None` — no such table.
+    pub(crate) fn get_step(
+        &mut self,
+        t: usize,
+        k: &[u8],
+    ) -> Option<(usize, Option<CacheValue>, PageId)> {
+        let root = *self.tables.roots.get(t)?;
+        Some((self.deaths.pin(), self.tables.get(t, k), root))
     }
 
     /// The guard away.
@@ -363,6 +387,33 @@ impl<D: IsFilesystem> Core<D> {
     /// (from the round's seal to its commit)?
     pub(crate) fn round_live(&self) -> bool {
         self.frees.taken(0) || self.frees.taken(1)
+    }
+
+    /// A failed round's rollback: the seal-time world comes back — the
+    /// taken pool reinstated (the husk's mid-round retires kept), the
+    /// retiring containers and the deaths pile back on top of what the
+    /// round's lifetime accumulated. The epoch never flipped, so the
+    /// round never was. (The flight's seal-time copies; `head`, `tail`,
+    /// `next` — the taken pool, `spent` — the seal's merged bag,
+    /// `dying` — the sealed pile.)
+    pub(crate) fn unseal(
+        &mut self,
+        head: Vec<PageId>,
+        tail: ChainEntry,
+        next: PageId,
+        spent: Vec<PageId>,
+        dying: Vec<PageId>,
+    ) {
+        self.frees.unseal(head, tail, next, spent);
+        self.deaths.give_back(dying);
+    }
+
+    /// The task pool's bookmark past a round-eaten remainder (a
+    /// recovered off≠0 entry the round swallowed whole) — see
+    /// [`Frees::retask`]. Called in the round's commit section, before
+    /// the commit flips the epoch.
+    pub(crate) fn retask(&mut self, old: ChainEntry, new: ChainEntry) {
+        self.frees.retask(old, new)
     }
 
     /// The flush commit (the SB is synced): the flight's pool lands

@@ -1,7 +1,7 @@
 //! One flush round, end to end: the round agent — the perpetual task
 //! that owns every round — the round's body, and its two atomic
-//! sections, the seal and the commit. The flight (the round's locals)
-//! lives in [`super::flight`].
+//! sections, the seal and the commit. The flight (the round's locals,
+//! the stock fixpoint) lives in [`super::flight`].
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -10,7 +10,7 @@ use compio::runtime::JoinHandle;
 use futures::channel::oneshot;
 
 use super::PersistentCore;
-use super::flight::{Flight, FlipData};
+use super::flight::{Flight, FlipData, Home, flip_loop};
 use super::graft;
 use super::image::walk_chain_raw;
 use crate::blockcache;
@@ -82,106 +82,15 @@ pub(super) fn spawn_agent<D: IsFilesystem>(
     compio::runtime::spawn(agent(Rc::clone(inner)))
 }
 
-/// Take `n` pages from the flight: the head's remainder → the tail's
-/// chunks → growing the round's own counter. The flight is the
-/// accumulator (the round's locals).
-async fn take_flight<D: IsFilesystem>(
-    inner: &Rc<RefCell<PersistentCore<D>>>,
-    fl: &mut Flight,
-    fuel0: u64,
-    mut n: usize,
-) -> Result<Vec<PageId>, StoreError> {
-    let mut out = Vec::new();
-    let mut fuel = fuel0;
-    loop {
-        if n == 0 {
-            return Ok(out);
-        }
-        if fuel == 0 {
-            return Err(StoreError::Steps("takeFlight: steps"));
-        }
-        fuel -= 1;
-        if let Some(p) = fl.head.pop() {
-            out.push(p);
-            n -= 1;
-        } else if fl.tail.page == 0 {
-            let p = fl.next;
-            fl.next += 2;
-            fl.head.push(p);
-        } else {
-            let tp = fl.tail.page;
-            let off = fl.tail.off;
-            let (cells, nx) = blockcache::read::<D, _>(inner, tp, move |b| {
-                (chunk_cells(b, off as usize), chunk_next(b))
-            })
-            .await?;
-            fl.eat(cells, nx, tp);
-        }
-    }
-}
-
-/// The stock fixpoint: snapshot → cells → need → take what is
-/// missing (eating the tail grows the drains — the cells grow —
-/// resnapshot). The snapshot's one live read is the husk — the
-/// mid-round retires into the taken pool, whose listings retire
-/// with this round's fronts.
-async fn flip_loop<D: IsFilesystem>(
-    inner: &Rc<RefCell<PersistentCore<D>>>,
-    mut fl: Flight,
-    need_pages: usize,
-) -> Result<(Flight, FlipData), StoreError> {
-    let mut stock: Vec<PageId> = Vec::new();
-    let mut fuel = fl.next + 4;
-    // The taken pool's runs are separate (its bookmark must land at
-    // a chunk boundary); the copied pool's make do with one.
-    let chunks = |l: usize, f: usize, split: bool| {
-        if split {
-            l.div_ceil(CHUNK_SLOTS) + f.div_ceil(CHUNK_SLOTS)
-        } else {
-            (l + f).div_ceil(CHUNK_SLOTS)
-        }
-    };
-    loop {
-        if fuel == 0 {
-            return Err(StoreError::Steps("flip: steps"));
-        }
-        fuel -= 1;
-        let husk = {
-            let in_ = inner.borrow();
-            in_.core.husk()
-        };
-        let (l0, f0) = fl.cells(&husk, 0);
-        let (l1, f1) = fl.cells(&husk, 1);
-        let need = need_pages
-            + chunks(l0.len(), f0.len(), fl.ep != 0)
-            + chunks(l1.len(), f1.len(), fl.ep != 1);
-        if stock.len() >= need {
-            let (ep, old_gen) = (fl.ep, fl.old_gen);
-            return Ok((
-                fl,
-                FlipData {
-                    stock,
-                    limbo: [l0, l1],
-                    free: [f0, f1],
-                    ep,
-                    old_gen,
-                },
-            ));
-        }
-        let want = need - stock.len();
-        let more = take_flight::<D>(inner, &mut fl, 2 * want as u64 + 2, want).await?;
-        stock.extend(more);
-    }
-}
-
-/// One round: seal → per table, graft the delta onto the standing
-/// tree (an empty delta keeps it — no churn; an empty table is built
-/// whole) → the stock fixpoint → the writes (trees, chunks) → write
-/// back the dirty and sync the data → the full chains (counts, sums)
-/// → the SB into the alternating slot → sync — the commit point → the
-/// RAM commit in one borrow. The retired pages — the grafted paths'
-/// old pages — ride the round's limbo cells (crash safety) and die at
-/// the commit (EBR — the readers mid-descent).
+/// One round: the seal, then the engraving — per table, graft the
+/// delta onto the standing tree (an empty delta keeps it — no churn;
+/// an empty table is built whole) → the stock fixpoint → the writes
+/// (trees, chunks) → write back the dirty and sync the data → the
+/// full chains (counts, sums) → the SB into the alternating slot →
+/// sync — the commit point → the RAM commit in one borrow. A failure
+/// anywhere before that commit rolls the seal back: the store stands
+/// as if the round never was — the bytes it wrote belong to no image
+/// and die unissued.
 async fn round<D: IsFilesystem>(inner: &Rc<RefCell<PersistentCore<D>>>) -> Result<(), StoreError> {
     // The seal: everything the round starts with leaves for the
     // flight — the round's locals; the core's flush pool stays
@@ -189,18 +98,25 @@ async fn round<D: IsFilesystem>(inner: &Rc<RefCell<PersistentCore<D>>>) -> Resul
     let mut fl = {
         let mut in_ = inner.borrow_mut();
         let s = in_.core.seal();
+        let home = Home {
+            head: s.ahead.clone(),
+            tail: s.atail,
+            next: s.anext,
+        };
         Flight {
             ep: s.ep,
             head: s.ahead,
             tail: s.atail,
             next: s.anext,
             drains: Vec::new(),
+            home,
             spent: s.spent,
             dying: s.dying,
             pend: s.pend,
             drafts: s.drafts,
             bhead: s.bhead,
             btail: s.btail,
+            bhome: s.btail,
             bnext: s.bnext,
             snaps: s.snaps,
             roots: s.roots,
@@ -208,6 +124,24 @@ async fn round<D: IsFilesystem>(inner: &Rc<RefCell<PersistentCore<D>>>) -> Resul
             old_gen: in_.r#gen,
         }
     };
+    let r = engrave::<D>(inner, &mut fl).await;
+    if r.is_err() {
+        // The rollback in one section: the seal-time world back, the
+        // husk's mid-round retires and the containers eaten since the
+        // seal kept (merged, not lost). The epoch never flipped, so
+        // the round never was.
+        let mut in_ = inner.borrow_mut();
+        let Home { head, tail, next } = fl.home;
+        in_.core.unseal(head, tail, next, fl.spent, fl.dying);
+    }
+    r
+}
+
+/// The round's body, from the grafts to the RAM commit.
+async fn engrave<D: IsFilesystem>(
+    inner: &Rc<RefCell<PersistentCore<D>>>,
+    fl: &mut Flight,
+) -> Result<(), StoreError> {
     // The trees, per table: the delta as the sorted batch, then a
     // standing tree takes the graft — only its dirty paths change —
     // while an empty table is built whole. The grafts' reads run
@@ -245,14 +179,28 @@ async fn round<D: IsFilesystem>(inner: &Rc<RefCell<PersistentCore<D>>>) -> Resul
         }
         need_pages += counts[t];
     }
-    let (fl2, fd) = flip_loop::<D>(inner, fl, need_pages).await?;
+    // A recovered off≠0 tail (the one place an offset can appear
+    // besides the SB) cannot serve as a continuation — a continuation
+    // behind a page pointer must be a whole page — so the round
+    // swallows such a remainder before any stock moves; the copied
+    // pool's bookmark follows at the commit.
+    if fl.tail.page != 0 && fl.tail.off != 0 {
+        let e = fl.tail;
+        let (cells, nx) = read_chunk::<D>(inner, e).await?;
+        fl.eat_remainder(true, cells, nx);
+    }
+    if fl.btail.page != 0 && fl.btail.off != 0 {
+        let e = fl.btail;
+        let (cells, nx) = read_chunk::<D>(inner, e).await?;
+        fl.eat_remainder(false, cells, nx);
+    }
     let FlipData {
         stock,
         limbo,
         free,
         ep,
         old_gen,
-    } = fd;
+    } = flip_loop::<D>(inner, fl, need_pages).await?;
     let nep = 1 - ep;
     let [l0, l1] = limbo;
     let [f0, f1] = free;
@@ -283,8 +231,8 @@ async fn round<D: IsFilesystem>(inner: &Rc<RefCell<PersistentCore<D>>>) -> Resul
     // copied pool — the chunks the tasks eat during the round stay
     // linked, their cells stale-listed). The last new chunk points
     // here — NOT at the chain's entry (that would be a ring).
-    let ftail = fl2.tail;
-    let btail = fl2.btail;
+    let ftail = fl.tail;
+    let btail = fl.btail;
     // The taken pool's new bookmark: the free run's head, past the
     // limbo — consumption starts with the round's fresh free
     // cells.
@@ -308,17 +256,17 @@ async fn round<D: IsFilesystem>(inner: &Rc<RefCell<PersistentCore<D>>>) -> Resul
     // touch it — and the task pool's seal-time copy (mid-round
     // growth stays above it, unlisted and unborn).
     let (sn0, sn1) = if nep == 0 {
-        (fl2.next, fl2.bnext)
+        (fl.next, fl.bnext)
     } else {
-        (fl2.bnext, fl2.next)
+        (fl.bnext, fl.next)
     };
     debug_assert!(
         ln.iter()
             .chain(&nfree)
-            .all(|&x| (x % 2) as usize == nep && x < fl2.next)
+            .all(|&x| (x % 2) as usize == nep && x < fl.next)
             && ecells
                 .iter()
-                .all(|&x| (x % 2) as usize == ep && x < fl2.bnext),
+                .all(|&x| (x % 2) as usize == ep && x < fl.bnext),
         "a cell outside its pool's parity or counter"
     );
     // The trees: each table over its stock slice, written page by
@@ -327,7 +275,7 @@ async fn round<D: IsFilesystem>(inner: &Rc<RefCell<PersistentCore<D>>>) -> Resul
     // ids against the stock — a clean child keeps its page. The
     // root is the slice's last page — the build's and the graft's
     // orders put it there alike.
-    let mut new_roots = fl2.roots.clone();
+    let mut new_roots = fl.roots.clone();
     let mut at = 0usize;
     for t in 0..n {
         if counts[t] == 0 {
@@ -384,34 +332,50 @@ async fn round<D: IsFilesystem>(inner: &Rc<RefCell<PersistentCore<D>>>) -> Resul
     .await?;
     blockcache::ensure_saved::<D>(inner, sb_id).await?;
     sync::<D>(inner).await?;
-    // The RAM commit in one borrow: the pools land back (the
-    // bookmark and the fronts with them), the old trees die (EBR),
-    // the deltas purge the sealed, the world moves to the new
-    // image.
+    // The RAM commit in one borrow: the copied pool's bookmark past
+    // a round-eaten remainder (if the round swallowed one), then the
+    // pools land back (the bookmark and the fronts with them), the
+    // old trees die (EBR), the deltas purge the sealed, the world
+    // moves to the new image.
     {
         let mut in_ = inner.borrow_mut();
+        if fl.btail != fl.bhome {
+            in_.core.retask(fl.bhome, fl.btail);
+        }
         let (f0, f1) = if nep == 0 {
             (&nlimbo_ps, &ep_ps)
         } else {
             (&ep_ps, &nlimbo_ps)
         };
         in_.core.commit(
-            fl2.dying
+            fl.dying
                 .iter()
-                .chain(fl2.drains.iter())
-                .chain(fl2.spent.iter())
+                .chain(fl.drains.iter())
+                .chain(fl.spent.iter())
                 .copied(),
-            &fl2.old_tree,
+            &fl.old_tree,
             mark,
-            fl2.next,
+            fl.next,
             surplus,
             [f0, f1],
-            &fl2.snaps,
+            &fl.snaps,
             &new_roots,
         );
         in_.r#gen += 1;
     }
     Ok(())
+}
+
+/// A tail chunk's live cells from its entry's offset, and the next
+/// page.
+async fn read_chunk<D: IsFilesystem>(
+    inner: &Rc<RefCell<PersistentCore<D>>>,
+    e: ChainEntry,
+) -> Result<(Vec<PageId>, PageId), StoreError> {
+    blockcache::read::<D, _>(inner, e.page, move |b| {
+        (chunk_cells(b, e.off as usize), chunk_next(b))
+    })
+    .await
 }
 
 /// The writes for the chain's new head: chunk pages with next
@@ -431,7 +395,8 @@ async fn init_chain<D: IsFilesystem>(
             // be a whole page: eating is page-granular, and the one
             // place a nonzero off can appear — an untouched
             // recovered head — goes straight into the SB, never
-            // behind a next.
+            // behind a next (the round swallows such a remainder
+            // before the stock moves).
             None => {
                 assert_eq!(entry.off, 0, "a continuation behind a next is not whole");
                 entry.page

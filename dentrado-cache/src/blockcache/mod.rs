@@ -6,8 +6,8 @@
 //!
 //! A page wish goes through one door: [`BlockCache::request`] seats it
 //! in the machine ([`seq::SeqArena::submit`]), which serves a page at
-//! rest — or an init over a claimed fresh slot — on the spot, and turns
-//! anything else into a post ([`PostFn`]): the caller's closure with a
+//! rest on the spot, and turns anything else — a fresh page's init
+//! included — into a post ([`PostFn`]): the caller's closure with a
 //! oneshot home, run against the page (or a refusal) exactly once. The
 //! post joins the page's queue — the queue's order is the issue order,
 //! and only its head is ever in motion (one flight per page at most);

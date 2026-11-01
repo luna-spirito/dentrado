@@ -39,6 +39,16 @@ impl ChainEntry {
     pub fn full(page: PageId) -> Self {
         Self { page, off: 0 }
     }
+
+    /// An entry as parsed off a superblock: a dead page (`0` — no
+    /// chain) carries no offset, so junk normalizes to the empty entry.
+    pub fn at(page: PageId, off: u32) -> Self {
+        if page == 0 {
+            Self::default()
+        } else {
+            Self { page, off }
+        }
+    }
 }
 
 /// Write a chunk page in place.

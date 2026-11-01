@@ -72,13 +72,13 @@ impl<D: IsFilesystem> Future for Flight<D> {
             Flight::Load { s, id, fut } => fut.as_mut().poll(cx).map(|(ok, page)| FlDone {
                 s: *s,
                 id: *id,
-                ok: ok.map_err(|e| StoreError::Io(e.to_string())),
+                ok: ok.map_err(StoreError::from_io),
                 wings: Wings::Load(page),
             }),
             Flight::Save { s, id, fut } => fut.as_mut().poll(cx).map(|(ok, page)| FlDone {
                 s: *s,
                 id: *id,
-                ok: ok.map_err(|e| StoreError::Io(e.to_string())),
+                ok: ok.map_err(StoreError::from_io),
                 wings: Wings::Save(page),
             }),
         }

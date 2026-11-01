@@ -215,6 +215,25 @@ impl Frees {
         }
     }
 
+    /// An abandoned tail-read's rollback: a Busy tail without its
+    /// reader bricks the pool (every later step parks on a splice that
+    /// never comes), so the read's owner defuses at the splice and
+    /// rolls back otherwise — an io failure's `?` or the caller's
+    /// cancellation. The parked steps re-run on the wake; a tail
+    /// already not `busy e` — a no-op.
+    pub(super) fn unbusy(&mut self, ep: usize, e: ChainEntry) {
+        let old = std::mem::replace(&mut self.pools[ep].tail, Tail::Taken);
+        match old {
+            Tail::Busy(e2, ev) if e2 == e => {
+                ev.notify_all();
+                self.pools[ep].tail = Tail::Free(e);
+            }
+            other => {
+                self.pools[ep].tail = other;
+            }
+        }
+    }
+
     /// A retired task-parity page — back into its own pool's head.
     pub(super) fn retire(&mut self, p: PageId) {
         self.pools[(p % 2) as usize].head.push(p);
@@ -225,13 +244,20 @@ impl Frees {
     /// containers: the task-eaten ones and both pools' fronts (the
     /// copied pool's front retires with this round's copy chunks too);
     /// a husk remains (empty head, `taken` tail, the seal-time counter
-    /// — only a retire may still drop arrivals into the head).
+    /// — only a retire may still drop arrivals into the head). A busy
+    /// tail's parked steps wake before their event dies (a dropped
+    /// event never fires) — they re-run their step against the current
+    /// epoch and land on the other pool.
     pub(super) fn seal(&mut self) -> (Vec<PageId>, ChainEntry, PageId, Vec<PageId>) {
+        debug_assert!(!self.round_live(), "a seal over a taken pool");
         let nep = 1 - self.ep();
         let n = self.pools[nep].next;
         let old = std::mem::replace(&mut self.pools[nep], Freelist::empty(n));
         self.pools[nep].tail = Tail::Taken;
         let tail = old.tail_entry();
+        if let Tail::Busy(_, ev) = &old.tail {
+            ev.notify_all();
+        }
         let mut spent = std::mem::take(&mut self.spent);
         spent.extend(old.front);
         spent.extend(std::mem::take(&mut self.pools[1 - nep].front));
@@ -272,5 +298,170 @@ impl Frees {
         }
         self.pools[ep].front = fronts[ep].to_vec();
         self.epoch = !self.epoch;
+    }
+
+    /// Is a flush round holding the flush pool (a seal without a land
+    /// or an unseal)?
+    pub(super) fn round_live(&self) -> bool {
+        self.taken(1 - self.ep())
+    }
+
+    /// Is the page back in a pool's RAM side — a head or a spent
+    /// container? (The seal's double-registration check.)
+    pub(super) fn holds(&self, p: PageId) -> bool {
+        self.pools.iter().any(|l| l.head.contains(&p)) || self.spent.contains(&p)
+    }
+
+    /// A failed round's rollback: the seal-time world comes back — the
+    /// taken pool reinstated, the husk's mid-round retires and the
+    /// containers eaten since the seal kept (merged, not lost — a
+    /// dropped retire would orphan its page, a dropped eat would cut it
+    /// out of the next chain unretired). The epoch never flipped, so
+    /// the round never was.
+    pub(super) fn unseal(
+        &mut self,
+        head: Vec<PageId>,
+        tail: ChainEntry,
+        next: PageId,
+        mut spent: Vec<PageId>,
+    ) {
+        let nep = 1 - self.ep();
+        let mut home = head;
+        home.append(&mut self.pools[nep].head);
+        self.pools[nep] = Freelist {
+            head: home,
+            tail: Tail::Free(tail),
+            front: Vec::new(),
+            next,
+        };
+        self.spent.append(&mut spent);
+    }
+
+    /// The task pool's bookmark past a round-eaten remainder: a tail
+    /// still at the seal-time entry moves to the next whole chunk (a
+    /// tail that moved on — a task ate through — keeps its position; a
+    /// busy tail's parked steps re-run on the wake).
+    pub(super) fn retask(&mut self, old: ChainEntry, new: ChainEntry) {
+        if old == new {
+            return;
+        }
+        let ep = self.ep();
+        let hit = matches!(self.pools[ep].tail_entry(), e if e == old);
+        if hit {
+            let prev = std::mem::replace(&mut self.pools[ep].tail, Tail::Free(new));
+            if let Tail::Busy(_, ev) = prev {
+                ev.notify_all();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::pin;
+    use std::task::{Context, Waker};
+
+    /// The counter grows by the pool's parity, and the bound (the
+    /// other pool's counter included) sees it.
+    #[test]
+    fn alloc_grows_the_counter() {
+        let mut f = Frees::fresh();
+        assert!(matches!(f.alloc(), Ok(FreeAct::Got(2))));
+        assert!(matches!(f.alloc(), Ok(FreeAct::Got(4))));
+        assert_eq!(f.bound(), 7); // max(6, 3) + 1
+    }
+
+    /// A tail-read parks the later steps; the reader's rollback frees
+    /// the tail and wakes them — a dropped Busy tail (its event dies
+    /// without a word) would leave them Pending forever.
+    #[test]
+    fn unbusy_frees_the_tail_and_wakes_the_parked() {
+        let mut f = Frees::of_sb(ChainEntry::full(8), 10, ChainEntry::default(), 11);
+        match f.alloc() {
+            Ok(FreeAct::Read { e, .. }) => assert_eq!(e, ChainEntry::full(8)),
+            _ => panic!("the first step reads the tail"),
+        }
+        let mut parked = pin!(match f.alloc() {
+            Ok(FreeAct::Park(ln)) => ln,
+            _ => panic!("the next step parks"),
+        });
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(parked.as_mut().poll(&mut cx).is_pending());
+        f.unbusy(0, ChainEntry::full(8));
+        assert!(parked.poll(&mut cx).is_ready());
+        // the tail is Free again: a later step re-reads instead of parking
+        assert!(matches!(f.alloc(), Ok(FreeAct::Read { .. })));
+        // a rollback against a tail that moved on — a no-op
+        f.unbusy(0, ChainEntry::full(99));
+        assert!(matches!(f.alloc(), Ok(FreeAct::Park(_))));
+    }
+
+    /// A seal over the flush pool's busy tail wakes its parked steps
+    /// before their event dies, and takes the pool whole; the rollback
+    /// reinstates it.
+    #[test]
+    fn seal_wakes_the_flush_pools_parked() {
+        let mut f = Frees::of_sb(ChainEntry::full(8), 10, ChainEntry::default(), 11);
+        match f.alloc() {
+            Ok(FreeAct::Read { .. }) => {}
+            _ => panic!("pool 0's tail reads"),
+        }
+        let parked = pin!(match f.alloc() {
+            Ok(FreeAct::Park(ln)) => ln,
+            _ => panic!("the next step parks"),
+        });
+        // the epoch flips (an empty round lands on the other side) —
+        // the busy pool survives the landing untouched
+        f.land(std::iter::empty(), ChainEntry::default(), 12, &[], [&[]; 2]);
+        assert_eq!(f.ep(), 1);
+        let (head, tail, next, spent) = f.seal();
+        assert_eq!(
+            (head.as_slice(), tail, next, spent.len()),
+            ([].as_slice(), ChainEntry::full(8), 10, 0)
+        );
+        assert!(f.round_live() && f.taken(0));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(parked.poll(&mut cx).is_ready());
+        f.unseal(head, tail, next, spent);
+        assert!(!f.round_live());
+        assert_eq!(f.tail_of(0), ChainEntry::full(8));
+    }
+
+    /// A failed round's rollback keeps the husk's mid-round retires —
+    /// merged after the home head, never dropped (a dropped retire
+    /// would orphan its page).
+    #[test]
+    fn unseal_keeps_the_mid_round_retires() {
+        let mut f = Frees::of_sb(ChainEntry::default(), 10, ChainEntry::full(9), 11);
+        f.retire(7); // the flush pool's parity (epoch false → pool 1 seals)
+        let (head, tail, next, spent) = f.seal();
+        f.retire(5); // a husk arrival during the round
+        f.unseal(head, tail, next, spent);
+        assert_eq!(f.head(1), &[7, 5]);
+        assert_eq!(f.next_of(1), 11);
+        assert_eq!(f.tail_of(1), ChainEntry::full(9));
+    }
+
+    /// The bookmark moves only while stale: a tail the tasks moved
+    /// past keeps its position, and a no-move is a no-op.
+    #[test]
+    fn retask_moves_only_the_stale_bookmark() {
+        let mut f = Frees::of_sb(ChainEntry::full(8), 10, ChainEntry::default(), 11);
+        f.retask(ChainEntry::full(8), ChainEntry::full(12));
+        assert_eq!(f.tail_of(0), ChainEntry::full(12));
+        f.retask(ChainEntry::full(99), ChainEntry::full(14)); // moved on
+        assert_eq!(f.tail_of(0), ChainEntry::full(12));
+        f.retask(ChainEntry::full(12), ChainEntry::full(12)); // the same
+        assert_eq!(f.tail_of(0), ChainEntry::full(12));
+    }
+
+    /// `holds` sees a pool's RAM side — the seal's double-listing check.
+    #[test]
+    fn holds_sees_the_ram_side() {
+        let mut f = Frees::fresh();
+        f.retire(4);
+        assert!(f.holds(4));
+        assert!(!f.holds(5));
     }
 }

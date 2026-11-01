@@ -155,10 +155,11 @@ impl<D: IsFilesystem> SeqArena<D> {
     // ## Wishes
 
     /// A wish against a page: `f` runs over its bytes — `true`, the
-    /// write left it dirty. A page at rest (no live queue) is served
-    /// right here, and an init claims a fresh slot besides (`load`
-    /// says the disk past matters — only an init's doesn't); anything
-    /// else takes a seat in the queue, the answer by the receiver.
+    /// write left it dirty. Only a resident page at rest (no live
+    /// queue) is served right here; anything else — a fresh page
+    /// included — takes a seat in the queue, the answer by the
+    /// receiver. The room search stays the driver's: a kick hands the
+    /// victim's save to whoever drives it, and this desk has no hands.
     pub(super) fn submit<R>(
         &mut self,
         id: PageId,
@@ -169,31 +170,17 @@ impl<D: IsFilesystem> SeqArena<D> {
         R: 'static,
     {
         if !self.queues.contains_key(&id) {
-            match self.disk.slot_of(id) {
-                Some(s) => {
-                    if let SlotSt::Resident { .. } = self.disk.state(s) {
-                        let (dirty, r) = f(self.disk.page_mut(s));
-                        if dirty {
-                            self.disk.dirtied(s);
-                        } else {
-                            self.disk.touch(s);
-                        }
-                        return Submit::Now(r);
+            if let Some(s) = self.disk.slot_of(id) {
+                if let SlotSt::Resident { .. } = self.disk.state(s) {
+                    let (dirty, r) = f(self.disk.page_mut(s));
+                    if dirty {
+                        self.disk.dirtied(s);
+                    } else {
+                        self.disk.touch(s);
                     }
-                    // in flight — the bytes belong to a lease; queue behind
+                    return Submit::Now(r);
                 }
-                None if !load => match self.take_room() {
-                    // a fresh page has no past: a claimed slot is enough
-                    Room::Slot(s) => {
-                        self.disk.bind(s, id);
-                        let (_, r) = f(self.disk.page_mut(s));
-                        return Submit::Now(r);
-                    }
-                    // no room — the slow path's drive flies the kicked
-                    // victim's save, and this wish waits in line
-                    _ => {}
-                },
-                _ => {}
+                // in flight — the bytes belong to a lease; queue behind
             }
         }
         let (tx, rx) = oneshot::channel();

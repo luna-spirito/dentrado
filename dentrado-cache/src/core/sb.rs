@@ -79,7 +79,9 @@ pub fn write_sb(
     c.fin();
 }
 
-/// Parse an SB page; `None` — not an SB (garbage, torn noise).
+/// Parse an SB page; `None` — not an SB (garbage, torn noise). A dead
+/// entry page (`0` — no chain) with a stray offset is junk normalized
+/// to the empty entry.
 pub fn parse_sb(b: &Page) -> Option<Sb> {
     (b.u32_at(0) == SB_MAGIC && b.u32_at(4) == SB_VERSION).then(|| {
         let n = (b.u32_at(32) as usize).min(MAX_ROOTS);
@@ -88,18 +90,75 @@ pub fn parse_sb(b: &Page) -> Option<Sb> {
             next0: b.u64_at(16),
             next1: b.u64_at(24),
             roots: (0..n).map(|i| b.u64_at(40 + 8 * i)).collect(),
-            e0: ChainEntry {
-                page: b.u64_at(40 + 8 * n),
-                off: b.u32_at(48 + 8 * n),
-            },
-            e1: ChainEntry {
-                page: b.u64_at(52 + 8 * n),
-                off: b.u32_at(60 + 8 * n),
-            },
+            e0: ChainEntry::at(b.u64_at(40 + 8 * n), b.u32_at(48 + 8 * n)),
+            e1: ChainEntry::at(b.u64_at(52 + 8 * n), b.u32_at(60 + 8 * n)),
             c0: b.u64_at(64 + 8 * n),
             c1: b.u64_at(72 + 8 * n),
             s0: b.u64_at(80 + 8 * n),
             s1: b.u64_at(88 + 8 * n),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A page written and parsed comes back whole — entries, roots and
+    /// counters alike.
+    #[test]
+    fn sb_round_trip() {
+        let sb = Sb {
+            r#gen: 3,
+            next0: 10,
+            next1: 11,
+            roots: vec![7, 0],
+            e0: ChainEntry { page: 4, off: 3 },
+            e1: ChainEntry::full(5),
+            c0: 1,
+            c1: 2,
+            s0: 3,
+            s1: 4,
+        };
+        let mut p = Page::zeroed();
+        write_sb(
+            &mut p, sb.r#gen, sb.next0, sb.next1, &sb.roots, sb.e0, sb.e1, sb.c0, sb.c1, sb.s0,
+            sb.s1,
+        );
+        assert_eq!(parse_sb(&p), Some(sb));
+    }
+
+    /// A dead entry page (`0` — no chain) with a stray offset is junk:
+    /// the parse normalizes it to the empty entry (a continuation
+    /// behind a null pointer cannot exist).
+    #[test]
+    fn a_dead_entry_drops_its_junk_offset() {
+        let mut p = Page::zeroed();
+        write_sb(
+            &mut p,
+            1,
+            4,
+            5,
+            &[],
+            ChainEntry { page: 0, off: 9 },
+            ChainEntry::default(),
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(parse_sb(&p).unwrap().e0, ChainEntry::default());
+    }
+
+    /// Garbage is not an SB — a zeroed page, a wrong version.
+    #[test]
+    fn garbage_is_not_an_sb() {
+        assert_eq!(parse_sb(&Page::zeroed()), None);
+        let mut p = Page::zeroed();
+        let mut c = Cur::at(&mut p);
+        c.u32(SB_MAGIC);
+        c.u32(SB_VERSION + 1);
+        c.fin();
+        assert_eq!(parse_sb(&p), None);
+    }
 }

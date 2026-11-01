@@ -19,8 +19,9 @@ use crate::storage::{Storage, Violation};
 impl<D: IsFilesystem> Storage<D> {
     /// Recovery: the newest valid SB (both chains walk through, counts
     /// and sums agree) — its table set must equal the opener's; both
-    /// eof — a fresh store; content without a valid image — death.
-    /// Reads go through the pool: pages live only there.
+    /// eof — a fresh store; content without a valid image — death; the
+    /// disk refusing — the error itself, never a fresh store over a
+    /// live image. Reads go through the pool: pages live only there.
     pub async fn open(
         disk: &D,
         path: &str,
@@ -39,8 +40,8 @@ impl<D: IsFilesystem> Storage<D> {
         // the store alive forever.
         let driver = blockcache::spawn_driver(&inner);
         let flusher = super::flush::spawn_agent(&inner);
-        let (ra, sa) = sb_slot::<D>(&inner, 0).await;
-        let (rb, sb1) = sb_slot::<D>(&inner, 1).await;
+        let (ra, sa) = sb_slot::<D>(&inner, 0).await?;
+        let (rb, sb1) = sb_slot::<D>(&inner, 1).await?;
         let mut pick: Option<Sb> = None;
         for sb in [sa, sb1].into_iter().flatten() {
             if sb_valid::<D>(&inner, &sb).await {
@@ -85,8 +86,12 @@ impl<D: IsFilesystem> Storage<D> {
         if !ram_ok {
             return false;
         }
-        let (_, sa) = sb_slot::<D>(&self.inner, 0).await;
-        let (_, sb1) = sb_slot::<D>(&self.inner, 1).await;
+        let Ok((_, sa)) = sb_slot::<D>(&self.inner, 0).await else {
+            return false;
+        };
+        let Ok((_, sb1)) = sb_slot::<D>(&self.inner, 1).await else {
+            return false;
+        };
         let mut cands: Vec<(Sb, Vec<PageId>, Vec<PageId>)> = Vec::new();
         for sb in [sa, sb1].into_iter().flatten() {
             if sb_valid::<D>(&self.inner, &sb).await {
@@ -112,8 +117,12 @@ impl<D: IsFilesystem> Storage<D> {
     /// the drafts, the undrained deaths). The SB slots (pages 0 and 1)
     /// sit outside — permanently occupied.
     pub async fn partition_ok(&self) -> bool {
-        let (_, sa) = sb_slot::<D>(&self.inner, 0).await;
-        let (_, sb1) = sb_slot::<D>(&self.inner, 1).await;
+        let Ok((_, sa)) = sb_slot::<D>(&self.inner, 0).await else {
+            return false;
+        };
+        let Ok((_, sb1)) = sb_slot::<D>(&self.inner, 1).await else {
+            return false;
+        };
         let mut cands: Vec<Sb> = Vec::new();
         for sb in [sa, sb1].into_iter().flatten() {
             if sb_valid::<D>(&self.inner, &sb).await {
@@ -189,8 +198,13 @@ impl<D: IsFilesystem> Storage<D> {
     /// combination — and a duplicate listing above all — is the
     /// double-issue family: the same page listed twice serves twice.
     pub async fn partition_exact(&self) -> Result<(), Vec<Violation>> {
-        let (_, sa) = sb_slot::<D>(&self.inner, 0).await;
-        let (_, sb1) = sb_slot::<D>(&self.inner, 1).await;
+        let (sa, sb1) = match (
+            sb_slot::<D>(&self.inner, 0).await,
+            sb_slot::<D>(&self.inner, 1).await,
+        ) {
+            (Ok((_, a)), Ok((_, b))) => (a, b),
+            _ => return Err(vec![Violation::Broken("sb unreadable")]),
+        };
         let mut cands: Vec<Sb> = Vec::new();
         for sb in [sa, sb1].into_iter().flatten() {
             if sb_valid::<D>(&self.inner, &sb).await {
@@ -394,14 +408,17 @@ fn legal_roles(rs: &[&'static str]) -> bool {
     }
 }
 
-/// An SB slot: readability (eof/failure — none) and the parse.
+/// An SB slot: eof — no content; a read that lands — the parse; the
+/// disk refusing — the error itself (absence and refusal must not
+/// blur: a fresh store over a live image would wipe it).
 async fn sb_slot<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     id: PageId,
-) -> (bool, Option<Sb>) {
+) -> Result<(bool, Option<Sb>), StoreError> {
     match blockcache::read::<D, _>(inner, id, parse_sb).await {
-        Ok(sb) => (true, sb),
-        Err(_) => (false, None),
+        Ok(sb) => Ok((true, sb)),
+        Err(StoreError::Eof) => Ok((false, None)),
+        Err(e) => Err(e),
     }
 }
 

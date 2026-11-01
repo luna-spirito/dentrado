@@ -104,6 +104,19 @@ impl Deaths {
         std::mem::take(&mut self.dying)
     }
 
+    /// A failed round's pile comes back, on top of what the round's
+    /// lifetime accumulated (deaths never vanish — only a commit may
+    /// spend them).
+    pub(super) fn give_back(&mut self, ps: Vec<PageId>) {
+        self.dying.extend(ps);
+    }
+
+    /// Does the machine still hold the page — the pile or any bucket's
+    /// undrained pending? (The seal's double-registration check.)
+    pub(super) fn holds(&self, p: PageId) -> bool {
+        self.dying.contains(&p) || self.ebr.slots.iter().any(|s| s.pending.contains(&p))
+    }
+
     /// The undrained pendings' pages, copied (the flush's seal packs
     /// them as limbo cells — a crash must not lose them; the buckets
     /// keep them until the hand drains them into the pile).
@@ -147,5 +160,40 @@ impl Deaths {
     pub(super) fn reg(&mut self, ps: &[PageId]) {
         let d = self.ebr.reg(ps);
         self.dying.extend(d);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deaths never vanish: a sealed pile comes back on top of what
+    /// the round's lifetime accumulated — only a commit may spend them.
+    #[test]
+    fn give_back_restores_the_pile() {
+        let mut d = Deaths::fresh();
+        d.reg(&[4]);
+        let sealed = d.take();
+        assert_eq!(sealed, vec![4]);
+        d.reg(&[6]); // accumulated while the round ran
+        d.give_back(sealed);
+        assert_eq!(d.held(), vec![6, 4]);
+        assert!(d.holds(4) && d.holds(6));
+        assert_eq!(d.len(), 2);
+    }
+
+    /// A live guard holds its epoch's deaths: they sit undrained in
+    /// the bucket (`holds` sees them there) and move to the pile only
+    /// when the guard leaves.
+    #[test]
+    fn a_guard_holds_its_epoch_deaths() {
+        let mut d = Deaths::fresh();
+        let b = d.pin();
+        d.reg(&[4]);
+        assert!(d.holds(4)); // pending, undrained
+        assert_eq!(d.len(), 0);
+        d.unpin(b);
+        assert!(d.holds(4)); // in the pile now
+        assert_eq!(d.len(), 1);
     }
 }
