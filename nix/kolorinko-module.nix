@@ -25,6 +25,7 @@ let
         server.web_dist = "${cfg.package}/share/web-dist";
         server.cert_file = "${credentialsDir}/cert";
         server.key_file = "${credentialsDir}/key";
+        storage.dir = ".";
       };
     in
     toml.generate "kolorinko.toml" (lib.recursiveUpdate cfg.settings managed);
