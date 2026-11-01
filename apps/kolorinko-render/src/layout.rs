@@ -45,6 +45,24 @@ const BANNER_CSS: &str = "\
 #dentrado-banner .dentrado-about{white-space:nowrap}\
 ";
 
+/// The source wiki's address — the read-only banner's backlink: a registry
+/// name containing a dot is itself the site's domain (evakuilo keys some
+/// exports by custom domain, e.g. `castopia.site`); otherwise it is the
+/// Wikidot slug and the wiki lives at `<slug>.wikidot.com`. Always HTTPS —
+/// every Wikidot site and custom domain serves it. `slug` is the mirrored
+/// page's fullname (`cat:slug`), riding the same URL the source wiki served.
+fn source_wiki_url(site: &str, slug: Option<&str>) -> String {
+    let base = if site.contains('.') {
+        format!("https://{site}")
+    } else {
+        format!("https://{site}.wikidot.com")
+    };
+    match slug {
+        Some(slug) => format!("{base}/{slug}"),
+        None => format!("{base}/"),
+    }
+}
+
 /// Render the full page layout. `scope` — see [`Scope`] — is the render's
 /// addressing scope: the space pages render under and, on the client, the
 /// origin's default space every href simplifies against (the server passes
@@ -114,10 +132,10 @@ pub fn layout(
                             // getter keeps this closure `Fn` (a fresh `url`
                             // per re-run, the shared getter captured once).
                             let page_slug = page_slug.clone();
-                            let url = move || page_slug()
-                                .map(|a| a.meta.slug)
-                                .map(|slug| format!("http://{site}.wikidot.com/{slug}"))
-                                .unwrap_or_else(|| format!("http://{site}.wikidot.com/"));
+                            let url = move || {
+                                let slug = page_slug().map(|a| a.meta.slug);
+                                source_wiki_url(&site, slug.as_deref())
+                            };
                             let href = url.clone();
                             view! { <a class="dentrado-mirror" href=href>{url}</a> }.into_any()
                         }
@@ -331,13 +349,22 @@ mod tests {
         assert!(html(None, None, "").contains(BANNER_CSS));
     }
 
-    /// The banner names the source wiki (and page) it mirrors; a space the
-    /// registry doesn't know has no source to point at.
+    /// The banner names the source wiki (and page) it mirrors over HTTPS; a
+    /// registry name that is itself a domain (a custom-domain export key)
+    /// links the domain, not a Wikidot slug; a space the registry doesn't
+    /// know has no source to point at.
     #[test]
     fn banner_mirrors_source_url() {
         let known = html(Some("obscurative"), None, "docs:guide");
-        assert!(known.contains("http://obscurative.wikidot.com/docs:guide"));
+        assert!(known.contains("https://obscurative.wikidot.com/docs:guide"));
         assert!(known.contains(r#"href="/~/about""#));
+        // A domain-keyed export: the site's own home, never
+        // `<domain>.wikidot.com`.
+        let domain = html(Some("castopia.site"), None, "main");
+        assert!(domain.contains("https://castopia.site/main"));
+        assert!(!domain.contains("wikidot.com"));
+        // No slug yet: the wiki root.
+        assert!(html(Some("obscurative"), None, "").contains("https://obscurative.wikidot.com/"));
         assert!(!html(None, None, "").contains("wikidot.com"));
     }
 

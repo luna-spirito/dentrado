@@ -23,6 +23,37 @@
         color: #888;
       }
     </style>
+    <script>
+      // Hydration crash net. Tachys hydration traps (panic = abort → the
+      // `unreachable` instruction) whenever the browser's HTML parser has
+      // restructured the server's markup (nested anchors, foster parenting,
+      // …) — and a wasm trap, while uncatchable in Rust, unwinds to its JS
+      // caller as a RuntimeError. The Trunk glue runs the boot inside
+      // init(), so a trapped boot rejects this module; that rejection lands
+      // here, and instead of a dead page the app re-boots client-side from
+      // the embedded SSR state. `window.wasmBindings` is set by the glue
+      // only after a completed boot, so its absence identifies the boot as
+      // the rejector; the flag makes the net one-shot.
+      (() => {
+        let used = false;
+        addEventListener("unhandledrejection", (ev) => {
+          if (used || window.wasmBindings !== undefined) return;
+          if (!(ev.reason instanceof WebAssembly.RuntimeError)) return;
+          used = true;
+          ev.preventDefault();
+          console.error("kolorinko: hydration trapped — re-rendering client-side", ev.reason);
+          (async () => {
+            try {
+              const glue = document.querySelector('link[rel="modulepreload"]').href;
+              const wasm = await (await import(glue)).default();
+              wasm.boot_fresh();
+            } catch (e) {
+              console.error("kolorinko: client-side re-render failed", e);
+            }
+          })();
+        });
+      })();
+    </script>
   </head>
   <body id="html-body">
     <div id="container"></div>

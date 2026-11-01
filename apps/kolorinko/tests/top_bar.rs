@@ -103,3 +103,29 @@ fn topbar_transform_is_idempotent_without_sublists() {
     let html = render_topbar_html(test_space(), "* [[[a|A]]]\n* [[[b|B]]]\n");
     assert!(!html.contains("javascript:"), "{html}");
 }
+
+#[test]
+fn topbar_never_nests_anchors() {
+    // A submenu trigger written as its own link (`[[a]]` raw HTML pairing —
+    // castopia's `nav:top` shape) must not get the `javascript:;` wrap: the
+    // HTML parser's adoption agency splits nested anchors, so the browser's
+    // DOM would diverge from the SSR tree and hydration would trap.
+    let html = render_topbar_html(
+        test_space(),
+        concat!(
+            "[[div class=\"top-bar\"]]\n",
+            "* [[a href=\"###\"]]Введение[[/a]]\n",
+            " * [[[main | Основная страница]]]\n",
+            "[[/div]]\n",
+        ),
+    );
+    // Escaped string: the literal's `"###"` would close any sane raw string.
+    assert!(
+        html.contains("<li><a href=\"###\">Введение</a>"),
+        "author anchor not kept as the trigger: {html}"
+    );
+    assert!(
+        !html.contains("javascript:"),
+        "wrapped a link-carrying trigger: {html}"
+    );
+}

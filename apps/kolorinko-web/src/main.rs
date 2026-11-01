@@ -26,6 +26,7 @@ use kolorinko_render::{
 use kolorinko_rt::wire;
 use kolorinko_rt::{SSR_STATE_ID, SiteShell, SsrState};
 use kolorinko_wikitext::ArticleView;
+use wasm_bindgen::prelude::wasm_bindgen;
 use leptos::prelude::*;
 use std::{cell::Cell, rc::Rc};
 use transport::Transport;
@@ -266,16 +267,37 @@ fn main() {
             // ServiceWorker served). `mount_to_body` appends, so the body is
             // cleared first — the client re-renders the identical static view
             // and owns routing from there.
-            if window_path().trim_end_matches('/') == ABOUT_PATH
-                && let Some(body) =
-                    web_sys::window().and_then(|w| w.document()).and_then(|d| d.body())
-            {
-                while let Some(child) = body.first_child() {
-                    let _ = body.remove_child(&child);
-                }
+            if window_path().trim_end_matches('/') == ABOUT_PATH {
+                clear_body();
             }
             leptos::mount::mount_to_body(|| app(None));
         }
+    }
+}
+
+/// Emergency re-boot after a hydration trap, called by the recovery script in
+/// `index.html`. A wasm trap (`panic = "abort"` → `unreachable`) unwinds to
+/// the JS caller, where it is catchable — but not in Rust — so the script
+/// catches the rejected boot and calls this export instead of leaving a dead
+/// page. The half-hydrated DOM is discarded wholesale and the app
+/// client-side rendered from the embedded SSR state (read *before* clearing:
+/// the state script is itself a body child). A page lifetime's listeners
+/// (router, menu) may double-install across the two boots — both pairs are
+/// delegated and idempotent, so the cost is a duplicated no-op.
+#[wasm_bindgen]
+pub fn boot_fresh() {
+    let state = ssr_state();
+    clear_body();
+    leptos::mount::mount_to_body(move || app(state));
+}
+
+/// Drop every `<body>` child.
+fn clear_body() {
+    let Some(body) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.body()) else {
+        return;
+    };
+    while let Some(child) = body.first_child() {
+        let _ = body.remove_child(&child);
     }
 }
 

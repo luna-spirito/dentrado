@@ -131,6 +131,7 @@ pub(crate) struct Ram {
     pub(crate) dying: usize,
 }
 
+// TODO: Drafts should be a separate, incapsulated model, not put into `core`
 /// The draft arena: keys → (page, fresh — never yet written). A page
 /// enters as a fresh draft and leaves by publication or death.
 struct Drafts {

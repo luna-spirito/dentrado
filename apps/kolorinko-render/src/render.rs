@@ -808,17 +808,20 @@ fn render_list(ctx: &RenderCtx, list: &List) -> AnyView {
 
 /// Wikidot's `nav:top` quirk: a top-level list item that opens a submenu has
 /// its content wrapped in `<a href="javascript:;">` — the inert "button"
-/// legacy themes target with `#top-bar li a`. Only the first level of each
-/// list is wrapped: we descend through containers (the nav page keeps its
-/// lists in `[[div class="top-bar"]]` / `mobile-top-bar`) but never into a
-/// sublist, so nested entries keep their real links. Apply to the `nav:top`
-/// content before [`render_block`].
+/// legacy themes target with `#top-bar li a` — unless the item already
+/// contains a link of its own: nested anchors are unrepresentable in the DOM
+/// (the HTML parser's adoption agency splits them), which would both diverge
+/// from the live site and break hydration. Only the first level of each list
+/// is wrapped: we descend through containers (the nav page keeps its lists in
+/// `[[div class="top-bar"]]` / `mobile-top-bar`) but never into a sublist, so
+/// nested entries keep their real links. Apply to the `nav:top` content
+/// before [`render_block`].
 pub fn wrap_topbar_lists(content: &mut Content) {
     for node in content {
         match node {
             Node::List(list) => {
                 for item in &mut list.items {
-                    if item.sublist.is_some() {
+                    if item.sublist.is_some() && !contains_link(&item.content) {
                         let text = std::mem::take(&mut item.content);
                         item.content = vec![Node::Link {
                             target: LinkTarget::Url("javascript:;".to_string()),
@@ -833,6 +836,16 @@ pub fn wrap_topbar_lists(content: &mut Content) {
             _ => {}
         }
     }
+}
+
+/// Does this content contain a hyperlink anywhere (recursing through every
+/// nested content slot)? A nested `<a>` cannot exist in the DOM, so any link
+/// inside a submenu trigger forbids the `javascript:;` wrap.
+fn contains_link(content: &Content) -> bool {
+    content.iter().any(|node| match node {
+        Node::Link { .. } => true,
+        other => other.sub_contents().iter().any(|c| contains_link(c)),
+    })
 }
 
 fn render_table(ctx: &RenderCtx, rows: &[Vec<TableCell>]) -> AnyView {
