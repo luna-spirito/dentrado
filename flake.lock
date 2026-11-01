@@ -28,11 +28,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1793460098,
-        "narHash": "sha256-F/fZMFToLH2yiHP3Q9KLYbQ53c1uYWBl3Qvg8D7lFvY=",
+        "lastModified": 1793525604,
+        "narHash": "sha256-xCALNR05VZtM3ubO4sebRhcYkvjQ8HBZFz5LEttFi1w=",
         "owner": "luna-spirito",
         "repo": "wikidot-evakuilo",
-        "rev": "bfdb14402c54f95d336f400b5a6162bbccbb6c0a",
+        "rev": "59851b6a315eef30bec61028c488fb9a44e9de5f",
         "type": "github"
       },
       "original": {
