@@ -190,7 +190,7 @@ impl Drafts {
 }
 
 impl<D: IsFilesystem> Core<D> {
-    pub(crate) fn fresh(file: D::File, cap: usize, n_tables: usize) -> Self {
+    pub(crate) fn fresh(file: D::File, cap: usize, names: &[&str]) -> Self {
         // The arena's pages, born here at the top and shared downward: a
         // flight's lease is an `Rc` to these very pages, so the bytes
         // stay put for as long as the kernel holds them — through any
@@ -203,18 +203,19 @@ impl<D: IsFilesystem> Core<D> {
             frees: Frees::fresh(),
             drafts: Drafts::fresh(),
             deaths: Deaths::fresh(),
-            tables: Tables::fresh(n_tables),
+            tables: Tables::fresh(names),
         }
     }
 
     /// Recovery over a live store: the image's fields go on top; the
     /// block cache is not touched (the validation chains are read
-    /// directly).
-    pub(crate) fn of_sb(&mut self, sb: &Sb) {
+    /// directly). The tables are the union of the image's set and the
+    /// opener's — see [`Tables::of_image`].
+    pub(crate) fn of_sb(&mut self, sb: &Sb, opener: &[&str]) {
         self.frees = Frees::of_sb(sb.e0, sb.next0, sb.e1, sb.next1);
         self.drafts = Drafts::fresh();
         self.deaths = Deaths::fresh();
-        self.tables = Tables::of_image(&sb.roots);
+        self.tables = Tables::of_image(&sb.tables, opener);
     }
 
     // ## Atomic sections: pure transitions
@@ -326,6 +327,47 @@ impl<D: IsFilesystem> Core<D> {
     /// The guard away.
     pub(crate) fn drop_step(&mut self, b: usize) {
         self.deaths.unpin(b);
+    }
+
+    // ## The tables' verbs (the named-set surface)
+
+    /// A live name's slot — `None` for a name outside the set or a
+    /// dropped slot.
+    pub(crate) fn table_index(&self, name: &str) -> Option<usize> {
+        self.tables.idx(name)
+    }
+
+    /// A slot's standing tree root (0 — empty).
+    pub(crate) fn table_root(&self, t: usize) -> PageId {
+        self.tables.roots[t]
+    }
+
+    /// A slot's delta value pages — see [`Tables::delta_pages`].
+    pub(crate) fn table_delta_pages(&self, t: usize) -> Vec<PageId> {
+        self.tables.delta_pages(t)
+    }
+
+    /// The live names — enumeration for the caller's startup GC.
+    pub(crate) fn table_names(&self) -> Vec<String> {
+        self.tables.names()
+    }
+
+    /// The live `(name, root)` pairs over a roots vector — the SB's
+    /// set at a flush's engraving.
+    pub(crate) fn live_tables(&self, roots: &[PageId]) -> Vec<(String, PageId)> {
+        self.tables.live_with(roots)
+    }
+
+    /// Register page deaths outside a seal (a table drop's tree and
+    /// value pages).
+    pub(crate) fn reg_deaths(&mut self, ps: &[PageId]) {
+        self.deaths.reg(ps);
+    }
+
+    /// A slot's death — the tombstone, see [`Tables::drop_slot`]. The
+    /// pages themselves die by the caller's [`Core::reg_deaths`].
+    pub(crate) fn drop_table_slot(&mut self, t: usize) {
+        self.tables.drop_slot(t);
     }
 
     // ## The drafts' verbs (the steps around the io)

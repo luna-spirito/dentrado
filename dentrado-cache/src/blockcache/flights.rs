@@ -4,11 +4,13 @@
 
 use std::cell::RefCell;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use compio::runtime::JoinHandle;
+use futures::FutureExt;
 use futures::future::poll_fn;
 
 use super::arena::{LoadPage, SavePage};
@@ -174,11 +176,18 @@ impl<D: IsFilesystem> BlockCache<D> {
 /// the kernel.
 async fn drive<D: IsFilesystem>(inner: Rc<RefCell<PersistentCore<D>>>) -> ! {
     loop {
-        poll_fn(|cx| match inner.borrow_mut().core.reap(cx) {
+        // A panicking reap poisons the store (from then on every
+        // semantic op refuses) — but the loop lives on: the io plumbing
+        // must keep draining, or the readers parked before the poison
+        // would wait for flights that never land. The default panic
+        // hook has already reported the cause by the time we land here.
+        let step = poll_fn(|cx| match inner.borrow_mut().core.reap(cx) {
             0 => Poll::Pending,
             _ => Poll::Ready(()),
-        })
-        .await;
+        });
+        if AssertUnwindSafe(step).catch_unwind().await.is_err() {
+            inner.borrow_mut().poison();
+        }
     }
 }
 

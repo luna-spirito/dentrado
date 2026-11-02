@@ -3,7 +3,7 @@
 use dentrado_cache::core::freelist::{
     CHUNK_SLOTS, ChainEntry, chunk_cells, chunk_next, write_chunk,
 };
-use dentrado_cache::core::sb::{MAX_ROOTS, parse_sb, write_sb};
+use dentrado_cache::core::sb::{MAX_TABLES, parse_sb, write_sb};
 use dentrado_cache::core::tree::{build, leaf_find, parse_node, plan, route, write_node};
 use dentrado_cache::core::val::{link_val, val_split, write_val};
 use dentrado_cache::page::{PAGE_SIZE, Page, PageId, TORN_BYTE, fnv_id};
@@ -104,35 +104,25 @@ fn tree_build_shape() {
 fn sb_roundtrip() {
     let e0 = ChainEntry { page: 12, off: 5 };
     let e1 = ChainEntry::default();
+    let tables = vec![("a".to_string(), 7), ("cache:Repo:v3".to_string(), 12)];
     let mut p = Page::zeroed();
-    write_sb(
-        &mut p,
-        9,
-        42,
-        43,
-        &[7, 0, 12],
-        e0,
-        e1,
-        100,
-        0,
-        0xDEAD,
-        0xBEEF,
-    );
+    write_sb(&mut p, 9, 42, 43, &tables, e0, e1, 100, 0, 0xDEAD, 0xBEEF);
     let sb = parse_sb(&p).unwrap();
     assert_eq!((sb.r#gen, sb.next0, sb.next1), (9, 42, 43));
-    assert_eq!(sb.roots, vec![7, 0, 12]);
+    assert_eq!(sb.tables, tables);
     assert_eq!(
         (sb.e0, sb.e1, sb.c0, sb.c1, sb.s0, sb.s1),
         (e0, e1, 100, 0, 0xDEAD, 0xBEEF)
     );
     assert!(parse_sb(&Page::zeroed()).is_none());
     assert!(parse_sb(&Page([TORN_BYTE; PAGE_SIZE])).is_none());
-    // шум: гигантский счётчик таблиц зажат форматом страницы
+    // шум: гигантский счётчик таблиц зажат форматом страницы — запись
+    // полного набора читается ровно, хвост не заходит
+    let full: Vec<(String, PageId)> = (0..MAX_TABLES).map(|i| (format!("t{i}"), 0)).collect();
     let mut junk = Page::zeroed();
-    junk.0[0..4].copy_from_slice(&0x52544E44u32.to_le_bytes());
-    junk.0[4..8].copy_from_slice(&3u32.to_le_bytes());
+    write_sb(&mut junk, 1, 4, 5, &full, e0, e1, 0, 0, 0, 0);
     junk.0[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
-    assert_eq!(parse_sb(&junk).unwrap().roots.len(), MAX_ROOTS);
+    assert_eq!(parse_sb(&junk).unwrap().tables.len(), MAX_TABLES);
 }
 
 #[test]

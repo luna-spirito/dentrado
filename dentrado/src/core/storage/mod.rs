@@ -41,8 +41,7 @@
 //! 2. **event log** — the dedup index + log itself commit atomically;
 //! 3. **gear cache** — carries each gear's event watermark, so it must land
 //!    strictly *after* the log (a watermark surviving past its events would
-//!    point past the tail);
-//! 4. **pages** (when used) — the write-once substrate for spill maps.
+//!    point past the tail).
 //!
 //! Everything in this trait is restart-surviving state. A *RAM-only* backend
 //! like [`InMemoryStorage`](crate::core::storage::in_memory::InMemoryStorage)
@@ -98,65 +97,29 @@ use crate::{
 
 /// Changes to a group since a watermark: ids of events added and ids of events
 /// superseded/removed, plus the new tip watermark to persist. Bodies are
-/// fetched on demand via [`Storage::fetch_event`] — mirrors the current
+/// fetched on demand via [`IsStorage::fetch_event`] — mirrors the current
 /// `query_events` + `get_stored_event` two-step and avoids loading bodies a
 /// gear never reads.
 #[derive(Debug, Clone)]
-pub struct GroupDiff<W> {
+pub struct GroupDiff {
     pub added: Vec<GroupEventId>,
     pub removed: Vec<GroupEventId>,
-    pub watermark: W,
+    pub watermark: Watermark,
 }
 
-/// Page size of the write-once page substrate ([`AlignedPage`]). Matches the
-/// on-disk direct-IO page (see `fs`), so a page is one IO unit.
-pub const PAGE_SIZE: usize = 4096;
+/// Event-log watermark: how far a consumer has walked a group's changelog —
+/// the counts of `added`/`removed` entries seen. `Watermark::default()` means
+/// "from the beginning".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Watermark(pub u64, pub u64);
 
-/// Positional id of a write-once (immutable) page. Identity is by position, not
-/// by content hash. A raw `PageId` carries **no** reference-counting: it is
-/// what [`Storage::read_page`] takes, and it is the key a gear cache (via
-/// [`CacheSer::page_roots`]) or a parent page's `refs` roots. Dormant today: the
-/// substrate for future disk-spilling persistent maps; unused by dentrado yet.
-/// Page content is raw bytes by design — its layout is defined by the spill-map
-/// format, not a typed domain object.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PageId(pub u64);
-
-/// Owned, reference-counted handle to a page — what [`Storage::write_page`]
-/// hands back and [`Storage::drop_page_handle`] consumes. While a handle (or a
-/// rooting edge: a parent page's `refs`, or a cache's `page_roots`) exists, the
-/// page is live; dropping the last such reference cascade-frees it. Wraps the
-/// positional [`PageId`] so the runtime can still [`Storage::read_page`] by id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PageHandle(pub PageId); // TODO: Doesn't call drop right now, causing leak.
-
-/// A single aligned page — the write-once storage unit. `#[repr(align(4096))]`
-/// so it can later be handed to direct IO verbatim; owned by value (move on
-/// write, clone on read).
-#[repr(align(4096))]
-#[derive(Clone, Debug)]
-pub struct AlignedPage(pub [u8; PAGE_SIZE]);
-
-/// (De)serialization + page-rooting interface a gear cache (`R::GearCache`)
-/// implements so a [`Storage`] backend can persist it and track the pages it
-/// roots.
-///
-/// `page_roots` is what an in-process backend calls to reference-count the
-/// pages a cache directly roots (incref on [`Storage::put_cache`] **before**
-/// decref of the superseded cache's roots, so a shared root never dips to zero
-/// mid-swap). `ser_image`/`de_image` are what a restart-surviving backend
-/// ([`PagedStorage`](crate::core::storage::PagedStorage)) calls to spill the
-/// cache itself into pages; a cache that leaves them at the default simply
-/// cold-starts after a restart — correct, only slower (the cache is
-/// recomputable from the event log).
-///
-/// TODO: Add <GearId> parameter to make key-aware deserialization
+/// (De)serialization interface a gear cache (`R::GearCache`) implements so a
+/// restart-surviving backend
+/// ([`PagedStorage`](crate::core::storage::PagedStorage)) can persist it:
+/// `ser_image`/`de_image` spill the cache as one self-contained byte image; a
+/// cache that leaves them at the default simply cold-starts after a restart —
+/// correct, only slower (the cache is recomputable from the event log).
 pub trait CacheSer {
-    /// The pages this cache directly roots.
-    fn page_roots(&self) -> &[PageId] {
-        &[]
-    }
-
     /// The cache as one self-contained byte image, or `None` if this cache
     /// does not persist. The image must round-trip through [`de_image`] into
     /// an equivalent cache.
@@ -183,7 +146,6 @@ impl CacheSer for () {}
 /// internal monotonic counter (NOT a row count) so that future sender eviction
 /// cannot alias a live id.
 pub trait IsStorage<R: IsRuntime>: GlobalResolver /* TODO: Remove this, unviable. */ + 'static {
-    type Watermark: Clone + Debug + Default + 'static;
 
     // ── Layer 1: localization, идемпотентные аллокаторы ──────────────────
 
@@ -238,37 +200,22 @@ pub trait IsStorage<R: IsRuntime>: GlobalResolver /* TODO: Remove this, unviable
     fn diff_group(
         &self,
         group: LocGroupId,
-        since: Self::Watermark,
-    ) -> impl Future<Output = GroupDiff<Self::Watermark>>;
+        since: Watermark,
+    ) -> impl Future<Output = GroupDiff>;
 
-    // ── Layer 3: gear cache + страницы (CoW, reference counting) ─────────
+    // ── Layer 3: gear cache ───────────────────────────────────────────────
 
     /// Получить cache по id. Десериализует и возвращает typed cache.
-    fn get_cache(&self, gear: &R::GearId) -> impl Future<Output = Option<R::GearCache<Self::Watermark>>>;
+    fn get_cache(&self, gear: &R::GearId) -> impl Future<Output = Option<R::GearCache>>;
 
-    /// Перезаписать cache. Storage сам извлекает корни старой и новой записи
-    /// через [`CacheSer::page_roots`]: incref новых ДО decref старых, чтобы
-    /// общий корень никогда не проваливался в ноль между проходами.
-    fn put_cache(&self, gear: R::GearId, cache: R::GearCache<Self::Watermark>) -> impl Future<Output = ()>;
-
-    /// Записать новую страницу, вернуть owned handle. `refs` — дочерние
-    /// страницы (их refcount инкрементится). Страница immutable.
-    fn write_page(&self, data: AlignedPage, refs: &[PageId]) -> impl Future<Output = PageHandle>;
-
-    /// Прочитать страницу по id. Паника на несуществующем id — чтение
-    /// не-живой страницы это баг вызывающего (live-страница не может быть
-    /// освобождена, пока на неё есть handle или ссылка).
-    fn read_page(&self, id: PageId) -> impl Future<Output = AlignedPage>;
-
-    /// Вызывается рантаймом при дропе handle. Дочерние refs страницы storage
-    /// знает сам (они записаны вместе со страницей) — каскадный decref.
-    fn drop_page_handle(&self, handle: PageHandle) -> impl Future<Output = ()>;
+    /// Перезаписать cache.
+    fn put_cache(&self, gear: R::GearId, cache: R::GearCache) -> impl Future<Output = ()>;
 
     // ── Durability ────────────────────────────────────────────────────────
 
     /// Commit point: после успешного `flush` всё, записанное до него,
     /// переживает крах процесса. Порядок внутри: layer 1 → layer 2 →
-    /// gear cache → страницы.
+    /// gear cache.
     fn flush(&self) -> impl Future<Output = io::Result<()>>;
 }
 

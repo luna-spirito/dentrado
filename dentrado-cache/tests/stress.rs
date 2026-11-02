@@ -46,7 +46,7 @@ async fn offset_image(disk: &MemDisk) {
         1,
         14,
         15,
-        &[0],
+        &[("t0".to_string(), 0)],
         ChainEntry { page: 2, off: 2 },
         ChainEntry::default(),
         3,
@@ -68,7 +68,7 @@ fn image_entry_offset() {
         let disk = MemDisk::default();
         offset_image(&disk).await;
 
-        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         assert_eq!(st.debug_state().free_nexts, [14, 15], "мир читан из SB");
         let mut ks = Vec::new();
         for _ in 0..3 {
@@ -99,7 +99,7 @@ fn image_entry_offset() {
 fn multi_chunk_flush() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         let key = b"big";
         let mut ks = Vec::new();
         for _ in 0..1100 {
@@ -109,10 +109,10 @@ fn multi_chunk_flush() {
                 .unwrap();
             ks.push(k);
         }
-        st.put_cache(0, key, &[0], &ks, &[]).await.unwrap();
+        st.put_cache("t0", key, &[0], &ks, &[]).await.unwrap();
         st.flush().await.unwrap();
         assert!(st.ok_store().await);
-        let (g, cv) = st.get_cache(0, key).await.unwrap().expect("ключ");
+        let (g, cv) = st.get_cache("t0", key).await.unwrap().expect("ключ");
         assert_eq!(cv.pages.len(), 1100);
         let old = cv.pages;
         drop(g);
@@ -123,7 +123,7 @@ fn multi_chunk_flush() {
         st.write_draft_page(k2, |_| (vec![1, 2, 3], ()))
             .await
             .unwrap();
-        st.put_cache(0, key, &[0], &[k2], &old).await.unwrap();
+        st.put_cache("t0", key, &[0], &[k2], &old).await.unwrap();
         // гвардов нет — reg сам осаждает свою партию, печать забирает
         // смерти без пин-цикла (случай под гвардом — death_pending_bucket)
         st.flush().await.unwrap();
@@ -143,8 +143,8 @@ fn multi_chunk_flush() {
         st.partition_exact().await.expect("смерти — клетки цепей");
         drop(st);
         // восстановление: запас живёт в цепочках, головы пусты
-        let st2 = Storage::open(&disk, "db", 4, 1).await.unwrap();
-        let (g, cv2) = st2.get_cache(0, key).await.unwrap().expect("ключ");
+        let st2 = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
+        let (g, cv2) = st2.get_cache("t0", key).await.unwrap().expect("ключ");
         assert_eq!(cv2.pages.len(), 1);
         drop(g);
         let dbg2 = st2.debug_state();
@@ -166,7 +166,7 @@ fn multi_chunk_flush() {
             st2.write_draft_page(k, |_| (vec![9; 3], ())).await.unwrap();
             ks2.push(k);
         }
-        st2.put_cache(0, b"two", &[0], &ks2, &[]).await.unwrap();
+        st2.put_cache("t0", b"two", &[0], &ks2, &[]).await.unwrap();
         st2.flush().await.unwrap();
         assert!(st2.ok_store().await, "выедание цепочки с дренажом");
     });
@@ -188,7 +188,7 @@ fn random_ops_smoke() {
             seed
         };
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         let mut shadow: HashMap<u8, (u8, Vec<u8>)> = HashMap::new();
         let mut held: Vec<Guard<MemDisk>> = Vec::new();
         for op in 0..260u32 {
@@ -214,18 +214,18 @@ fn random_ops_smoke() {
                             .unwrap();
                         ks.push(k);
                     }
-                    let prev = match st.get_cache(0, &[key]).await.unwrap() {
+                    let prev = match st.get_cache("t0", &[key]).await.unwrap() {
                         Some((g, cv)) => {
                             drop(g);
                             cv.pages
                         }
                         None => Vec::new(),
                     };
-                    st.put_cache(0, &[key], &mt, &ks, &prev).await.unwrap();
+                    st.put_cache("t0", &[key], &mt, &ks, &prev).await.unwrap();
                     shadow.insert(key, (ver, payload));
                 }
                 12..=16 => {
-                    if let Some((g, cv)) = st.get_cache(0, &[key]).await.unwrap() {
+                    if let Some((g, cv)) = st.get_cache("t0", &[key]).await.unwrap() {
                         let mut got = Vec::new();
                         for &p in &cv.pages {
                             let b = st
@@ -250,14 +250,14 @@ fn random_ops_smoke() {
                     }
                 }
                 17..=18 => {
-                    let prev = match st.get_cache(0, &[key]).await.unwrap() {
+                    let prev = match st.get_cache("t0", &[key]).await.unwrap() {
                         Some((g, cv)) => {
                             drop(g);
                             cv.pages
                         }
                         None => continue,
                     };
-                    st.put_cache(0, &[key], &[], &[], &prev).await.unwrap();
+                    st.put_cache("t0", &[key], &[], &[], &prev).await.unwrap();
                     shadow.insert(key, (0, vec![]));
                 }
                 _ => {
@@ -278,9 +278,9 @@ fn random_ops_smoke() {
         st.partition_exact().await.expect("биекция финала");
         drop(st);
 
-        let st2 = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st2 = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         for key in 0..8u8 {
-            match st2.get_cache(0, &[key]).await.unwrap() {
+            match st2.get_cache("t0", &[key]).await.unwrap() {
                 Some((g, cv)) => {
                     let mut got = Vec::new();
                     for &p in &cv.pages {
@@ -319,18 +319,18 @@ fn random_ops_smoke() {
 fn tiny_pool_stress() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 2, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 2, &["t0"]).await.unwrap();
         for r in 0..40u8 {
             let k = st.alloc_draft_page().await.unwrap();
             st.write_draft_page(k, move |_| (vec![r; 100], ()))
                 .await
                 .unwrap();
-            st.put_cache(0, &[r], &[r], &[k], &[]).await.unwrap();
+            st.put_cache("t0", &[r], &[r], &[k], &[]).await.unwrap();
         }
         st.flush().await.unwrap();
         assert!(st.ok_store().await);
         for r in 0..40u8 {
-            let (g, cv) = st.get_cache(0, &[r]).await.unwrap().expect("ключ");
+            let (g, cv) = st.get_cache("t0", &[r]).await.unwrap().expect("ключ");
             let b = st
                 .read_page_guarded(&g, cv.pages[0], |p| val_split(p).1[..3].to_vec())
                 .await
@@ -339,8 +339,8 @@ fn tiny_pool_stress() {
             assert_eq!(b, vec![r; 3]);
         }
         drop(st);
-        let st2 = Storage::open(&disk, "db", 2, 1).await.unwrap();
-        let (g, cv) = st2.get_cache(0, &[7]).await.unwrap().expect("ключ");
+        let st2 = Storage::open(&disk, "db", 2, &["t0"]).await.unwrap();
+        let (g, cv) = st2.get_cache("t0", &[7]).await.unwrap().expect("ключ");
         let b = st2
             .read_page_guarded(&g, cv.pages[0], |p| val_split(p).1[..3].to_vec())
             .await
@@ -369,7 +369,7 @@ fn tiny_pool_stress() {
 fn death_pending_bucket() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         let key = b"big";
         let mut ks = Vec::new();
         for i in 0..6u8 {
@@ -379,9 +379,9 @@ fn death_pending_bucket() {
                 .unwrap();
             ks.push(k);
         }
-        st.put_cache(0, key, &[0], &ks, &[]).await.unwrap();
+        st.put_cache("t0", key, &[0], &ks, &[]).await.unwrap();
         st.flush().await.unwrap();
-        let (g, cv) = st.get_cache(0, key).await.unwrap().expect("ключ");
+        let (g, cv) = st.get_cache("t0", key).await.unwrap().expect("ключ");
         let old = cv.pages;
         let k2 = st.alloc_draft_page().await.unwrap();
         st.write_draft_page(k2, |_| (vec![1, 2, 3], ()))
@@ -389,7 +389,7 @@ fn death_pending_bucket() {
             .unwrap();
         // смерть и печать — под живым гвардом: оборот руки невозможен,
         // смерти сидят в pending-бакете и раунд пропускают
-        st.put_cache(0, key, &[0], &[k2], &old).await.unwrap();
+        st.put_cache("t0", key, &[0], &[k2], &old).await.unwrap();
         st.flush().await.unwrap();
         let dbg = st.debug_state();
         assert_eq!(dbg.dying_len, 0, "{dbg:?}");
@@ -425,7 +425,7 @@ fn death_pending_bucket() {
 fn pending_deaths_survive_crash() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         let key = b"k";
         let mut ks = Vec::new();
         for i in 0..4u8 {
@@ -435,17 +435,17 @@ fn pending_deaths_survive_crash() {
                 .unwrap();
             ks.push(k);
         }
-        st.put_cache(0, key, &[0], &ks, &[]).await.unwrap();
+        st.put_cache("t0", key, &[0], &ks, &[]).await.unwrap();
         st.flush().await.unwrap();
-        let (g, cv) = st.get_cache(0, key).await.unwrap().expect("ключ");
+        let (g, cv) = st.get_cache("t0", key).await.unwrap().expect("ключ");
         let old = cv.pages;
         let k2 = st.alloc_draft_page().await.unwrap();
         st.write_draft_page(k2, |_| (vec![9; 3], ())).await.unwrap();
-        st.put_cache(0, key, &[0], &[k2], &old).await.unwrap();
+        st.put_cache("t0", key, &[0], &[k2], &old).await.unwrap();
         st.flush().await.unwrap(); // смерти — под гвардом: pending
         drop(g);
         drop(st); // краш: гварды и арена исчезли, образ — как закоммичен
-        let st2 = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st2 = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         st2.partition_exact()
             .await
             .expect("pending-смерти упакованы клетками");
@@ -460,7 +460,7 @@ fn pending_deaths_survive_crash() {
 fn live_drafts_survive_crash() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         let mut ks = Vec::new();
         for i in 0..6u8 {
             let k = st.alloc_draft_page().await.unwrap();
@@ -471,7 +471,7 @@ fn live_drafts_survive_crash() {
         }
         st.flush().await.unwrap(); // черновики живы на печати
         drop(st); // краш
-        let st2 = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st2 = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         st2.partition_exact()
             .await
             .expect("страницы черновиков — клетки");
@@ -486,7 +486,7 @@ fn live_drafts_survive_crash() {
 fn page_partition() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         let key = b"big";
         let mut old: Vec<PageId> = Vec::new();
         for r in 0..3u8 {
@@ -498,9 +498,9 @@ fn page_partition() {
                     .unwrap();
                 ks.push(k);
             }
-            st.put_cache(0, key, &[0], &ks, &old).await.unwrap();
+            st.put_cache("t0", key, &[0], &ks, &old).await.unwrap();
             {
-                let (g, cv) = st.get_cache(0, key).await.unwrap().expect("ключ");
+                let (g, cv) = st.get_cache("t0", key).await.unwrap().expect("ключ");
                 old = cv.pages;
                 drop(g);
             }
@@ -525,7 +525,7 @@ fn page_partition() {
 fn eaten_container_survives_two_rounds() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         let key = b"big";
         let mut ks = Vec::new();
         for _ in 0..8 {
@@ -535,16 +535,16 @@ fn eaten_container_survives_two_rounds() {
                 .unwrap();
             ks.push(k);
         }
-        st.put_cache(0, key, &[0], &ks, &[]).await.unwrap();
+        st.put_cache("t0", key, &[0], &ks, &[]).await.unwrap();
         st.flush().await.unwrap();
-        let (g, cv) = st.get_cache(0, key).await.unwrap().expect("ключ");
+        let (g, cv) = st.get_cache("t0", key).await.unwrap().expect("ключ");
         let old = cv.pages;
         drop(g);
         let k2 = st.alloc_draft_page().await.unwrap();
         st.write_draft_page(k2, |_| (vec![1, 2, 3], ()))
             .await
             .unwrap();
-        st.put_cache(0, key, &[0], &[k2], &old).await.unwrap();
+        st.put_cache("t0", key, &[0], &[k2], &old).await.unwrap();
         st.flush().await.unwrap(); // смерти — клетками в цепи
         // вычерпать головы аллокациями — сплайсы едят чанки, контейнеры
         // оседают в spent
@@ -576,17 +576,17 @@ fn recovered_tail_behind_new_chunk() {
     run(async {
         let disk = MemDisk::default();
         offset_image(&disk).await;
-        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
-        st.put_cache(0, b"k", &[0], &[], &[8]).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
+        st.put_cache("t0", b"k", &[0], &[], &[8]).await.unwrap();
         {
-            let (g, _) = st.get_cache(0, b"k").await.unwrap().expect("ключ");
+            let (g, _) = st.get_cache("t0", b"k").await.unwrap().expect("ключ");
             drop(g); // пин-цикл: смерть осаждается в кучу
         }
         st.flush().await.unwrap(); // здесь паника
         assert!(st.ok_store().await);
         drop(st);
-        let st2 = Storage::open(&disk, "db", 4, 1).await.unwrap();
-        let (g, cv) = st2.get_cache(0, b"k").await.unwrap().expect("ключ");
+        let st2 = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
+        let (g, cv) = st2.get_cache("t0", b"k").await.unwrap().expect("ключ");
         drop(g);
         assert_eq!(cv.mt, vec![0]);
         assert!(st2.ok_store().await);
@@ -608,10 +608,10 @@ fn tree_holds_many_keys() {
                 .await
                 .unwrap();
             let (k, m) = (key.to_vec(), mt.to_vec());
-            st.put_cache(0, &k, &m, &[p], &[]).await.unwrap();
+            st.put_cache("t0", &k, &m, &[p], &[]).await.unwrap();
         }
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         // круг 1 — нечётные 1..599: сплошная укладка полного дерева
         for r in 0..300u16 {
             let mut k = vec![1u8];
@@ -639,11 +639,11 @@ fn tree_holds_many_keys() {
         for r in 0..800u16 {
             let mut k = vec![2u8];
             k.extend_from_slice(&r.to_le_bytes());
-            st.put_cache(0, &k, &fat, &[], &[]).await.unwrap();
+            st.put_cache("t0", &k, &fat, &[], &[]).await.unwrap();
         }
         st.flush().await.unwrap();
         drop(st);
-        let st2 = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st2 = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         let mut expect: Vec<Vec<u8>> = (0..50u16)
             .map(|r| [0u8, r.to_le_bytes()[0], r.to_le_bytes()[1]].to_vec())
             .chain((0..600u16).map(|r| [1u8, r.to_le_bytes()[0], r.to_le_bytes()[1]].to_vec()))
@@ -652,7 +652,7 @@ fn tree_holds_many_keys() {
         expect.sort_unstable();
         for k in &expect {
             let (g, cv) = st2
-                .get_cache(0, k)
+                .get_cache("t0", k)
                 .await
                 .unwrap()
                 .unwrap_or_else(|| panic!("ключ {k:?} потерян"));

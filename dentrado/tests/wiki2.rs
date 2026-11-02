@@ -4,7 +4,7 @@ use dentrado::{
     core::{
         core_ctx::GearCtx,
         gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime},
-        storage::{CacheSer, InMemoryStorage, IsStorage, PageId},
+        storage::{CacheSer, InMemoryStorage, IsStorage, Watermark},
     },
     types::*,
     utils::{
@@ -150,29 +150,25 @@ impl GlobalHash for BranchData {
 }
 
 #[derive(Debug, Clone)]
-pub struct InvitedCache<W> {
-    pub watermark: W,
+pub struct InvitedCache {
+    pub watermark: Watermark,
     pub sg: StateGraph<(), (), (), LocUserId, bool>,
 }
 
 #[derive(Debug, Clone)]
-pub struct DocContentCache<W> {
-    pub watermark: W,
+pub struct DocContentCache {
+    pub watermark: Watermark,
     pub anchors: AnchorAgg,
     pub sg: StateGraph<LocDataId, LocUserId, bool, LocDataId, TextAgg>,
 }
 
 #[derive(Debug, Clone)]
-pub enum Wiki2Cache<W> {
-    Invited(InvitedCache<W>),
-    DocContent(DocContentCache<W>),
+pub enum Wiki2Cache {
+    Invited(InvitedCache),
+    DocContent(DocContentCache),
 }
 
-impl<W> CacheSer for Wiki2Cache<W> {
-    fn page_roots(&self) -> &[PageId] {
-        &[]
-    }
-}
+impl CacheSer for Wiki2Cache {}
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Wiki2Group {
@@ -218,10 +214,7 @@ impl IsRuntime for Wiki2Runtime {
     type Group = Wiki2Group;
     type Body = Wiki2Body;
     type Data = BranchData;
-    type GearCache<W>
-        = Wiki2Cache<W>
-    where
-        W: Debug + Clone + 'static;
+    type GearCache = Wiki2Cache;
 
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
@@ -236,14 +229,14 @@ impl IsRuntime for Wiki2Runtime {
         }
     }
 
-    fn make_cache<W: Debug + Clone + Default + 'static>(gear: &Self::GearId) -> Self::GearCache<W> {
+    fn make_cache(gear: &Self::GearId) -> Self::GearCache {
         match gear {
             Wiki2Gear::Invited { .. } => Wiki2Cache::Invited(InvitedCache {
-                watermark: W::default(),
+                watermark: Watermark::default(),
                 sg: StateGraph::new(),
             }),
             Wiki2Gear::DocContent { .. } => Wiki2Cache::DocContent(DocContentCache {
-                watermark: W::default(),
+                watermark: Watermark::default(),
                 anchors: AnchorAgg::new(),
                 sg: StateGraph::new(),
             }),
@@ -253,7 +246,7 @@ impl IsRuntime for Wiki2Runtime {
     async fn run_step<S: IsStorage<Self>>(
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
-        cache: &mut Self::GearCache<S::Watermark>,
+        cache: &mut Self::GearCache,
     ) -> GearProduce<Self> {
         let GearInput::Events(group) = input else {
             return match cache {

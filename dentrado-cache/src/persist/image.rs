@@ -9,7 +9,7 @@ use std::rc::Rc;
 use super::PersistentCore;
 use crate::blockcache;
 use crate::core::freelist::{ChainEntry, chunk_cells, chunk_next};
-use crate::core::sb::{Sb, parse_sb};
+use crate::core::sb::{MAX_TABLE_NAME, MAX_TABLES, Sb, parse_sb};
 use crate::core::tree::{Item, parse_node};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
@@ -18,23 +18,35 @@ use crate::storage::{Storage, Violation};
 
 impl<D: IsFilesystem> Storage<D> {
     /// Recovery: the newest valid SB (both chains walk through, counts
-    /// and sums agree) — its table set must equal the opener's; both
-    /// eof — a fresh store; content without a valid image — death; the
-    /// disk refusing — the error itself, never a fresh store over a
-    /// live image. Reads go through the pool: pages live only there.
+    /// and sums agree) — its table set unions with `tables` (the
+    /// opener's new names start empty, the image's orphans stay
+    /// enumerable and droppable); both eof — a fresh store; content
+    /// without a valid image — death; the disk refusing — the error
+    /// itself, never a fresh store over a live image. A name outside
+    /// the format (empty, over [`MAX_TABLE_NAME`] bytes, a duplicate)
+    /// refuses the whole set. Reads go through the pool: pages live
+    /// only there.
     pub async fn open(
         disk: &D,
         path: &str,
         cap: usize,
-        n_tables: usize,
+        tables: &[&str],
     ) -> Result<Storage<D>, StoreError>
     where
         D: 'static,
     {
+        if tables
+            .iter()
+            .any(|n| n.is_empty() || n.len() > MAX_TABLE_NAME)
+            || tables.len() > MAX_TABLES
+            || (0..tables.len()).any(|i| tables[..i].contains(&tables[i]))
+        {
+            return Err(StoreError::BadName);
+        }
         let file = D::open(disk, path)
             .await
             .map_err(|e| StoreError::Io(e.to_string()))?;
-        let inner = Rc::new(RefCell::new(PersistentCore::fresh(file, cap, n_tables)));
+        let inner = Rc::new(RefCell::new(PersistentCore::fresh(file, cap, tables)));
         // An error from here on drops the handles — and with them the
         // driver and the round agent, whose `Rc`s would otherwise keep
         // the store alive forever.
@@ -52,8 +64,7 @@ impl<D: IsFilesystem> Storage<D> {
             }
         }
         match pick {
-            Some(sb) if sb.roots.len() != n_tables => return Err(StoreError::TableMismatch),
-            Some(sb) => inner.borrow_mut().of_sb(&sb),
+            Some(sb) => inner.borrow_mut().of_sb(&sb, tables),
             None if ra || rb => return Err(StoreError::CorruptImage),
             None => {}
         }
@@ -62,6 +73,53 @@ impl<D: IsFilesystem> Storage<D> {
             _driver: driver,
             _flusher: flusher,
         })
+    }
+
+    /// The store's live table names — enumeration for the caller's
+    /// startup GC (an image's orphans from an older set version are
+    /// found here and dropped).
+    pub fn tables(&self) -> Vec<String> {
+        self.inner.borrow().core.table_names()
+    }
+
+    /// Drop a table: its tree, its value chains and its delta's pages
+    /// die (EBR shepherds them past live readers), the name leaves the
+    /// set (tombstoned in place — see [`Tables`]). Only at rest: a
+    /// live flush round is already rebuilding this very tree, and its
+    /// commit would resurrect it — `PoolTaken` refuses, the caller
+    /// drops after the round.
+    pub async fn drop_table(&self, table: &str) -> Result<(), StoreError> {
+        let (t, root, bound) = {
+            let inner = self.inner.borrow_mut();
+            if inner.poisoned {
+                return Err(StoreError::Poisoned);
+            }
+            let Some(t) = inner.core.table_index(table) else {
+                return Err(StoreError::NoTable);
+            };
+            if inner.core.round_live() {
+                return Err(StoreError::PoolTaken);
+            }
+            (t, inner.core.table_root(t), inner.core.bound())
+        };
+        let mut pages = {
+            let inner = self.inner.borrow();
+            inner.core.table_delta_pages(t)
+        };
+        let (es, tree) = walk_tree::<D>(&self.inner, root, bound).await?;
+        pages.extend(tree);
+        for (_, _, vr) in es {
+            if vr != 0 {
+                pages.extend(self.walk_value(vr, bound).await?);
+            }
+        }
+        let mut inner = self.inner.borrow_mut();
+        if inner.poisoned {
+            return Err(StoreError::Poisoned);
+        }
+        inner.core.reg_deaths(&pages);
+        inner.core.drop_table_slot(t);
+        Ok(())
     }
 
     /// The store's invariant against the file's bytes (checked at rest
@@ -304,7 +362,7 @@ impl<D: IsFilesystem> Storage<D> {
         let fuel = sb.next0.max(sb.next1) + 1;
         let mut tree = Vec::new();
         let mut vals = Vec::new();
-        for &r in &sb.roots {
+        for &(_, r) in &sb.tables {
             let (es, ps) = walk_tree::<D>(&self.inner, r, fuel).await.ok()?;
             tree.extend(ps);
             for (_, _, vr) in es {

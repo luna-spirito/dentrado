@@ -15,9 +15,9 @@ fn run<F: Future>(f: F) -> F::Output {
 fn a_missing_table_refuses_honestly() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         assert!(matches!(
-            st.get_cache(1, b"k").await,
+            st.get_cache("t1", b"k").await,
             Err(StoreError::NoTable)
         ));
         let d = st.alloc_draft_page().await.unwrap();
@@ -25,7 +25,7 @@ fn a_missing_table_refuses_honestly() {
             .await
             .unwrap();
         assert_eq!(
-            st.put_cache(1, b"k", &[0], &[d], &[]).await,
+            st.put_cache("t1", b"k", &[0], &[d], &[]).await,
             Err(StoreError::NoTable)
         );
         // the draft survived the refusal: it still deallocs, its twin
@@ -34,7 +34,7 @@ fn a_missing_table_refuses_honestly() {
         st.write_draft_page(d2, |_| (vec![2u8; 3], ()))
             .await
             .unwrap();
-        st.put_cache(0, b"j", &[0], &[d2], &[]).await.unwrap();
+        st.put_cache("t0", b"j", &[0], &[d2], &[]).await.unwrap();
         st.dealloc_draft_page(d).await.unwrap();
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
@@ -48,20 +48,20 @@ fn a_missing_table_refuses_honestly() {
 fn a_bad_seal_refuses_and_keeps_the_draft() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         let d = st.alloc_draft_page().await.unwrap();
         st.write_draft_page(d, |_| (vec![1u8; 3], ()))
             .await
             .unwrap();
         assert!(matches!(
-            st.put_cache(0, b"k", &[0], &[d], &[999]).await,
+            st.put_cache("t0", b"k", &[0], &[d], &[999]).await,
             Err(StoreError::BadSeal(_))
         ));
         assert!(matches!(
-            st.put_cache(0, b"k", &[0], &[d], &[5, 5]).await,
+            st.put_cache("t0", b"k", &[0], &[d], &[5, 5]).await,
             Err(StoreError::BadSeal(_))
         ));
-        st.put_cache(0, b"k", &[0], &[d], &[]).await.unwrap();
+        st.put_cache("t0", b"k", &[0], &[d], &[]).await.unwrap();
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
     });
@@ -73,7 +73,7 @@ fn a_bad_seal_refuses_and_keeps_the_draft() {
 fn a_draft_dies_once() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         let d = st.alloc_draft_page().await.unwrap();
         st.dealloc_draft_page(d).await.unwrap();
         assert_eq!(
@@ -85,7 +85,7 @@ fn a_draft_dies_once() {
         st.write_draft_page(e, |_| (vec![1u8; 3], ()))
             .await
             .unwrap();
-        st.put_cache(0, b"k", &[0], &[e], &[]).await.unwrap();
+        st.put_cache("t0", b"k", &[0], &[e], &[]).await.unwrap();
         assert_eq!(
             st.dealloc_draft_page(e).await,
             Err(StoreError::UnknownDraft)
@@ -97,7 +97,7 @@ fn a_draft_dies_once() {
             .unwrap();
         st.dealloc_draft_page(v).await.unwrap();
         assert_eq!(
-            st.put_cache(0, b"v", &[0], &[v], &[]).await,
+            st.put_cache("t0", b"v", &[0], &[v], &[]).await,
             Err(StoreError::UnknownDraft)
         );
         st.flush().await.unwrap();
@@ -111,18 +111,18 @@ fn a_draft_dies_once() {
 fn a_transient_fault_rolls_back_the_round() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, 1).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
         let k = st.alloc_draft_page().await.unwrap();
         st.write_draft_page(k, |_| (vec![1u8; 3], ()))
             .await
             .unwrap();
-        st.put_cache(0, b"k", &[0], &[k], &[]).await.unwrap();
+        st.put_cache("t0", b"k", &[0], &[k], &[]).await.unwrap();
         st.flush().await.unwrap();
         let k2 = st.alloc_draft_page().await.unwrap();
         st.write_draft_page(k2, |_| (vec![2u8; 3], ()))
             .await
             .unwrap();
-        let old = match st.get_cache(0, b"k").await.unwrap() {
+        let old = match st.get_cache("t0", b"k").await.unwrap() {
             Some((g, cv)) => {
                 let p = cv.pages.clone();
                 drop(g);
@@ -130,7 +130,7 @@ fn a_transient_fault_rolls_back_the_round() {
             }
             None => Vec::new(),
         };
-        st.put_cache(0, b"k", &[0], &[k2], &old).await.unwrap();
+        st.put_cache("t0", b"k", &[0], &[k2], &old).await.unwrap();
         disk.file("db").set_fault(Fault::Once(2));
         assert!(st.flush().await.is_err());
         disk.file("db").set_fault(Fault::None);
@@ -139,7 +139,7 @@ fn a_transient_fault_rolls_back_the_round() {
         st.write_draft_page(k3, |_| (vec![3u8; 3], ()))
             .await
             .unwrap();
-        st.put_cache(0, b"j", &[0], &[k3], &[]).await.unwrap();
+        st.put_cache("t0", b"j", &[0], &[k3], &[]).await.unwrap();
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
     });

@@ -267,3 +267,89 @@ Nov 01 05:07:39 dentrado kolorinko[238178]: dentrado: warning: a Shared handle o
 Nov 01 05:07:39 dentrado kolorinko[238178]: dentrado: warning: a Shared handle outlived its Core — leaking its allocation (i'm not dealing with it rn)
   
   ```
+
+----
+
+Нашёл запись в `files.json`: файл числится со `status: "saved"` и блобом `files_ca/dd/1a/2ced...`. Проверю, существует ли блоб на диске и что отдаёт HTTP.
+
+Блоб на диске есть (620 KB, сохранён сегодня в 10:37), но HTTP отдаёт 404 на обоих хостах. Копаю дальше: тело 404, свежесть индекса, работает ли другой файл.
+
+Паблишер — отдельный бинарник `kolorinko` со своим конфигом, запущен сегодня 16:20. Смотрю его конфиг и сервис, проверяю страницы vs файлы.
+
+Конфиг маппинг имеет: `backroomsru.dentrado.art` → сайт `www.backroomswiki.ru`. Но файлы не отдаются. Смотрю логи kolorinko и характер 404 (страницы/файлы/другие сайты).
+
+Страницы работают (200), а файлы 404 на всех сайтах — похоже, kolorinko вообще не отдаёт `local--files`. Проверю пути в files.json викидот-сайтов и найду исходники kolorinko локально.
+
+kolorinko не читает `files.json` напрямую — видимо, импортирует out/ в свою БД. Ищу ingestion-код.
+
+Серверный код kolorinko живёт в `/home/luna/prj/dentrado/dentrado/`. Ищу там логику отдачи файлов.
+
+Это проекции датасета. Теперь посмотрю, как HTTP-слой обрабатывает запрос `/local--files/...` и как out_walk импортирует files.json.
+
+CA-URL формируется как `/-/repo/<site>/files/<xx>/<yy>/<hash>.<ext>` — то есть kolorinko раздаёт файлы через системный префикс, а не по оригинальным путям. Проверю, работает ли CA-URL баннера на сервере и есть ли в HTML страницы перезаписанная ссылка.
+
+CA-URL отдаёт 302, а в HTML ссылки остались оригинальными (`/local--files/...`). Смотрю, куда ведёт редирект и как out_walk импортирует файлы.
+
+Нашёл кое-что странное: CA-URL отвечает 302 с **перепутанным** location: `//1a/<hash>.png/files/dd/repo/www.backroomswiki.ru` — сегменты пути перевёрнуты. Смотрю `repo::serve`.
+
+`repo::serve` тут вообще не может дать 302 — только 404 или 200. Значит, что-то ещё перехватывает. Но важнее главного: в отрендеренной HTML ссылки остались сырыми `/local--files/...` — подстановка на CA-URL не сработала. Смотрю пайплайн перезаписи ссылок.
+
+Пазл складывается: в HTML ссылки относительные (`/local--files/...`), а резолвер собирает только абсолютные `host/path`-хвосты. Проверю `http_tail` и `canon_file_key`.
+
+`http_tail(u, None)` для относительного URL возвращает `None` — значит относительные ссылки вообще не собираются резолвером. Но ещё странно 302 от CA-URL. Проверю `SYSTEM_PREFIX` и свежесть задеплоенного бинарника.
+
+В локальном репо dentrado есть свежайший коммит сегодня: `e2e3dd5 fix(k): hydration crash + banner link` (19:18 +0300), а сервис перезапущен в 19:20 +0300. Смотрю, что он чинит и собран ли деплой из него.
+
+Этот коммит про баннер-ссылку на исходную вики, не про вложения. Надо перепроверить мой ранний тест CA-URL — я делал curl без `--resolve`, и DNS мог увести запрос на реальный сайт, а не на зеркало.
+
+Всё встало на место: CA-URL через зеркало отдаёт **200 image/png** — файл на месте. А мой ранний 302 был с реального сайта (www.backroomswiki.ru резолвится в 176.108.249.243, не в зеркало) — ложный след. Теперь подтвержу, что ссылки в HTML не перезаписаны, и сравню с викидот-сайтом.
+
+Подтверждено: весь HTML зеркала rufoundation-сайта усыпан неперезаписанными относительными `/local--files/...`. Быстро гляну, как evakuilo сохраняет тела страниц rufoundation — чтобы понять, с какой стороны чинить.
+
+Баннера нет в pages.json — значит, он в шелле (шапке сайта). Проверяю.
+
+Странно — в pages.json и shell баннера нет, но SSR его отдаёт. Смотрю, где живёт тело главной страницы (pages_by_id).
+
+Нигде в публикации literal-ссылки на баннер нет, кроме files.json — но SSR HTML её выдал. Проверяю сырой HTML страницы ещё раз, с контекстом.
+
+Полная ясность. В состоянии страницы видно: `[[image Backrooms_Banner_Rus.png link="/local--files/main/Backrooms_Banner_Rus.png"]]` — источник голого имени файла и относительной ссылки. Гляну, как рендерер обрабатывает голый `[[image name]]`.
+
+Диагностика завершена — причинно-следственная цепочка полностью восстановлена. Вот итог:
+
+## Файл не потерян — он есть и отдаётся
+
+- evakuilo сохранил баннер: в `files.json` сайта `www.backroomswiki.ru` запись со `status: "saved"`, sha256 `dd1a2c…`, 620 712 байт; блоб лежит на диске (`files_ca/dd/1a/2ced…`).
+- Через CA-URL зеркало отдаёт его нормально — проверено с сервера:
+  ```
+  https://backroomsru.dentrado.art/-/repo/www.backroomswiki.ru/files/dd/1a/dd1a2ced….png → 200, image/png
+  ```
+
+## Почему оригинальный путь даёт 404
+
+**kolorinko вообще не раздаёт `/local--files/…`** — это by design ([repo.rs:16-19](/home/luna/prj/dentrado/dentrado/apps/kolorinko/src/repo.rs#L16-L19): «there is no path-based form to serve here»). Вложения живут только в системном неймспейсе `/-/repo/<site>/files/<hash>`, а ссылки в страницах должны перезаписываться на CA-URL при рендере.
+
+## Почему ссылка на баннер не перезаписалась
+
+На странице баннер вставлен как `[[image Backrooms_Banner_Rus.png link="/local--files/main/Backrooms_Banner_Rus.png"]]` — **обе формы относительные**. А пасс ресурсов собирает только абсолютные `http(s)://`-хвосты:
+
+- [resources.rs:94](/home/luna/prj/dentrado/dentrado/apps/kolorinko/src/wikidot_page/resources.rs#L94) — `http_tail(&url, None)` с `base=None`;
+- [css.rs:180](/home/luna/prj/dentrado/dentrado/apps/kolorinko-render/src/css.rs#L180) — для URL без схемы и без `//` ответ `let base = base?` → `None` → ссылка не собирается → не резолвится;
+- [render.rs:964](/home/luna/prj/dentrado/dentrado/apps/kolorinko-render/src/render.rs#L964) — `render_image` пишет `src` как есть.
+
+В итоге HTML зеркала содержит сырые `href="/local--files/main/…"` и `src="Backrooms_Banner_Rus.png"`, браузер просит это у зеркала → 404. Битыми на зеркале будут **все** относительные вложения (иконки навигации `noaccess:nav-pages-css` и т.д.) — я это подтвердил на выдаче.
+
+## Замечание
+
+Мой первый тест CA-URL дал ложный 302 — curl без `--resolve` уходил на реальный сайт: `www.backroomswiki.ru` резолвится в `176.108.249.243`, а не в зеркало. Зеркало — только `backroomsru.dentrado.art`.
+
+## Где чинить
+
+Два варианта:
+1. **kolorinko** (предпочтительнее): в пассе ресурсов абсолютизировать относительные ссылки против хоста сайта (`http_tail(u, Some(base))`), плюс развернуть голую wikidot-форму `[[image name]]` → `local--files/{slug}/{name}`. Чинит уже собранный корпус без пере-краулинга.
+2. **evakuilo**: абсолютизировать URL при сохранении страниц — но потребует пере-краула rufoundation-сайтов.
+
+Сказать, чтобы я взялся за фикс в kolorinko (вариант 1)?
+```
+  
+* I believe something's fishy with `repo` gear, and it's probably being awaited on the hot path?
+Whatever, it needs caching and proper background update smeanics

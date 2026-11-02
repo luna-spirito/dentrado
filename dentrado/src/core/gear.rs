@@ -201,15 +201,11 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
     /// type and skip all type erasure. A runtime whose gears need heterogeneous
     /// cache payloads can instead erase them, e.g. `type GearCache = Box<dyn Any>`
     /// (or a tagged pointer) and downcast inside `run_step`.
-    type GearCache<Watermark>: Debug + Clone + 'static
-    where
-        Watermark: Debug + Clone + 'static;
+    type GearCache: Debug + Clone + 'static;
 
     fn meta(gear: &Self::GearId) -> GearMeta<Self>;
 
-    fn make_cache<Watermark: Debug + Clone + Default + 'static>(
-        gear: &Self::GearId,
-    ) -> Self::GearCache<Watermark>;
+    fn make_cache(gear: &Self::GearId) -> Self::GearCache;
 
     /// Compute (or incrementally update) the gear's output.
     ///
@@ -220,7 +216,7 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
     async fn run_step<S: IsStorage<Self>>(
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
-        cache: &mut Self::GearCache<S::Watermark>,
+        cache: &mut Self::GearCache,
     ) -> GearProduce<Self>;
 }
 
@@ -412,10 +408,7 @@ impl IsRuntime for EmptyRuntime {
     type Group = ();
     type Body = ();
     type Data = ();
-    type GearCache<Watermark>
-        = ()
-    where
-        Watermark: Debug + Clone + 'static;
+    type GearCache = ();
 
     fn meta(_gear: &Self::GearId) -> GearMeta<Self> {
         GearMeta::Event {
@@ -424,15 +417,12 @@ impl IsRuntime for EmptyRuntime {
         }
     }
 
-    fn make_cache<Watermark: Debug + Clone + Default + 'static>(
-        _gear: &Self::GearId,
-    ) -> Self::GearCache<Watermark> {
-    }
+    fn make_cache(_gear: &Self::GearId) -> Self::GearCache {}
 
     async fn run_step<S: IsStorage<Self>>(
         _ctx: &mut crate::core::core_ctx::GearCtx<Self, S>,
         _input: GearInput<Self>,
-        _cache: &mut Self::GearCache<S::Watermark>,
+        _cache: &mut Self::GearCache,
     ) -> GearProduce<Self> {
         GearProduce::Ship(())
     }

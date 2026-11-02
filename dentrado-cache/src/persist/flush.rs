@@ -4,9 +4,11 @@
 //! the stock fixpoint) lives in [`super::flight`].
 
 use std::cell::RefCell;
+use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 
 use compio::runtime::JoinHandle;
+use futures::FutureExt;
 use futures::channel::oneshot;
 
 use super::PersistentCore;
@@ -49,15 +51,17 @@ impl<D: IsFilesystem> Storage<D> {
 /// The round agent — the flush's counterpart of the io driver: a
 /// round must complete whatever its requesters do, so it lives in a
 /// task the store dies with, never in a caller's future (a dropped
-/// `flush` cancels only its reply address). Each batch drained from
-/// the mailbox is spun as exactly one round; a body failure is data —
+/// `flush` cancels only its reply address). Each batch drained from the
+/// mailbox is spun as exactly one round; a body failure is data —
 /// the reply — never the loop's death, for the agent must not die
 /// before the store does, or the mailbox would fill with letters
-/// nobody answers. The listener is taken out before the mailbox is
-/// looked into, and the only await is an empty mailbox under a live
-/// listener: a letter's push and ring are one section of the single
-/// lock, and a letter landing anywhere else sits in the mailbox for
-/// the next look — a wake can be spurious, never lost.
+/// nobody answers. A round that *panics* poisons the store (terminal)
+/// and the batch gets its verdict — a refusal; the loop lives on to
+/// answer the letters that follow. The listener is taken out before
+/// the mailbox is looked into, and the only await is an empty mailbox
+/// under a live listener: a letter's push and ring are one section of
+/// the single lock, and a letter landing anywhere else sits in the
+/// mailbox for the next look — a wake can be spurious, never lost.
 async fn agent<D: IsFilesystem>(inner: Rc<RefCell<PersistentCore<D>>>) -> ! {
     loop {
         let ln = inner.borrow().mail_ev.listen();
@@ -67,7 +71,17 @@ async fn agent<D: IsFilesystem>(inner: Rc<RefCell<PersistentCore<D>>>) -> ! {
             continue;
         }
         drop(ln);
-        let r = round::<D>(&inner).await;
+        let r = if inner.borrow().poisoned {
+            Err(StoreError::Poisoned)
+        } else {
+            match AssertUnwindSafe(round::<D>(&inner)).catch_unwind().await {
+                Ok(r) => r,
+                Err(_) => {
+                    inner.borrow_mut().poison();
+                    Err(StoreError::Poisoned)
+                }
+            }
+        };
         for tx in batch {
             let _ = tx.send(r.clone());
         }
@@ -320,13 +334,14 @@ async fn engrave<D: IsFilesystem>(
     let (even_cells, odd_cells) = (teven.len() as u64, todd.len() as u64);
     let (even_sum, odd_sum) = (fnv_id(teven), fnv_id(todd));
     // The SB is a full-fledged pool page: settle it into a slot,
-    // save, sync — the commit point.
+    // save, sync — the commit point. The set written is the live
+    // tables over the new roots — tombstones out.
     let sb_id = old_gen % 2;
     let sb_gen = old_gen + 1;
-    let sb_roots = new_roots.clone();
+    let sb_tables = inner.borrow().core.live_tables(&new_roots);
     blockcache::init::<D, _>(inner, sb_id, move |b| {
         write_sb(
-            b, sb_gen, sn0, sn1, &sb_roots, even, odd, even_cells, odd_cells, even_sum, odd_sum,
+            b, sb_gen, sn0, sn1, &sb_tables, even, odd, even_cells, odd_cells, even_sum, odd_sum,
         )
     })
     .await?;

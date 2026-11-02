@@ -149,6 +149,9 @@ impl<D: IsFilesystem> Storage<D> {
     pub async fn alloc_draft_page(&self) -> Result<DraftId, StoreError> {
         let bound = {
             let inner = self.inner.borrow();
+            if inner.poisoned {
+                return Err(StoreError::Poisoned);
+            }
             2 * inner.core.bound()
         };
         let mut fuel = bound;
@@ -159,6 +162,9 @@ impl<D: IsFilesystem> Storage<D> {
             fuel -= 1;
             let act = {
                 let mut inner = self.inner.borrow_mut();
+                if inner.poisoned {
+                    return Err(StoreError::Poisoned);
+                }
                 inner.core.alloc_step()
             }?;
             match act {
@@ -187,6 +193,9 @@ impl<D: IsFilesystem> Storage<D> {
     pub async fn dealloc_draft_page(&self, k: DraftId) -> Result<(), StoreError> {
         let ok = {
             let mut inner = self.inner.borrow_mut();
+            if inner.poisoned {
+                return Err(StoreError::Poisoned);
+            }
             inner.core.dealloc_step(k)
         };
         if ok {
@@ -209,6 +218,9 @@ impl<D: IsFilesystem> Storage<D> {
     {
         let (p, fresh) = {
             let inner = self.inner.borrow();
+            if inner.poisoned {
+                return Err(StoreError::Poisoned);
+            }
             inner.core.draft(&k).ok_or(StoreError::UnknownDraft)?
         };
         let g = move |b: &mut Page| {
@@ -239,6 +251,9 @@ impl<D: IsFilesystem> Storage<D> {
     {
         let p = {
             let inner = self.inner.borrow();
+            if inner.poisoned {
+                return Err(StoreError::Poisoned);
+            }
             inner.core.draft(&k).ok_or(StoreError::UnknownDraft)?.0
         };
         blockcache::init::<D, _>(&self.inner, p, move |b| {
@@ -261,6 +276,12 @@ impl<D: IsFilesystem> Storage<D> {
     where
         R: 'static,
     {
+        {
+            let inner = self.inner.borrow();
+            if inner.poisoned {
+                return Err(StoreError::Poisoned);
+            }
+        }
         blockcache::read::<D, _>(&self.inner, p, f).await
     }
 
@@ -269,12 +290,18 @@ impl<D: IsFilesystem> Storage<D> {
     /// the guard (RAII).
     pub async fn get_cache(
         &self,
-        table: usize,
+        table: &str,
         key: &[u8],
     ) -> Result<Option<(Guard<D>, CacheValue)>, StoreError> {
         let (g, dv, root, bound) = {
             let mut inner = self.inner.borrow_mut();
-            let Some((g, dv, root)) = inner.core.get_step(table, key) else {
+            if inner.poisoned {
+                return Err(StoreError::Poisoned);
+            }
+            let Some(t) = inner.core.table_index(table) else {
+                return Err(StoreError::NoTable);
+            };
+            let Some((g, dv, root)) = inner.core.get_step(t, key) else {
                 return Err(StoreError::NoTable);
             };
             (g, dv, root, inner.core.bound())
@@ -356,22 +383,32 @@ impl<D: IsFilesystem> Storage<D> {
     /// nothing; the drafts stay held.
     pub async fn put_cache(
         &self,
-        table: usize,
+        table: &str,
         key: &[u8],
         mt: &[u8],
         consumed: &[DraftId],
         freed: &[PageId],
     ) -> Result<(), StoreError> {
-        let pages = {
+        let (t, pages) = {
             let inner = self.inner.borrow();
-            inner
+            if inner.poisoned {
+                return Err(StoreError::Poisoned);
+            }
+            let Some(t) = inner.core.table_index(table) else {
+                return Err(StoreError::NoTable);
+            };
+            let pages = inner
                 .core
                 .pages_of(consumed)
-                .ok_or(StoreError::UnknownDraft)?
+                .ok_or(StoreError::UnknownDraft)?;
+            (t, pages)
         };
         self.link_all(&pages).await?;
         let mut inner = self.inner.borrow_mut();
-        inner.core.seal_step(table, key, mt, consumed, freed)
+        if inner.poisoned {
+            return Err(StoreError::Poisoned);
+        }
+        inner.core.seal_step(t, key, mt, consumed, freed)
     }
 
     /// Stitch a value's chain: the pages' next headers in consumed

@@ -6,7 +6,7 @@ use super::*;
 use crate::disk::MemDisk;
 
 fn core() -> Core<MemDisk> {
-    Core::fresh(MemDisk::default().file("db"), 4, 2)
+    Core::fresh(MemDisk::default().file("db"), 4, &["a", "b"])
 }
 
 /// A fresh pool serves at once (the head, then the counter).

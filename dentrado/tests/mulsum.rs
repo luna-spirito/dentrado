@@ -4,7 +4,7 @@ use dentrado::{
     core::{
         core_ctx::{Core, GearCtx},
         gear::{GearInput, GearMeta, GearProduce, IsRuntime},
-        storage::{CacheSer, InMemoryStorage, IsStorage, PageId},
+        storage::{CacheSer, InMemoryStorage, IsStorage, Watermark},
     },
     types::*,
     wire::WireEventBody,
@@ -39,16 +39,12 @@ impl Localizable for MulSumBody {
 }
 
 #[derive(Debug, Clone)]
-pub struct MulSumCache<W> {
-    pub watermark: W,
+pub struct MulSumCache {
+    pub watermark: Watermark,
     pub agg: i64,
 }
 
-impl<W> CacheSer for MulSumCache<W> {
-    fn page_roots(&self) -> &[PageId] {
-        &[]
-    }
-}
+impl CacheSer for MulSumCache {}
 
 #[derive(Debug, Clone)]
 pub struct MulSumRuntime;
@@ -62,10 +58,7 @@ impl IsRuntime for MulSumRuntime {
     type Group = i64;
     type Body = MulSumBody;
     type Data = ();
-    type GearCache<W>
-        = MulSumCache<W>
-    where
-        W: Debug + Clone + 'static;
+    type GearCache = MulSumCache;
 
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
@@ -76,11 +69,9 @@ impl IsRuntime for MulSumRuntime {
         }
     }
 
-    fn make_cache<W: Debug + Clone + Default + 'static>(
-        _gear: &Self::GearId,
-    ) -> Self::GearCache<W> {
+    fn make_cache(_gear: &Self::GearId) -> Self::GearCache {
         MulSumCache {
-            watermark: W::default(),
+            watermark: Watermark::default(),
             agg: 0,
         }
     }
@@ -88,7 +79,7 @@ impl IsRuntime for MulSumRuntime {
     async fn run_step<S: IsStorage<Self>>(
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
-        cache: &mut Self::GearCache<S::Watermark>,
+        cache: &mut Self::GearCache,
     ) -> GearProduce<Self> {
         let GearInput::Events(group) = input else {
             return GearProduce::Ship(cache.agg);

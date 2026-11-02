@@ -1245,10 +1245,6 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         }
 
         impl ::dentrado::core::storage::CacheSer for GearCache {
-            fn page_roots(&self) -> &[::dentrado::core::storage::PageId] {
-                &[]
-            }
-
             fn ser_image(&self) -> ::core::option::Option<::std::vec::Vec<u8>> {
                 match self {
                     #( #cache_ser_arms, )*
@@ -1271,10 +1267,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             type Group = Group;
             type Body = ();
             type Data = ();
-            type GearCache<W>
-                = GearCache
-            where
-                W: ::core::fmt::Debug + Clone + 'static;
+            type GearCache = GearCache;
 
             fn meta(gear: &Self::GearId) -> ::dentrado::core::gear::GearMeta<Self> {
                 match gear {
@@ -1282,9 +1275,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
                 }
             }
 
-            fn make_cache<Watermark: ::core::fmt::Debug + Clone + ::core::default::Default + 'static>(
-                gear: &Self::GearId,
-            ) -> Self::GearCache<Watermark> {
+            fn make_cache(gear: &Self::GearId) -> Self::GearCache {
                 match gear {
                     #( #make_cache_arms ),*
                 }
@@ -1293,7 +1284,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             async fn run_step<S: ::dentrado::core::storage::IsStorage<Self>>(
                 ctx: &mut ::dentrado::core::core_ctx::GearCtx<Self, S>,
                 input: ::dentrado::core::gear::GearInput<Self>,
-                cache: &mut Self::GearCache<S::Watermark>,
+                cache: &mut Self::GearCache,
             ) -> ::dentrado::core::gear::GearProduce<Self> {
                 match (ctx.gear().clone(), cache) {
                     #( #run_arms )*

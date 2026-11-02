@@ -3,8 +3,8 @@ use std::fmt::Debug;
 use dentrado::{
     core::{
         core_ctx::GearCtx,
-        gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime},
-        storage::{CacheSer, InMemoryStorage, IsStorage, PageId},
+        gear::{GearInput, GearMeta, GearProduce, IsRuntime},
+        storage::{CacheSer, InMemoryStorage, IsStorage, Watermark},
     },
     types::*,
     wire::WireEventBody,
@@ -31,16 +31,12 @@ impl Localizable for WikiGear {
 }
 
 #[derive(Debug, Clone)]
-pub struct CounterCache<W> {
-    pub watermark: W,
+pub struct CounterCache {
+    pub watermark: Watermark,
     pub out: i64,
 }
 
-impl<W> CacheSer for CounterCache<W> {
-    fn page_roots(&self) -> &[PageId] {
-        &[]
-    }
-}
+impl CacheSer for CounterCache {}
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct BranchData {
@@ -80,10 +76,7 @@ impl IsRuntime for WikiCounterRuntime {
     type Group = LocDataId;
     type Body = LocUserId;
     type Data = BranchData;
-    type GearCache<W>
-        = CounterCache<W>
-    where
-        W: Debug + Clone + 'static;
+    type GearCache = CounterCache;
 
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
@@ -94,11 +87,9 @@ impl IsRuntime for WikiCounterRuntime {
         }
     }
 
-    fn make_cache<W: Debug + Clone + Default + 'static>(
-        _gear: &Self::GearId,
-    ) -> Self::GearCache<W> {
+    fn make_cache(_gear: &Self::GearId) -> Self::GearCache {
         CounterCache {
-            watermark: W::default(),
+            watermark: Watermark::default(),
             out: 0,
         }
     }
@@ -106,7 +97,7 @@ impl IsRuntime for WikiCounterRuntime {
     async fn run_step<S: IsStorage<Self>>(
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
-        cache: &mut Self::GearCache<S::Watermark>,
+        cache: &mut Self::GearCache,
     ) -> GearProduce<Self> {
         let GearInput::Events(group) = input else {
             return GearProduce::Ship(cache.out);

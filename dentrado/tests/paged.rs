@@ -8,7 +8,7 @@ use dentrado::{
     core::{
         core_ctx::GearCtx,
         gear::{GearInput, GearMeta, GearProduce, IsRuntime},
-        storage::{CacheSer, IsStorage, PageId, PagedStorage},
+        storage::{CacheSer, IsStorage, PagedStorage, Watermark},
     },
     types::*,
 };
@@ -27,16 +27,12 @@ impl Localizable for BlobGear {
 /// A cache whose image is the blob verbatim; an empty blob means "do not
 /// persist" (the None image → tombstone path).
 #[derive(Debug, Clone)]
-struct BlobCache<W> {
-    watermark: W,
+struct BlobCache {
+    watermark: Watermark,
     blob: String,
 }
 
-impl<W> CacheSer for BlobCache<W> {
-    fn page_roots(&self) -> &[PageId] {
-        &[]
-    }
-
+impl CacheSer for BlobCache {
     fn ser_image(&self) -> Option<Vec<u8>> {
         (!self.blob.is_empty()).then(|| self.blob.clone().into_bytes())
     }
@@ -64,10 +60,7 @@ impl IsRuntime for BlobRuntime {
     type Group = i64;
     type Body = ();
     type Data = ();
-    type GearCache<W>
-        = BlobCache<W>
-    where
-        W: Debug + Clone + 'static;
+    type GearCache = BlobCache;
 
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
@@ -78,11 +71,9 @@ impl IsRuntime for BlobRuntime {
         }
     }
 
-    fn make_cache<W: Debug + Clone + Default + 'static>(
-        _gear: &Self::GearId,
-    ) -> Self::GearCache<W> {
+    fn make_cache(_gear: &Self::GearId) -> Self::GearCache {
         BlobCache {
-            watermark: W::default(),
+            watermark: Watermark::default(),
             blob: String::new(),
         }
     }
@@ -90,7 +81,7 @@ impl IsRuntime for BlobRuntime {
     async fn run_step<S: IsStorage<Self>>(
         _ctx: &mut GearCtx<Self, S>,
         _input: GearInput<Self>,
-        _cache: &mut Self::GearCache<S::Watermark>,
+        _cache: &mut Self::GearCache,
     ) -> GearProduce<Self> {
         unreachable!("this test drives storage directly")
     }
@@ -108,7 +99,7 @@ async fn roundtrip(file: &std::path::Path) {
     st.put_cache(
         gear.clone(),
         BlobCache {
-            watermark: (0, 0),
+            watermark: Watermark(0, 0),
             blob: big.clone(),
         },
     )
@@ -127,7 +118,7 @@ async fn roundtrip(file: &std::path::Path) {
     st.put_cache(
         gear.clone(),
         BlobCache {
-            watermark: (1, 0),
+            watermark: Watermark(1, 0),
             blob: small.clone(),
         },
     )
@@ -141,7 +132,7 @@ async fn roundtrip(file: &std::path::Path) {
     st.put_cache(
         gear.clone(),
         BlobCache {
-            watermark: (2, 0),
+            watermark: Watermark(2, 0),
             blob: String::new(),
         },
     )
@@ -156,7 +147,7 @@ async fn roundtrip(file: &std::path::Path) {
     ram.put_cache(
         gear,
         BlobCache {
-            watermark: (0, 0),
+            watermark: Watermark(0, 0),
             blob: "z".into(),
         },
     )
@@ -178,5 +169,89 @@ fn paged_storage_persists_and_resumes() {
         .block_on(async {
             let dir = tempfile::tempdir().unwrap();
             roundtrip(&dir.path().join("core-0.dstore")).await;
+        });
+}
+
+/// A corrupt image is quarantined (renamed aside, kept for inspection) and a
+/// fresh store opens in its place — corruption neither crashloops the process
+/// nor gets silently rewritten.
+#[test]
+fn paged_storage_quarantines_corruption() {
+    compio::runtime::RuntimeBuilder::new()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("core-0.dstore");
+            // Two garbage pages where the SB slots live: content without a
+            // valid image.
+            std::fs::write(&file, [0x5Au8; 8192]).unwrap();
+            let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.clone());
+            let gear = BlobGear::Blob { key: 7 };
+            assert!(st.get_cache(&gear).await.is_none());
+            st.put_cache(
+                gear.clone(),
+                BlobCache {
+                    watermark: Watermark::default(),
+                    blob: "fresh".into(),
+                },
+            )
+            .await;
+            st.flush().await.unwrap();
+            drop(st);
+            // The corrupt file was renamed aside; the new one is a working
+            // store.
+            let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| {
+                    let name = e.unwrap().file_name().into_string().ok()?;
+                    name.starts_with("core-0.dstore.corrupt-").then_some(name)
+                })
+                .collect();
+            assert_eq!(quarantined.len(), 1, "the corrupt file was renamed aside");
+            let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file);
+            assert_eq!(st.get_cache(&gear).await.unwrap().blob, "fresh");
+        });
+}
+
+/// The startup GC: a table left by an older cache-format version is dropped
+/// on open; the current version's table survives.
+#[test]
+fn paged_storage_gcs_old_versions() {
+    compio::runtime::RuntimeBuilder::new()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use dentrado_cache::{Storage, disk::FsDisk};
+
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("core-0.dstore");
+            let path = file.display().to_string();
+            // An old-version store with one live entry.
+            {
+                let old = Storage::open(&FsDisk, &path, 4, &["cache:v0"])
+                    .await
+                    .unwrap();
+                let k = old.alloc_draft_page().await.unwrap();
+                old.write_draft_page(k, |_| (b"ancient".to_vec(), ()))
+                    .await
+                    .unwrap();
+                old.put_cache("cache:v0", b"gear", &[1], &[k], &[])
+                    .await
+                    .unwrap();
+                old.flush().await.unwrap();
+            }
+            // Opening through PagedStorage drops the orphan…
+            let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.clone());
+            let gear = BlobGear::Blob { key: 7 };
+            assert!(st.get_cache(&gear).await.is_none());
+            st.flush().await.unwrap();
+            drop(st);
+            // …and a raw reopen sees only the current version's table.
+            let raw = Storage::open(&FsDisk, &path, 4, &["cache:v1"])
+                .await
+                .unwrap();
+            let names = raw.tables();
+            assert_eq!(names, ["cache:v1".to_string()]);
         });
 }

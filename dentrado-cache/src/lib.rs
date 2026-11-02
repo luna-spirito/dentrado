@@ -19,13 +19,19 @@
 //! slots, the flight registry, the queues); [`crate::core`] — the
 //! store's flush-agnostic core: the machines (`freelist` — the
 //! two-pool page dispenser, `ebr` — deaths), the drafts arena and the
-//! tables (a fixed set, each a B-tree plus its delta), and the page
-//! codecs beside them (`val`, `tree`, `sb`, `freelist::chunk`);
-//! [`persist`] — the persistence overlay (the round agent and its
-//! mailbox, the generation), the flush round, recovery; [`store`] —
-//! the async surface: drafts
-//! and the cache, the read guard. Semantics and the derived loop
-//! bounds live in the doc comments — ported from the model.
+//! named tables (each a B-tree plus its delta; the set unions at open,
+//! tables enumerate and drop), and the page codecs beside them (`val`,
+//! `tree`, `sb`, `freelist::chunk`); [`persist`] — the persistence
+//! overlay (the round agent and its mailbox, the generation, the
+//! poison flag), the flush round, recovery; [`store`] — the async
+//! surface: drafts and the cache, the read guard. Semantics and the
+//! derived loop bounds live in the doc comments — ported from the
+//! model.
+//!
+//! The store is a component, not a trust boundary: any error or panic
+//! inside the plumbing poisons it terminally (every semantic op refuses
+//! with [`StoreError::Poisoned`] while the io drains), and the caller
+//! degrades — see [`persist`] and [`StoreError`].
 //!
 //! The crate's `unsafe` is confined to `blockcache`: two page-lease
 //! fabrications (`&'static (mut) Page` from the arena's cells — the

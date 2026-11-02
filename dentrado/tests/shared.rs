@@ -10,7 +10,7 @@ use dentrado::{
     core::{
         core_ctx::{Core, GearCtx},
         gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime},
-        storage::{CacheSer, InMemoryStorage, IsStorage, PageId},
+        storage::{CacheSer, InMemoryStorage, IsStorage},
     },
     types::*,
 };
@@ -47,13 +47,9 @@ pub enum SharedOut {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct SharedCache<W>(core::marker::PhantomData<W>);
+pub struct SharedCache;
 
-impl<W> CacheSer for SharedCache<W> {
-    fn page_roots(&self) -> &[PageId] {
-        &[]
-    }
-}
+impl CacheSer for SharedCache {}
 
 #[derive(Debug, Clone)]
 pub struct SharedRuntime;
@@ -67,10 +63,7 @@ impl IsRuntime for SharedRuntime {
     type Group = i64;
     type Body = ();
     type Data = ();
-    type GearCache<W>
-        = SharedCache<W>
-    where
-        W: Debug + Clone + 'static;
+    type GearCache = SharedCache;
 
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
@@ -87,16 +80,14 @@ impl IsRuntime for SharedRuntime {
         }
     }
 
-    fn make_cache<W: Debug + Clone + Default + 'static>(
-        _gear: &Self::GearId,
-    ) -> Self::GearCache<W> {
-        SharedCache(core::marker::PhantomData)
+    fn make_cache(_gear: &Self::GearId) -> Self::GearCache {
+        SharedCache
     }
 
     async fn run_step<S: IsStorage<Self>>(
         ctx: &mut GearCtx<Self, S>,
         _input: GearInput<Self>,
-        _cache: &mut Self::GearCache<S::Watermark>,
+        _cache: &mut Self::GearCache,
     ) -> GearProduce<Self> {
         match ctx.gear() {
             SharedGear::Src { bucket } => {
