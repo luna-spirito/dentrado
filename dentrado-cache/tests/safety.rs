@@ -1,103 +1,153 @@
 //! Safe-API regressions: a misused surface refuses honestly, and a
-//! refusal leaves the world whole — no phantom table reads, no draft
-//! swallowed by a refused publication, no page double-listed. Every
-//! test ends at rest with the page bijection checked.
+//! refusal leaves the world whole — no phantom table reads, no key a
+//! leaf could never hold, no half-landed batch, no draft swallowed by
+//! a refusal. Every test ends at rest with the page bijection checked.
 
-use dentrado_cache::{Fault, MemDisk, Storage, StoreError};
+use dentrado_cache::{Fault, MemDisk, Rec, Storage, StoreError, TableSpec};
 
 fn run<F: Future>(f: F) -> F::Output {
     compio::runtime::Runtime::new().unwrap().block_on(f)
 }
 
-/// A table index outside the fixed set: reads and publications alike
-/// refuse — never a phantom root read, never a swallowed draft.
+fn specs(ids: &[&[u8]]) -> Vec<TableSpec> {
+    ids.iter().map(|i| TableSpec::flat(i.to_vec())).collect()
+}
+
+/// A table the store never heard of: reads, scans and publications
+/// alike refuse — never a phantom root read, never a written byte.
 #[test]
 fn a_missing_table_refuses_honestly() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+            .await
+            .unwrap();
         assert!(matches!(
-            st.get_cache("t1", b"k").await,
+            st.get(b"t1", b"k").await,
             Err(StoreError::NoTable)
         ));
-        let d = st.alloc_draft_page().await.unwrap();
-        st.write_draft_page(d, |_| (vec![1u8; 3], ()))
-            .await
-            .unwrap();
-        assert_eq!(
-            st.put_cache("t1", b"k", &[0], &[d], &[]).await,
+        assert!(matches!(
+            st.scan(b"t1", b"", b"").await,
             Err(StoreError::NoTable)
-        );
-        // the draft survived the refusal: it still deallocs, its twin
-        // still publishes
-        let d2 = st.alloc_draft_page().await.unwrap();
-        st.write_draft_page(d2, |_| (vec![2u8; 3], ()))
-            .await
-            .unwrap();
-        st.put_cache("t0", b"j", &[0], &[d2], &[]).await.unwrap();
-        st.dealloc_draft_page(d).await.unwrap();
+        ));
+        assert!(matches!(
+            st.put_many(
+                b"t1",
+                &[Rec::Put {
+                    key: b"k",
+                    val: b"v"
+                }]
+            )
+            .await,
+            Err(StoreError::NoTable)
+        ));
+        // the refusal swallowed nothing: the well-formed twin publishes
+        st.put_many(
+            b"t0",
+            &[Rec::Put {
+                key: b"j",
+                val: b"v",
+            }],
+        )
+        .await
+        .unwrap();
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
     });
 }
 
-/// A freed list that would conjure or double-list a page: the
-/// publication refuses whole, and the consumed draft stays held — the
-/// next well-formed publication of the very same draft goes through.
+/// Identities outside the format refuse the open: empty, over the
+/// 63-byte bound, a duplicate. The bound itself is a name like any
+/// other, and the refusals wrote nothing.
 #[test]
-fn a_bad_seal_refuses_and_keeps_the_draft() {
+fn identities_outside_the_format_refuse() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
-        let d = st.alloc_draft_page().await.unwrap();
-        st.write_draft_page(d, |_| (vec![1u8; 3], ()))
+        let long = vec![0u8; 64];
+        assert!(matches!(
+            Storage::open(&disk, "db", 4, &[TableSpec::flat(long)]).await,
+            Err(StoreError::BadName)
+        ));
+        assert!(matches!(
+            Storage::open(&disk, "db", 4, &specs(&[b"t0", b"t0"])).await,
+            Err(StoreError::BadName)
+        ));
+        assert!(matches!(
+            Storage::open(&disk, "db", 4, &specs(&[b""])).await,
+            Err(StoreError::BadName)
+        ));
+        let edge = TableSpec::flat(vec![1u8; 63]);
+        assert!(Storage::open(&disk, "db", 4, &[edge]).await.is_ok());
+    });
+}
+
+/// A key no leaf could hold refuses the batch whole — the good records
+/// of the same batch land none, the store's pages stay a bijection.
+#[test]
+fn a_bad_key_refuses_the_batch_whole() {
+    run(async {
+        let disk = MemDisk::default();
+        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
             .await
             .unwrap();
+        let huge = vec![0u8; 5000];
         assert!(matches!(
-            st.put_cache("t0", b"k", &[0], &[d], &[999]).await,
-            Err(StoreError::BadSeal(_))
+            st.put_many(
+                b"t0",
+                &[
+                    Rec::Put {
+                        key: b"good",
+                        val: b"v"
+                    },
+                    Rec::Put {
+                        key: &huge,
+                        val: b"v"
+                    },
+                ]
+            )
+            .await,
+            Err(StoreError::BadKey)
         ));
+        assert_eq!(st.get(b"t0", b"good").await.unwrap(), None);
+        // a big value's blob is given back too: the alloc'd pages return
         assert!(matches!(
-            st.put_cache("t0", b"k", &[0], &[d], &[5, 5]).await,
-            Err(StoreError::BadSeal(_))
+            st.put_many(
+                b"t0",
+                &[Rec::Put {
+                    key: &huge,
+                    val: &[7u8; 600]
+                }]
+            )
+            .await,
+            Err(StoreError::BadKey)
         ));
-        st.put_cache("t0", b"k", &[0], &[d], &[]).await.unwrap();
+        st.put_many(
+            b"t0",
+            &[Rec::Put {
+                key: b"good",
+                val: b"v",
+            }],
+        )
+        .await
+        .unwrap();
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
     });
 }
 
-/// A draft dies once: a second death, a death after publication, a
-/// publication of the dead — honest refusals, the world untouched.
+/// A draft dies once (the escape hatch's own honesty): a second death,
+/// a phantom key — refusals, the world untouched.
 #[test]
 fn a_draft_dies_once() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+            .await
+            .unwrap();
         let d = st.alloc_draft_page().await.unwrap();
         st.dealloc_draft_page(d).await.unwrap();
         assert_eq!(
             st.dealloc_draft_page(d).await,
-            Err(StoreError::UnknownDraft)
-        );
-        // a consumed draft is no longer the caller's to kill
-        let e = st.alloc_draft_page().await.unwrap();
-        st.write_draft_page(e, |_| (vec![1u8; 3], ()))
-            .await
-            .unwrap();
-        st.put_cache("t0", b"k", &[0], &[e], &[]).await.unwrap();
-        assert_eq!(
-            st.dealloc_draft_page(e).await,
-            Err(StoreError::UnknownDraft)
-        );
-        // a vanished consumed draft — the publication refuses
-        let v = st.alloc_draft_page().await.unwrap();
-        st.write_draft_page(v, |_| (vec![2u8; 3], ()))
-            .await
-            .unwrap();
-        st.dealloc_draft_page(v).await.unwrap();
-        assert_eq!(
-            st.put_cache("t0", b"v", &[0], &[v], &[]).await,
             Err(StoreError::UnknownDraft)
         );
         st.flush().await.unwrap();
@@ -106,40 +156,52 @@ fn a_draft_dies_once() {
 }
 
 /// A transient fault mid-round rolls the world back (the unseal path):
-/// the retried round lands, and the image stays a strict bijection.
+/// the sealed delta stands, the retried round lands, and the image
+/// stays a strict bijection.
 #[test]
 fn a_transient_fault_rolls_back_the_round() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
-        let k = st.alloc_draft_page().await.unwrap();
-        st.write_draft_page(k, |_| (vec![1u8; 3], ()))
+        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
             .await
             .unwrap();
-        st.put_cache("t0", b"k", &[0], &[k], &[]).await.unwrap();
+        st.put_many(
+            b"t0",
+            &[Rec::Put {
+                key: b"k",
+                val: &[1u8; 3],
+            }],
+        )
+        .await
+        .unwrap();
         st.flush().await.unwrap();
-        let k2 = st.alloc_draft_page().await.unwrap();
-        st.write_draft_page(k2, |_| (vec![2u8; 3], ()))
-            .await
-            .unwrap();
-        let old = match st.get_cache("t0", b"k").await.unwrap() {
-            Some((g, cv)) => {
-                let p = cv.pages.clone();
-                drop(g);
-                p
-            }
-            None => Vec::new(),
-        };
-        st.put_cache("t0", b"k", &[0], &[k2], &old).await.unwrap();
-        disk.file("db").set_fault(Fault::Once(2));
+        // the replacement's old closure is the store's own bookkeeping
+        st.put_many(
+            b"t0",
+            &[Rec::Put {
+                key: b"k",
+                val: &[2u8; 3],
+            }],
+        )
+        .await
+        .unwrap();
+        // op 3 — mid-round (op 2 is a tail read whose failure the
+        // round rides out)
+        disk.file("db").set_fault(Fault::Once(3));
         assert!(st.flush().await.is_err());
         disk.file("db").set_fault(Fault::None);
-        // the world came back: the value still reads, a fresh round lands
-        let k3 = st.alloc_draft_page().await.unwrap();
-        st.write_draft_page(k3, |_| (vec![3u8; 3], ()))
-            .await
-            .unwrap();
-        st.put_cache("t0", b"j", &[0], &[k3], &[]).await.unwrap();
+        // the world came back: the sealed value still reads, a fresh
+        // round lands
+        assert_eq!(st.get(b"t0", b"k").await.unwrap(), Some(vec![2u8; 3]));
+        st.put_many(
+            b"t0",
+            &[Rec::Put {
+                key: b"j",
+                val: &[3u8; 3],
+            }],
+        )
+        .await
+        .unwrap();
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
     });

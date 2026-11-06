@@ -11,16 +11,18 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use dentrado_cache::{Storage, StoreError, core::val::VAL_PAYLOAD, disk::FsDisk};
+use dentrado_cache::{Storage, StoreError, TableSpec, disk::FsDisk};
 use futures::{FutureExt, channel::oneshot};
 
 use super::PagedStorage;
 use crate::core::gear::IsRuntime;
 
-/// The gear-cache table: the cache format version lives in the name — a new
+/// The gear-cache table's identity: the format's name and version — a new
 /// format opens a new table, and the startup GC (below) drops every other
 /// name the file carries.
-pub(super) const CACHE_TABLE: &str = "cache:v1";
+pub(super) fn cache_table() -> Vec<u8> {
+    postcard::to_stdvec(&("dentrado/gear-cache", 0u64)).expect("a flat tuple serializes")
+}
 /// Page-cache arena slots per core (1024 pages = 4 MiB).
 const BLOCK_CACHE: usize = 1024;
 
@@ -104,14 +106,15 @@ impl<R: IsRuntime> PagedStorage<R> {
     }
 
     /// Open the store (see [`open_quarantining`]), then the version GC:
-    /// this file holds only cache tables, so every name that is not the
-    /// current version's is an orphan an older build left — dropped here,
+    /// this file holds only cache tables, so every identity that is not
+    /// the current version's is an orphan an older build left — dropped
     /// at rest, before the first cache op (and the drop marked dirty, so
-    /// the next `flush` engraves the tombstone into the image).
+    /// the next `flush` engraves it into the image).
     async fn open(&self, file: &Path) -> Result<Storage<FsDisk>, StoreError> {
         let store = open_quarantining(file).await?;
+        let id = cache_table();
         for name in store.tables() {
-            if name != CACHE_TABLE {
+            if name != id {
                 // A GC drop failing is an inconvenience, not a boundary
                 // trip: the orphan stays (unread, its pages paid for) until
                 // a future start retries.
@@ -154,52 +157,6 @@ impl<R: IsRuntime> PagedStorage<R> {
             }
         }
     }
-
-    /// Pages a key's live entry occupies (chain order); empty when absent.
-    pub(super) async fn old_pages(
-        store: &Storage<FsDisk>,
-        key: &[u8],
-    ) -> Result<Vec<u64>, StoreError> {
-        match store.get_cache(CACHE_TABLE, key).await? {
-            Some((guard, cv)) => {
-                drop(guard);
-                Ok(cv.pages)
-            }
-            None => Ok(Vec::new()),
-        }
-    }
-
-    /// Write `image` as a fresh value chain, freeing the pages it supersedes.
-    pub(super) async fn publish(
-        store: &Storage<FsDisk>,
-        key: &[u8],
-        image: &[u8],
-    ) -> Result<(), StoreError> {
-        let old = Self::old_pages(store, key).await?;
-        let mut drafts = Vec::new();
-        for chunk in image.chunks(VAL_PAYLOAD) {
-            let k = match store.alloc_draft_page().await {
-                Ok(k) => k,
-                Err(e) => return undraft(store, drafts, e).await,
-            };
-            drafts.push(k);
-            let chunk = chunk.to_vec();
-            if let Err(e) = store
-                .write_draft_page(k, move |_| (chunk.clone(), ()))
-                .await
-            {
-                return undraft(store, drafts, e).await;
-            }
-        }
-        let mt = u64::try_from(image.len()).unwrap_or(u64::MAX).to_le_bytes();
-        store.put_cache(CACHE_TABLE, key, &mt, &drafts, &old).await
-    }
-
-    /// Tombstone the key and free its pages.
-    pub(super) async fn erase(store: &Storage<FsDisk>, key: &[u8]) -> Result<(), StoreError> {
-        let old = Self::old_pages(store, key).await?;
-        store.put_cache(CACHE_TABLE, key, &[], &[], &old).await
-    }
 }
 
 /// Open the store, quarantining a corrupt image: the file is renamed aside
@@ -207,7 +164,8 @@ impl<R: IsRuntime> PagedStorage<R> {
 /// failure falls back to the plain open — its error decides RAM-only mode.
 async fn open_quarantining(file: &Path) -> Result<Storage<FsDisk>, StoreError> {
     let path = file.display().to_string();
-    match Storage::open(&FsDisk, &path, BLOCK_CACHE, &[CACHE_TABLE]).await {
+    let spec = dentrado_cache::TableSpec::flat(cache_table());
+    match Storage::open(&FsDisk, &path, BLOCK_CACHE, &[spec]).await {
         Err(StoreError::CorruptImage) => {
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -229,7 +187,13 @@ async fn open_quarantining(file: &Path) -> Result<Storage<FsDisk>, StoreError> {
                     );
                 }
             }
-            Storage::open(&FsDisk, &path, BLOCK_CACHE, &[CACHE_TABLE]).await
+            Storage::open(
+                &FsDisk,
+                &path,
+                BLOCK_CACHE,
+                &[TableSpec::flat(cache_table())],
+            )
+            .await
         }
         other => other,
     }

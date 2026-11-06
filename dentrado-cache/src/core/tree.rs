@@ -101,6 +101,13 @@ pub fn leaf_e((k, mt, _): &Item) -> usize {
     16 + k.len() + mt.len()
 }
 
+/// Could any leaf hold this record — the record surface's `BadKey`
+/// line (a bigger one no page could hold, and the flush would refuse
+/// the whole round).
+pub fn leaf_holds(k: &[u8], mt: &[u8]) -> bool {
+    16 + k.len() + mt.len() <= PAYLOAD
+}
+
 /// A route's cost: the child slot, two lengths, the key — the length
 /// word of the (always empty) inline bytes is still written.
 pub fn route_e((k, _, _): &Item) -> usize {

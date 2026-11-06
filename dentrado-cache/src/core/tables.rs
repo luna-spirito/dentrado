@@ -1,78 +1,100 @@
-//! The tables — the store's named set of key-addressed tables, each a
+//! The tables — the store's set of key-addressed tables, each a
 //! B-tree on disk plus the delta before it. The delta is the latest
 //! writes not yet moved into the tree: it is searched first, and the
 //! flush commit purges what the round sealed. The set is identified by
-//! names (see [`crate::core::sb`]); the trees' page codec and geometry
-//! live in [`crate::core::tree`].
+//! opaque id bytes (see [`crate::core::sb`]); the trees' page codec
+//! and geometry live in [`crate::core::tree`].
 
 use std::collections::HashMap;
 
 use super::CacheValue;
 use crate::page::PageId;
+use crate::schema::{TableSchema, TableSpec};
+
+/// One delta entry: a value on its way in, a key on its way out.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum DeltaV {
+    Put(CacheValue),
+    Del,
+}
 
 /// The delta map — a table's not-yet-flushed half.
-pub(crate) type Delta = imbl::HashMap<Vec<u8>, CacheValue>;
+pub(crate) type Delta = imbl::HashMap<Vec<u8>, DeltaV>;
 
-/// The tables: each slot's name, B-tree root and own delta. A dropped
-/// slot is a tombstone — an empty name — not a removal: slots never
-/// shift while the store lives (a flush round's sealed snapshots index
-/// by slot), and the tombstone leaves the SB and every lookup, dying
-/// whole at the next process (which opens by name, not position).
+/// The tables: each slot's id, schema, B-tree root and own delta. A
+/// dropped slot is a tombstone — an empty id — not a removal: slots
+/// never shift while the store lives (a flush round's sealed snapshots
+/// index by slot), and the tombstone leaves the SB and every lookup,
+/// dying whole at the next process (which opens by id, not position).
 pub(crate) struct Tables {
-    /// Each slot's name; empty — a dropped slot's tombstone.
-    names: Vec<String>,
-    /// Live names → slot (a tombstone leaves it).
-    index: HashMap<String, usize>,
+    /// Each slot's id bytes; empty — a dropped slot's tombstone.
+    names: Vec<Vec<u8>>,
+    /// Live ids → slot (a tombstone leaves it).
+    index: HashMap<Vec<u8>, usize>,
+    /// Each slot's schema, parallel to the ids. An image orphan the
+    /// opener didn't name gets [`crate::schema::NO_DEPS`]: its bytes
+    /// cannot be trusted to follow any schema the opener knows, so a
+    /// dropped orphan frees only its own pages.
+    schemas: Vec<&'static dyn TableSchema>,
     /// Each table's tree root; 0 — empty.
-    pub(crate) roots: Vec<PageId>,
+    pub(crate) roots: Vec<PageId>, // TODO: pub(crate) should be avoided on fields.
     deltas: Vec<Delta>,
 }
 
 impl Tables {
-    pub(crate) fn fresh(names: &[&str]) -> Self {
-        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+    pub(crate) fn fresh(specs: &[TableSpec]) -> Self {
+        let names: Vec<Vec<u8>> = specs.iter().map(|s| s.id.clone()).collect();
         Self {
             index: names
                 .iter()
                 .enumerate()
                 .map(|(i, n)| (n.clone(), i))
                 .collect(),
+            schemas: specs.iter().map(|s| s.schema).collect(),
             roots: vec![0; names.len()],
             deltas: (0..names.len()).map(|_| Delta::new()).collect(),
             names,
         }
     }
 
-    /// The union: the opener's names first (in opener order), then the
+    /// The union: the opener's tables first (in opener order), then the
     /// image's extras (in image order) — the opener's new tables start
     /// empty, the image's orphans stay enumerable and droppable.
-    pub(crate) fn of_image(image: &[(String, PageId)], opener: &[&str]) -> Self {
-        let mut names = opener.to_vec();
-        for (n, _) in image {
-            if !names.iter().any(|o| o == n) {
-                names.push(n.as_str());
+    pub(crate) fn of_image(image: &[(Vec<u8>, PageId)], opener: &[TableSpec]) -> Self {
+        let mut specs = opener.to_vec();
+        for (id, _) in image {
+            if !specs.iter().any(|s| &s.id == id) {
+                specs.push(TableSpec::flat(id.clone()));
             }
         }
-        let mut t = Self::fresh(&names);
-        for (n, r) in image {
-            if let Some(&i) = t.index.get(n) {
+        let mut t = Self::fresh(&specs);
+        for (id, r) in image {
+            if let Some(&i) = t.index.get(id) {
                 t.roots[i] = *r;
             }
         }
         t
     }
 
-    /// A live name's slot.
-    pub(crate) fn idx(&self, name: &str) -> Option<usize> {
-        self.index.get(name).copied()
+    /// A live id's slot.
+    pub(crate) fn idx(&self, id: &[u8]) -> Option<usize> {
+        self.index.get(id).copied()
     }
 
-    pub(crate) fn get(&self, t: usize, k: &[u8]) -> Option<CacheValue> {
+    pub(crate) fn schema(&self, t: usize) -> &'static dyn TableSchema {
+        self.schemas[t]
+    }
+
+    pub(crate) fn get(&self, t: usize, k: &[u8]) -> Option<DeltaV> {
         self.deltas[t].get(k).cloned()
     }
 
     pub(crate) fn put(&mut self, t: usize, k: &[u8], v: CacheValue) {
-        self.deltas[t].insert(k.to_vec(), v);
+        self.deltas[t].insert(k.to_vec(), DeltaV::Put(v));
+    }
+
+    pub(crate) fn del(&mut self, t: usize, k: &[u8]) {
+        self.deltas[t].insert(k.to_vec(), DeltaV::Del);
     }
 
     /// The delta snapshots for a flush round's seal.
@@ -92,8 +114,8 @@ impl Tables {
         }
     }
 
-    /// The live names (slot order, tombstones out).
-    pub(crate) fn names(&self) -> Vec<String> {
+    /// The live ids (slot order, tombstones out).
+    pub(crate) fn names(&self) -> Vec<Vec<u8>> {
         self.names
             .iter()
             .filter(|n| !n.is_empty())
@@ -101,9 +123,9 @@ impl Tables {
             .collect()
     }
 
-    /// The live `(name, root)` pairs over a roots vector (the flush's
+    /// The live `(id, root)` pairs over a roots vector (the flush's
     /// new roots) — the SB's table set.
-    pub(crate) fn live_with(&self, roots: &[PageId]) -> Vec<(String, PageId)> {
+    pub(crate) fn live_with(&self, roots: &[PageId]) -> Vec<(Vec<u8>, PageId)> {
         self.names
             .iter()
             .zip(roots)
@@ -113,22 +135,52 @@ impl Tables {
     }
 
     /// A slot's delta value pages — the uncommitted half of one table
-    /// (a drop must free them with the tree).
+    /// (a drop must free them with the tree). A delta deletion names no
+    /// pages: its record's closure was freed the moment it registered.
     pub(crate) fn delta_pages(&self, t: usize) -> Vec<PageId> {
         self.deltas[t]
             .values()
-            .flat_map(|v| v.pages.iter().copied())
+            .filter_map(|v| match v {
+                DeltaV::Put(cv) => Some(cv.pages.iter().copied()),
+                DeltaV::Del => None,
+            })
+            .flatten()
             .collect()
     }
 
-    /// A slot's death: the name and delta go, the root zeroes — the
+    /// A slot's delta records' inline bytes — a drop must free the
+    /// pages their schemas name too.
+    pub(crate) fn delta_inline(&self, t: usize) -> Vec<Vec<u8>> {
+        self.deltas[t]
+            .values()
+            .filter_map(|v| match v {
+                DeltaV::Put(cv) => Some(cv.mt.clone()),
+                DeltaV::Del => None,
+            })
+            .collect()
+    }
+
+    /// A slot's delta entries in a key range — a scan's overlay half.
+    pub(crate) fn delta_range(
+        &self,
+        t: usize,
+        lo: &[u8],
+        hi: Option<&[u8]>,
+    ) -> Vec<(Vec<u8>, DeltaV)> {
+        self.deltas[t]
+            .iter()
+            .filter(|(k, _)| k.as_slice() >= lo && hi.is_none_or(|h| k.as_slice() < h))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// A slot's death: the id and delta go, the root zeroes — the
     /// pages themselves die with the caller's EBR registration.
     pub(crate) fn drop_slot(&mut self, t: usize) {
-        let name = self.names[t].clone();
-        if name.is_empty() {
+        if self.names[t].is_empty() {
             return; // already a tombstone
         }
-        self.names[t].clear();
+        let name = std::mem::take(&mut self.names[t]);
         self.index.remove(&name);
         self.roots[t] = 0;
         self.deltas[t] = Delta::new();
@@ -142,6 +194,12 @@ impl Tables {
     pub(crate) fn pages(&self) -> impl Iterator<Item = PageId> + '_ {
         self.deltas
             .iter()
-            .flat_map(|d| d.values().flat_map(|v| v.pages.iter().copied()))
+            .flat_map(|d| {
+                d.values().filter_map(|v| match v {
+                    DeltaV::Put(cv) => Some(cv.pages.iter().copied()),
+                    DeltaV::Del => None,
+                })
+            })
+            .flatten()
     }
 }

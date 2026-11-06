@@ -5,12 +5,14 @@
 //! blockcache's desk) drive the core through its verbs, each an
 //! atomic section: a pure transition, one decision and one mutation
 //! in a piece. The small machines live each in its own module
-//! ([`freelist`], [`ebr`], [`tables`]); the draft arena is defined
-//! here; the page codecs beside them ([`val`], [`tree`],
-//! [`sb`], `freelist::chunk`). The lock's other half — the
+//! ([`freelist`], [`ebr`], [`tables`], [`drafts`]); the page codecs
+//! beside them ([`val`], [`tree`], [`sb`], `freelist::chunk`); the
+//! flush round's sections in [`round`]. The lock's other half — the
 //! persistence overlay — in [`crate::persist`].
 
+mod drafts;
 mod ebr;
+pub mod flush_round;
 pub mod freelist;
 pub mod sb;
 pub mod tables;
@@ -21,27 +23,25 @@ pub mod val;
 mod tests;
 
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::task::Context;
 
 use synchrony::unsync::event::EventListener;
 
+pub use self::drafts::DraftId;
+use self::drafts::Drafts;
 use self::ebr::Deaths;
 use self::freelist::{ChainEntry, FreeAct, Frees};
 use self::sb::Sb;
-pub(crate) use self::tables::Delta;
 use self::tables::Tables;
+pub(crate) use self::tables::{Delta, DeltaV};
 use crate::blockcache::{BlockCache, Reply, Submit};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{Page, PageId};
+use crate::schema::{TableSchema, TableSpec};
 
 // ## Types
-
-/// A draft's key in the store's arena.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct DraftId(u64);
 
 /// A cache entry: inline bytes and the value's pages (chain order).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -59,13 +59,26 @@ pub(crate) enum AllocAct {
     Read { ep: usize, e: ChainEntry },
 }
 
-// REVIEW 8: Слишком много полей у структуры. Необходимо разбить на несколько логических куско, если это возможно.
-// ANSWER: split realized — the five machines by concern (`bc` —
-// buffers, `frees` — page dispensing, `deaths` — deaths, `drafts` —
-// drafts, `cache` — tree+delta) are the core; the two globals
-// (the round agent's mailbox, `gen`) left for the persistence overlay
-// ([`crate::persist::PersistentCore`]). The machines are closed
-// behind the core's verbs below.
+/// The delta's answer for one key — [`Core::get_step`]'s second half.
+pub(crate) enum StepHit {
+    /// A delta entry — a value on its way in.
+    Put(CacheValue),
+    /// A delta deletion — the key is gone even if the tree still has
+    /// it.
+    Del,
+    /// Nothing in the delta — the standing tree decides.
+    Tree,
+}
+
+/// One record of a `put_many` batch at its seal: the key, the record's
+/// inline bytes (`None` — a deletion), and the drafts it publishes
+/// (the value's own pages — empty for an inline value or a deletion).
+pub(crate) struct SealRec {
+    pub(crate) k: Vec<u8>,
+    pub(crate) put: Option<Vec<u8>>,
+    pub(crate) consumed: Vec<DraftId>,
+}
+
 /// The store's core — the flush-agnostic half of the lock's content.
 pub(crate) struct Core<D: IsFilesystem> {
     // REVIEW 9: Оно чем-то кроме BlockCache используется вообще? Может, перевести в BlockCache?
@@ -82,31 +95,6 @@ pub(crate) struct Core<D: IsFilesystem> {
     deaths: Deaths,
     /// The tables: each table's tree root plus the delta before it.
     tables: Tables,
-}
-
-/// The flush seal's take: everything a round starts from, out in one
-/// section — the flush pool taken whole (head, tail entry, counter)
-/// with the retiring containers (the task-eaten ones and both pools'
-/// fronts, folded into `spent` by [`Frees::seal`]), the task pool
-/// copied (head, bookmark, counter), the deaths pile, the pendings
-/// copy, the drafts' pages copy, the delta snapshots, the table roots.
-pub(crate) struct Sealed {
-    pub(crate) ep: usize,
-    /// A — the flush pool, taken whole.
-    pub(crate) ahead: Vec<PageId>,
-    pub(crate) atail: ChainEntry,
-    pub(crate) anext: PageId,
-    /// The containers retiring into this round's cells.
-    pub(crate) spent: Vec<PageId>,
-    /// B — the task pool, copied.
-    pub(crate) bhead: Vec<PageId>,
-    pub(crate) btail: ChainEntry,
-    pub(crate) bnext: PageId,
-    pub(crate) dying: Vec<PageId>,
-    pub(crate) pend: Vec<PageId>,
-    pub(crate) drafts: Vec<PageId>,
-    pub(crate) snaps: Vec<Delta>,
-    pub(crate) roots: Vec<PageId>,
 }
 
 /// The RAM evidence at rest — the invariants' half that lives in the
@@ -131,66 +119,8 @@ pub(crate) struct Ram {
     pub(crate) dying: usize,
 }
 
-// TODO: Drafts should be a separate, incapsulated model, not put into `core`
-/// The draft arena: keys → (page, fresh — never yet written). A page
-/// enters as a fresh draft and leaves by publication or death.
-struct Drafts {
-    next: u64,
-    map: HashMap<DraftId, (PageId, bool)>,
-}
-
-impl Drafts {
-    fn fresh() -> Self {
-        Self {
-            next: 0,
-            map: HashMap::new(),
-        }
-    }
-
-    /// A page enters the arena as a fresh draft — the key out.
-    fn take(&mut self, p: PageId) -> DraftId {
-        let k = DraftId(self.next);
-        self.next += 1;
-        self.map.insert(k, (p, true));
-        k
-    }
-
-    fn get(&self, k: &DraftId) -> Option<(PageId, bool)> {
-        self.map.get(k).copied()
-    }
-
-    /// The first write went through — no longer fresh (an overwrite of
-    /// the slot's garbage).
-    fn defresh(&mut self, k: &DraftId) {
-        if let Some(e) = self.map.get_mut(k) {
-            e.1 = false;
-        }
-    }
-
-    /// Does the arena still hold this page?
-    fn has_page(&self, p: PageId) -> bool {
-        self.map.values().any(|&(q, _)| q == p)
-    }
-
-    /// The consumed drafts' pages — `None` if any has vanished.
-    fn pages_of(&self, cs: &[DraftId]) -> Option<Vec<PageId>> {
-        cs.iter()
-            .map(|c| self.map.get(c).map(|&(p, _)| p))
-            .collect()
-    }
-
-    fn remove(&mut self, k: &DraftId) -> Option<(PageId, bool)> {
-        self.map.remove(k)
-    }
-
-    /// The live drafts' pages (the invariant's inspection).
-    fn pages(&self) -> impl Iterator<Item = PageId> + '_ {
-        self.map.values().map(|&(p, _)| p)
-    }
-}
-
 impl<D: IsFilesystem> Core<D> {
-    pub(crate) fn fresh(file: D::File, cap: usize, names: &[&str]) -> Self {
+    pub(crate) fn fresh(file: D::File, cap: usize, specs: &[TableSpec]) -> Self {
         // The arena's pages, born here at the top and shared downward: a
         // flight's lease is an `Rc` to these very pages, so the bytes
         // stay put for as long as the kernel holds them — through any
@@ -203,7 +133,7 @@ impl<D: IsFilesystem> Core<D> {
             frees: Frees::fresh(),
             drafts: Drafts::fresh(),
             deaths: Deaths::fresh(),
-            tables: Tables::fresh(names),
+            tables: Tables::fresh(specs),
         }
     }
 
@@ -211,7 +141,7 @@ impl<D: IsFilesystem> Core<D> {
     /// block cache is not touched (the validation chains are read
     /// directly). The tables are the union of the image's set and the
     /// opener's — see [`Tables::of_image`].
-    pub(crate) fn of_sb(&mut self, sb: &Sb, opener: &[&str]) {
+    pub(crate) fn of_sb(&mut self, sb: &Sb, opener: &[TableSpec]) {
         self.frees = Frees::of_sb(sb.e0, sb.next0, sb.e1, sb.next1);
         self.drafts = Drafts::fresh();
         self.deaths = Deaths::fresh();
@@ -256,32 +186,32 @@ impl<D: IsFilesystem> Core<D> {
         }
     }
 
-    /// The `put_cache` seal: the delta + death registration — one
-    /// section. The published pages are the consumed drafts' own (no
-    /// way to declare a page the caller does not hold), and the freed
-    /// list is checked whole before anything registers — a page both
-    /// consumed and freed, a freed page still held (a draft, dying,
-    /// back in a pool) or outside the issued range (the SB slots, a
-    /// never-issued id — conjured from nothing), a duplicate: each
-    /// would list one page twice or forge a free cell. A refusal
-    /// registers nothing; the drafts stay held.
-    pub(crate) fn seal_step(
+    /// The `put_many` seal: a whole batch's deltas, draft consumption
+    /// and death registration — one section, so a batch lands whole or
+    /// not at all. The freed pages are the store's own closure walks
+    /// (each record's replaced value), not a caller's word: each must
+    /// be a published page — never a draft, never dying, never back in
+    /// a pool, never conjured — and no page twice. A refusal registers
+    /// nothing; the drafts stay held.
+    pub(crate) fn seal_batch(
         &mut self,
         t: usize,
-        k: &[u8],
-        mt: &[u8],
-        consumed: &[DraftId],
+        recs: &[SealRec],
         freed: &[PageId],
     ) -> Result<(), StoreError> {
         if t >= self.tables.roots.len() {
             return Err(StoreError::NoTable);
         }
-        let Some(pages) = self.drafts.pages_of(consumed) else {
-            return Err(StoreError::ConsumedVanished);
-        };
+        let mut owned = Vec::with_capacity(recs.len());
+        for r in recs {
+            let Some(pages) = self.drafts.pages_of(&r.consumed) else {
+                return Err(StoreError::ConsumedVanished);
+            };
+            owned.push(pages);
+        }
         let bound = self.frees.bound();
         for (i, p) in freed.iter().enumerate() {
-            let why = if pages.contains(p) {
+            let why = if owned.iter().any(|ps| ps.contains(p)) {
                 "a page both consumed and freed"
             } else if self.drafts.has_page(*p) {
                 "a freed page still held as a draft"
@@ -299,29 +229,36 @@ impl<D: IsFilesystem> Core<D> {
             return Err(StoreError::BadSeal(why));
         }
         self.deaths.reg(freed);
-        self.tables.put(
-            t,
-            k,
-            CacheValue {
-                mt: mt.to_vec(),
-                pages,
-            },
-        );
-        for c in consumed {
-            self.drafts.remove(c);
+        for (r, pages) in recs.iter().zip(owned) {
+            match r.put {
+                Some(ref mt) => self.tables.put(
+                    t,
+                    &r.k,
+                    CacheValue {
+                        mt: mt.clone(),
+                        pages,
+                    },
+                ),
+                None => self.tables.del(t, &r.k),
+            }
+            for c in &r.consumed {
+                self.drafts.remove(c);
+            }
         }
         Ok(())
     }
 
-    /// The pin + the `get_cache` decision: the guard — the subscription
-    /// bucket; the delta before the tree. `None` — no such table.
-    pub(crate) fn get_step(
-        &mut self,
-        t: usize,
-        k: &[u8],
-    ) -> Option<(usize, Option<CacheValue>, PageId)> {
+    /// The pin + the `get` decision: the guard — the subscription
+    /// bucket; the delta before the tree, a delta deletion before the
+    /// descent. `None` — no such table.
+    pub(crate) fn get_step(&mut self, t: usize, k: &[u8]) -> Option<(usize, StepHit, PageId)> {
         let root = *self.tables.roots.get(t)?;
-        Some((self.deaths.pin(), self.tables.get(t, k), root))
+        let hit = match self.tables.get(t, k) {
+            Some(DeltaV::Put(cv)) => StepHit::Put(cv),
+            Some(DeltaV::Del) => StepHit::Del,
+            None => StepHit::Tree,
+        };
+        Some((self.deaths.pin(), hit, root))
     }
 
     /// The guard away.
@@ -331,10 +268,10 @@ impl<D: IsFilesystem> Core<D> {
 
     // ## The tables' verbs (the named-set surface)
 
-    /// A live name's slot — `None` for a name outside the set or a
+    /// A live id's slot — `None` for an id outside the set or a
     /// dropped slot.
-    pub(crate) fn table_index(&self, name: &str) -> Option<usize> {
-        self.tables.idx(name)
+    pub(crate) fn table_index(&self, id: &[u8]) -> Option<usize> {
+        self.tables.idx(id)
     }
 
     /// A slot's standing tree root (0 — empty).
@@ -342,19 +279,45 @@ impl<D: IsFilesystem> Core<D> {
         self.tables.roots[t]
     }
 
+    /// A slot's schema — how its records name dependent pages.
+    pub(crate) fn table_schema(&self, t: usize) -> &'static dyn TableSchema {
+        self.tables.schema(t)
+    }
+
     /// A slot's delta value pages — see [`Tables::delta_pages`].
     pub(crate) fn table_delta_pages(&self, t: usize) -> Vec<PageId> {
         self.tables.delta_pages(t)
     }
 
-    /// The live names — enumeration for the caller's startup GC.
-    pub(crate) fn table_names(&self) -> Vec<String> {
+    /// A slot's delta records' inline bytes — see
+    /// [`Tables::delta_inline`].
+    pub(crate) fn table_delta_inline(&self, t: usize) -> Vec<Vec<u8>> {
+        self.tables.delta_inline(t)
+    }
+
+    /// A bare EBR pin (a scan's multi-page walk) — the guard's bucket.
+    pub(crate) fn pin_step(&mut self) -> usize {
+        self.deaths.pin()
+    }
+
+    /// A slot's delta entries in a key range — a scan's overlay half.
+    pub(crate) fn table_delta_range(
+        &self,
+        t: usize,
+        lo: &[u8],
+        hi: Option<&[u8]>,
+    ) -> Vec<(Vec<u8>, DeltaV)> {
+        self.tables.delta_range(t, lo, hi)
+    }
+
+    /// The live ids — enumeration for the caller's startup GC.
+    pub(crate) fn table_names(&self) -> Vec<Vec<u8>> {
         self.tables.names()
     }
 
-    /// The live `(name, root)` pairs over a roots vector — the SB's
+    /// The live `(id, root)` pairs over a roots vector — the SB's
     /// set at a flush's engraving.
-    pub(crate) fn live_tables(&self, roots: &[PageId]) -> Vec<(String, PageId)> {
+    pub(crate) fn live_tables(&self, roots: &[PageId]) -> Vec<(Vec<u8>, PageId)> {
         self.tables.live_with(roots)
     }
 
@@ -388,37 +351,6 @@ impl<D: IsFilesystem> Core<D> {
         self.drafts.pages_of(cs)
     }
 
-    // ## The flush round's sections
-
-    /// The flush seal: the round's whole starting world out in one
-    /// section — see [`Sealed`].
-    pub(crate) fn seal(&mut self) -> Sealed {
-        let ep = self.frees.ep();
-        let (ahead, atail, anext, spent) = self.frees.seal();
-        Sealed {
-            ep,
-            ahead,
-            atail,
-            anext,
-            spent,
-            bhead: self.frees.head(ep).to_vec(),
-            btail: self.frees.task_tail(),
-            bnext: self.frees.next_of(ep),
-            dying: self.deaths.take(),
-            pend: self.deaths.pendings(),
-            drafts: self.drafts.pages().collect(),
-            snaps: self.tables.snap(),
-            roots: self.tables.roots.clone(),
-        }
-    }
-
-    /// The taken pool's husk — the retires that arrived during the
-    /// round. Their listings retire with this round's fronts, so the
-    /// flight re-lists them at its snapshot.
-    pub(crate) fn husk(&self) -> Vec<PageId> {
-        self.frees.head(1 - self.frees.ep()).to_vec()
-    }
-
     /// The world's page-id bound — every issued id is below it (a
     /// round's own flight counter included by the caller while it
     /// runs).
@@ -430,58 +362,6 @@ impl<D: IsFilesystem> Core<D> {
     /// (from the round's seal to its commit)?
     pub(crate) fn round_live(&self) -> bool {
         self.frees.taken(0) || self.frees.taken(1)
-    }
-
-    /// A failed round's rollback: the seal-time world comes back — the
-    /// taken pool reinstated (the husk's mid-round retires kept), the
-    /// retiring containers and the deaths pile back on top of what the
-    /// round's lifetime accumulated. The epoch never flipped, so the
-    /// round never was. (The flight's seal-time copies; `head`, `tail`,
-    /// `next` — the taken pool, `spent` — the seal's merged bag,
-    /// `dying` — the sealed pile.)
-    pub(crate) fn unseal(
-        &mut self,
-        head: Vec<PageId>,
-        tail: ChainEntry,
-        next: PageId,
-        spent: Vec<PageId>,
-        dying: Vec<PageId>,
-    ) {
-        self.frees.unseal(head, tail, next, spent);
-        self.deaths.give_back(dying);
-    }
-
-    /// The task pool's bookmark past a round-eaten remainder (a
-    /// recovered off≠0 entry the round swallowed whole) — see
-    /// [`Frees::retask`]. Called in the round's commit section, before
-    /// the commit flips the epoch.
-    pub(crate) fn retask(&mut self, old: ChainEntry, new: ChainEntry) {
-        self.frees.retask(old, new)
-    }
-
-    /// The flush commit (the SB is synced): the flight's pool lands
-    /// back — the bookmark at the free run's head, the front — the
-    /// limbo chunks, the head — the husk plus the stock surplus; the
-    /// copied pool keeps its head and bookmark, gaining this round's
-    /// deaths of its own parity into the head and the copy chunks as
-    /// its front; the rebuilt tables' old pages register as deaths (the
-    /// EBR shepherds them past the readers mid-descent); the deltas
-    /// purge the sealed, the tables move to the new roots.
-    pub(crate) fn commit(
-        &mut self,
-        deaths: impl Iterator<Item = PageId>,
-        old_tree: &[PageId],
-        entry: ChainEntry,
-        fnext: PageId,
-        surplus: &[PageId],
-        fronts: [&[PageId]; 2],
-        snaps: &[Delta],
-        roots: &[PageId],
-    ) {
-        self.deaths.reg(old_tree);
-        self.frees.land(deaths, entry, fnext, surplus, fronts);
-        self.tables.commit(snaps);
-        self.tables.roots.copy_from_slice(roots);
     }
 
     // ## The desk's doors (the io through the cache below)

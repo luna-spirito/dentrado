@@ -4,9 +4,37 @@
 
 use super::*;
 use crate::disk::MemDisk;
+use crate::schema::TableSpec;
 
 fn core() -> Core<MemDisk> {
-    Core::fresh(MemDisk::default().file("db"), 4, &["a", "b"])
+    Core::fresh(
+        MemDisk::default().file("db"),
+        4,
+        &[
+            TableSpec::flat(b"a".to_vec()),
+            TableSpec::flat(b"b".to_vec()),
+        ],
+    )
+}
+
+/// One record's seal — the tests' shorthand over [`Core::seal_batch`].
+fn seal(
+    c: &mut Core<MemDisk>,
+    t: usize,
+    k: &[u8],
+    mt: &[u8],
+    consumed: &[DraftId],
+    freed: &[PageId],
+) -> Result<(), StoreError> {
+    c.seal_batch(
+        t,
+        &[SealRec {
+            k: k.to_vec(),
+            put: Some(mt.to_vec()),
+            consumed: consumed.to_vec(),
+        }],
+        freed,
+    )
 }
 
 /// A fresh pool serves at once (the head, then the counter).
@@ -26,7 +54,7 @@ fn a_missing_table_refuses() {
     assert!(c.get_step(0, b"k").is_some());
     let k = draft(&mut c);
     assert_eq!(
-        c.seal_step(2, b"k", b"", &[k], &[]),
+        seal(&mut c, 2, b"k", b"", &[k], &[]),
         Err(StoreError::NoTable)
     );
 }
@@ -44,23 +72,23 @@ fn a_bad_seal_refuses_whole() {
         other => panic!("a bad seal: {other:?}"),
     };
     assert_eq!(
-        why(c.seal_step(0, b"k", b"", &[a], &[2])),
+        why(seal(&mut c, 0, b"k", b"", &[a], &[2])),
         "a page both consumed and freed"
     );
     assert_eq!(
-        why(c.seal_step(0, b"k", b"", &[a], &[4])),
+        why(seal(&mut c, 0, b"k", b"", &[a], &[4])),
         "a freed page still held as a draft"
     );
     assert_eq!(
-        why(c.seal_step(0, b"k", b"", &[a], &[7, 7])),
+        why(seal(&mut c, 0, b"k", b"", &[a], &[7, 7])),
         "a page freed twice"
     );
     assert_eq!(
-        why(c.seal_step(0, b"k", b"", &[a], &[999])),
+        why(seal(&mut c, 0, b"k", b"", &[a], &[999])),
         "a freed page outside the issued range"
     );
     assert_eq!(
-        why(c.seal_step(0, b"k", b"", &[a], &[0])),
+        why(seal(&mut c, 0, b"k", b"", &[a], &[0])),
         "a freed page outside the issued range"
     );
     // nothing was registered by any refusal
@@ -70,29 +98,29 @@ fn a_bad_seal_refuses_whole() {
     // a published page freed (the legit flow), then — a dying page, a
     // pooled page — refused alike
     let j = draft(&mut c); // page 8
-    assert!(c.seal_step(0, b"j", b"", &[j], &[]).is_ok());
+    assert!(seal(&mut c, 0, b"j", b"", &[j], &[]).is_ok());
     let d = draft(&mut c); // page 10
-    assert!(c.seal_step(0, b"k2", b"", &[d], &[8]).is_ok());
+    assert!(seal(&mut c, 0, b"k2", b"", &[d], &[8]).is_ok());
     let ram = c.ram();
     assert!(ram.held.contains(&8));
     let e = draft(&mut c);
     assert_eq!(
-        why(c.seal_step(0, b"k3", b"", &[e], &[8])),
+        why(seal(&mut c, 0, b"k3", b"", &[e], &[8])),
         "a freed page already dying"
     );
     c.dealloc_step(b); // page 4 back into its pool's head
     assert_eq!(
-        why(c.seal_step(0, b"k4", b"", &[sp], &[4])),
+        why(seal(&mut c, 0, b"k4", b"", &[sp], &[4])),
         "a freed page back in a pool"
     );
     // a vanished draft — refused, and the good seal still goes through
     let v = draft(&mut c);
     c.dealloc_step(v);
     assert_eq!(
-        c.seal_step(0, b"v", b"", &[v], &[]),
+        seal(&mut c, 0, b"v", b"", &[v], &[]),
         Err(StoreError::ConsumedVanished)
     );
-    assert!(c.seal_step(0, b"k", b"m", &[a], &[]).is_ok());
+    assert!(seal(&mut c, 0, b"k", b"m", &[a], &[]).is_ok());
     assert!(c.pages_of(&[a]).is_none()); // consumed — gone from the arena
 }
 
@@ -104,7 +132,7 @@ fn a_draft_dies_once() {
     let k = draft(&mut c);
     assert!(c.dealloc_step(k));
     assert!(!c.dealloc_step(k));
-    assert!(!c.dealloc_step(DraftId(99)));
+    assert!(!c.dealloc_step(DraftId::phantom(99)));
 }
 
 /// A seal over a taken pool is a bug caught loud (the round owns the
@@ -123,7 +151,7 @@ fn a_second_seal_is_caught() {
 fn unseal_restores_the_world() {
     let mut c = core();
     let a = draft(&mut c);
-    assert!(c.seal_step(0, b"k", b"m", &[a], &[3]).is_ok()); // an in-range page dies
+    assert!(seal(&mut c, 0, b"k", b"m", &[a], &[3]).is_ok()); // an in-range page dies
     let before = c.ram();
     let s = c.seal();
     assert!(c.round_live());

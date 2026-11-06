@@ -1,9 +1,15 @@
 //! The incremental half of a tree flush — grafting a round's delta
 //! onto the standing tree copy-on-write. Only the dirty root-to-leaf
 //! paths take new pages; the clean subtrees keep theirs (their pages
-//! live on in both images until the path above them changes). The
-//! retired pages ride the round like any death: limbo first, EBR at
-//! the commit. Never a merge — the store only ever adds keys.
+//! live on in both images until the path above them changes), and a
+//! rewrite that changes nothing — a no-op delete, a re-put of the very
+//! same record — keeps the old page too, the skip cascading up through
+//! the reports. The retired pages ride the round like any death: limbo
+//! first, EBR at the commit. Deletion is real: a `Del` removes its
+//! record, an emptied leaf drops its route, an emptied root empties
+//! the table. Never a sibling merge — an underfull node is correct
+//! (the repack of a dirty node is already greedy); a wholesale
+//! repacking of a hollowed tree is a future op.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -16,35 +22,62 @@ use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::PageId;
 
-/// A visited node on a dirty path: its page (a death this round), its
-/// parse, and its share of the round's sorted batch.
+/// One batch element: a record going in, or a key going out.
+#[derive(Clone)]
+pub(super) enum Op {
+    Put(Item),
+    Del(Vec<u8>),
+}
+
+impl Op {
+    pub(super) fn key(&self) -> &[u8] {
+        match self {
+            Op::Put((k, _, _)) => k,
+            Op::Del(k) => k,
+        }
+    }
+}
+
+/// The graft's outcome: the new drafts — children before parents, the
+/// new root last, `tree::build`'s order (empty — nothing changed, or
+/// the tree emptied), the pages the dirty paths retired (an unchanged
+/// frame keeps its page), and whether the batch emptied the tree (the
+/// table's root becomes 0).
+pub(super) struct Grafted {
+    pub(super) drafts: Vec<tree::Node>,
+    pub(super) replaced: Vec<PageId>,
+    pub(super) emptied: bool,
+}
+
+/// A visited node on a dirty path: its page (a death this round, if
+/// the rewrite changes it), its parse, and its share of the round's
+/// sorted batch.
 struct Frame {
     p: PageId,
     node: tree::Node,
-    batch: Vec<Item>,
+    batch: Vec<Op>,
 }
 
 /// The report up from one rewritten node: the draft replacing the old
-/// page, the subtree's lo key (the parent's route), and the right
-/// siblings a repack was born.
+/// page (the old page itself, for a rewrite that changed nothing; 0 —
+/// the node emptied and its route dies), the subtree's lo key (the
+/// parent's route), and the right siblings a repack was born.
 struct Up {
     id: PageId,
     lo: Vec<u8>,
     cuts: Vec<(PageId, Vec<u8>)>,
 }
 
-/// Graft `batch` (any order — the graft sorts) onto the tree at `root`
-/// (never 0 — an empty table is built whole): the new drafts —
-/// children before parents, the new root last, `tree::build`'s order —
-/// and the old pages the dirty paths retired. `fuel0` bounds the
-/// reads: more nodes than the file holds can only be corruption.
+/// Graft `batch` (sorted by key) onto the tree at `root`
+/// (never 0 — an empty table is built whole): see [`Grafted`]. `fuel0`
+/// bounds the reads: more nodes than the file holds can only be
+/// corruption.
 pub(super) async fn run<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     root: PageId,
-    mut batch: Vec<Item>,
+    batch: Vec<Op>,
     fuel0: u64,
-) -> Result<(Vec<tree::Node>, Vec<PageId>), StoreError> {
-    batch.sort_by(|a, b| a.0.cmp(&b.0));
+) -> Result<Grafted, StoreError> {
     let mut fuel = fuel0;
     // Top-down: each frontier interior splits its share among the
     // children — the sorted keys give each child one run — and the
@@ -64,10 +97,10 @@ pub(super) async fn run<D: IsFilesystem>(
             }
             let mut at = 0;
             while at < f.batch.len() {
-                let i = tree::route_at(&f.node, &f.batch[at].0).unwrap_or(0);
+                let i = tree::route_at(&f.node, f.batch[at].key()).unwrap_or(0);
                 let mut end = at + 1;
                 while end < f.batch.len()
-                    && tree::route_at(&f.node, &f.batch[end].0).unwrap_or(0) == i
+                    && tree::route_at(&f.node, f.batch[end].key()).unwrap_or(0) == i
                 {
                     end += 1;
                 }
@@ -88,13 +121,24 @@ pub(super) async fn run<D: IsFilesystem>(
     // overflows repacks again (one round can dirty the whole tree).
     let mut ups: HashMap<PageId, Up> = HashMap::new();
     let mut drafts: Vec<tree::Node> = Vec::new();
+    let mut replaced: Vec<PageId> = Vec::new();
     for layer in layers.iter().rev() {
         for f in layer {
-            let up = rewrite(f, &ups, &mut drafts)?;
+            let (up, retired) = rewrite(f, &ups, &mut drafts)?;
+            if retired {
+                replaced.push(f.p);
+            }
             ups.insert(f.p, up);
         }
     }
     let mut up = ups.remove(&root).expect("the root is a frame");
+    if up.id == 0 {
+        return Ok(Grafted {
+            drafts,
+            replaced,
+            emptied: true,
+        });
+    }
     let mut level = layers[0][0].node.level;
     while !up.cuts.is_empty() {
         level += 1;
@@ -105,40 +149,95 @@ pub(super) async fn run<D: IsFilesystem>(
         ts.extend(up.cuts.drain(..).map(|(id, lo)| (lo, Vec::new(), id)));
         up = repack(level, ts, tree::NODE_MAX, tree::route_e, &mut drafts)?;
     }
-    let replaced: Vec<PageId> = layers.iter().flat_map(|l| l.iter().map(|f| f.p)).collect();
-    Ok((drafts, replaced))
+    Ok(Grafted {
+        drafts,
+        replaced,
+        emptied: false,
+    })
 }
 
 /// One frame's rewrite: a leaf merges its share in, an interior
 /// re-points its dirty children; either way an overflowing node repacks
 /// into as many siblings as fit — the same greedy packing as the
-/// wholesale build.
+/// wholesale build. The report pairs with whether the rewrite retired
+/// the old page: a rewrite that lands on the very same records keeps
+/// it (the skip cascades — the parent re-points nothing), an emptied
+/// node drops its route (`id` 0).
 fn rewrite(
     f: &Frame,
     ups: &HashMap<PageId, Up>,
     drafts: &mut Vec<tree::Node>,
-) -> Result<Up, StoreError> {
+) -> Result<(Up, bool), StoreError> {
     if f.node.level == 0 {
-        repack(
-            0,
-            merge(&f.node, &f.batch),
-            tree::LEAF_MAX,
-            tree::leaf_e,
-            drafts,
-        )
+        let merged = merge(&f.node, &f.batch);
+        if same_records(&f.node, &merged) {
+            return Ok((keep(f), false));
+        }
+        if merged.is_empty() {
+            return Ok((dropped(), true));
+        }
+        Ok((
+            repack(0, merged, tree::LEAF_MAX, tree::leaf_e, drafts)?,
+            true,
+        ))
     } else {
-        repack(
-            f.node.level,
-            repoint(&f.node, ups),
-            tree::NODE_MAX,
-            tree::route_e,
-            drafts,
-        )
+        let ts = repoint(&f.node, ups);
+        if same_routes(&f.node, &ts) {
+            return Ok((keep(f), false));
+        }
+        if ts.is_empty() {
+            return Ok((dropped(), true));
+        }
+        Ok((
+            repack(f.node.level, ts, tree::NODE_MAX, tree::route_e, drafts)?,
+            true,
+        ))
     }
 }
 
+/// The unchanged frame's report: the old page stays, no siblings.
+fn keep(f: &Frame) -> Up {
+    Up {
+        id: f.p,
+        lo: f.node.es[0].0.clone(),
+        cuts: Vec::new(),
+    }
+}
+
+/// The emptied node's report: id 0 — the parent drops this route.
+fn dropped() -> Up {
+    Up {
+        id: 0,
+        lo: Vec::new(),
+        cuts: Vec::new(),
+    }
+}
+
+/// Did a merged leaf land on exactly the node's own records?
+fn same_records(node: &tree::Node, ts: &[Item]) -> bool {
+    node.es.len() == ts.len()
+        && node
+            .es
+            .iter()
+            .zip(&node.ids)
+            .zip(ts)
+            .all(|(((k, mt), &vr), (tk, tmt, tvr))| k == tk && mt == tmt && vr == *tvr)
+}
+
+/// Did a re-pointed interior land on exactly the node's own routes?
+fn same_routes(node: &tree::Node, ts: &[Item]) -> bool {
+    node.es.len() == ts.len()
+        && node
+            .es
+            .iter()
+            .zip(&node.ids)
+            .zip(ts)
+            .all(|(((lo, _), &id), (tlo, _, tid))| lo == tlo && id == *tid)
+}
+
 /// The packed records as drafts — one node, or a run of siblings born
-/// of the repack; the report goes up.
+/// of the repack; the report goes up. Never called on an empty `ts` —
+/// the rewrite reports the emptied node before this.
 fn repack(
     level: u32,
     ts: Vec<Item>,
@@ -172,14 +271,15 @@ fn emit(drafts: &mut Vec<tree::Node>, level: u32, ts: &[Item]) {
     });
 }
 
-/// The leaf's records with its share merged in — both sides sorted, an
-/// equal key's old record steps aside (the delta is the newer half).
-fn merge(node: &tree::Node, batch: &[Item]) -> Vec<Item> {
+/// The leaf's records with its share merged in — both sides sorted; an
+/// equal key's old record steps aside (the delta is the newer half),
+/// and a `Del` takes its record away without leaving one behind.
+fn merge(node: &tree::Node, batch: &[Op]) -> Vec<Item> {
     let (es, mut out) = (&node.es, Vec::with_capacity(node.es.len() + batch.len()));
     let (mut i, mut j) = (0usize, 0usize);
     while i < es.len() || j < batch.len() {
         let old = match (es.get(i), batch.get(j)) {
-            (Some((k, _)), Some(b)) => k.as_slice() < b.0.as_slice(),
+            (Some((k, _)), Some(op)) => k.as_slice() < op.key(),
             (Some(_), None) => true,
             _ => false,
         };
@@ -187,11 +287,15 @@ fn merge(node: &tree::Node, batch: &[Item]) -> Vec<Item> {
             out.push((es[i].0.clone(), es[i].1.clone(), node.ids[i]));
             i += 1;
         } else {
-            out.push(batch[j].clone());
+            match &batch[j] {
+                Op::Put(it) => out.push(it.clone()),
+                Op::Del(_) => {}
+            }
+            let k = batch[j].key();
             j += 1;
-            if let Some((k, _)) = es.get(i) {
-                if k.as_slice() == out.last().unwrap().0.as_slice() {
-                    i += 1; // the replaced record
+            if let Some((ok, _)) = es.get(i) {
+                if ok.as_slice() == k {
+                    i += 1; // the replaced or deleted record
                 }
             }
         }
@@ -201,11 +305,15 @@ fn merge(node: &tree::Node, batch: &[Item]) -> Vec<Item> {
 
 /// The interior's routes with its dirty children re-pointed: each
 /// replaced child's report from below — its draft, its subtree's lo,
-/// the right siblings born under it.
+/// the right siblings born under it; an emptied child (id 0) drops its
+/// route.
 fn repoint(node: &tree::Node, ups: &HashMap<PageId, Up>) -> Vec<Item> {
     let mut out = Vec::with_capacity(node.ids.len());
     for ((lo, _), &id) in node.es.iter().zip(&node.ids) {
         if let Some(up) = ups.get(&id) {
+            if up.id == 0 {
+                continue; // the dropped route
+            }
             out.push((up.lo.clone(), Vec::new(), up.id));
             for (cid, clo) in &up.cuts {
                 out.push((clo.clone(), Vec::new(), *cid));

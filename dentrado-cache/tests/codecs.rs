@@ -104,7 +104,7 @@ fn tree_build_shape() {
 fn sb_roundtrip() {
     let e0 = ChainEntry { page: 12, off: 5 };
     let e1 = ChainEntry::default();
-    let tables = vec![("a".to_string(), 7), ("cache:Repo:v3".to_string(), 12)];
+    let tables = vec![(b"a".to_vec(), 7), (b"cache:Repo:v3".to_vec(), 12)];
     let mut p = Page::zeroed();
     write_sb(&mut p, 9, 42, 43, &tables, e0, e1, 100, 0, 0xDEAD, 0xBEEF);
     let sb = parse_sb(&p).unwrap();
@@ -118,7 +118,9 @@ fn sb_roundtrip() {
     assert!(parse_sb(&Page([TORN_BYTE; PAGE_SIZE])).is_none());
     // шум: гигантский счётчик таблиц зажат форматом страницы — запись
     // полного набора читается ровно, хвост не заходит
-    let full: Vec<(String, PageId)> = (0..MAX_TABLES).map(|i| (format!("t{i}"), 0)).collect();
+    let full: Vec<(Vec<u8>, PageId)> = (0..MAX_TABLES)
+        .map(|i| (format!("t{i}").into_bytes(), 0))
+        .collect();
     let mut junk = Page::zeroed();
     write_sb(&mut junk, 1, 4, 5, &full, e0, e1, 0, 0, 0, 0);
     junk.0[32..36].copy_from_slice(&u32::MAX.to_le_bytes());

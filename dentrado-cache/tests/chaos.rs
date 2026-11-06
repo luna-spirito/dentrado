@@ -10,9 +10,8 @@ use std::rc::Rc;
 use std::task::Poll;
 
 use common::{expect_turns, race_turns};
-use dentrado_cache::core::val::val_split;
-use dentrado_cache::page::PageId;
-use dentrado_cache::{Fault, MemDisk, Storage, StoreError};
+use dentrado_cache::core::val::VAL_PAYLOAD;
+use dentrado_cache::{Fault, MemDisk, Rec, Storage, StoreError, TableSpec};
 
 fn run<F: Future>(f: F) -> F::Output {
     compio::runtime::Runtime::new().unwrap().block_on(f)
@@ -21,36 +20,26 @@ fn run<F: Future>(f: F) -> F::Output {
 const KEY: &[u8] = b"k";
 const KEY2: &[u8] = b"j";
 
+fn specs(ids: &[&[u8]]) -> Vec<TableSpec> {
+    ids.iter().map(|i| TableSpec::flat(i.to_vec())).collect()
+}
+
 /// Публикация значения из трёх байт.
-async fn put_v(st: &Storage<MemDisk>, key: &[u8], val: u8, freed: &[PageId]) {
-    let k = st.alloc_draft_page().await.unwrap();
-    st.write_draft_page(k, move |_| (vec![val; 3], ()))
-        .await
-        .unwrap();
-    st.put_cache("t0", key, &[0], &[k], freed).await.unwrap();
+async fn put_v(st: &Storage<MemDisk>, key: &[u8], val: u8) {
+    st.put_many(
+        b"t0",
+        &[Rec::Put {
+            key,
+            val: &[val; 3],
+        }],
+    )
+    .await
+    .unwrap();
 }
 
 /// Прочитать первый байт значения (со сверкой по теневой версии).
 async fn first_byte(st: &Storage<MemDisk>, key: &[u8]) -> Option<u8> {
-    let (g, cv) = st.get_cache("t0", key).await.unwrap()?;
-    let b = st
-        .read_page_guarded(&g, cv.pages[0], |p| val_split(p).1[0])
-        .await
-        .unwrap();
-    drop(g);
-    Some(b)
-}
-
-/// Страницы текущего значения ключа (что освободится при замене).
-async fn prev_pages(st: &Storage<MemDisk>, key: &[u8]) -> Vec<PageId> {
-    match st.get_cache("t0", key).await.unwrap() {
-        Some((g, cv)) => {
-            let p = cv.pages.clone();
-            drop(g);
-            p
-        }
-        None => Vec::new(),
-    }
+    st.get(b"t0", key).await.unwrap().map(|v| v[0])
 }
 
 /// Харнесс жив: обычные операции проходят под бюджетом оборотов, биекция
@@ -59,12 +48,16 @@ async fn prev_pages(st: &Storage<MemDisk>, key: &[u8]) -> Vec<PageId> {
 fn harness_sanity() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
-        expect_turns(put_v(&st, KEY, 1, &[]), 256, "put_v").await;
+        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+            .await
+            .unwrap();
+        expect_turns(put_v(&st, KEY, 1), 256, "put_v").await;
         expect_turns(st.flush(), 512, "flush").await.unwrap();
         st.partition_exact().await.expect("биекция после круга");
         drop(st);
-        let st2 = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
+        let st2 = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+            .await
+            .unwrap();
         st2.partition_exact().await.expect("биекция после рестарта");
     });
 }
@@ -80,8 +73,10 @@ fn flush_cancel_recovers() {
     run(async {
         for k in 0..48u32 {
             let disk = MemDisk::default();
-            let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
-            put_v(&st, KEY, 1, &[]).await;
+            let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+                .await
+                .unwrap();
+            put_v(&st, KEY, 1).await;
             let _ = race_turns(st.flush(), k).await; // отмена в точке №k
             expect_turns(st.flush(), 512, &format!("flush после отмены на {k}"))
                 .await
@@ -96,43 +91,32 @@ fn flush_cancel_recovers() {
 /// Провал хвостового чтения не клинит пул: хвост обязан вернуться в
 /// Free (Busy → Free отката нет), следующий alloc — пройти. Репро по
 /// мотивам ревьи 2026-10-20 #7: `?` в alloc бросает Busy-хвост, все
-/// последующие аллоки паркутся навсегда.
+/// последующие аллоки паркуются навсегда.
 
 #[test]
 fn alloc_cancel_recovers() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+            .await
+            .unwrap();
         // 1100 смертей (рецепт multi_chunk_flush): запас уезжает в цепь
         // своего пула, головы пусты — первый аллок обязан читать чанк
         let key = b"tail";
-        let mut ks = Vec::new();
-        for i in 0..1100u16 {
-            let k = st.alloc_draft_page().await.unwrap();
-            st.write_draft_page(k, move |_| (vec![i as u8; 3], ()))
-                .await
-                .unwrap();
-            ks.push(k);
-        }
-        st.put_cache("t0", key, &[0], &ks, &[]).await.unwrap();
-        st.flush().await.unwrap();
-        let old = st
-            .get_cache("t0", key)
+        let big = vec![1u8; 1100 * VAL_PAYLOAD];
+        st.put_many(b"t0", &[Rec::Put { key, val: &big }])
             .await
-            .unwrap()
-            .unwrap()
-            .1
-            .pages
-            .clone();
-        let k2 = st.alloc_draft_page().await.unwrap();
-        st.write_draft_page(k2, |_| (vec![9; 3], ())).await.unwrap();
-        st.put_cache("t0", key, &[0], &[k2], &old).await.unwrap();
+            .unwrap();
+        st.flush().await.unwrap();
+        put_v(&st, key, 9).await; // замена: цепь умирает замыканием
         st.flush().await.unwrap();
         drop(st);
         // рестарт с кэшем в одну страницу: проход загрузки вымывает чанк
         // из резидента, первый аллок обязан лететь в диск; Fault валит
         // его, `?` бросает хвост в Busy
-        let st = Storage::open(&disk, "db", 1, &["t0"]).await.unwrap();
+        let st = Storage::open(&disk, "db", 1, &specs(&[b"t0"]))
+            .await
+            .unwrap();
         disk.file("db").set_fault(Fault::At(1));
         let e = st.alloc_draft_page().await;
         disk.file("db").set_fault(Fault::None);
@@ -161,35 +145,24 @@ fn alloc_cancel_recovers() {
 fn alloc_reader_cancel_recovers() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
-        let key = b"tail";
-        let mut ks = Vec::new();
-        for i in 0..1100u16 {
-            let k = st.alloc_draft_page().await.unwrap();
-            st.write_draft_page(k, move |_| (vec![i as u8; 3], ()))
-                .await
-                .unwrap();
-            ks.push(k);
-        }
-        st.put_cache("t0", key, &[0], &ks, &[]).await.unwrap();
-        st.flush().await.unwrap();
-        let old = st
-            .get_cache("t0", key)
+        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
             .await
-            .unwrap()
-            .unwrap()
-            .1
-            .pages
-            .clone();
-        let k2 = st.alloc_draft_page().await.unwrap();
-        st.write_draft_page(k2, |_| (vec![9; 3], ())).await.unwrap();
-        st.put_cache("t0", key, &[0], &[k2], &old).await.unwrap();
+            .unwrap();
+        let key = b"tail";
+        let big = vec![1u8; 1100 * VAL_PAYLOAD];
+        st.put_many(b"t0", &[Rec::Put { key, val: &big }])
+            .await
+            .unwrap();
+        st.flush().await.unwrap();
+        put_v(&st, key, 9).await;
         st.flush().await.unwrap();
         drop(st);
         // рестарт с кэшем в одну страницу: головы пусты, хвост чётного
         // пула — на диске; первый опрос алока делает Free→Busy и паркует
         // на чтении — дроп. Хвост обязан вернуться в Free.
-        let st = Storage::open(&disk, "db", 1, &["t0"]).await.unwrap();
+        let st = Storage::open(&disk, "db", 1, &specs(&[b"t0"]))
+            .await
+            .unwrap();
         assert!(race_turns(st.alloc_draft_page(), 0).await.is_none());
         expect_turns(st.alloc_draft_page(), 512, "аллок после отмены читателя")
             .await
@@ -206,8 +179,10 @@ fn alloc_reader_cancel_recovers() {
 fn flush_waiter_cancel_recovers() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
-        put_v(&st, KEY, 1, &[]).await;
+        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+            .await
+            .unwrap();
+        put_v(&st, KEY, 1).await;
         // ждун №1 — живой пиннед фьючерс: один опрос кладёт письмо и
         // паркует на ответе; круг крутится в агенте
         let mut w = std::pin::pin!(st.flush());
@@ -233,22 +208,24 @@ fn flush_waiter_cancel_recovers() {
     });
 }
 
-/// Отмена чтения безвредна: гварды — RAII, биекция чиста.
+/// Отмена чтения безвредна: пины — внутренние RAII, биекция чиста.
 #[test]
 fn get_cancel_is_harmless() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
-        put_v(&st, KEY, 1, &[]).await;
+        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+            .await
+            .unwrap();
+        put_v(&st, KEY, 1).await;
         st.flush().await.unwrap();
         for j in 0..16u32 {
-            let _ = race_turns(st.get_cache("t0", KEY), j).await;
+            let _ = race_turns(st.get(b"t0", KEY), j).await;
         }
-        let (g, _) = expect_turns(st.get_cache("t0", KEY), 256, "get после отмен")
+        let v = expect_turns(st.get(b"t0", KEY), 256, "get после отмен")
             .await
             .unwrap()
             .unwrap();
-        drop(g);
+        assert_eq!(v, vec![1u8; 3]);
         st.partition_exact().await.expect("биекция");
     });
 }
@@ -267,25 +244,34 @@ fn transient_flush_failure_keeps_partition() {
     run(async {
         for f in 1..40u64 {
             let disk = MemDisk::default();
-            let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
-            put_v(&st, KEY, 1, &[]).await;
+            let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+                .await
+                .unwrap();
+            put_v(&st, KEY, 1).await;
             st.flush().await.unwrap();
-            let k2 = st.alloc_draft_page().await.unwrap();
-            st.write_draft_page(k2, |_| (vec![2; 3], ())).await.unwrap();
-            let old = prev_pages(&st, KEY).await;
-            st.put_cache("t0", KEY, &[0], &[k2], &old).await.unwrap();
+            st.put_many(
+                b"t0",
+                &[Rec::Put {
+                    key: KEY,
+                    val: &[2u8; 3],
+                }],
+            )
+            .await
+            .unwrap();
             disk.file("db").set_fault(Fault::Once(f));
             let _ = st.flush().await; // transient отказ пережит
             disk.file("db").set_fault(Fault::None);
             // стор обязан продолжать работать (как того требует сценарий
             // concurrent_workers) и закоммитить честный мир
-            put_v(&st, KEY2, 3, &[]).await;
+            put_v(&st, KEY2, 3).await;
             st.flush().await.unwrap();
             st.partition_exact()
                 .await
                 .unwrap_or_else(|v| panic!("f={f}: {v:?}"));
             drop(st);
-            let st2 = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
+            let st2 = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+                .await
+                .unwrap();
             st2.partition_exact()
                 .await
                 .unwrap_or_else(|v| panic!("f={f}, после рестарта: {v:?}"));
@@ -305,12 +291,14 @@ fn transient_flush_failure_keeps_partition() {
 fn read_error_does_not_wipe_image() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
-        put_v(&st, KEY, 1, &[]).await;
+        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+            .await
+            .unwrap();
+        put_v(&st, KEY, 1).await;
         st.flush().await.unwrap();
         drop(st);
         disk.file("db").set_fault(Fault::At(1)); // «transient EIO на чтениях»
-        let opened = Storage::open(&disk, "db", 4, &["t0"]).await;
+        let opened = Storage::open(&disk, "db", 4, &specs(&[b"t0"])).await;
         disk.file("db").set_fault(Fault::None);
         assert!(opened.is_err(), "молчаливая загрузка поверх живого образа");
     });
@@ -324,18 +312,25 @@ fn torn_write_recovery_is_binary() {
     run(async {
         for f in 1..40u64 {
             let disk = MemDisk::default();
-            let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
-            put_v(&st, KEY, 1, &[]).await;
+            let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+                .await
+                .unwrap();
+            put_v(&st, KEY, 1).await;
             st.flush().await.unwrap();
-            let k2 = st.alloc_draft_page().await.unwrap();
-            st.write_draft_page(k2, |_| (vec![2; 3], ())).await.unwrap();
-            let old = prev_pages(&st, KEY).await;
-            st.put_cache("t0", KEY, &[0], &[k2], &old).await.unwrap();
+            st.put_many(
+                b"t0",
+                &[Rec::Put {
+                    key: KEY,
+                    val: &[2u8; 3],
+                }],
+            )
+            .await
+            .unwrap();
             disk.file("db").set_fault(Fault::Torn(f));
             let _ = st.flush().await; // запись в полёте порвана, далее — смерть
             drop(st); // краш
             disk.file("db").set_fault(Fault::None); // новый процесс — диск здоров
-            match Storage::open(&disk, "db", 4, &["t0"]).await {
+            match Storage::open(&disk, "db", 4, &specs(&[b"t0"])).await {
                 Ok(st2) => {
                     let out = first_byte(&st2, KEY).await;
                     assert!(out == Some(1) || out == Some(2), "f={f}: {out:?}");
@@ -368,21 +363,17 @@ async fn worker(st: Rc<Storage<MemDisk>>, kb: u8, mut seed: u64, rounds: u8) -> 
     for _ in 0..rounds {
         match rnd() % 4 {
             0..=1 => {
-                let k = st.alloc_draft_page().await.unwrap();
                 let v = ver.wrapping_add(1);
                 let cell = vec![kb, v];
-                st.write_draft_page(k, move |_| (cell.clone(), ()))
-                    .await
-                    .unwrap();
-                let prev = match st.get_cache("t0", &key).await.unwrap() {
-                    Some((g, cv)) => {
-                        let p = cv.pages;
-                        drop(g);
-                        p
-                    }
-                    None => Vec::new(),
-                };
-                st.put_cache("t0", &key, &[0], &[k], &prev).await.unwrap();
+                st.put_many(
+                    b"t0",
+                    &[Rec::Put {
+                        key: &key,
+                        val: &cell,
+                    }],
+                )
+                .await
+                .unwrap();
                 ver = v;
             }
             2 => {
@@ -392,12 +383,7 @@ async fn worker(st: Rc<Storage<MemDisk>>, kb: u8, mut seed: u64, rounds: u8) -> 
                 st.dealloc_draft_page(k).await.unwrap();
             }
             _ => {
-                if let Some((g, cv)) = st.get_cache("t0", &key).await.unwrap() {
-                    let b = st
-                        .read_page_guarded(&g, cv.pages[0], |p| val_split(p).1[..2].to_vec())
-                        .await
-                        .unwrap();
-                    drop(g);
+                if let Some(b) = st.get(b"t0", &key).await.unwrap() {
                     assert_eq!(b, vec![kb, ver], "чтение работника {kb}");
                 }
             }
@@ -410,7 +396,11 @@ async fn worker(st: Rc<Storage<MemDisk>>, kb: u8, mut seed: u64, rounds: u8) -> 
 fn chaos_workers_partition() {
     run(async {
         let disk = MemDisk::default();
-        let st = Rc::new(Storage::open(&disk, "db", 4, &["t0"]).await.unwrap());
+        let st = Rc::new(
+            Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+                .await
+                .unwrap(),
+        );
         let mut ts = Vec::new();
         for (kb, seed) in [(5u8, 0x1234u64), (9u8, 0x5678), (13u8, 0x9abc)] {
             let s = st.clone();
@@ -426,19 +416,12 @@ fn chaos_workers_partition() {
         st.flush().await.unwrap();
         st.partition_exact().await.expect("биекция после дренажа");
         drop(st);
-        let st2 = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
+        let st2 = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+            .await
+            .unwrap();
         for (kb, v) in &expected {
-            let (g, cv) = st2
-                .get_cache("t0", &[*kb])
-                .await
-                .unwrap()
-                .expect("ключ потерян");
-            let b = st2
-                .read_page_guarded(&g, cv.pages[0], |p| val_split(p).1[1])
-                .await
-                .unwrap();
-            drop(g);
-            assert_eq!(b, *v, "работник {kb} после рестарта");
+            let b = st2.get(b"t0", &[*kb]).await.unwrap().expect("ключ потерян");
+            assert_eq!(b[1], *v, "работник {kb} после рестарта");
         }
         st2.partition_exact().await.expect("биекция после рестарта");
     });

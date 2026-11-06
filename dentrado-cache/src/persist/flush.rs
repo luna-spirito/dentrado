@@ -14,8 +14,9 @@ use futures::channel::oneshot;
 use super::PersistentCore;
 use super::flight::{Flight, FlipData, Home, flip_loop};
 use super::graft;
-use super::image::walk_chain_raw;
+use super::walks::walk_chain_raw;
 use crate::blockcache;
+use crate::core::DeltaV;
 use crate::core::freelist::{CHUNK_SLOTS, ChainEntry, chunk_cells, chunk_next, write_chunk};
 use crate::core::sb::write_sb;
 use crate::core::tree;
@@ -156,40 +157,53 @@ async fn engrave<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     fl: &mut Flight,
 ) -> Result<(), StoreError> {
-    // The trees, per table: the delta as the sorted batch, then a
-    // standing tree takes the graft — only its dirty paths change —
-    // while an empty table is built whole. The grafts' reads run
-    // before any stock moves; their bound is the seal-time
-    // counters.
+    // The trees, per table: the delta as the sorted batch (a put's
+    // record, a delete's key), then a standing tree takes the graft —
+    // only its dirty paths change — while an empty table is built
+    // whole (its deletes delete nothing). A batch that empties a
+    // standing tree takes its root to 0. The grafts' reads run before
+    // any stock moves; their bound is the seal-time counters.
     let fn_next = fl.next.max(fl.bnext) + 1;
     let n = fl.snaps.len();
     let mut builds: Vec<Vec<tree::Item>> = (0..n).map(|_| Vec::new()).collect();
     let mut grafts: Vec<Vec<tree::Node>> = (0..n).map(|_| Vec::new()).collect();
     let mut counts: Vec<usize> = vec![0; n];
+    let mut emptied = vec![false; n];
     let mut need_pages = 0usize;
     for t in 0..n {
         if fl.snaps[t].is_empty() {
             continue; // nothing new — the old tree stands
         }
-        let mut batch: Vec<tree::Item> = fl.snaps[t]
+        let mut batch: Vec<graft::Op> = fl.snaps[t]
             .iter()
-            .map(|(k, cv)| {
-                (
+            .map(|(k, v)| match v {
+                DeltaV::Put(cv) => graft::Op::Put((
                     k.clone(),
                     cv.mt.clone(),
                     cv.pages.first().copied().unwrap_or(0),
-                )
+                )),
+                DeltaV::Del => graft::Op::Del(k.clone()),
             })
             .collect();
-        batch.sort_by(|a, b| a.0.cmp(&b.0));
+        // A delta iterates in hash order; both takers — the graft's
+        // runs and the wholesale build's leaves — need key order.
+        batch.sort_by(|a, b| a.key().cmp(b.key()));
         if fl.roots[t] == 0 {
-            counts[t] = tree::plan(&batch)?.iter().sum();
-            builds[t] = batch;
+            let puts: Vec<tree::Item> = batch
+                .into_iter()
+                .filter_map(|op| match op {
+                    graft::Op::Put(it) => Some(it),
+                    graft::Op::Del(_) => None,
+                })
+                .collect();
+            counts[t] = tree::plan(&puts)?.iter().sum();
+            builds[t] = puts;
         } else {
-            let (drafts, replaced) = graft::run::<D>(inner, fl.roots[t], batch, fn_next).await?;
-            fl.old_tree.extend(replaced);
-            counts[t] = drafts.len();
-            grafts[t] = drafts;
+            let g = graft::run::<D>(inner, fl.roots[t], batch, fn_next).await?;
+            fl.old_tree.extend(g.replaced);
+            counts[t] = g.drafts.len();
+            grafts[t] = g.drafts;
+            emptied[t] = g.emptied;
         }
         need_pages += counts[t];
     }
@@ -227,19 +241,33 @@ async fn engrave<D: IsFilesystem>(
     // free run is written once and only ever eaten. The copied
     // pool's chunks are all front (above its live bookmark) — one
     // run.
-    let nl = ln.len().div_ceil(CHUNK_SLOTS);
-    let need_n = nl + nfree.len().div_ceil(CHUNK_SLOTS);
+    //
+    // The surplus — the stock beyond the carriers — is free and
+    // RAM-side (the commit lands it back into the head), so it is
+    // front matter like the limbo: listed in the re-copied run,
+    // never the free run (a free-run cell is deep stock, eaten
+    // from the bookmark — listing a head page there would double it
+    // at the next eating). The carriers follow the listing to its
+    // smallest covering split (a spare carrier ships a thinner
+    // chunk); every stock page ends a tree, a carrier, or a listed
+    // cell — the old protocol returned the surplus to the head
+    // unlisted, and a crash before the next round lost it.
     let ecells: Vec<PageId> = le.into_iter().chain(fe).collect();
-    let used = need_pages + need_n + ecells.len().div_ceil(CHUNK_SLOTS);
-    // The surplus — stock beyond need (popping it out of the head
-    // shrank the cells, so the need sank under the taken) — returns
-    // into the pool's head at the commit; its listing retired with
-    // this round's fronts, the next round packs it again.
+    let nc = nfree.len().div_ceil(CHUNK_SLOTS) + ecells.len().div_ceil(CHUNK_SLOTS);
+    let mut used = need_pages;
+    while used < need_pages + (ln.len() + stock.len() - used).div_ceil(CHUNK_SLOTS) + nc {
+        used += 1;
+    }
     let surplus = &stock[used..];
+    let mut front_cells = ln;
+    front_cells.extend_from_slice(surplus);
     let chunk_ps = &stock[need_pages..used];
+    let nl = front_cells.len().div_ceil(CHUNK_SLOTS);
+    let nfree_ps: Vec<PageId> =
+        chunk_ps[nl..chunk_ps.len() - ecells.len().div_ceil(CHUNK_SLOTS)].to_vec();
     let nlimbo_ps: Vec<PageId> = chunk_ps[..nl].to_vec();
-    let nfree_ps: Vec<PageId> = chunk_ps[nl..need_n].to_vec();
-    let ep_ps: Vec<PageId> = chunk_ps[need_n..].to_vec();
+    let ep_ps: Vec<PageId> =
+        chunk_ps[chunk_ps.len() - ecells.len().div_ceil(CHUNK_SLOTS)..].to_vec();
     // The continuations past the new chunks: what the flush left
     // uneaten (the taken pool) or the seal-time bookmark (the
     // copied pool — the chunks the tasks eat during the round stay
@@ -275,7 +303,8 @@ async fn engrave<D: IsFilesystem>(
         (fl.bnext, fl.next)
     };
     debug_assert!(
-        ln.iter()
+        front_cells
+            .iter()
             .chain(&nfree)
             .all(|&x| (x % 2) as usize == nep && x < fl.next)
             && ecells
@@ -292,7 +321,11 @@ async fn engrave<D: IsFilesystem>(
     let mut new_roots = fl.roots.clone();
     let mut at = 0usize;
     for t in 0..n {
-        if counts[t] == 0 {
+        if counts[t] == 0 && !emptied[t] {
+            continue; // nothing changed — the old root stands
+        }
+        if emptied[t] {
+            new_roots[t] = 0; // the batch deleted the tree whole
             continue;
         }
         let ids = &stock[at..at + counts[t]];
@@ -315,7 +348,7 @@ async fn engrave<D: IsFilesystem>(
         new_roots[t] = ids[counts[t] - 1];
         at += counts[t];
     }
-    init_chain::<D>(inner, &nlimbo_ps, mark, &ln).await?;
+    init_chain::<D>(inner, &nlimbo_ps, mark, &front_cells).await?;
     init_chain::<D>(inner, &nfree_ps, ftail, &nfree).await?;
     init_chain::<D>(inner, &ep_ps, btail, &ecells).await?;
     blockcache::write_back_all::<D>(inner).await?;
@@ -403,7 +436,8 @@ async fn init_chain<D: IsFilesystem>(
     entry: ChainEntry,
     cells: &[PageId],
 ) -> Result<(), StoreError> {
-    for (i, g) in cells.chunks(CHUNK_SLOTS).enumerate() {
+    let empty: &[PageId] = &[];
+    for (i, &p) in pages.iter().enumerate() {
         let nx = match pages.get(i + 1) {
             Some(&q) => q,
             // A continuation sits behind a page pointer, so it must
@@ -417,8 +451,13 @@ async fn init_chain<D: IsFilesystem>(
                 entry.page
             }
         };
-        let g = g.to_vec();
-        blockcache::init::<D, _>(inner, pages[i], move |b| write_chunk(b, nx, &g)).await?;
+        // A spare carrier — more pages than cell groups — ships an
+        // empty chunk: written and linked like any other, so the
+        // page is born with a role (a stale page must never sit in
+        // the chain unwritten), at the price of one hollow read on
+        // its eating.
+        let g = cells.chunks(CHUNK_SLOTS).nth(i).unwrap_or(empty).to_vec();
+        blockcache::init::<D, _>(inner, p, move |b| write_chunk(b, nx, &g)).await?;
     }
     Ok(())
 }

@@ -3,43 +3,42 @@
 //! only there.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 
 use super::PersistentCore;
+use super::walks::{walk_chain_raw, walk_deps, walk_parts, walk_tree, walk_value};
 use crate::blockcache;
-use crate::core::freelist::{ChainEntry, chunk_cells, chunk_next};
-use crate::core::sb::{MAX_TABLE_NAME, MAX_TABLES, Sb, parse_sb};
-use crate::core::tree::{Item, parse_node};
+use crate::core::sb::{MAX_TABLE_ID, MAX_TABLES, Sb, parse_sb};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{PageId, fnv_id};
+use crate::schema::TableSpec;
 use crate::storage::{Storage, Violation};
 
 impl<D: IsFilesystem> Storage<D> {
     /// Recovery: the newest valid SB (both chains walk through, counts
     /// and sums agree) — its table set unions with `tables` (the
-    /// opener's new names start empty, the image's orphans stay
+    /// opener's new tables start empty, the image's orphans stay
     /// enumerable and droppable); both eof — a fresh store; content
     /// without a valid image — death; the disk refusing — the error
-    /// itself, never a fresh store over a live image. A name outside
-    /// the format (empty, over [`MAX_TABLE_NAME`] bytes, a duplicate)
-    /// refuses the whole set. Reads go through the pool: pages live
-    /// only there.
+    /// itself, never a fresh store over a live image. An identity
+    /// outside the format (empty, over [`MAX_TABLE_ID`] bytes, a
+    /// duplicate) refuses the whole set. Reads go through the pool:
+    /// pages live only there.
     pub async fn open(
         disk: &D,
         path: &str,
         cap: usize,
-        tables: &[&str],
+        tables: &[TableSpec],
     ) -> Result<Storage<D>, StoreError>
     where
         D: 'static,
     {
-        if tables
-            .iter()
-            .any(|n| n.is_empty() || n.len() > MAX_TABLE_NAME)
-            || tables.len() > MAX_TABLES
-            || (0..tables.len()).any(|i| tables[..i].contains(&tables[i]))
+        let ids: Vec<&[u8]> = tables.iter().map(|s| &s.id[..]).collect();
+        if ids.iter().any(|n| n.is_empty() || n.len() > MAX_TABLE_ID)
+            || ids.len() > MAX_TABLES
+            || (0..ids.len()).any(|i| ids[..i].contains(&ids[i]))
         {
             return Err(StoreError::BadName);
         }
@@ -75,21 +74,22 @@ impl<D: IsFilesystem> Storage<D> {
         })
     }
 
-    /// The store's live table names — enumeration for the caller's
-    /// startup GC (an image's orphans from an older set version are
-    /// found here and dropped).
-    pub fn tables(&self) -> Vec<String> {
+    /// The store's live table identities — enumeration for the
+    /// caller's startup GC (an image's orphans from an older set
+    /// version are found here and dropped).
+    pub fn tables(&self) -> Vec<Vec<u8>> {
         self.inner.borrow().core.table_names()
     }
 
-    /// Drop a table: its tree, its value chains and its delta's pages
-    /// die (EBR shepherds them past live readers), the name leaves the
+    /// Drop a table: its tree, its records' full closures (value
+    /// chains and schema-named pages alike, tree half and delta half)
+    /// die (EBR shepherds them past live readers), the id leaves the
     /// set (tombstoned in place — see [`Tables`]). Only at rest: a
     /// live flush round is already rebuilding this very tree, and its
     /// commit would resurrect it — `PoolTaken` refuses, the caller
     /// drops after the round.
-    pub async fn drop_table(&self, table: &str) -> Result<(), StoreError> {
-        let (t, root, bound) = {
+    pub async fn drop_table(&self, table: &[u8]) -> Result<(), StoreError> {
+        let (t, schema, root, bound) = {
             let inner = self.inner.borrow_mut();
             if inner.poisoned {
                 return Err(StoreError::Poisoned);
@@ -100,24 +100,36 @@ impl<D: IsFilesystem> Storage<D> {
             if inner.core.round_live() {
                 return Err(StoreError::PoolTaken);
             }
-            (t, inner.core.table_root(t), inner.core.bound())
+            let schema = inner.core.table_schema(t);
+            (t, schema, inner.core.table_root(t), inner.core.bound())
         };
-        let mut pages = {
+        // A set, not a bag: two records may name one page (a shared
+        // subtree) — a page dies once, or the world splits its roles.
+        let mut pages: HashSet<PageId> = {
             let inner = self.inner.borrow();
             inner.core.table_delta_pages(t)
-        };
+        }
+        .into_iter()
+        .collect();
         let (es, tree) = walk_tree::<D>(&self.inner, root, bound).await?;
         pages.extend(tree);
-        for (_, _, vr) in es {
-            if vr != 0 {
-                pages.extend(self.walk_value(vr, bound).await?);
-            }
+        for (_, mt, vr) in es {
+            pages.extend(walk_deps::<D>(&self.inner, schema, &mt, vr, bound).await?);
+        }
+        // The delta half: its records' inline bytes name pages too.
+        for mt in {
+            let inner = self.inner.borrow();
+            inner.core.table_delta_inline(t)
+        } {
+            pages.extend(walk_deps::<D>(&self.inner, schema, &mt, 0, bound).await?);
         }
         let mut inner = self.inner.borrow_mut();
         if inner.poisoned {
             return Err(StoreError::Poisoned);
         }
-        inner.core.reg_deaths(&pages);
+        inner
+            .core
+            .reg_deaths(&pages.into_iter().collect::<Vec<_>>());
         inner.core.drop_table_slot(t);
         Ok(())
     }
@@ -367,82 +379,12 @@ impl<D: IsFilesystem> Storage<D> {
             tree.extend(ps);
             for (_, _, vr) in es {
                 if vr != 0 {
-                    vals.extend(self.walk_value(vr, fuel).await.ok()?);
+                    vals.extend(walk_value::<D>(&self.inner, vr, fuel).await.ok()?);
                 }
             }
         }
         Some((tree, vals))
     }
-}
-
-/// Walk a table's tree breadth-first: its records in key order (the
-/// leaves come out left to right) and all its pages.
-pub(super) async fn walk_tree<D: IsFilesystem>(
-    inner: &Rc<RefCell<PersistentCore<D>>>,
-    root: PageId,
-    fuel0: u64,
-) -> Result<(Vec<Item>, Vec<PageId>), StoreError> {
-    if root == 0 {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    let mut es = Vec::new();
-    let mut pages = Vec::new();
-    let mut q: VecDeque<PageId> = VecDeque::from([root]);
-    let mut fuel = fuel0;
-    while let Some(p) = q.pop_front() {
-        if fuel == 0 {
-            return Err(StoreError::Steps("tree: steps"));
-        }
-        fuel -= 1;
-        let n = blockcache::read::<D, _>(inner, p, parse_node).await?;
-        if n.level == 0 {
-            es.extend(n.es.into_iter().zip(n.ids).map(|((k, mt), vr)| (k, mt, vr)));
-        } else {
-            q.extend(n.ids);
-        }
-        pages.push(p);
-    }
-    Ok((es, pages))
-}
-
-/// Walk a tail chain, collecting each chunk page with its live cells —
-/// the chain's occupancy in walk order, from the entry down.
-async fn walk_parts<D: IsFilesystem>(
-    inner: &Rc<RefCell<PersistentCore<D>>>,
-    e0: ChainEntry,
-    fuel0: u64,
-) -> Result<Vec<(PageId, Vec<PageId>)>, StoreError> {
-    let mut out = Vec::new();
-    let mut e = e0;
-    let mut fuel = fuel0;
-    loop {
-        if e.page == 0 {
-            return Ok(out);
-        }
-        if fuel == 0 {
-            return Err(StoreError::Steps("walk: steps"));
-        }
-        fuel -= 1;
-        let (cs, nx) = blockcache::read::<D, _>(inner, e.page, move |b| {
-            (chunk_cells(b, e.off as usize), chunk_next(b))
-        })
-        .await?;
-        out.push((e.page, cs));
-        e = ChainEntry::full(nx);
-    }
-}
-
-/// Walk a tail chain: the cells in issue order.
-pub(super) async fn walk_chain_raw<D: IsFilesystem>(
-    inner: &Rc<RefCell<PersistentCore<D>>>,
-    e0: ChainEntry,
-    fuel0: u64,
-) -> Result<Vec<PageId>, StoreError> {
-    Ok(walk_parts::<D>(inner, e0, fuel0)
-        .await?
-        .into_iter()
-        .flat_map(|(_, cs)| cs)
-        .collect())
 }
 
 /// The design's legal role combinations (see [`Store::partition_exact`]):

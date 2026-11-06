@@ -1,8 +1,9 @@
-//! The store's async surface: drafts (allocation, the writes, the
-//! publication) and the cache (guarded reads — the delta before the
-//! tree). Under it: [`crate::core`] — the flush-agnostic machines the
-//! sections drive, [`crate::persist`] — the persistence overlay, the
-//! flush round, recovery.
+//! The store's async surface: the record surface (reads, scans, batched
+//! writes — [`records`]) and the drafts beneath it (allocation, the
+//! writes — the escape hatch for a future page-valued record). Under
+//! it: [`crate::core`] — the flush-agnostic machines the sections
+//! drive, [`crate::persist`] — the persistence overlay, the flush
+//! round, recovery.
 //!
 //! The state is the [`PersistentCore`] under a single `RefCell` (the
 //! store is single-threaded by construction — compio thread-per-core,
@@ -11,13 +12,17 @@
 //! [`Storage`] trait; the file handle (`Clone`, positional io) lives
 //! in the cache's disk arena ([`crate::blockcache`]). Handles
 //! outliving an operation hold their world through an `Rc` — the read
-//! guard ([`Guard`]) the store, a flight's lease the arena's pages;
-//! the pool's slow paths are the same sections plus the flight
+//! guard ([`Guard`], internal) the store, a flight's lease the arena's
+//! pages; the pool's slow paths are the same sections plus the flight
 //! driver and the round agent — tasks that hold the store and die by
 //! `Store`'s own drop.
 //!
 //! Loop bounds (fuel) are estimates derived in the model; running out
 //! is a visible [`StoreError::Steps`] error (image corruption).
+
+mod records;
+
+pub use records::{INLINE_MAX, Rec};
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -26,9 +31,8 @@ use compio::runtime::JoinHandle;
 
 use crate::blockcache;
 use crate::core::freelist::{ChainEntry, chunk_cells, chunk_next};
-use crate::core::tree::{leaf_find, parse_node, route};
-use crate::core::val::{link_val, val_split, write_val};
-use crate::core::{AllocAct, CacheValue, DraftId};
+use crate::core::val::{val_split, write_val};
+use crate::core::{AllocAct, DraftId};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{Page, PageId};
@@ -36,11 +40,12 @@ use crate::persist::PersistentCore;
 
 // ## The read guard
 
-/// The `get_cache` guard — an EBR pin (the subscription bucket). Death
-/// is RAII: dropping it unsubscribes and advances the emptied bucket.
-pub struct Guard<D: IsFilesystem> {
-    inner: Rc<RefCell<PersistentCore<D>>>,
-    bucket: usize,
+/// The read guard — an EBR pin (the subscription bucket) held across a
+/// multi-page walk. Death is RAII: dropping it unsubscribes and
+/// advances the emptied bucket.
+pub(crate) struct Guard<D: IsFilesystem> {
+    pub(crate) inner: Rc<RefCell<PersistentCore<D>>>,
+    pub(crate) bucket: usize,
 }
 
 impl<D: IsFilesystem> Drop for Guard<D> {
@@ -262,166 +267,5 @@ impl<D: IsFilesystem> Storage<D> {
             r
         })
         .await
-    }
-
-    /// A page read under a guard (the usual discipline: the guard is
-    /// from `get_cache`; the runtime does not check it — the reader is
-    /// obliged to hold it).
-    pub async fn read_page_guarded<R>(
-        &self,
-        _g: &Guard<D>,
-        p: PageId,
-        f: impl Fn(&Page) -> R + 'static,
-    ) -> Result<R, StoreError>
-    where
-        R: 'static,
-    {
-        {
-            let inner = self.inner.borrow();
-            if inner.poisoned {
-                return Err(StoreError::Poisoned);
-            }
-        }
-        blockcache::read::<D, _>(&self.inner, p, f).await
-    }
-
-    /// A cache read: an EBR pin (the guard), the delta first, the tree
-    /// second — a root-to-leaf descent. A miss and an error release
-    /// the guard (RAII).
-    pub async fn get_cache(
-        &self,
-        table: &str,
-        key: &[u8],
-    ) -> Result<Option<(Guard<D>, CacheValue)>, StoreError> {
-        let (g, dv, root, bound) = {
-            let mut inner = self.inner.borrow_mut();
-            if inner.poisoned {
-                return Err(StoreError::Poisoned);
-            }
-            let Some(t) = inner.core.table_index(table) else {
-                return Err(StoreError::NoTable);
-            };
-            let Some((g, dv, root)) = inner.core.get_step(t, key) else {
-                return Err(StoreError::NoTable);
-            };
-            (g, dv, root, inner.core.bound())
-        };
-        let guard = Guard {
-            inner: self.inner.clone(),
-            bucket: g,
-        };
-        match dv {
-            Some(v) => Ok(Some((guard, v))),
-            None => {
-                if root == 0 {
-                    return Ok(None);
-                }
-                // The descent: a page a level, the fuel the world's
-                // pages — a deeper tree can only be corruption.
-                let mut p = root;
-                let mut fuel = bound;
-                let hit = loop {
-                    if fuel == 0 {
-                        return Err(StoreError::Steps("tree: steps"));
-                    }
-                    fuel -= 1;
-                    let node = blockcache::read::<D, _>(&self.inner, p, parse_node).await?;
-                    if node.level == 0 {
-                        break leaf_find(&node, key).map(|(mt, vr)| (mt.to_vec(), vr));
-                    }
-                    match route(&node, key) {
-                        Some(q) => p = q,
-                        None => break None, // below the tree's smallest key
-                    }
-                };
-                match hit {
-                    None => Ok(None),
-                    Some((mt, 0)) => Ok(Some((
-                        guard,
-                        CacheValue {
-                            mt,
-                            pages: Vec::new(),
-                        },
-                    ))),
-                    Some((mt, vr)) => {
-                        let pages = self.walk_value(vr, bound).await?;
-                        Ok(Some((guard, CacheValue { mt, pages })))
-                    }
-                }
-            }
-        }
-    }
-
-    /// Walk a value's chain (pages by their `next` headers). The bound
-    /// is the world's pages: a longer value chain can only be
-    /// corruption.
-    pub(crate) async fn walk_value(
-        &self,
-        first: PageId,
-        bound: u64,
-    ) -> Result<Vec<PageId>, StoreError> {
-        let mut out = Vec::new();
-        let mut p = first;
-        let mut fuel = bound;
-        loop {
-            if fuel == 0 {
-                return Err(StoreError::Steps("value: steps"));
-            }
-            fuel -= 1;
-            out.push(p);
-            let next = blockcache::read::<D, _>(&self.inner, p, |b| val_split(b).0).await?;
-            if next == 0 {
-                return Ok(out);
-            }
-            p = next;
-        }
-    }
-
-    /// Publication: stitch the value's pages, then the seal — the delta
-    /// and the deaths in one borrow (a two-step death = corruption). A
-    /// refused seal (a disagreed freed list, an unknown table) registers
-    /// nothing; the drafts stay held.
-    pub async fn put_cache(
-        &self,
-        table: &str,
-        key: &[u8],
-        mt: &[u8],
-        consumed: &[DraftId],
-        freed: &[PageId],
-    ) -> Result<(), StoreError> {
-        let (t, pages) = {
-            let inner = self.inner.borrow();
-            if inner.poisoned {
-                return Err(StoreError::Poisoned);
-            }
-            let Some(t) = inner.core.table_index(table) else {
-                return Err(StoreError::NoTable);
-            };
-            let pages = inner
-                .core
-                .pages_of(consumed)
-                .ok_or(StoreError::UnknownDraft)?;
-            (t, pages)
-        };
-        self.link_all(&pages).await?;
-        let mut inner = self.inner.borrow_mut();
-        if inner.poisoned {
-            return Err(StoreError::Poisoned);
-        }
-        inner.core.seal_step(t, key, mt, consumed, freed)
-    }
-
-    /// Stitch a value's chain: the pages' next headers in consumed
-    /// order.
-    async fn link_all(&self, pages: &[PageId]) -> Result<(), StoreError> {
-        for (i, &p) in pages.iter().enumerate() {
-            let next = pages.get(i + 1).copied().unwrap_or(0);
-            let last = i + 1 == pages.len();
-            blockcache::update::<D, _>(&self.inner, p, move |b| {
-                link_val(b, next, last);
-            })
-            .await?;
-        }
-        Ok(())
     }
 }

@@ -5,9 +5,9 @@
 
 use std::rc::Rc;
 
-use dentrado_cache::core::val::val_split;
-use dentrado_cache::page::PageId;
-use dentrado_cache::{DraftId, Fault, FsDisk, IsFilesystem, MemDisk, Storage, StoreError};
+use dentrado_cache::{
+    DraftId, Fault, FsDisk, IsFilesystem, MemDisk, Rec, Storage, StoreError, TableSpec,
+};
 
 fn run<F: Future>(f: F) -> F::Output {
     compio::runtime::Runtime::new().unwrap().block_on(f)
@@ -15,18 +15,23 @@ fn run<F: Future>(f: F) -> F::Output {
 
 const KEY7: &[u8] = &[7];
 
-/// Публикация значения из трёх байт: драўт, запись, печать со смертью
-/// старых страниц.
+/// The three-act values: a full kilobyte each — over the inline bound,
+/// so every record rides a chain of value pages through the acts.
+const V1: &[u8] = &[1u8; 1000];
+const V2: &[u8] = &[2u8; 1000];
+
+fn specs(ids: &[&[u8]]) -> Vec<TableSpec> {
+    ids.iter().map(|i| TableSpec::flat(i.to_vec())).collect()
+}
+
+/// Публикация значения: стор сам держит цепочку и считает замыкания.
 async fn put_v<D: IsFilesystem>(
     st: &Storage<D>,
-    table: &str,
+    table: &[u8],
     key: &[u8],
-    val: u8,
-    freed: &[PageId],
+    val: &[u8],
 ) -> Result<(), StoreError> {
-    let k = st.alloc_draft_page().await?;
-    st.write_draft_page(k, move |_| (vec![val; 3], ())).await?;
-    st.put_cache(table, key, &[0], &[k], freed).await
+    st.put_many(table, &[Rec::Put { key, val }]).await
 }
 
 // ## Замена значения на живом сторе
@@ -35,81 +40,61 @@ async fn put_v<D: IsFilesystem>(
 fn repl_flow() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
-        // публикация v1 и коммит
-        put_v(&st, "t0", KEY7, 1, &[]).await.unwrap();
-        st.flush().await.unwrap();
-        let (g, cv) = st
-            .get_cache("t0", KEY7)
-            .await
-            .unwrap()
-            .expect("miss-after-commit");
-        // замена на v2 со смертью страниц v1
-        put_v(&st, "t0", KEY7, 2, &cv.pages).await.unwrap();
-        // дельта прежде дерева: свежая замена видна до flush'а
-        let (g2, cv2) = st.get_cache("t0", KEY7).await.unwrap().unwrap();
-        let mid = st
-            .read_page_guarded(&g2, cv2.pages[0], |p| val_split(p).1[0])
+        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
             .await
             .unwrap();
-        assert_eq!(mid, 2);
-        drop(g2);
-        drop(g); // гарды долой — смерти открылись
+        // публикация v1 и коммит
+        put_v(&st, b"t0", KEY7, V1).await.unwrap();
+        st.flush().await.unwrap();
+        assert_eq!(
+            st.get(b"t0", KEY7).await.unwrap(),
+            Some(V1.to_vec()),
+            "miss-after-commit"
+        );
+        // замена на v2 — страницы v1 умирают замыканием, без слова звонящего
+        put_v(&st, b"t0", KEY7, V2).await.unwrap();
+        // дельта прежде дерева: свежая замена видна до flush'а
+        assert_eq!(st.get(b"t0", KEY7).await.unwrap(), Some(V2.to_vec()));
         st.flush().await.unwrap();
         let dbg = st.debug_state();
         assert_eq!(dbg.delta_len, 0, "дельта вычищена: {dbg:?}");
-        // круг перестроил дерево: старая страница — в куче смертей (EBR),
-        // следующим кругом уедет в свободные клетки
-        assert_eq!(dbg.dying_len, 1, "старое дерево осаждено: {dbg:?}");
+        // круг перестроил дерево: старые страницы — в куче смертей (EBR),
+        // следующим кругом уедут в свободные клетки
+        assert!(dbg.dying_len >= 1, "старое дерево осаждено: {dbg:?}");
         st.partition_exact()
             .await
             .expect("мёртвая страница — клетка цепи");
         assert!(st.ok_store().await, "инвариант против байтов файла");
         // восстановление: новое значение пережило перезапуск
         drop(st);
-        let st2 = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
-        let (g3, cv3) = st2.get_cache("t0", KEY7).await.unwrap().unwrap();
-        let b = st2
-            .read_page_guarded(&g3, cv3.pages[0], |p| val_split(p).1[0])
+        let st2 = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
             .await
             .unwrap();
-        assert_eq!(b, 2);
+        assert_eq!(st2.get(b"t0", KEY7).await.unwrap(), Some(V2.to_vec()));
     });
 }
 
 // ## Трёхактка: коммит или откат
 
 async fn act1(st: &Storage<MemDisk>) -> Result<(), StoreError> {
-    put_v(st, "t0", KEY7, 1, &[]).await?;
+    put_v(st, b"t0", KEY7, V1).await?;
     st.flush().await
 }
 
 async fn act2(st: &Storage<MemDisk>) -> Result<(), StoreError> {
-    match st.get_cache("t0", KEY7).await? {
-        None => Ok(()),
-        Some((g, cv)) => {
-            let pages = cv.pages.clone();
-            drop(g);
-            put_v(st, "t0", KEY7, 2, &pages).await?;
-            st.flush().await
-        }
-    }
+    put_v(st, b"t0", KEY7, V2).await?;
+    st.flush().await
 }
 
 async fn act3(disk: &MemDisk) -> Option<u8> {
-    let st = Storage::open(disk, "db", 4, &["t0"]).await.unwrap();
-    let (g, cv) = st.get_cache("t0", KEY7).await.unwrap()?;
-    let b = st
-        .read_page_guarded(&g, cv.pages.first().copied().unwrap_or(0), |p| {
-            val_split(p).1[0]
-        })
+    let st = Storage::open(disk, "db", 4, &specs(&[b"t0"]))
         .await
         .unwrap();
-    drop(g);
+    let v = st.get(b"t0", KEY7).await.unwrap()?;
     // восстановленный образ обязан быть биективным и против байтов файла
     st.partition_exact().await.expect("биекция после краша");
     assert!(st.ok_store().await, "инвариант после краша");
-    Some(b)
+    Some(v[0])
 }
 
 /// Трёхактка: акт 1 (спокойствие) — публикация v1 и чекпойнт; акт 2 —
@@ -117,14 +102,16 @@ async fn act3(disk: &MemDisk) -> Option<u8> {
 /// разрыв незакоммиченных по предикату; акт 3 — перезапуск и чтение.
 async fn three_act(
     fault: u64,
-    torn: impl Fn(PageId) -> bool + Send + Sync + 'static,
+    torn: impl Fn(dentrado_cache::PageId) -> bool + Send + Sync + 'static,
 ) -> Option<u8> {
     let disk = MemDisk::default();
-    let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
+    let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+        .await
+        .unwrap();
     act1(&st).await.unwrap();
     drop(st);
     disk.file("db").set_fault(Fault::At(fault));
-    if let Ok(st) = Storage::open(&disk, "db", 4, &["t0"]).await {
+    if let Ok(st) = Storage::open(&disk, "db", 4, &specs(&[b"t0"])).await {
         let _ = act2(&st).await; // Err ≈ краш рабочей фазы
     }
     disk.file("db").torn_by(torn);
@@ -141,7 +128,7 @@ fn three_act_outcomes_binary() {
         let mut commits = 0u32;
         let mut rollbacks = 0u32;
         for j in 0..8u64 {
-            let torn = move |i: PageId| (i.wrapping_mul(j + 1) % 5) == 1;
+            let torn = move |i: dentrado_cache::PageId| (i.wrapping_mul(j + 1) % 5) == 1;
             let mut first_commit: Option<u64> = None;
             for n in 0..80u64 {
                 let out = three_act(n, torn).await;
@@ -176,22 +163,22 @@ fn three_act_quiet_commit() {
 
 // ## Ствол-планировщик: работники × flush
 
-/// Работник: раунды «аллок-запись-замена-со-смертью» своего ключа.
+/// Работник: раунды «запись-замена» своего ключа; килобайт значения —
+/// каждый раунд свежая цепочка страниц.
 async fn worker(st: Rc<Storage<MemDisk>>, kb: u8, rounds: u8) -> Result<(), StoreError> {
     let key = [kb];
     for r in 1..=rounds {
-        let k = st.alloc_draft_page().await?;
-        st.write_draft_page(k, move |_| (vec![kb, r], ())).await?;
-        let prev_ps = match st.get_cache("t0", &key).await? {
-            Some((g, cv)) => {
-                drop(g);
-                cv.pages
-            }
-            None => Vec::new(),
-        };
-        let ks = [k];
-        let mt = [0u8];
-        st.put_cache("t0", &key, &mt, &ks, &prev_ps).await?;
+        let mut val = vec![0u8; 1000];
+        val[0] = kb;
+        val[1] = r;
+        st.put_many(
+            b"t0",
+            &[Rec::Put {
+                key: &key,
+                val: &val,
+            }],
+        )
+        .await?;
     }
     Ok(())
 }
@@ -203,7 +190,11 @@ async fn worker(st: Rc<Storage<MemDisk>>, kb: u8, rounds: u8) -> Result<(), Stor
 fn concurrent_workers() {
     run(async {
         let disk = MemDisk::default();
-        let st = Rc::new(Storage::open(&disk, "db", 4, &["t0"]).await.unwrap());
+        let st = Rc::new(
+            Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+                .await
+                .unwrap(),
+        );
         let mut ts = Vec::new();
         for kb in [5u8, 9u8] {
             let s = st.clone();
@@ -220,19 +211,12 @@ fn concurrent_workers() {
         assert!(st.ok_store().await, "инвариант после дренажа");
         // восстановление: оба ключа, последние раунды
         drop(st);
-        let st2 = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
+        let st2 = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+            .await
+            .unwrap();
         for kb in [5u8, 9u8] {
-            let (g, cv) = st2
-                .get_cache("t0", &[kb])
-                .await
-                .unwrap()
-                .expect("ключ потерян");
-            let pl = st2
-                .read_page_guarded(&g, cv.pages[0], |p| val_split(p).1[..2].to_vec())
-                .await
-                .unwrap();
-            drop(g);
-            assert_eq!(pl, vec![kb, 6]);
+            let v = st2.get(b"t0", &[kb]).await.unwrap().expect("ключ потерян");
+            assert_eq!((v[0], v[1]), (kb, 6));
         }
     });
 }
@@ -243,8 +227,12 @@ fn concurrent_workers() {
 fn flush_queue() {
     run(async {
         let disk = MemDisk::default();
-        let st = Rc::new(Storage::open(&disk, "db", 4, &["t0"]).await.unwrap());
-        put_v(&st, "t0", KEY7, 1, &[]).await.unwrap();
+        let st = Rc::new(
+            Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+                .await
+                .unwrap(),
+        );
+        put_v(&st, b"t0", KEY7, V1).await.unwrap();
         let ts: Vec<_> = (0..4)
             .map(|_| {
                 let s = st.clone();
@@ -270,63 +258,47 @@ fn flush_queue() {
 fn table_set_roundtrip() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &["a", "b", "c"])
+        let st = Storage::open(&disk, "db", 4, &specs(&[b"a", b"b", b"c"]))
             .await
             .unwrap();
-        put_v(&st, "a", b"a", 1, &[]).await.unwrap();
-        let k = st.alloc_draft_page().await.unwrap();
-        st.write_draft_page(k, |_| (vec![2; 3], ())).await.unwrap();
-        st.put_cache("c", b"a", &[0], &[k], &[]).await.unwrap();
+        put_v(&st, b"a", b"a", V1).await.unwrap();
+        put_v(&st, b"c", b"a", &[2; 3]).await.unwrap();
         st.flush().await.unwrap();
         st.partition_exact().await.expect("биекция трёх таблиц");
         drop(st);
         // урезанный набор: образ несёт три таблицы, opener — одну
-        let st2 = Storage::open(&disk, "db", 4, &["a"]).await.unwrap();
-        assert_eq!(st2.tables(), ["a", "b", "c"].map(String::from));
-        let (g, cv) = st2
-            .get_cache("a", b"a")
-            .await
-            .unwrap()
-            .expect("ключ таблицы a");
-        let b0 = st2
-            .read_page_guarded(&g, cv.pages[0], |p| val_split(p).1[0])
+        let st2 = Storage::open(&disk, "db", 4, &specs(&[b"a"]))
             .await
             .unwrap();
-        drop(g);
-        assert_eq!(b0, 1);
+        assert_eq!(st2.tables(), [b"a", b"b", b"c"].map(|s| s.to_vec()));
+        assert_eq!(
+            st2.get(b"a", b"a").await.unwrap(),
+            Some(V1.to_vec()),
+            "ключ таблицы a"
+        );
         assert!(
-            st2.get_cache("b", b"a").await.unwrap().is_none(),
+            st2.get(b"b", b"a").await.unwrap().is_none(),
             "средняя таблица пуста"
         );
-        let (g2, cv2) = st2
-            .get_cache("c", b"a")
-            .await
-            .unwrap()
-            .expect("ключ таблицы c");
-        let b2 = st2
-            .read_page_guarded(&g2, cv2.pages[0], |p| val_split(p).1[0])
-            .await
-            .unwrap();
-        drop(g2);
-        assert_eq!(b2, 2);
+        assert_eq!(st2.get(b"c", b"a").await.unwrap(), Some(vec![2; 3]));
         // дроп: имя уходит, страницы умирают, биекция целых таблиц цела
-        st2.drop_table("c").await.unwrap();
-        assert_eq!(st2.tables(), ["a", "b"].map(String::from));
+        st2.drop_table(b"c").await.unwrap();
+        assert_eq!(st2.tables(), [b"a", b"b"].map(|s| s.to_vec()));
         assert!(matches!(
-            st2.get_cache("c", b"a").await,
+            st2.get(b"c", b"a").await,
             Err(StoreError::NoTable)
         ));
         st2.flush().await.unwrap();
         st2.partition_exact().await.expect("биекция после дропа");
         drop(st2);
         // tombstone умирает с процессом: новый образ несёт только живых
-        let st3 = Storage::open(&disk, "db", 4, &["a", "b", "c"])
+        let st3 = Storage::open(&disk, "db", 4, &specs(&[b"a", b"b", b"c"]))
             .await
             .unwrap();
-        assert_eq!(st3.tables(), ["a", "b", "c"].map(String::from));
-        assert!(st3.get_cache("c", b"a").await.unwrap().is_none());
+        assert_eq!(st3.tables(), [b"a", b"b", b"c"].map(|s| s.to_vec()));
+        assert!(st3.get(b"c", b"a").await.unwrap().is_none());
         assert!(matches!(
-            st3.get_cache("z", b"a").await,
+            st3.get(b"z", b"a").await,
             Err(StoreError::NoTable)
         ));
     });
@@ -336,13 +308,17 @@ fn table_set_roundtrip() {
 fn fresh_flush_and_reopen() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+            .await
+            .unwrap();
         st.flush().await.unwrap(); // пустой круг: SB поколения 1
         assert!(st.ok_store().await);
         drop(st);
-        let st2 = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
+        let st2 = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+            .await
+            .unwrap();
         assert_eq!(st2.debug_state().r#gen, 1);
-        assert!(st2.get_cache("t0", KEY7).await.unwrap().is_none());
+        assert!(st2.get(b"t0", KEY7).await.unwrap().is_none());
     });
 }
 
@@ -350,7 +326,9 @@ fn fresh_flush_and_reopen() {
 fn dealloc_returns_page() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &["t0"]).await.unwrap();
+        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+            .await
+            .unwrap();
         let k: DraftId = st.alloc_draft_page().await.unwrap();
         st.write_draft_page(k, |_| (vec![1], ())).await.unwrap();
         st.dealloc_draft_page(k).await.unwrap();
@@ -372,38 +350,22 @@ fn fs_disk_smoke() {
             std::env::temp_dir().join(format!("dentrado-cache-smoke-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         {
-            let st = Storage::<FsDisk>::open(&FsDisk, path.to_str().unwrap(), 4, &["t0"])
+            let st = Storage::<FsDisk>::open(&FsDisk, path.to_str().unwrap(), 4, &specs(&[b"t0"]))
                 .await
                 .unwrap();
-            put_v(&st, "t0", KEY7, 1, &[]).await.unwrap();
+            put_v(&st, b"t0", KEY7, V1).await.unwrap();
             st.flush().await.unwrap();
             assert!(st.ok_store().await);
-            let (g, cv) = st
-                .get_cache("t0", KEY7)
-                .await
-                .unwrap()
-                .expect("ключ потерян");
-            let pl = st
-                .read_page_guarded(&g, cv.pages[0], |p| val_split(p).1[..2].to_vec())
-                .await
-                .unwrap();
-            drop(g);
-            assert_eq!(pl, vec![1, 1]);
+            assert_eq!(st.get(b"t0", KEY7).await.unwrap(), Some(V1.to_vec()));
         }
-        let st = Storage::<FsDisk>::open(&FsDisk, path.to_str().unwrap(), 4, &["t0"])
+        let st = Storage::<FsDisk>::open(&FsDisk, path.to_str().unwrap(), 4, &specs(&[b"t0"]))
             .await
             .unwrap();
-        let (g, cv) = st
-            .get_cache("t0", KEY7)
-            .await
-            .unwrap()
-            .expect("ключ потерян после рестарта");
-        let pl = st
-            .read_page_guarded(&g, cv.pages[0], |p| val_split(p).1[..2].to_vec())
-            .await
-            .unwrap();
-        drop(g);
-        assert_eq!(pl, vec![1, 1]);
+        assert_eq!(
+            st.get(b"t0", KEY7).await.unwrap(),
+            Some(V1.to_vec()),
+            "ключ потерян после рестарта"
+        );
         assert!(st.ok_store().await);
         drop(st);
         std::fs::remove_file(&path).unwrap();

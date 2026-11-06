@@ -2,17 +2,16 @@
 //!
 //! [`PagedStorage`] wraps [`InMemoryStorage`]: localization and the event log
 //! stay in RAM and are delegated verbatim; only the gear cache
-//! (`get_cache`/`put_cache`) spills into the store's named table — one entry
-//! per gear:
+//! (`get_cache`/`put_cache`) spills into the store's table — one record per
+//! gear:
 //!
-//! * table — `cache:v<N>`, the cache format version in the name (a format
-//!   change opens a new table; the opener's startup GC drops every other
-//!   name this file carries — an old version's orphans);
+//! * table — the postcard of the format's name and version (a format change
+//!   opens a new table; the opener's startup GC drops every other identity
+//!   this file carries — an old version's orphans);
 //! * key — `postcard(gear_id)`;
-//! * value — the [`CacheSer`] image split into 4080-byte payload chunks, one
-//!   draft page each; the entry's `mt` carries the total image length (8-byte
-//!   LE), the only metadata needed to strip the zero padding on read;
-//! * deletion — a tombstone entry (empty `mt`, no pages).
+//! * value — the [`CacheSer`] image whole: the store itself splits an
+//!   oversized value into a page chain and reassembles it on read;
+//! * deletion — the record dies, really.
 //!
 //! The image is hashed, and an unchanged image skips the rewrite — the
 //! engine puts the cache after *every* gear run, so without this an idle
@@ -51,7 +50,7 @@ use std::{
     path::PathBuf,
 };
 
-use dentrado_cache::core::val::{VAL_PAYLOAD, val_split};
+use dentrado_cache::Rec;
 
 use crate::{
     core::{
@@ -64,7 +63,7 @@ use crate::{
         LocGroupId, LocMsgTypeId, LocSenderId, LocUserId, SenderPk, UserId,
     },
 };
-use disk::{CACHE_TABLE, Disk};
+use disk::Disk;
 
 /// [`Storage`] that persists gear caches into a dentrado-cache table.
 /// `ram()` behaves exactly like [`InMemoryStorage`] — the toggle.
@@ -207,7 +206,7 @@ where
         self.ram.diff_group(group, since)
     }
 
-    // ── Layer 3: gear cache → pages ────────────────────────────────────────
+    // ── Layer 3: gear cache → records ──────────────────────────────────────
 
     fn get_cache(&self, gear: &R::GearId) -> impl Future<Output = Option<R::GearCache>> {
         async move {
@@ -220,36 +219,8 @@ where
             let Some(store) = self.ensure().await else {
                 return self.ram.get_cache(gear).await;
             };
-            let read = async {
-                let Some((guard, cv)) = store.get_cache(CACHE_TABLE, &key).await? else {
-                    return Ok(None);
-                };
-                // Tombstones carry no `mt`; a foreign length can only be
-                // corruption — both mean "absent".
-                let Ok(mt) = <[u8; 8]>::try_from(cv.mt.as_slice()) else {
-                    return Ok(None);
-                };
-                let len = u64::from_le_bytes(mt) as usize;
-                if len > cv.pages.len() * VAL_PAYLOAD {
-                    return Ok(None);
-                }
-                let mut image = Vec::with_capacity(len);
-                for p in &cv.pages {
-                    match store
-                        .read_page_guarded(&guard, *p, |pg| val_split(pg).1.to_vec())
-                        .await
-                    {
-                        Ok(chunk) => image.extend_from_slice(&chunk),
-                        Err(e) => {
-                            // half an image is worse than a cold start
-                            return Err(e);
-                        }
-                    }
-                }
-                drop(guard);
-                image.truncate(len);
-                Ok(Some(image))
-            };
+            let table = disk::cache_table();
+            let read = store.get(&table, &key);
             // A read failure degrades but needs no tombstone: nothing was
             // written, the entry on disk stays whatever it was.
             let Some(image) = self.boundary(file, read).await? else {
@@ -281,11 +252,15 @@ where
                     let Some(store) = self.ensure().await else {
                         return self.ram.put_cache(gear, cache).await;
                     };
-                    if self
-                        .boundary(file, Self::publish(&store, &key, &image))
-                        .await
-                        .is_some()
-                    {
+                    // one record: the store builds the value chain and
+                    // frees the superseded closure itself
+                    let table = disk::cache_table();
+                    let batch = [Rec::Put {
+                        key: &key,
+                        val: &image,
+                    }];
+                    let put = store.put_many(&table, &batch);
+                    if self.boundary(file, put).await.is_some() {
                         self.dirty.set(true);
                         self.seen.borrow_mut().insert(key, hash);
                     }
@@ -297,11 +272,10 @@ where
                 None => {
                     if self.seen.borrow_mut().remove(&key).is_some() {
                         if let Some(store) = self.ensure().await {
-                            if self
-                                .boundary(file, Self::erase(&store, &key))
-                                .await
-                                .is_some()
-                            {
+                            let table = disk::cache_table();
+                            let batch = [Rec::Del { key: &key }];
+                            let del = store.put_many(&table, &batch);
+                            if self.boundary(file, del).await.is_some() {
                                 self.dirty.set(true);
                             }
                         }

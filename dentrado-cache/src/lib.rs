@@ -47,6 +47,7 @@ pub mod disk;
 mod error;
 pub mod page;
 mod persist;
+pub mod schema;
 pub mod storage;
 
 pub use crate::core::freelist::ChainEntry;
@@ -55,4 +56,5 @@ pub use crate::core::{CacheValue, DraftId};
 pub use disk::{Fault, FsDisk, IsFilesystem, MemDisk, MemFile};
 pub use error::StoreError;
 pub use page::{Page, PageId};
-pub use storage::{DebugState, Guard, Storage, Violation};
+pub use schema::{NO_DEPS, NO_DEPS_PAGE, NoDeps, PageSchema, TableSchema, TableSpec};
+pub use storage::{DebugState, INLINE_MAX, Rec, Storage, Violation};

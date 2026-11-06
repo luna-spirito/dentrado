@@ -1,6 +1,6 @@
 //! `PagedStorage` round-trip: gear-cache images survive flush + reopen as
-//! value pages, are fetched back on demand, overwrites free their
-//! predecessors, and a cache that stops persisting erases its entry.
+//! value chains, are fetched back on demand, overwrites free their
+//! predecessors, and a cache that stops persisting erases its record.
 
 use std::fmt::Debug;
 
@@ -128,7 +128,7 @@ async fn roundtrip(file: &std::path::Path) {
     let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.to_path_buf());
     assert_eq!(st.get_cache(&gear).await.unwrap().blob, small);
 
-    // A cache that stops persisting (empty image) tombstones its entry.
+    // A cache that stops persisting (empty image) erases its record.
     st.put_cache(
         gear.clone(),
         BlobCache {
@@ -222,23 +222,27 @@ fn paged_storage_gcs_old_versions() {
         .build()
         .unwrap()
         .block_on(async {
-            use dentrado_cache::{Storage, disk::FsDisk};
+            use dentrado_cache::{Rec, Storage, TableSpec, disk::FsDisk};
 
             let dir = tempfile::tempdir().unwrap();
             let file = dir.path().join("core-0.dstore");
             let path = file.display().to_string();
+            let old_id = postcard::to_stdvec(&("dentrado/gear-cache", 1u64)).unwrap();
+            let cur_id = postcard::to_stdvec(&("dentrado/gear-cache", 0u64)).unwrap();
             // An old-version store with one live entry.
             {
-                let old = Storage::open(&FsDisk, &path, 4, &["cache:v0"])
+                let old = Storage::open(&FsDisk, &path, 4, &[TableSpec::flat(old_id.clone())])
                     .await
                     .unwrap();
-                let k = old.alloc_draft_page().await.unwrap();
-                old.write_draft_page(k, |_| (b"ancient".to_vec(), ()))
-                    .await
-                    .unwrap();
-                old.put_cache("cache:v0", b"gear", &[1], &[k], &[])
-                    .await
-                    .unwrap();
+                old.put_many(
+                    &old_id,
+                    &[Rec::Put {
+                        key: b"gear",
+                        val: b"ancient",
+                    }],
+                )
+                .await
+                .unwrap();
                 old.flush().await.unwrap();
             }
             // Opening through PagedStorage drops the orphan…
@@ -248,10 +252,10 @@ fn paged_storage_gcs_old_versions() {
             st.flush().await.unwrap();
             drop(st);
             // …and a raw reopen sees only the current version's table.
-            let raw = Storage::open(&FsDisk, &path, 4, &["cache:v1"])
+            let raw = Storage::open(&FsDisk, &path, 4, &[TableSpec::flat(cur_id.clone())])
                 .await
                 .unwrap();
             let names = raw.tables();
-            assert_eq!(names, ["cache:v1".to_string()]);
+            assert_eq!(names, [cur_id]);
         });
 }

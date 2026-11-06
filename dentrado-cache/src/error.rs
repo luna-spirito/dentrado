@@ -15,10 +15,12 @@ pub enum StoreError {
     Io(String),
     Eof,
     CorruptImage,
-    /// A name outside the format's bounds (empty, over
-    /// [`crate::core::sb::MAX_TABLE_NAME`] bytes, or a duplicate) —
+    /// A table identity outside the format's bounds (empty, over
+    /// [`crate::core::sb::MAX_TABLE_ID`] bytes, or a duplicate) —
     /// `open` refuses the whole set.
     BadName,
+    /// A record key no leaf could hold — `put_many` refuses the batch.
+    BadKey,
     /// The table's name is not in the store's set (or the slot is
     /// dropped).
     NoTable,
@@ -27,6 +29,9 @@ pub enum StoreError {
     /// The store is poisoned — see the type's doc. Terminal.
     Poisoned,
     ConsumedVanished,
+    /// A record's schema refused its bytes — a `val_deps`/`deps` walk
+    /// met a page it could not parse. Corruption, not refusal.
+    CorruptValue(&'static str),
     /// A publication's lists disagree — a page both consumed and freed,
     /// a freed page still held (a draft, dying, back in a pool), a
     /// duplicate. Refused whole; nothing was registered.
@@ -55,6 +60,8 @@ impl std::fmt::Display for StoreError {
             Self::Eof => write!(f, "io: eof"),
             Self::CorruptImage => write!(f, "open: corrupt image"),
             Self::BadName => write!(f, "open: a name outside the format"),
+            Self::BadKey => write!(f, "put: a key no leaf could hold"),
+            Self::CorruptValue(why) => write!(f, "value: {why}"),
             Self::NoTable => write!(f, "table: no such table"),
             Self::Poisoned => write!(f, "store: poisoned"),
             Self::UnknownDraft => write!(f, "draft: unknown"),

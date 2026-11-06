@@ -11,6 +11,7 @@ mod flight;
 mod flush;
 mod graft;
 mod image;
+pub(crate) mod walks;
 
 use synchrony::unsync::event::Event;
 
@@ -18,6 +19,7 @@ use crate::blockcache::Reply;
 use crate::core::Core;
 use crate::core::sb::Sb;
 use crate::disk::IsFilesystem;
+use crate::schema::TableSpec;
 
 /// The single lock's full content: the core plus the round agent's
 /// mailbox, the commit generation, and the poison flag. Everything
@@ -48,7 +50,7 @@ pub(crate) struct PersistentCore<D: IsFilesystem> {
 }
 
 impl<D: IsFilesystem> PersistentCore<D> {
-    pub(super) fn fresh(file: D::File, cap: usize, tables: &[&str]) -> Self {
+    pub(super) fn fresh(file: D::File, cap: usize, tables: &[TableSpec]) -> Self {
         Self {
             core: Core::fresh(file, cap, tables),
             mail: Vec::new(),
@@ -66,7 +68,7 @@ impl<D: IsFilesystem> PersistentCore<D> {
     /// Recovery over a live store: the image's fields go on top; the
     /// block cache is not touched (the validation chains are read
     /// directly).
-    pub(super) fn of_sb(&mut self, sb: &Sb, opener: &[&str]) {
+    pub(super) fn of_sb(&mut self, sb: &Sb, opener: &[TableSpec]) {
         self.core.of_sb(sb, opener);
         self.r#gen = sb.r#gen;
     }
