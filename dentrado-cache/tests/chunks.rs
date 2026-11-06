@@ -8,10 +8,10 @@
 
 use std::task::Poll;
 
-use dentrado_cache::{MemDisk, Rec, Storage};
+use dentrado_cache::{MemDisk, Storage};
 
 mod util;
-use util::{PAYLOAD, chain_specs, offset_image, put_big, read_big, run, specs};
+use util::{PAYLOAD, chain_specs, offset_image, put_big, put_free, read_big, run, specs};
 
 // ## Многочанковые цепочки
 
@@ -35,17 +35,7 @@ fn multi_chunk_flush() {
         // замена на инлайн: 1100 умирают списком звонящего — в цепи
         // своего пула (свежий свободный запас: клетки пишутся один раз,
         // дальше их только едят — голова пула остаётся пустой)
-        st.put_many(
-            b"t0",
-            &[Rec::Put {
-                key,
-                val: &[1, 2, 3],
-                take: &[],
-                free: &chain,
-            }],
-        )
-        .await
-        .unwrap();
+        put_free(&st, b"t0", key, &[1, 2, 3], &chain).unwrap();
         // пинов снаружи нет — reg сам осаждает свою партию, печать забирает
         // смерти без пин-цикла (случай под чужим пином — death_pending_bucket)
         st.flush().await.unwrap();
@@ -74,12 +64,14 @@ fn multi_chunk_flush() {
             dbg2.heads[0].is_empty() && dbg2.heads[1].is_empty(),
             "рестарт видит запас в хвостах: {dbg2:?}"
         );
-        let _k = st2.alloc_draft_page().await.unwrap();
+        let mut s2 = st2.session();
+        let _k = s2.alloc().await.unwrap();
         let dbg3 = st2.debug_state();
         assert!(
             dbg3.heads[0].len() + dbg3.heads[1].len() >= 500,
             "чанк целиком в голову: {dbg3:?}"
         );
+        drop(s2);
         assert!(st2.ok_store().await);
         // пере-публикация поверх цепочек: flush ест чужой пул целиком
         let big2 = vec![9u8; 5 * PAYLOAD];
@@ -144,17 +136,7 @@ fn death_pending_bucket() {
             .await;
             // замена: цепь умирает списком звонящего, старый лист —
             // прививкой; обе партии — под чужим пином
-            st.put_many(
-                b"t0",
-                &[Rec::Put {
-                    key,
-                    val: &[1, 2, 3],
-                    take: &[],
-                    free: &blob,
-                }],
-            )
-            .await
-            .unwrap();
+            put_free(&st, b"t0", key, &[1, 2, 3], &blob).unwrap();
             st.flush().await.unwrap();
             let dbg = st.debug_state();
             assert_eq!(dbg.dying_len, 0, "{dbg:?}");
@@ -221,17 +203,7 @@ fn pending_deaths_survive_crash() {
             })
             .await;
         } // бросание читателя посреди спуска — снятие его пина
-        st.put_many(
-            b"t0",
-            &[Rec::Put {
-                key,
-                val: &[9; 3],
-                take: &[],
-                free: &blob,
-            }],
-        )
-        .await
-        .unwrap();
+        put_free(&st, b"t0", key, &[9; 3], &blob).unwrap();
         st.flush().await.unwrap(); // смерти — под чужим пином: pending
         drop(st); // краш: пины и арена исчезли, образ — как закоммичен
         let st2 = Storage::open(&disk, "db", 4, &chain_specs(&[b"t0"]))
@@ -254,13 +226,15 @@ fn live_drafts_survive_crash() {
         let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
             .await
             .unwrap();
+        let mut s = st.session();
         for i in 0..6u8 {
-            let k = st.alloc_draft_page().await.unwrap();
-            st.write_draft_page(k, move |pg| pg.0[..3].copy_from_slice(&[i; 3]))
+            let k = s.alloc().await.unwrap();
+            s.write(k, move |pg| pg.0[..3].copy_from_slice(&[i; 3]))
                 .await
                 .unwrap();
         }
         st.flush().await.unwrap(); // черновики живы на печати
+        drop(s);
         drop(st); // краш
         let st2 = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
             .await
@@ -292,10 +266,12 @@ fn page_partition() {
                 .unwrap_or_else(|v| panic!("раунд {r}: {v:?}"));
         }
         // вычерпать головы аллокациями — принудить поедание хвоста
+        let mut s = st.session();
         for _ in 0..40 {
-            st.alloc_draft_page().await.unwrap();
+            s.alloc().await.unwrap();
         }
         st.partition_exact().await.expect("биекция после дренажа");
+        drop(s);
     });
 }
 
@@ -313,23 +289,15 @@ fn eaten_container_survives_two_rounds() {
         let big = vec![7u8; 8 * PAYLOAD];
         let old = put_big(&st, b"t0", b"big", &big, &[]).await.unwrap();
         st.flush().await.unwrap();
-        st.put_many(
-            b"t0",
-            &[Rec::Put {
-                key: b"big",
-                val: &[1, 2, 3],
-                take: &[],
-                free: &old,
-            }],
-        )
-        .await
-        .unwrap();
+        put_free(&st, b"t0", b"big", &[1, 2, 3], &old).unwrap();
         st.flush().await.unwrap(); // смерти — клетками в цепи
         // вычерпать головы аллокациями — сплайсы едят чанки, контейнеры
         // оседают в spent
+        let mut s = st.session();
         for _ in 0..40 {
-            st.alloc_draft_page().await.unwrap();
+            s.alloc().await.unwrap();
         }
+        drop(s);
         st.flush().await.unwrap(); // контейнеры — клетками в чанки круга
         st.flush().await.unwrap(); // фронт суперседится — клетки живут?
         st.partition_exact()
@@ -362,17 +330,7 @@ fn recovered_tail_behind_new_chunk() {
         // хвост (вход ⟨2, off 2⟩) не тронут
         let old = put_big(&st, b"t0", b"k", &[7u8; 600], &[]).await.unwrap();
         // замена на инлайн: слот 8 умирает списком звонящего
-        st.put_many(
-            b"t0",
-            &[Rec::Put {
-                key: b"k",
-                val: &[9; 3],
-                take: &[],
-                free: &old,
-            }],
-        )
-        .await
-        .unwrap();
+        put_free(&st, b"t0", b"k", &[9; 3], &old).unwrap();
         st.flush().await.unwrap(); // здесь паника
         assert!(st.ok_store().await);
         drop(st);

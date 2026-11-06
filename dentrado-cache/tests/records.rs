@@ -6,12 +6,11 @@
 //! partition.
 
 use dentrado_cache::{
-    MemDisk, NO_DEPS, PageId, PageSchema, Rec, Storage, StoreError, TableSchema, TableSpec,
-    Violation,
+    MemDisk, NO_DEPS, PageId, PageSchema, Storage, StoreError, TableSchema, TableSpec, Violation,
 };
 
 mod util;
-use util::{chain_specs, del, keys, put, put_big, read_big, run, specs};
+use util::{chain_specs, del, keys, put, read_big, run, specs};
 
 /// Scan reads in key order — the standing tree pruned to the range,
 /// the delta overlaid on it (a put replaces, a deletion hides), and
@@ -24,15 +23,17 @@ fn scan_orders_and_overlays() {
             .await
             .unwrap();
         for (k, v) in [("b", 2u8), ("a", 1), ("d", 4)] {
-            st.put_many(b"t0", &[put(k.as_bytes(), &[v])])
-                .await
-                .unwrap();
+            put(&st, b"t0", k.as_bytes(), &[v]).unwrap();
         }
         st.flush().await.unwrap();
         // the delta half over the tree: a fresh key, an overwrite, a kill
-        st.put_many(b"t0", &[put(b"aa", &[9]), put(b"a", &[7]), del(b"d")])
-            .await
-            .unwrap();
+        {
+            let mut s = st.session();
+            s.put(b"t0", b"aa", &[9], &[], &[]).unwrap();
+            s.put(b"t0", b"a", &[7], &[], &[]).unwrap();
+            s.del(b"t0", b"d", &[]).unwrap();
+            s.commit().unwrap();
+        }
         let all = st.scan(b"t0", b"", b"").await.unwrap();
         assert_eq!(
             all,
@@ -76,16 +77,18 @@ fn deletion_empties_the_table() {
             .await
             .unwrap();
         for k in ["x", "y", "z"] {
-            st.put_many(b"t0", &[put(k.as_bytes(), &[1, 2])])
-                .await
-                .unwrap();
+            put(&st, b"t0", k.as_bytes(), &[1, 2]).unwrap();
         }
         st.flush().await.unwrap();
-        st.put_many(b"t0", &[del(b"no")]).await.unwrap();
+        del(&st, b"t0", b"no").unwrap();
         assert_eq!(st.scan(b"t0", b"", b"").await.unwrap().len(), 3);
-        st.put_many(b"t0", &[del(b"x"), del(b"y"), del(b"z")])
-            .await
-            .unwrap();
+        {
+            let mut s = st.session();
+            for k in ["x", "y", "z"] {
+                s.del(b"t0", k.as_bytes(), &[]).unwrap();
+            }
+            s.commit().unwrap();
+        }
         assert!(st.scan(b"t0", b"", b"").await.unwrap().is_empty());
         for k in ["x", "y", "z"] {
             assert_eq!(st.get(b"t0", k.as_bytes()).await.unwrap(), None);
@@ -93,7 +96,7 @@ fn deletion_empties_the_table() {
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
         // the emptied table lives on: a fresh record lands and survives
-        st.put_many(b"t0", &[put(b"w", &[3])]).await.unwrap();
+        put(&st, b"t0", b"w", &[3]).unwrap();
         st.flush().await.unwrap();
         drop(st);
         let st2 = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
@@ -117,54 +120,40 @@ fn a_batch_is_last_key_wins() {
         let st = Storage::open(&disk, "db", 4, &chain_specs(&[b"t0"]))
             .await
             .unwrap();
-        st.put_many(b"t0", &[put(b"k", &[1]), put(b"k", &[2]), put(b"j", &[3])])
-            .await
-            .unwrap();
+        {
+            let mut s = st.session();
+            s.put(b"t0", b"k", &[1], &[], &[]).unwrap();
+            s.put(b"t0", b"k", &[2], &[], &[]).unwrap(); // the later stage wins
+            s.put(b"t0", b"j", &[3], &[], &[]).unwrap();
+            s.commit().unwrap();
+        }
         assert_eq!(st.get(b"t0", b"k").await.unwrap(), Some(vec![2]));
         assert_eq!(st.scan(b"t0", b"", b"").await.unwrap().len(), 2);
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
-        // the vanished take: one draft dealloc'd, one alive
-        let gone = st.alloc_draft_page().await.unwrap();
-        st.dealloc_draft_page(gone).await.unwrap();
-        let fresh = st.alloc_draft_page().await.unwrap();
-        let r = st
-            .put_many(
-                b"t0",
-                &[
-                    Rec::Put {
-                        key: b"good",
-                        val: b"v",
-                        take: &[gone, fresh],
-                        free: &[],
-                    },
-                    del(b"j"),
-                ],
-            )
-            .await;
-        assert!(matches!(r, Err(StoreError::ConsumedVanished)));
+        // the vanished take: one draft discarded, one alive — the
+        // stage refuses before any take is marked
+        let mut s = st.session();
+        let gone = s.alloc().await.unwrap();
+        s.discard(gone).unwrap();
+        let fresh = s.alloc().await.unwrap();
+        let r = s.put(b"t0", b"good", b"v", &[gone, fresh], &[]);
+        assert!(matches!(r, Err(StoreError::UnknownDraft)));
+        s.del(b"t0", b"j", &[]).unwrap();
         assert_eq!(st.get(b"t0", b"good").await.unwrap(), None);
         assert_eq!(st.get(b"t0", b"j").await.unwrap(), Some(vec![3]));
         // the live draft stayed held: the retry publishes it alone,
         // the record naming its page (a chain head, `next` = 0)
-        let p = st.draft_page(&fresh).await.unwrap();
-        st.write_draft_page(fresh, move |pg| {
+        let p = s.page(fresh).unwrap();
+        s.write(fresh, move |pg| {
             pg.0[..8].fill(0);
             pg.0[8..11].copy_from_slice(b"vvv");
         })
         .await
         .unwrap();
-        st.put_many(
-            b"t0",
-            &[Rec::Put {
-                key: b"good",
-                val: &p.to_le_bytes(),
-                take: &[fresh],
-                free: &[],
-            }],
-        )
-        .await
-        .unwrap();
+        s.put(b"t0", b"good", &p.to_le_bytes(), &[fresh], &[])
+            .unwrap();
+        s.commit().unwrap();
         assert!(
             read_big(&st, b"t0", b"good")
                 .await
@@ -217,10 +206,11 @@ fn a_shared_closure_dies_once() {
         .unwrap();
         // the taken pages: 2 then 4, the first naming 4 in its content,
         // the second naming 2 — a content cycle
+        let mut s = st.session();
         let mut ks = Vec::new();
         for names in [4u64, 2u64] {
-            let k = st.alloc_draft_page().await.unwrap();
-            st.write_draft_page(k, move |pg| {
+            let k = s.alloc().await.unwrap();
+            s.write(k, move |pg| {
                 pg.0[..8].copy_from_slice(MAGIC);
                 pg.0[8..16].copy_from_slice(&names.to_le_bytes());
             })
@@ -230,7 +220,7 @@ fn a_shared_closure_dies_once() {
         }
         let mut pages = Vec::new();
         for k in &ks {
-            pages.push(st.draft_page(k).await.unwrap());
+            pages.push(s.page(*k).unwrap());
         }
         assert_eq!(pages, [2, 4], "свежий пул раздаёт чётные");
         // the inline namers: one at the pair's head, one at its tail
@@ -240,31 +230,11 @@ fn a_shared_closure_dies_once() {
             v[8..].copy_from_slice(&p.to_le_bytes());
             v
         };
-        st.put_many(
-            b"t0",
-            &[
-                Rec::Put {
-                    key: b"c",
-                    val: &namer(2),
-                    take: &ks,
-                    free: &[],
-                },
-                Rec::Put {
-                    key: b"h",
-                    val: &namer(2),
-                    take: &[],
-                    free: &[],
-                },
-                Rec::Put {
-                    key: b"t",
-                    val: &namer(4),
-                    take: &[],
-                    free: &[],
-                },
-            ],
-        )
-        .await
-        .unwrap();
+        s.put(b"t0", b"c", &namer(2), &ks, &[]).unwrap();
+        s.put(b"t0", b"h", &namer(2), &[], &[]).unwrap();
+        s.put(b"t0", b"t", &namer(4), &[], &[]).unwrap();
+        s.commit().unwrap();
+        drop(s);
         st.flush().await.unwrap();
         // the world: tree {3}, the pair {2, 4} — one set of three deaths
         st.drop_table(b"t0").await.unwrap();
@@ -301,7 +271,7 @@ fn a_refusing_schema_keeps_the_world() {
         )
         .await
         .unwrap();
-        st.put_many(b"t0", &[put(b"k", &[0xFF, 1])]).await.unwrap();
+        put(&st, b"t0", b"k", &[0xFF, 1]).unwrap();
         st.flush().await.unwrap();
         assert!(matches!(
             st.drop_table(b"t0").await,
@@ -337,19 +307,12 @@ fn untaken_pages_show_in_the_partition() {
         )
         .await
         .unwrap();
-        let k = st.alloc_draft_page().await.unwrap();
-        let p = st.draft_page(&k).await.unwrap();
-        st.put_many(
-            b"t0",
-            &[Rec::Put {
-                key: b"kk",
-                val: b"v",
-                take: &[k],
-                free: &[],
-            }],
-        )
-        .await
-        .unwrap();
+        let mut s = st.session();
+        let k = s.alloc().await.unwrap();
+        let p = s.page(k).unwrap();
+        s.put(b"t0", b"kk", b"v", &[k], &[]).unwrap();
+        s.commit().unwrap();
+        drop(s);
         st.flush().await.unwrap();
         let v = st.partition_exact().await.expect_err("orphaned page");
         assert!(

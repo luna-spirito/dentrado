@@ -38,7 +38,7 @@ pub(crate) struct Sealed {
 impl<D: IsFilesystem> Core<D> {
     /// The flush seal: the round's whole starting world out in one
     /// section — see [`Sealed`].
-    pub(crate) fn seal(&mut self) -> Sealed {
+    pub(crate) fn seal_round(&mut self) -> Sealed {
         let ep = self.frees.ep();
         let (ahead, atail, anext, spent) = self.frees.seal();
         Sealed {

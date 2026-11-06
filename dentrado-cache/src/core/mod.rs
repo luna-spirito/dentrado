@@ -27,7 +27,6 @@ use std::task::Context;
 
 use synchrony::unsync::event::EventListener;
 
-pub use self::drafts::DraftId;
 use self::drafts::Drafts;
 use self::ebr::Deaths;
 use self::freelist::{ChainEntry, FreeAct, Frees};
@@ -46,7 +45,7 @@ use crate::schema::{TableSchema, TableSpec};
 /// `Park` carries the listener (the parking decision and the
 /// registration share the section).
 pub(crate) enum AllocAct {
-    Got(DraftId),
+    Got(PageId),
     Park(EventListener),
     Read { ep: usize, e: ChainEntry },
 }
@@ -62,13 +61,19 @@ pub(crate) enum StepHit {
     Tree,
 }
 
-/// One record of a `put_many` batch at its seal: the key, the record's
-/// inline bytes (`None` — a deletion), and the drafts it publishes
-/// (the caller's own — empty for an inline-only record or a deletion).
+/// One record at a commit's seal: the key, the record's inline bytes
+/// (`None` — a deletion), and the draft pages it publishes (empty for
+/// an inline-only record or a deletion).
 pub(crate) struct SealRec {
     pub(crate) k: Vec<u8>,
     pub(crate) put: Option<Vec<u8>>,
-    pub(crate) consumed: Vec<DraftId>,
+    pub(crate) consumed: Vec<PageId>,
+}
+
+/// One table's records at a commit's seal.
+pub(crate) struct SealBatch {
+    pub(crate) t: usize,
+    pub(crate) recs: Vec<SealRec>,
 }
 
 /// The store's core — the flush-agnostic half of the lock's content.
@@ -145,7 +150,10 @@ impl<D: IsFilesystem> Core<D> {
     /// piece (the pools' half is [`Frees::alloc`]'s own).
     pub(crate) fn alloc_step(&mut self) -> Result<AllocAct, StoreError> {
         match self.frees.alloc()? {
-            FreeAct::Got(p) => Ok(AllocAct::Got(self.drafts.take(p))),
+            FreeAct::Got(p) => {
+                self.drafts.take(p);
+                Ok(AllocAct::Got(p))
+            }
             FreeAct::Park(ln) => Ok(AllocAct::Park(ln)),
             FreeAct::Read { ep, e } => Ok(AllocAct::Read { ep, e }),
         }
@@ -166,46 +174,50 @@ impl<D: IsFilesystem> Core<D> {
     }
 
     /// A draft's death: unpublished — no gate needed, back into its own
-    /// pool's head. An unknown key — an honest refusal.
-    pub(crate) fn dealloc_step(&mut self, k: DraftId) -> bool {
-        match self.drafts.remove(&k) {
-            Some((p, _)) => {
-                self.frees.retire(p);
-                true
-            }
-            None => false,
+    /// pool's head. An unknown page — an honest refusal.
+    pub(crate) fn dealloc(&mut self, p: PageId) -> bool {
+        if self.drafts.remove(p) {
+            self.frees.retire(p);
+            true
+        } else {
+            false
         }
     }
 
-    /// The `put_many` seal: a whole batch's deltas, draft consumption
-    /// and death registration — one section, so a batch lands whole or
-    /// not at all. The freed pages are the caller's word (the replaced
-    /// records' closures — the caller knows them, the store does not
-    /// traverse), yet not a free hand: each must be a published page —
-    /// never a draft, never dying, never back in a pool, never
-    /// conjured — and no page twice. A refusal registers nothing; the
-    /// taken drafts stay held (the caller's, to dealloc or reuse).
-    pub(crate) fn seal_batch(
+    /// The commit's seal: every table's deltas, the drafts' publication
+    /// and the death registration — one section, so a whole session
+    /// lands or nothing does. The freed pages are the caller's word
+    /// (the replaced records' closures — the caller knows them, the
+    /// store does not traverse), yet not a free hand: each must be a
+    /// published page — never a draft, never dying, never back in a
+    /// pool, never conjured — and no page twice. A refusal registers
+    /// nothing; the session stays whole (the caller's, to fix and
+    /// re-commit, or to drop for a clean abort).
+    pub(crate) fn seal(
         &mut self,
-        t: usize,
-        recs: &[SealRec],
+        batches: &[SealBatch],
         freed: &[PageId],
     ) -> Result<(), StoreError> {
-        if t >= self.tables.roots.len() {
-            return Err(StoreError::NoTable);
-        }
-        let mut owned = Vec::with_capacity(recs.len());
-        for r in recs {
-            let Some(pages) = self.drafts.pages_of(&r.consumed) else {
+        let owned: Vec<&PageId> = batches
+            .iter()
+            .flat_map(|b| b.recs.iter().flat_map(|r| &r.consumed))
+            .collect();
+        for b in batches {
+            if b.t >= self.tables.roots.len() {
+                return Err(StoreError::NoTable);
+            }
+            if b.recs
+                .iter()
+                .any(|r| !r.consumed.iter().all(|&p| self.drafts.has(p)))
+            {
                 return Err(StoreError::ConsumedVanished);
-            };
-            owned.push(pages);
+            }
         }
         let bound = self.frees.bound();
         for (i, p) in freed.iter().enumerate() {
-            let why = if owned.iter().any(|ps| ps.contains(p)) {
+            let why = if owned.contains(&p) {
                 "a page both consumed and freed"
-            } else if self.drafts.has_page(*p) {
+            } else if self.drafts.has(*p) {
                 "a freed page still held as a draft"
             } else if freed[..i].contains(p) {
                 "a page freed twice"
@@ -221,13 +233,15 @@ impl<D: IsFilesystem> Core<D> {
             return Err(StoreError::BadSeal(why));
         }
         self.deaths.reg(freed);
-        for (r, _) in recs.iter().zip(owned) {
-            match r.put {
-                Some(ref mt) => self.tables.put(t, &r.k, mt.clone()),
-                None => self.tables.del(t, &r.k),
-            }
-            for c in &r.consumed {
-                self.drafts.remove(c);
+        for b in batches {
+            for r in &b.recs {
+                match r.put {
+                    Some(ref mt) => self.tables.put(b.t, &r.k, mt.clone()),
+                    None => self.tables.del(b.t, &r.k),
+                }
+                for &c in &r.consumed {
+                    self.drafts.remove(c);
+                }
             }
         }
         Ok(())
@@ -324,17 +338,6 @@ impl<D: IsFilesystem> Core<D> {
     }
 
     // ## The drafts' verbs (the steps around the io)
-
-    /// A draft's locus: its page and whether it is fresh — never yet
-    /// written.
-    pub(crate) fn draft(&self, k: &DraftId) -> Option<(PageId, bool)> {
-        self.drafts.get(k)
-    }
-
-    /// The first write went through — the draft is no longer fresh.
-    pub(crate) fn defresh(&mut self, k: &DraftId) {
-        self.drafts.defresh(k);
-    }
 
     /// The world's page-id bound — every issued id is below it (a
     /// round's own flight counter included by the caller while it

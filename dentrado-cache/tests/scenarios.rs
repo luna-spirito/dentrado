@@ -5,9 +5,7 @@
 
 use std::rc::Rc;
 
-use dentrado_cache::{
-    DraftId, Fault, FsDisk, IsFilesystem, MemDisk, Rec, Storage, StoreError, TableSpec,
-};
+use dentrado_cache::{Fault, FsDisk, IsFilesystem, MemDisk, Storage, StoreError, TableSpec};
 
 fn run<F: Future>(f: F) -> F::Output {
     compio::runtime::Runtime::new().unwrap().block_on(f)
@@ -24,23 +22,17 @@ fn specs(ids: &[&[u8]]) -> Vec<TableSpec> {
     ids.iter().map(|i| TableSpec::flat(i.to_vec())).collect()
 }
 
-/// Публикация значения: инлайн-запись, никаких страниц.
-async fn put_v<D: IsFilesystem>(
+/// Публикация значения: инлайн-запись, никаких страниц — своя
+/// однострочная сессия.
+fn put_v<D: IsFilesystem>(
     st: &Storage<D>,
     table: &[u8],
     key: &[u8],
     val: &[u8],
 ) -> Result<(), StoreError> {
-    st.put_many(
-        table,
-        &[Rec::Put {
-            key,
-            val,
-            take: &[],
-            free: &[],
-        }],
-    )
-    .await
+    let mut s = st.session();
+    s.put(table, key, val, &[], &[])?;
+    s.commit()
 }
 
 // ## Замена значения на живом сторе
@@ -53,7 +45,7 @@ fn repl_flow() {
             .await
             .unwrap();
         // публикация v1 и коммит
-        put_v(&st, b"t0", KEY7, V1).await.unwrap();
+        put_v(&st, b"t0", KEY7, V1).unwrap();
         st.flush().await.unwrap();
         assert_eq!(
             st.get(b"t0", KEY7).await.unwrap(),
@@ -61,7 +53,7 @@ fn repl_flow() {
             "miss-after-commit"
         );
         // замена на v2 — старое дерево умирает прививкой, без слова звонящего
-        put_v(&st, b"t0", KEY7, V2).await.unwrap();
+        put_v(&st, b"t0", KEY7, V2).unwrap();
         // дельта прежде дерева: свежая замена видна до flush'а
         assert_eq!(st.get(b"t0", KEY7).await.unwrap(), Some(V2.to_vec()));
         st.flush().await.unwrap();
@@ -86,12 +78,12 @@ fn repl_flow() {
 // ## Трёхактка: коммит или откат
 
 async fn act1(st: &Storage<MemDisk>) -> Result<(), StoreError> {
-    put_v(st, b"t0", KEY7, V1).await?;
+    put_v(st, b"t0", KEY7, V1)?;
     st.flush().await
 }
 
 async fn act2(st: &Storage<MemDisk>) -> Result<(), StoreError> {
-    put_v(st, b"t0", KEY7, V2).await?;
+    put_v(st, b"t0", KEY7, V2)?;
     st.flush().await
 }
 
@@ -180,7 +172,7 @@ async fn worker(st: Rc<Storage<MemDisk>>, kb: u8, rounds: u8) -> Result<(), Stor
         let mut val = vec![0u8; 1000];
         val[0] = kb;
         val[1] = r;
-        put_v(&st, b"t0", &key, &val).await?;
+        put_v(&st, b"t0", &key, &val)?;
     }
     Ok(())
 }
@@ -234,7 +226,7 @@ fn flush_queue() {
                 .await
                 .unwrap(),
         );
-        put_v(&st, b"t0", KEY7, V1).await.unwrap();
+        put_v(&st, b"t0", KEY7, V1).unwrap();
         let ts: Vec<_> = (0..4)
             .map(|_| {
                 let s = st.clone();
@@ -263,8 +255,8 @@ fn table_set_roundtrip() {
         let st = Storage::open(&disk, "db", 4, &specs(&[b"a", b"b", b"c"]))
             .await
             .unwrap();
-        put_v(&st, b"a", b"a", V1).await.unwrap();
-        put_v(&st, b"c", b"a", &[2; 3]).await.unwrap();
+        put_v(&st, b"a", b"a", V1).unwrap();
+        put_v(&st, b"c", b"a", &[2; 3]).unwrap();
         st.flush().await.unwrap();
         st.partition_exact().await.expect("биекция трёх таблиц");
         drop(st);
@@ -331,14 +323,13 @@ fn dealloc_returns_page() {
         let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
             .await
             .unwrap();
-        let k: DraftId = st.alloc_draft_page().await.unwrap();
-        st.write_draft_page(k, |p| p.0[0] = 1).await.unwrap();
-        st.dealloc_draft_page(k).await.unwrap();
-        assert!(matches!(
-            st.dealloc_draft_page(k).await,
-            Err(StoreError::UnknownDraft)
-        ));
-        let _k2 = st.alloc_draft_page().await.unwrap(); // страница вернулась в голову
+        let mut s = st.session();
+        let k = s.alloc().await.unwrap();
+        s.write(k, |p| p.0[0] = 1).await.unwrap();
+        s.discard(k).unwrap();
+        assert_eq!(s.discard(k), Err(StoreError::UnknownDraft));
+        let _k2 = s.alloc().await.unwrap(); // страница вернулась в голову
+        drop(s);
         assert!(st.ok_store().await);
     });
 }
@@ -355,7 +346,7 @@ fn fs_disk_smoke() {
             let st = Storage::<FsDisk>::open(&FsDisk, path.to_str().unwrap(), 4, &specs(&[b"t0"]))
                 .await
                 .unwrap();
-            put_v(&st, b"t0", KEY7, V1).await.unwrap();
+            put_v(&st, b"t0", KEY7, V1).unwrap();
             st.flush().await.unwrap();
             assert!(st.ok_store().await);
             assert_eq!(st.get(b"t0", KEY7).await.unwrap(), Some(V1.to_vec()));

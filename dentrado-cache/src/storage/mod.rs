@@ -1,12 +1,12 @@
-//! The store's async surface: the record surface (reads, scans,
-//! batched writes — [`records`]) and the raw page surface beneath it —
-//! drafts (allocation, the writes) and page reads. A record's value is
-//! the caller's inline bytes; anything bigger the caller pages itself
-//! (the drafts are its pages, the schema its declaration of what a
-//! record names), and reads of those pages go by reference — bytes
-//! never leave the arena. Under it: [`crate::core`] — the
-//! flush-agnostic machines the sections drive, [`crate::persist`] —
-//! the persistence overlay, the flush round, recovery.
+//! The store's async surface: the reads ([`records`]) and the write
+//! session ([`session`]) — the one door to the store's pages. A
+//! record's value is the caller's inline bytes; anything bigger the
+//! caller pages itself (the session's drafts are its pages, the schema
+//! its declaration of what a record names), and reads of those pages
+//! go by reference — bytes never leave the arena. Under it:
+//! [`crate::core`] — the flush-agnostic machines the sections drive,
+//! [`crate::persist`] — the persistence overlay, the flush round,
+//! recovery.
 //!
 //! The state is the [`PersistentCore`] under a single `RefCell` (the
 //! store is single-threaded by construction — compio thread-per-core,
@@ -24,22 +24,17 @@
 //! is a visible [`StoreError::Steps`] error (image corruption).
 
 mod records;
+mod session;
 
-// TODO: REALLY TODO: Safe interface.
-
-pub use records::Rec;
+pub use session::{DraftPageId, Session};
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use compio::runtime::JoinHandle;
 
-use crate::blockcache;
-use crate::core::freelist::{ChainEntry, chunk_cells, chunk_next};
-use crate::core::{AllocAct, DraftId};
 use crate::disk::IsFilesystem;
-use crate::error::StoreError;
-use crate::page::{AlignedPage, PageId};
+use crate::page::PageId;
 use crate::persist::PersistentCore;
 
 // ## The read guard
@@ -55,42 +50,6 @@ pub(crate) struct Guard<D: IsFilesystem> {
 impl<D: IsFilesystem> Drop for Guard<D> {
     fn drop(&mut self) {
         self.inner.borrow_mut().core.drop_step(self.bucket);
-    }
-}
-
-/// A tail-read's rollback, RAII: a Busy tail without its reader bricks
-/// the pool — every later alloc parks on a splice that never comes.
-/// Defused once the read lands and the splice follows in the same
-/// section; drops otherwise (an io failure's `?` or the caller's
-/// cancellation between the section and the splice).
-struct ReadRollback<D: IsFilesystem> {
-    inner: Rc<RefCell<PersistentCore<D>>>,
-    ep: usize,
-    e: ChainEntry,
-    armed: bool,
-}
-
-impl<D: IsFilesystem> ReadRollback<D> {
-    fn new(inner: Rc<RefCell<PersistentCore<D>>>, ep: usize, e: ChainEntry) -> Self {
-        Self {
-            inner,
-            ep,
-            e,
-            armed: true,
-        }
-    }
-
-    /// The read landed — the splice follows in the same section.
-    fn defuse(mut self) {
-        self.armed = false;
-    }
-}
-
-impl<D: IsFilesystem> Drop for ReadRollback<D> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.inner.borrow_mut().core.abort_read(self.ep, self.e);
-        }
     }
 }
 
@@ -151,150 +110,5 @@ impl<D: IsFilesystem> Storage<D> {
             flush_busy,
             dying_len: ram.dying,
         }
-    }
-
-    /// Draft allocation: own pool's head → the tail chain (a single
-    /// reader, the rest park) → growing the world.
-    pub async fn alloc_draft_page(&self) -> Result<DraftId, StoreError> {
-        let bound = {
-            let inner = self.inner.borrow();
-            if inner.poisoned {
-                return Err(StoreError::Poisoned);
-            }
-            2 * inner.core.bound()
-        };
-        let mut fuel = bound;
-        loop {
-            if fuel == 0 {
-                return Err(StoreError::Steps("alloc: steps"));
-            }
-            fuel -= 1;
-            let act = {
-                let mut inner = self.inner.borrow_mut();
-                if inner.poisoned {
-                    return Err(StoreError::Poisoned);
-                }
-                inner.core.alloc_step()
-            }?;
-            match act {
-                AllocAct::Got(k) => return Ok(k),
-                AllocAct::Park(ln) => ln.await,
-                AllocAct::Read { ep, e } => {
-                    // The read may die (an io failure's `?`) or be
-                    // cancelled (the caller's future dropped mid-await);
-                    // either way the Busy tail must not outlive its
-                    // reader — the guard rolls it back and wakes the
-                    // parked, unless defused at the splice.
-                    let rb = ReadRollback::new(self.inner.clone(), ep, e);
-                    let (cells, nx) = blockcache::read::<D, _>(&self.inner, e.page, move |b| {
-                        (chunk_cells(b, e.off as usize), chunk_next(b))
-                    })
-                    .await?;
-                    rb.defuse();
-                    let mut inner = self.inner.borrow_mut();
-                    inner.core.splice(ep, e, cells, nx);
-                }
-            }
-        }
-    }
-
-    /// A draft's death: back into its own pool's head, no gate.
-    pub async fn dealloc_draft_page(&self, k: DraftId) -> Result<(), StoreError> {
-        let ok = {
-            let mut inner = self.inner.borrow_mut();
-            if inner.poisoned {
-                return Err(StoreError::Poisoned);
-            }
-            inner.core.dealloc_step(k)
-        };
-        if ok {
-            Ok(())
-        } else {
-            Err(StoreError::UnknownDraft)
-        }
-    }
-
-    /// A draft's locus: its page — a draft is a key, the page it names
-    /// is the store's own bookkeeping. The caller needs the id to
-    /// build its own references (a chain head in a record's bytes).
-    pub async fn draft_page(&self, k: &DraftId) -> Result<PageId, StoreError> {
-        let (p, _) = {
-            let inner = self.inner.borrow();
-            if inner.poisoned {
-                return Err(StoreError::Poisoned);
-            }
-            inner.core.draft(k).ok_or(StoreError::UnknownDraft)?
-        };
-        Ok(p)
-    }
-
-    /// A write into a draft: the closure gets the page's bytes in the
-    /// arena and shapes them as the owner's format pleases — the store
-    /// writes nothing itself. A fresh page is not read from disk (the
-    /// write lands over the slot's garbage).
-    pub async fn write_draft_page<R>(
-        &self,
-        k: DraftId,
-        f: impl Fn(&mut AlignedPage) -> R + 'static,
-    ) -> Result<R, StoreError>
-    where
-        R: 'static,
-    {
-        let (p, fresh) = {
-            let inner = self.inner.borrow();
-            if inner.poisoned {
-                return Err(StoreError::Poisoned);
-            }
-            inner.core.draft(&k).ok_or(StoreError::UnknownDraft)?
-        };
-        let r = if fresh {
-            blockcache::init::<D, _>(&self.inner, p, f).await?
-        } else {
-            blockcache::update::<D, _>(&self.inner, p, f).await?
-        };
-        if fresh {
-            let mut inner = self.inner.borrow_mut();
-            inner.core.defresh(&k);
-        }
-        Ok(r)
-    }
-
-    /// Overwrite a draft over the slot's current contents, no read.
-    pub async fn overwrite_draft_page<R>(
-        &self,
-        k: DraftId,
-        f: impl Fn(&mut AlignedPage) -> R + 'static,
-    ) -> Result<R, StoreError>
-    where
-        R: 'static,
-    {
-        let p = {
-            let inner = self.inner.borrow();
-            if inner.poisoned {
-                return Err(StoreError::Poisoned);
-            }
-            inner.core.draft(&k).ok_or(StoreError::UnknownDraft)?.0
-        };
-        blockcache::init::<D, _>(&self.inner, p, f).await
-    }
-
-    /// A page's bytes by reference — the read half of the drafts'
-    /// write half: the closure runs against the page in the arena, the
-    /// bytes never leave it. The caller reads only pages it owns (the
-    /// ones its own records and schemas brought into the world); the
-    /// store does not police the id.
-    pub async fn read_page<R>(
-        &self,
-        p: PageId,
-        f: impl Fn(&AlignedPage) -> R + 'static,
-    ) -> Result<R, StoreError>
-    where
-        R: 'static,
-    {
-        let poisoned = { self.inner.borrow().poisoned };
-        if poisoned {
-            return Err(StoreError::Poisoned);
-        }
-        blockcache::read::<D, _>(&self.inner, p, f).await
     }
 }

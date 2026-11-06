@@ -17,30 +17,32 @@ fn core() -> Core<MemDisk> {
     )
 }
 
-/// One record's seal — the tests' shorthand over [`Core::seal_batch`].
+/// One record's seal — the tests' shorthand over [`Core::seal`].
 fn seal(
     c: &mut Core<MemDisk>,
     t: usize,
     k: &[u8],
     mt: &[u8],
-    consumed: &[DraftId],
+    consumed: &[PageId],
     freed: &[PageId],
 ) -> Result<(), StoreError> {
-    c.seal_batch(
-        t,
-        &[SealRec {
-            k: k.to_vec(),
-            put: Some(mt.to_vec()),
-            consumed: consumed.to_vec(),
+    c.seal(
+        &[SealBatch {
+            t,
+            recs: vec![SealRec {
+                k: k.to_vec(),
+                put: Some(mt.to_vec()),
+                consumed: consumed.to_vec(),
+            }],
         }],
         freed,
     )
 }
 
 /// A fresh pool serves at once (the head, then the counter).
-fn draft(c: &mut Core<MemDisk>) -> DraftId {
+fn draft(c: &mut Core<MemDisk>) -> PageId {
     match c.alloc_step() {
-        Ok(AllocAct::Got(k)) => k,
+        Ok(AllocAct::Got(p)) => p,
         _ => panic!("a fresh pool serves at once"),
     }
 }
@@ -94,7 +96,7 @@ fn a_bad_seal_refuses_whole() {
     // nothing was registered by any refusal
     let ram = c.ram();
     assert_eq!((ram.dying, ram.delta, ram.drafts.len()), (0, 0, 3));
-    assert_eq!(c.draft(&a), Some((2, true)));
+    assert!(c.drafts.has(a));
     // a published page freed (the legit flow), then — a dying page, a
     // pooled page — refused alike
     let j = draft(&mut c); // page 8
@@ -108,31 +110,31 @@ fn a_bad_seal_refuses_whole() {
         why(seal(&mut c, 0, b"k3", b"", &[e], &[8])),
         "a freed page already dying"
     );
-    c.dealloc_step(b); // page 4 back into its pool's head
+    c.dealloc(b); // page 4 back into its pool's head
     assert_eq!(
         why(seal(&mut c, 0, b"k4", b"", &[sp], &[4])),
         "a freed page back in a pool"
     );
     // a vanished draft — refused, and the good seal still goes through
     let v = draft(&mut c);
-    c.dealloc_step(v);
+    c.dealloc(v);
     assert_eq!(
         seal(&mut c, 0, b"v", b"", &[v], &[]),
         Err(StoreError::ConsumedVanished)
     );
     assert!(seal(&mut c, 0, b"k", b"m", &[a], &[]).is_ok());
-    assert!(c.draft(&a).is_none()); // consumed — gone from the arena
+    assert!(!c.drafts.has(a)); // consumed — gone from the arena
 }
 
-/// A draft dies once: an unknown key and a second death are honest
-/// refusals (a double retire would list the page in a pool twice).
+/// A draft dies once: a second death is an honest refusal (a double
+/// retire would list the page in a pool twice).
 #[test]
 fn a_draft_dies_once() {
     let mut c = core();
     let k = draft(&mut c);
-    assert!(c.dealloc_step(k));
-    assert!(!c.dealloc_step(k));
-    assert!(!c.dealloc_step(DraftId::phantom(99)));
+    assert!(c.dealloc(k));
+    assert!(!c.dealloc(k));
+    assert!(!c.dealloc(999));
 }
 
 /// A seal over a taken pool is a bug caught loud (the round owns the
@@ -141,8 +143,8 @@ fn a_draft_dies_once() {
 #[should_panic(expected = "a seal over a taken pool")]
 fn a_second_seal_is_caught() {
     let mut c = core();
-    let _ = c.seal();
-    let _ = c.seal();
+    let _ = c.seal_round();
+    let _ = c.seal_round();
 }
 
 /// A failed round's rollback restores the seal-time world whole — the
@@ -153,7 +155,7 @@ fn unseal_restores_the_world() {
     let a = draft(&mut c);
     assert!(seal(&mut c, 0, b"k", b"m", &[a], &[3]).is_ok()); // an in-range page dies
     let before = c.ram();
-    let s = c.seal();
+    let s = c.seal_round();
     assert!(c.round_live());
     c.unseal(s.ahead, s.atail, s.anext, s.spent, s.dying);
     assert!(!c.round_live());

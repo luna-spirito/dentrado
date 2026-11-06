@@ -24,9 +24,10 @@ fn image_entry_offset() {
             .await
             .unwrap();
         assert_eq!(st.debug_state().free_nexts, [14, 15], "мир читан из SB");
+        let mut s = st.session();
         let mut ks = Vec::new();
         for _ in 0..3 {
-            ks.push(st.alloc_draft_page().await.unwrap());
+            ks.push(s.alloc().await.unwrap());
         }
         assert_eq!(
             st.debug_state().free_nexts,
@@ -34,8 +35,9 @@ fn image_entry_offset() {
             "три страницы — из цепочки, не ростом мира"
         );
         for k in ks {
-            st.dealloc_draft_page(k).await.unwrap();
+            s.discard(k).unwrap();
         }
+        drop(s);
         let mut head = st.debug_state().heads[0].clone();
         head.sort_unstable();
         assert_eq!(head, vec![8, 10, 12], "мёртвые слоты пропущены");
@@ -73,7 +75,7 @@ fn random_ops_smoke() {
                     let payload: Vec<u8> = (0..len as u32)
                         .map(|i| key.wrapping_add(ver).wrapping_add(i as u8))
                         .collect();
-                    st.put_many(b"t0", &[put(&[key], &payload)]).await.unwrap();
+                    put(&st, b"t0", &[key], &payload).unwrap();
                     shadow.insert(key, payload);
                 }
                 12..=16 => {
@@ -82,7 +84,7 @@ fn random_ops_smoke() {
                     assert_eq!(got, want, "op {op}, ключ {key}");
                 }
                 17..=18 => {
-                    st.put_many(b"t0", &[del(&[key])]).await.unwrap();
+                    del(&st, b"t0", &[key]).unwrap();
                     shadow.remove(&key);
                 }
                 _ => {
@@ -129,7 +131,7 @@ fn tiny_pool_stress() {
             .await
             .unwrap();
         for r in 0..40u8 {
-            st.put_many(b"t0", &[put(&[r], &[r; 100])]).await.unwrap();
+            put(&st, b"t0", &[r], &[r; 100]).unwrap();
         }
         st.flush().await.unwrap();
         assert!(st.ok_store().await);
@@ -159,28 +161,24 @@ fn tree_holds_many_keys() {
             .unwrap();
         // круг 1 — нечётные 1..599: сплошная укладка полного дерева
         for r in 0..300u16 {
-            st.put_many(b"t0", &[put(&odd(1, 2 * r + 1), b"")])
-                .await
-                .unwrap();
+            put(&st, b"t0", &odd(1, 2 * r + 1), b"").unwrap();
         }
         st.flush().await.unwrap();
         // круг 2 — чётные 0..598: прививка в середину полных листьев
         for r in 0..300u16 {
-            st.put_many(b"t0", &[put(&odd(1, 2 * r), b"")])
-                .await
-                .unwrap();
+            put(&st, b"t0", &odd(1, 2 * r), b"").unwrap();
         }
         st.flush().await.unwrap();
         // круг 3 — ниже наименьшего: прививка под левый край
         for r in 0..50u16 {
-            st.put_many(b"t0", &[put(&odd(0, r), b"")]).await.unwrap();
+            put(&st, b"t0", &odd(0, r), b"").unwrap();
         }
         st.flush().await.unwrap();
         // круг 4 — жирные записи поверх правого края: 500 байт инлайн,
         // раскол корня
         let fat = vec![7u8; 500];
         for r in 0..800u16 {
-            st.put_many(b"t0", &[put(&odd(2, r), &fat)]).await.unwrap();
+            put(&st, b"t0", &odd(2, r), &fat).unwrap();
         }
         st.flush().await.unwrap();
         drop(st);

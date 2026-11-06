@@ -11,15 +11,15 @@ use std::rc::Rc;
 use std::task::Poll;
 
 use common::{expect_turns, race_turns};
-use dentrado_cache::{Fault, MemDisk, Rec, Storage, StoreError};
-use util::{PAYLOAD, chain_specs, put, put_big, run, specs};
+use dentrado_cache::{Fault, MemDisk, Storage, StoreError};
+use util::{PAYLOAD, chain_specs, put, put_big, put_free, run, specs};
 
 const KEY: &[u8] = b"k";
 const KEY2: &[u8] = b"j";
 
 /// Публикация значения из трёх байт.
-async fn put_v(st: &Storage<MemDisk>, key: &[u8], val: u8) {
-    st.put_many(b"t0", &[put(key, &[val; 3])]).await.unwrap();
+fn put_v(st: &Storage<MemDisk>, key: &[u8], val: u8) {
+    put(st, b"t0", key, &[val; 3]).unwrap();
 }
 
 /// Прочитать первый байт значения (со сверкой по теневой версии).
@@ -33,10 +33,11 @@ async fn chain_pages(st: &Storage<MemDisk>, key: &[u8]) -> Vec<dentrado_cache::P
     let mt = st.get(b"t0", key).await.unwrap().expect("ключ есть");
     let mut head = u64::from_le_bytes(mt[..8].try_into().unwrap());
     let mut ps = Vec::new();
+    let s = st.session();
     while head != 0 {
         ps.push(head);
-        head = st
-            .read_page(head, |pg| u64::from_le_bytes(pg.0[..8].try_into().unwrap()))
+        head = s
+            .read(head, |pg| u64::from_le_bytes(pg.0[..8].try_into().unwrap()))
             .await
             .unwrap();
     }
@@ -52,7 +53,7 @@ fn harness_sanity() {
         let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
             .await
             .unwrap();
-        expect_turns(put_v(&st, KEY, 1), 256, "put_v").await;
+        put_v(&st, KEY, 1);
         expect_turns(st.flush(), 512, "flush").await.unwrap();
         st.partition_exact().await.expect("биекция после круга");
         drop(st);
@@ -77,7 +78,7 @@ fn flush_cancel_recovers() {
             let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
                 .await
                 .unwrap();
-            put_v(&st, KEY, 1).await;
+            put_v(&st, KEY, 1);
             let _ = race_turns(st.flush(), k).await; // отмена в точке №k
             expect_turns(st.flush(), 512, &format!("flush после отмены на {k}"))
                 .await
@@ -109,17 +110,7 @@ fn alloc_cancel_recovers() {
         st.flush().await.unwrap();
         // замена на инлайн: 1100 страниц цепи — во free
         let pages = chain_pages(&st, key).await;
-        st.put_many(
-            b"t0",
-            &[Rec::Put {
-                key,
-                val: &[9; 3],
-                take: &[],
-                free: &pages,
-            }],
-        )
-        .await
-        .unwrap();
+        put_free(&st, b"t0", key, &[9; 3], &pages).unwrap();
         st.flush().await.unwrap();
         drop(st);
         // рестарт с кэшем в одну страницу: проход загрузки вымывает чанк
@@ -128,20 +119,17 @@ fn alloc_cancel_recovers() {
         let st = Storage::open(&disk, "db", 1, &chain_specs(&[b"t0"]))
             .await
             .unwrap();
+        let mut s = st.session();
         disk.file("db").set_fault(Fault::At(1));
-        let e = st.alloc_draft_page().await;
+        let e = s.alloc().await;
         disk.file("db").set_fault(Fault::None);
         assert!(
             matches!(e, Err(StoreError::Io(_))),
             "хвостовое чтение обязано было пасть: {e:?}"
         );
-        expect_turns(
-            st.alloc_draft_page(),
-            512,
-            "аллок после провала чтения хвоста",
-        )
-        .await
-        .unwrap();
+        expect_turns(s.alloc(), 512, "аллок после провала чтения хвоста")
+            .await
+            .unwrap();
         st.partition_exact().await.expect("биекция");
     });
 }
@@ -165,17 +153,7 @@ fn alloc_reader_cancel_recovers() {
         st.flush().await.unwrap();
         // замена на инлайн: цепь умирает списком звонящего
         let pages = chain_pages(&st, key).await;
-        st.put_many(
-            b"t0",
-            &[Rec::Put {
-                key,
-                val: &[9; 3],
-                take: &[],
-                free: &pages,
-            }],
-        )
-        .await
-        .unwrap();
+        put_free(&st, b"t0", key, &[9; 3], &pages).unwrap();
         st.flush().await.unwrap();
         drop(st);
         // рестарт с кэшем в одну страницу: головы пусты, хвост чётного
@@ -184,8 +162,9 @@ fn alloc_reader_cancel_recovers() {
         let st = Storage::open(&disk, "db", 1, &chain_specs(&[b"t0"]))
             .await
             .unwrap();
-        assert!(race_turns(st.alloc_draft_page(), 0).await.is_none());
-        expect_turns(st.alloc_draft_page(), 512, "аллок после отмены читателя")
+        let mut s = st.session();
+        assert!(race_turns(s.alloc(), 0).await.is_none());
+        expect_turns(s.alloc(), 512, "аллок после отмены читателя")
             .await
             .unwrap();
         st.partition_exact().await.expect("биекция");
@@ -203,7 +182,7 @@ fn flush_waiter_cancel_recovers() {
         let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
             .await
             .unwrap();
-        put_v(&st, KEY, 1).await;
+        put_v(&st, KEY, 1);
         // ждун №1 — живой пиннед фьючерс: один опрос кладёт письмо и
         // паркует на ответе; круг крутится в агенте
         let mut w = std::pin::pin!(st.flush());
@@ -237,7 +216,7 @@ fn get_cancel_is_harmless() {
         let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
             .await
             .unwrap();
-        put_v(&st, KEY, 1).await;
+        put_v(&st, KEY, 1);
         st.flush().await.unwrap();
         for j in 0..16u32 {
             let _ = race_turns(st.get(b"t0", KEY), j).await;
@@ -268,15 +247,15 @@ fn transient_flush_failure_keeps_partition() {
             let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
                 .await
                 .unwrap();
-            put_v(&st, KEY, 1).await;
+            put_v(&st, KEY, 1);
             st.flush().await.unwrap();
-            st.put_many(b"t0", &[put(KEY, &[2u8; 3])]).await.unwrap();
+            put(&st, b"t0", KEY, &[2u8; 3]).unwrap();
             disk.file("db").set_fault(Fault::Once(f));
             let _ = st.flush().await; // transient отказ пережит
             disk.file("db").set_fault(Fault::None);
             // стор обязан продолжать работать (как того требует сценарий
             // concurrent_workers) и закоммитить честный мир
-            put_v(&st, KEY2, 3).await;
+            put_v(&st, KEY2, 3);
             st.flush().await.unwrap();
             st.partition_exact()
                 .await
@@ -307,7 +286,7 @@ fn read_error_does_not_wipe_image() {
         let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
             .await
             .unwrap();
-        put_v(&st, KEY, 1).await;
+        put_v(&st, KEY, 1);
         st.flush().await.unwrap();
         drop(st);
         disk.file("db").set_fault(Fault::At(1)); // «transient EIO на чтениях»
@@ -328,9 +307,9 @@ fn torn_write_recovery_is_binary() {
             let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
                 .await
                 .unwrap();
-            put_v(&st, KEY, 1).await;
+            put_v(&st, KEY, 1);
             st.flush().await.unwrap();
-            st.put_many(b"t0", &[put(KEY, &[2u8; 3])]).await.unwrap();
+            put(&st, b"t0", KEY, &[2u8; 3]).unwrap();
             disk.file("db").set_fault(Fault::Torn(f));
             let _ = st.flush().await; // запись в полёте порвана, далее — смерть
             drop(st); // краш
@@ -370,14 +349,15 @@ async fn worker(st: Rc<Storage<MemDisk>>, kb: u8, mut seed: u64, rounds: u8) -> 
             0..=1 => {
                 let v = ver.wrapping_add(1);
                 let cell = vec![kb, v];
-                st.put_many(b"t0", &[put(&key, &cell)]).await.unwrap();
+                put(&st, b"t0", &key, &cell).unwrap();
                 ver = v;
             }
             2 => {
                 // черновик в никуда: страница домой, посреди круга в том числе
-                let k = st.alloc_draft_page().await.unwrap();
-                st.write_draft_page(k, |pg| pg.0[0] = 0).await.unwrap();
-                st.dealloc_draft_page(k).await.unwrap();
+                let mut s = st.session();
+                let k = s.alloc().await.unwrap();
+                s.write(k, |pg| pg.0[0] = 0).await.unwrap();
+                s.discard(k).unwrap();
             }
             _ => {
                 if let Some(b) = st.get(b"t0", &key).await.unwrap() {

@@ -112,7 +112,7 @@ async fn round<D: IsFilesystem>(inner: &Rc<RefCell<PersistentCore<D>>>) -> Resul
     // empty until the commit.
     let mut fl = {
         let mut in_ = inner.borrow_mut();
-        let s = in_.core.seal();
+        let s = in_.core.seal_round();
         let home = Home {
             head: s.ahead.clone(),
             tail: s.atail,

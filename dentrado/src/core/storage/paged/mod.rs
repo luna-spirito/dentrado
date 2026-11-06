@@ -58,7 +58,7 @@ use std::{
     path::PathBuf,
 };
 
-use dentrado_cache::{PageId, Rec};
+use dentrado_cache::PageId;
 
 use crate::{
     core::{
@@ -312,11 +312,11 @@ where
                     };
                     if let Some(store) = self.ensure().await {
                         let table = disk::cache_table();
-                        let batch = [Rec::Del {
-                            key: &key,
-                            free: &old,
-                        }];
-                        let del = store.put_many(&table, &batch);
+                        let del = async {
+                            let mut s = store.session();
+                            s.del(&table, &key, &old)?;
+                            s.commit()
+                        };
                         if self.boundary(file, del).await.is_some() {
                             self.dirty.set(true);
                         }

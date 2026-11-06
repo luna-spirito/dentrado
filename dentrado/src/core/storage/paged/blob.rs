@@ -8,7 +8,7 @@
 //! walks (`drop_table`, the partition audit) run on.
 
 use dentrado_cache::{
-    Dep, IsFilesystem, PageId, PageSchema, Rec, Storage, StoreError, TableSchema, TableSpec,
+    Dep, IsFilesystem, PageId, PageSchema, Storage, StoreError, TableSchema, TableSpec,
     page::PAGE_SIZE,
 };
 
@@ -85,14 +85,15 @@ pub(super) async fn read_image<D: IsFilesystem>(
             let mut pages = Vec::new();
             let mut left = len;
             let mut p = head;
+            let s = store.session();
             while left > 0 {
                 if p == 0 {
                     return Err(StoreError::CorruptValue("gear-cache chain runs short"));
                 }
                 let take = left.min(CHUNK_PAYLOAD as u64) as usize;
                 pages.push(p);
-                let (next, chunk) = store
-                    .read_page(p, move |pg| {
+                let (next, chunk) = s
+                    .read(p, move |pg| {
                         (
                             u64::from_le_bytes(pg.0[..8].try_into().expect("a page is 4096")),
                             pg.0[8..8 + take].to_vec(),
@@ -123,55 +124,37 @@ pub(super) async fn put_image<D: IsFilesystem>(
     image: &[u8],
     free: &[PageId],
 ) -> Result<Vec<PageId>, StoreError> {
+    let mut s = store.session();
     if image.len() <= INLINE_MAX {
         let mt = postcard::to_stdvec(&ImgRef::Inline(image.to_vec())).expect("a vec serializes");
-        store
-            .put_many(
-                table,
-                &[Rec::Put {
-                    key,
-                    val: &mt,
-                    take: &[],
-                    free,
-                }],
-            )
-            .await?;
+        s.put(table, key, &mt, &[], free)?;
+        s.commit()?;
         return Ok(Vec::new());
     }
     let n = image.len().div_ceil(CHUNK_PAYLOAD);
     let mut ks = Vec::new();
     let mut pages: Vec<PageId> = Vec::new();
     for _ in 0..n {
-        let k = store.alloc_draft_page().await?;
-        pages.push(store.draft_page(&k).await?);
+        let k = s.alloc().await?;
+        pages.push(s.page(k)?);
         ks.push(k);
     }
     for (i, &k) in ks.iter().enumerate() {
         let next = if i + 1 < n { pages[i + 1] } else { 0 };
         let lo = i * CHUNK_PAYLOAD;
         let chunk = image[lo..(lo + CHUNK_PAYLOAD).min(image.len())].to_vec();
-        store
-            .write_draft_page(k, move |pg| {
-                pg.0[..8].copy_from_slice(&next.to_le_bytes());
-                pg.0[8..8 + chunk.len()].copy_from_slice(&chunk);
-            })
-            .await?;
+        s.write(k, move |pg| {
+            pg.0[..8].copy_from_slice(&next.to_le_bytes());
+            pg.0[8..8 + chunk.len()].copy_from_slice(&chunk);
+        })
+        .await?;
     }
     let mt = postcard::to_stdvec(&ImgRef::Chain {
         head: pages[0],
         len: image.len() as u64,
     })
     .expect("a pair serializes");
-    store
-        .put_many(
-            table,
-            &[Rec::Put {
-                key,
-                val: &mt,
-                take: &ks,
-                free,
-            }],
-        )
-        .await?;
+    s.put(table, key, &mt, &ks, free)?;
+    s.commit()?;
     Ok(pages)
 }

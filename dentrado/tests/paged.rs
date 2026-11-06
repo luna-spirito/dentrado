@@ -224,7 +224,7 @@ fn paged_storage_gcs_old_versions() {
         .build()
         .unwrap()
         .block_on(async {
-            use dentrado_cache::{Rec, Storage, TableSpec, disk::FsDisk};
+            use dentrado_cache::{Storage, TableSpec, disk::FsDisk};
 
             let dir = tempfile::tempdir().unwrap();
             let file = dir.path().join("core-0.dstore");
@@ -236,17 +236,9 @@ fn paged_storage_gcs_old_versions() {
                 let old = Storage::open(&FsDisk, &path, 4, &[TableSpec::flat(old_id.clone())])
                     .await
                     .unwrap();
-                old.put_many(
-                    &old_id,
-                    &[Rec::Put {
-                        key: b"gear",
-                        val: b"ancient",
-                        take: &[],
-                        free: &[],
-                    }],
-                )
-                .await
-                .unwrap();
+                let mut s = old.session();
+                s.put(&old_id, b"gear", b"ancient", &[], &[]).unwrap();
+                s.commit().unwrap();
                 old.flush().await.unwrap();
             }
             // Opening through PagedStorage drops the orphan…
