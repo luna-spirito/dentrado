@@ -7,13 +7,13 @@ use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 
 use super::PersistentCore;
-use super::walks::{walk_chain_raw, walk_deps, walk_parts, walk_tree, walk_value};
+use super::walks::{walk_chain_raw, walk_deps, walk_parts, walk_tree};
 use crate::blockcache;
 use crate::core::sb::{MAX_TABLE_ID, MAX_TABLES, Sb, parse_sb};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{PageId, fnv_id};
-use crate::schema::TableSpec;
+use crate::schema::{NO_DEPS, TableSpec};
 use crate::storage::{Storage, Violation};
 
 impl<D: IsFilesystem> Storage<D> {
@@ -81,13 +81,13 @@ impl<D: IsFilesystem> Storage<D> {
         self.inner.borrow().core.table_names()
     }
 
-    /// Drop a table: its tree, its records' full closures (value
-    /// chains and schema-named pages alike, tree half and delta half)
-    /// die (EBR shepherds them past live readers), the id leaves the
-    /// set (tombstoned in place — see [`Tables`]). Only at rest: a
-    /// live flush round is already rebuilding this very tree, and its
-    /// commit would resurrect it — `PoolTaken` refuses, the caller
-    /// drops after the round.
+    /// Drop a table: its tree and its records' full closures (the
+    /// pages their schemas name — the tree half and the delta half
+    /// alike) die (EBR shepherds them past live readers), the id
+    /// leaves the set (tombstoned in place — see [`Tables`]). Only at
+    /// rest: a live flush round is already rebuilding this very tree,
+    /// and its commit would resurrect it — `PoolTaken` refuses, the
+    /// caller drops after the round.
     pub async fn drop_table(&self, table: &[u8]) -> Result<(), StoreError> {
         let (t, schema, root, bound) = {
             let inner = self.inner.borrow_mut();
@@ -105,23 +105,18 @@ impl<D: IsFilesystem> Storage<D> {
         };
         // A set, not a bag: two records may name one page (a shared
         // subtree) — a page dies once, or the world splits its roles.
-        let mut pages: HashSet<PageId> = {
-            let inner = self.inner.borrow();
-            inner.core.table_delta_pages(t)
-        }
-        .into_iter()
-        .collect();
+        let mut pages: HashSet<PageId> = HashSet::new();
         let (es, tree) = walk_tree::<D>(&self.inner, root, bound).await?;
         pages.extend(tree);
-        for (_, mt, vr) in es {
-            pages.extend(walk_deps::<D>(&self.inner, schema, &mt, vr, bound).await?);
+        for (_, mt) in es {
+            pages.extend(walk_deps::<D>(&self.inner, schema, &mt, bound).await?);
         }
         // The delta half: its records' inline bytes name pages too.
         for mt in {
             let inner = self.inner.borrow();
             inner.core.table_delta_inline(t)
         } {
-            pages.extend(walk_deps::<D>(&self.inner, schema, &mt, 0, bound).await?);
+            pages.extend(walk_deps::<D>(&self.inner, schema, &mt, bound).await?);
         }
         let mut inner = self.inner.borrow_mut();
         if inner.poisoned {
@@ -183,9 +178,9 @@ impl<D: IsFilesystem> Storage<D> {
     }
 
     /// The page partition at rest: every page below the newest image's
-    /// counters is the root's, a chain cell, or held in RAM (the heads,
-    /// the drafts, the undrained deaths). The SB slots (pages 0 and 1)
-    /// sit outside — permanently occupied.
+    /// counters is the root's, a record's named page, a chain cell, or
+    /// held in RAM (the heads, the drafts, the undrained deaths). The
+    /// SB slots (pages 0 and 1) sit outside — permanently occupied.
     pub async fn partition_ok(&self) -> bool {
         let Ok((_, sa)) = sb_slot::<D>(&self.inner, 0).await else {
             return false;
@@ -253,20 +248,21 @@ impl<D: IsFilesystem> Storage<D> {
 
     /// The page partition, exact: every page below the newest image's
     /// counters carries a legal combination of roles and only legal
-    /// ones. The roles: the tables' `tree` pages and the `value` chains'
-    /// pages; the chains' `chunk` containers and their `cell`s — a
+    /// ones. The roles: the tables' `tree` pages and the `value` pages
+    /// their records' schemas name (tree half and delta half alike);
+    /// the pools' chains — a `chunk` container and its `cell`s — a
     /// `front` cell above the pool's live bookmark (RAM-side: the head
     /// materializes it, or it is the limbo — a live draft, an undrained
     /// death, a retired tree) and a `free` cell at-and-below it
     /// (write-once, only ever eaten); the RAM `head`s, `draft`s, `held`
-    /// deaths, task-eaten containers in `spent` (still links until the
-    /// next round lists them) and the deltas' uncommitted pages. The
-    /// design's pairings: a tree page and a free cell stand strictly
-    /// alone; a value at most once, possibly still held by a pending
-    /// death; a chunk alone or riding `spent`; a front cell at most
-    /// once, with at most one RAM role beside it. Every other
-    /// combination — and a duplicate listing above all — is the
-    /// double-issue family: the same page listed twice serves twice.
+    /// deaths, and task-eaten containers in `spent` (still links until
+    /// the next round lists them). The design's pairings: a tree page
+    /// and a free cell stand strictly alone; a value at most once,
+    /// possibly still held by a pending death; a chunk alone or riding
+    /// `spent`; a front cell at most once, with at most one RAM role
+    /// beside it. Every other combination — and a duplicate listing
+    /// above all — is the double-issue family: the same page listed
+    /// twice serves twice.
     pub async fn partition_exact(&self) -> Result<(), Vec<Violation>> {
         let (sa, sb1) = match (
             sb_slot::<D>(&self.inner, 0).await,
@@ -290,16 +286,49 @@ impl<D: IsFilesystem> Storage<D> {
         fn add(roles: &mut BTreeMap<PageId, Vec<&'static str>>, p: PageId, r: &'static str) {
             roles.entry(p).or_default().push(r);
         }
-        match self.disk_ref(&sb).await {
-            Some((tree, vals)) => {
-                for &p in &tree {
-                    add(&mut roles, p, "tree");
+        // The tables' half, live slots (schemas live in the registry;
+        // at rest the roots are the image's): tree pages, and the
+        // records' schema-named closures — the tree's own records and
+        // the delta's alike.
+        let slots = self.inner.borrow().core.roots_len();
+        for t in 0..slots {
+            let (schema, root, mts) = {
+                let inner = self.inner.borrow();
+                if inner.core.table_name(t).is_empty() {
+                    continue;
                 }
-                for &p in &vals {
-                    add(&mut roles, p, "value");
+                (
+                    inner.core.table_schema(t),
+                    inner.core.table_root(t),
+                    inner.core.table_delta_inline(t),
+                )
+            };
+            let (es, tree) = match walk_tree::<D>(&self.inner, root, fuel).await {
+                Ok(x) => x,
+                Err(_) => {
+                    bad.push(Violation::Broken("a table tree broke past a valid SB"));
+                    continue;
+                }
+            };
+            for &p in &tree {
+                add(&mut roles, p, "tree");
+            }
+            let recs = es
+                .iter()
+                .map(|(_, mt)| mt.as_slice())
+                .chain(mts.iter().map(|m| m.as_slice()));
+            for mt in recs {
+                match walk_deps::<D>(&self.inner, schema, mt, fuel).await {
+                    Ok(ps) => {
+                        for p in ps {
+                            add(&mut roles, p, "value");
+                        }
+                    }
+                    Err(_) => {
+                        bad.push(Violation::Broken("a dependency walk broke past a valid SB"))
+                    }
                 }
             }
-            None => bad.push(Violation::Broken("a value chain broke past a valid SB")),
         }
         let ram = self.inner.borrow().core.ram();
         for (p, e) in [(0usize, sb.e0), (1usize, sb.e1)] {
@@ -344,9 +373,6 @@ impl<D: IsFilesystem> Storage<D> {
         for &x in &ram.spent {
             add(&mut roles, x, "spent");
         }
-        for &x in &ram.delta_pages {
-            add(&mut roles, x, "delta");
-        }
         for (&p, rs) in &roles {
             if !legal_roles(rs) {
                 bad.push(Violation::Roles(p, rs.clone()));
@@ -368,18 +394,32 @@ impl<D: IsFilesystem> Storage<D> {
         if bad.is_empty() { Ok(()) } else { Err(bad) }
     }
 
-    /// The image's closure: every table's tree pages + all the value
-    /// chains (through the pool).
+    /// The image's closure: every table's tree pages and the pages its
+    /// records' schemas name (the delta half included — a record may
+    /// still sit there), through the pool.
     async fn disk_ref(&self, sb: &Sb) -> Option<(Vec<PageId>, Vec<PageId>)> {
         let fuel = sb.next0.max(sb.next1) + 1;
         let mut tree = Vec::new();
         let mut vals = Vec::new();
-        for &(_, r) in &sb.tables {
-            let (es, ps) = walk_tree::<D>(&self.inner, r, fuel).await.ok()?;
+        for (id, r) in &sb.tables {
+            let (schema, t) = {
+                let inner = self.inner.borrow();
+                let t = inner.core.table_index(id);
+                let schema = t.map(|t| inner.core.table_schema(t)).unwrap_or(NO_DEPS);
+                (schema, t)
+            };
+            let (es, ps) = walk_tree::<D>(&self.inner, *r, fuel).await.ok()?;
             tree.extend(ps);
-            for (_, _, vr) in es {
-                if vr != 0 {
-                    vals.extend(walk_value::<D>(&self.inner, vr, fuel).await.ok()?);
+            for (_, mt) in es {
+                vals.extend(walk_deps::<D>(&self.inner, schema, &mt, fuel).await.ok()?);
+            }
+            if let Some(t) = t {
+                let mts = {
+                    let inner = self.inner.borrow();
+                    inner.core.table_delta_inline(t)
+                };
+                for mt in mts {
+                    vals.extend(walk_deps::<D>(&self.inner, schema, &mt, fuel).await.ok()?);
                 }
             }
         }

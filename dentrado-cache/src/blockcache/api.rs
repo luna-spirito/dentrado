@@ -8,7 +8,7 @@ use futures::channel::oneshot;
 use super::seq::Submit;
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
-use crate::page::{Page, PageId};
+use crate::page::{AlignedPage, PageId};
 use crate::persist::PersistentCore;
 
 /// A wish's one ladder: the answer on the spot, or the queue's by the
@@ -26,7 +26,7 @@ async fn finish<R>(s: Submit<R>) -> Result<R, StoreError> {
 pub(crate) async fn read<D: IsFilesystem, R>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     id: PageId,
-    f: impl Fn(&Page) -> R + 'static,
+    f: impl Fn(&AlignedPage) -> R + 'static,
 ) -> Result<R, StoreError>
 where
     R: 'static,
@@ -45,7 +45,7 @@ where
 pub(crate) async fn update<D: IsFilesystem, R>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     id: PageId,
-    f: impl Fn(&mut Page) -> R + 'static,
+    f: impl Fn(&mut AlignedPage) -> R + 'static,
 ) -> Result<R, StoreError>
 where
     R: 'static,
@@ -62,7 +62,7 @@ where
 pub(crate) async fn init<D: IsFilesystem, R>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     id: PageId,
-    f: impl Fn(&mut Page) -> R + 'static,
+    f: impl Fn(&mut AlignedPage) -> R + 'static,
 ) -> Result<R, StoreError>
 where
     R: 'static,

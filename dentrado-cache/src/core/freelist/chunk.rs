@@ -8,7 +8,7 @@
 
 use std::mem::size_of;
 
-use crate::page::{Cur, PAGE_SIZE, Page, PageId};
+use crate::page::{AlignedPage, Cur, PAGE_SIZE, PageId};
 
 /// The chunk page's header: the next page.
 const HDR: usize = 8;
@@ -52,7 +52,7 @@ impl ChainEntry {
 }
 
 /// Write a chunk page in place.
-pub fn write_chunk(p: &mut Page, nx: PageId, cells: &[PageId]) {
+pub fn write_chunk(p: &mut AlignedPage, nx: PageId, cells: &[PageId]) {
     let mut c = Cur::at(p);
     c.u64(nx);
     for k in 0..CHUNK_SLOTS {
@@ -62,7 +62,7 @@ pub fn write_chunk(p: &mut Page, nx: PageId, cells: &[PageId]) {
 }
 
 /// The live cells of a chunk page from an offset.
-pub fn chunk_cells(b: &Page, off: usize) -> Vec<PageId> {
+pub fn chunk_cells(b: &AlignedPage, off: usize) -> Vec<PageId> {
     (off.min(CHUNK_SLOTS)..CHUNK_SLOTS)
         .map(|i| b.u64_at(HDR + 8 * i))
         .filter(|&x| x > 0)
@@ -70,6 +70,6 @@ pub fn chunk_cells(b: &Page, off: usize) -> Vec<PageId> {
 }
 
 /// The next page of a chain chunk.
-pub fn chunk_next(b: &Page) -> PageId {
+pub fn chunk_next(b: &AlignedPage) -> PageId {
     b.u64_at(0)
 }

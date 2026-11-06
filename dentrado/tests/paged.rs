@@ -1,6 +1,7 @@
-//! `PagedStorage` round-trip: gear-cache images survive flush + reopen as
-//! value chains, are fetched back on demand, overwrites free their
-//! predecessors, and a cache that stops persisting erases its record.
+//! `PagedStorage` round-trip: gear-cache images survive flush + reopen
+//! (small ones as their records, big ones as page chains), are fetched
+//! back on demand, overwrites vouch their predecessors' pages free,
+//! and a cache that stops persisting erases its record.
 
 use std::fmt::Debug;
 
@@ -94,7 +95,8 @@ async fn roundtrip(file: &std::path::Path) {
     // Absent before the first write.
     assert!(st.get_cache(&gear).await.is_none());
 
-    // An image larger than one page payload (4080 B) spans a value chain.
+    // An image spanning three chunks (2×4088 payload + a tail) rides a
+    // page chain: chunking is this layer's job now.
     let big = format!("{}+tail", "x".repeat(9000));
     st.put_cache(
         gear.clone(),
@@ -112,8 +114,8 @@ async fn roundtrip(file: &std::path::Path) {
     let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.to_path_buf());
     assert_eq!(st.get_cache(&gear).await.unwrap().blob, big);
 
-    // Overwrite, reopen: the new image wins (the old chain is freed inside
-    // the store's own accounting).
+    // Overwrite, reopen: the new image wins (the old chain's pages ride
+    // the ledger's `free` list).
     let small = "y".to_string();
     st.put_cache(
         gear.clone(),
@@ -239,6 +241,8 @@ fn paged_storage_gcs_old_versions() {
                     &[Rec::Put {
                         key: b"gear",
                         val: b"ancient",
+                        take: &[],
+                        free: &[],
                     }],
                 )
                 .await

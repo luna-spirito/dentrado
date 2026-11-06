@@ -13,7 +13,7 @@
 //! enumerable and droppable, the opener's new ones start empty.
 
 use super::freelist::ChainEntry;
-use crate::page::{Cur, PAGE_SIZE, Page, PageId};
+use crate::page::{AlignedPage, Cur, PAGE_SIZE, PageId};
 
 /// Superblock magic (`"DNTR"` little-endian).
 pub const SB_MAGIC: u32 = 0x52544E44;
@@ -53,7 +53,7 @@ pub struct Sb {
 /// page holds, or an id past its bound, is the caller's set outgrowing
 /// the format — refused loudly, never truncated.
 pub fn write_sb(
-    p: &mut Page,
+    p: &mut AlignedPage,
     r#gen: u64,
     next0: PageId,
     next1: PageId,
@@ -103,7 +103,7 @@ pub fn write_sb(
 /// any opener's id, so it is invisible either way. A dead entry page
 /// (`0` — no chain) with a stray offset is junk normalized to the
 /// empty entry.
-pub fn parse_sb(b: &Page) -> Option<Sb> {
+pub fn parse_sb(b: &AlignedPage) -> Option<Sb> {
     (b.u32_at(0) == SB_MAGIC && b.u32_at(4) == SB_VERSION).then(|| {
         let n = (b.u32_at(32) as usize).min(MAX_TABLES);
         let mut at = 40usize;
@@ -152,7 +152,7 @@ mod tests {
             s0: 3,
             s1: 4,
         };
-        let mut p = Page::zeroed();
+        let mut p = AlignedPage::zeroed();
         write_sb(
             &mut p, sb.r#gen, sb.next0, sb.next1, &sb.tables, sb.e0, sb.e1, sb.c0, sb.c1, sb.s0,
             sb.s1,
@@ -164,7 +164,7 @@ mod tests {
     /// a refusal: the tables that parsed stand.
     #[test]
     fn torn_ids_are_skipped() {
-        let mut p = Page::zeroed();
+        let mut p = AlignedPage::zeroed();
         write_sb(
             &mut p,
             1,
@@ -191,7 +191,7 @@ mod tests {
     /// behind a null pointer cannot exist).
     #[test]
     fn a_dead_entry_drops_its_junk_offset() {
-        let mut p = Page::zeroed();
+        let mut p = AlignedPage::zeroed();
         write_sb(
             &mut p,
             1,
@@ -211,8 +211,8 @@ mod tests {
     /// Garbage is not an SB — a zeroed page, a wrong version.
     #[test]
     fn garbage_is_not_an_sb() {
-        assert_eq!(parse_sb(&Page::zeroed()), None);
-        let mut p = Page::zeroed();
+        assert_eq!(parse_sb(&AlignedPage::zeroed()), None);
+        let mut p = AlignedPage::zeroed();
         let mut c = Cur::at(&mut p);
         c.u32(SB_MAGIC);
         c.u32(SB_VERSION + 1);

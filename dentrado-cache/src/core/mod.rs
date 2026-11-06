@@ -1,14 +1,14 @@
 //! The store's core — the flush-agnostic half of the single lock's
 //! content. The five machines it composes are its own: nobody outside
 //! reaches a field — the layers (the store's surface
-//! [`crate::store`], the persistence overlay [`crate::persist`], the
+//! [`crate::storage`], the persistence overlay [`crate::persist`], the
 //! blockcache's desk) drive the core through its verbs, each an
 //! atomic section: a pure transition, one decision and one mutation
 //! in a piece. The small machines live each in its own module
-//! ([`freelist`], [`ebr`], [`tables`], [`drafts`]); the page codecs
-//! beside them ([`val`], [`tree`], [`sb`], `freelist::chunk`); the
-//! flush round's sections in [`round`]. The lock's other half — the
-//! persistence overlay — in [`crate::persist`].
+//! ([`freelist`], [`ebr`], [`tables`], [`drafts`]); the store's own
+//! page codecs beside them ([`tree`], [`sb`], `freelist::chunk`); the
+//! flush round's sections in [`flush_round`]. The lock's other half —
+//! the persistence overlay — in [`crate::persist`].
 
 mod drafts;
 mod ebr;
@@ -17,7 +17,6 @@ pub mod freelist;
 pub mod sb;
 pub mod tables;
 pub mod tree;
-pub mod val;
 
 #[cfg(test)]
 mod tests;
@@ -38,17 +37,10 @@ pub(crate) use self::tables::{Delta, DeltaV};
 use crate::blockcache::{BlockCache, Reply, Submit};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
-use crate::page::{Page, PageId};
+use crate::page::{AlignedPage, PageId};
 use crate::schema::{TableSchema, TableSpec};
 
 // ## Types
-
-/// A cache entry: inline bytes and the value's pages (chain order).
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct CacheValue {
-    pub mt: Vec<u8>,
-    pub pages: Vec<PageId>,
-}
 
 /// One draft-allocation step: the outcome the async surface acts on.
 /// `Park` carries the listener (the parking decision and the
@@ -61,8 +53,8 @@ pub(crate) enum AllocAct {
 
 /// The delta's answer for one key — [`Core::get_step`]'s second half.
 pub(crate) enum StepHit {
-    /// A delta entry — a value on its way in.
-    Put(CacheValue),
+    /// A delta entry — a record's inline bytes on their way in.
+    Put(Vec<u8>),
     /// A delta deletion — the key is gone even if the tree still has
     /// it.
     Del,
@@ -72,7 +64,7 @@ pub(crate) enum StepHit {
 
 /// One record of a `put_many` batch at its seal: the key, the record's
 /// inline bytes (`None` — a deletion), and the drafts it publishes
-/// (the value's own pages — empty for an inline value or a deletion).
+/// (the caller's own — empty for an inline-only record or a deletion).
 pub(crate) struct SealRec {
     pub(crate) k: Vec<u8>,
     pub(crate) put: Option<Vec<u8>>,
@@ -113,8 +105,6 @@ pub(crate) struct Ram {
     pub(crate) held: Vec<PageId>,
     /// The task-eaten containers awaiting the next round's listing.
     pub(crate) spent: Vec<PageId>,
-    /// The deltas' value pages — the uncommitted half of the tables.
-    pub(crate) delta_pages: Vec<PageId>,
     pub(crate) delta: usize,
     pub(crate) dying: usize,
 }
@@ -126,8 +116,9 @@ impl<D: IsFilesystem> Core<D> {
         // stay put for as long as the kernel holds them — through any
         // store section, and past the store's own death: a cancelled
         // op's buffer stays compio's until the op is reaped.
-        let pages: Rc<[UnsafeCell<Page>]> =
-            (0..cap).map(|_| UnsafeCell::new(Page::zeroed())).collect();
+        let pages: Rc<[UnsafeCell<AlignedPage>]> = (0..cap)
+            .map(|_| UnsafeCell::new(AlignedPage::zeroed()))
+            .collect();
         Self {
             bc: BlockCache::new(file, pages),
             frees: Frees::fresh(),
@@ -188,11 +179,12 @@ impl<D: IsFilesystem> Core<D> {
 
     /// The `put_many` seal: a whole batch's deltas, draft consumption
     /// and death registration — one section, so a batch lands whole or
-    /// not at all. The freed pages are the store's own closure walks
-    /// (each record's replaced value), not a caller's word: each must
-    /// be a published page — never a draft, never dying, never back in
-    /// a pool, never conjured — and no page twice. A refusal registers
-    /// nothing; the drafts stay held.
+    /// not at all. The freed pages are the caller's word (the replaced
+    /// records' closures — the caller knows them, the store does not
+    /// traverse), yet not a free hand: each must be a published page —
+    /// never a draft, never dying, never back in a pool, never
+    /// conjured — and no page twice. A refusal registers nothing; the
+    /// taken drafts stay held (the caller's, to dealloc or reuse).
     pub(crate) fn seal_batch(
         &mut self,
         t: usize,
@@ -229,16 +221,9 @@ impl<D: IsFilesystem> Core<D> {
             return Err(StoreError::BadSeal(why));
         }
         self.deaths.reg(freed);
-        for (r, pages) in recs.iter().zip(owned) {
+        for (r, _) in recs.iter().zip(owned) {
             match r.put {
-                Some(ref mt) => self.tables.put(
-                    t,
-                    &r.k,
-                    CacheValue {
-                        mt: mt.clone(),
-                        pages,
-                    },
-                ),
+                Some(ref mt) => self.tables.put(t, &r.k, mt.clone()),
                 None => self.tables.del(t, &r.k),
             }
             for c in &r.consumed {
@@ -254,7 +239,7 @@ impl<D: IsFilesystem> Core<D> {
     pub(crate) fn get_step(&mut self, t: usize, k: &[u8]) -> Option<(usize, StepHit, PageId)> {
         let root = *self.tables.roots.get(t)?;
         let hit = match self.tables.get(t, k) {
-            Some(DeltaV::Put(cv)) => StepHit::Put(cv),
+            Some(DeltaV::Put(mt)) => StepHit::Put(mt),
             Some(DeltaV::Del) => StepHit::Del,
             None => StepHit::Tree,
         };
@@ -274,19 +259,24 @@ impl<D: IsFilesystem> Core<D> {
         self.tables.idx(id)
     }
 
+    /// A slot's id (empty — a dropped slot's tombstone) and the slot
+    /// count — the invariants' walk over the live set.
+    pub(crate) fn table_name(&self, t: usize) -> &[u8] {
+        self.tables.name(t)
+    }
+
+    pub(crate) fn roots_len(&self) -> usize {
+        self.tables.roots.len()
+    }
+
     /// A slot's standing tree root (0 — empty).
     pub(crate) fn table_root(&self, t: usize) -> PageId {
         self.tables.roots[t]
     }
 
     /// A slot's schema — how its records name dependent pages.
-    pub(crate) fn table_schema(&self, t: usize) -> &'static dyn TableSchema {
+    pub(crate) fn table_schema(&self, t: usize) -> TableSchema {
         self.tables.schema(t)
-    }
-
-    /// A slot's delta value pages — see [`Tables::delta_pages`].
-    pub(crate) fn table_delta_pages(&self, t: usize) -> Vec<PageId> {
-        self.tables.delta_pages(t)
     }
 
     /// A slot's delta records' inline bytes — see
@@ -346,11 +336,6 @@ impl<D: IsFilesystem> Core<D> {
         self.drafts.defresh(k);
     }
 
-    /// The consumed drafts' pages — `None` if any has vanished.
-    pub(crate) fn pages_of(&self, cs: &[DraftId]) -> Option<Vec<PageId>> {
-        self.drafts.pages_of(cs)
-    }
-
     /// The world's page-id bound — every issued id is below it (a
     /// round's own flight counter included by the caller while it
     /// runs).
@@ -372,7 +357,7 @@ impl<D: IsFilesystem> Core<D> {
         &mut self,
         id: PageId,
         load: bool,
-        f: impl FnOnce(&mut Page) -> (bool, R) + 'static,
+        f: impl FnOnce(&mut AlignedPage) -> (bool, R) + 'static,
     ) -> Submit<R>
     where
         R: 'static,
@@ -413,7 +398,6 @@ impl<D: IsFilesystem> Core<D> {
             drafts: self.drafts.pages().collect(),
             held: self.deaths.held(),
             spent: self.frees.spent().to_vec(),
-            delta_pages: self.tables.pages().collect(),
             delta: self.tables.len(),
             dying: self.deaths.len(),
         }

@@ -3,15 +3,10 @@
 //! leaf could never hold, no half-landed batch, no draft swallowed by
 //! a refusal. Every test ends at rest with the page bijection checked.
 
-use dentrado_cache::{Fault, MemDisk, Rec, Storage, StoreError, TableSpec};
+use dentrado_cache::{Fault, MemDisk, Storage, StoreError, TableSpec};
 
-fn run<F: Future>(f: F) -> F::Output {
-    compio::runtime::Runtime::new().unwrap().block_on(f)
-}
-
-fn specs(ids: &[&[u8]]) -> Vec<TableSpec> {
-    ids.iter().map(|i| TableSpec::flat(i.to_vec())).collect()
-}
+mod util;
+use util::{put, run, specs};
 
 /// A table the store never heard of: reads, scans and publications
 /// alike refuse — never a phantom root read, never a written byte.
@@ -31,26 +26,11 @@ fn a_missing_table_refuses_honestly() {
             Err(StoreError::NoTable)
         ));
         assert!(matches!(
-            st.put_many(
-                b"t1",
-                &[Rec::Put {
-                    key: b"k",
-                    val: b"v"
-                }]
-            )
-            .await,
+            st.put_many(b"t1", &[put(b"k", b"v")]).await,
             Err(StoreError::NoTable)
         ));
         // the refusal swallowed nothing: the well-formed twin publishes
-        st.put_many(
-            b"t0",
-            &[Rec::Put {
-                key: b"j",
-                val: b"v",
-            }],
-        )
-        .await
-        .unwrap();
+        st.put_many(b"t0", &[put(b"j", b"v")]).await.unwrap();
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
     });
@@ -92,44 +72,18 @@ fn a_bad_key_refuses_the_batch_whole() {
             .unwrap();
         let huge = vec![0u8; 5000];
         assert!(matches!(
-            st.put_many(
-                b"t0",
-                &[
-                    Rec::Put {
-                        key: b"good",
-                        val: b"v"
-                    },
-                    Rec::Put {
-                        key: &huge,
-                        val: b"v"
-                    },
-                ]
-            )
-            .await,
+            st.put_many(b"t0", &[put(b"good", b"v"), put(&huge, b"v")])
+                .await,
             Err(StoreError::BadKey)
         ));
         assert_eq!(st.get(b"t0", b"good").await.unwrap(), None);
-        // a big value's blob is given back too: the alloc'd pages return
+        // a value no leaf could hold beside the oversized key: refused
+        // alike, and nothing of the batch lands
         assert!(matches!(
-            st.put_many(
-                b"t0",
-                &[Rec::Put {
-                    key: &huge,
-                    val: &[7u8; 600]
-                }]
-            )
-            .await,
+            st.put_many(b"t0", &[put(&huge, &[7u8; 600])]).await,
             Err(StoreError::BadKey)
         ));
-        st.put_many(
-            b"t0",
-            &[Rec::Put {
-                key: b"good",
-                val: b"v",
-            }],
-        )
-        .await
-        .unwrap();
+        st.put_many(b"t0", &[put(b"good", b"v")]).await.unwrap();
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
     });
@@ -165,26 +119,10 @@ fn a_transient_fault_rolls_back_the_round() {
         let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
             .await
             .unwrap();
-        st.put_many(
-            b"t0",
-            &[Rec::Put {
-                key: b"k",
-                val: &[1u8; 3],
-            }],
-        )
-        .await
-        .unwrap();
+        st.put_many(b"t0", &[put(b"k", &[1u8; 3])]).await.unwrap();
         st.flush().await.unwrap();
-        // the replacement's old closure is the store's own bookkeeping
-        st.put_many(
-            b"t0",
-            &[Rec::Put {
-                key: b"k",
-                val: &[2u8; 3],
-            }],
-        )
-        .await
-        .unwrap();
+        // the replacement lists no pages: both records are inline
+        st.put_many(b"t0", &[put(b"k", &[2u8; 3])]).await.unwrap();
         // op 3 — mid-round (op 2 is a tail read whose failure the
         // round rides out)
         disk.file("db").set_fault(Fault::Once(3));
@@ -193,15 +131,7 @@ fn a_transient_fault_rolls_back_the_round() {
         // the world came back: the sealed value still reads, a fresh
         // round lands
         assert_eq!(st.get(b"t0", b"k").await.unwrap(), Some(vec![2u8; 3]));
-        st.put_many(
-            b"t0",
-            &[Rec::Put {
-                key: b"j",
-                val: &[3u8; 3],
-            }],
-        )
-        .await
-        .unwrap();
+        st.put_many(b"t0", &[put(b"j", &[3u8; 3])]).await.unwrap();
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
     });

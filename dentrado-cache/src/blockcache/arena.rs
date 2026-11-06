@@ -12,7 +12,7 @@ use std::rc::Rc;
 use compio::buf::{IoBuf, IoBufMut, SetLen};
 
 use super::SlotId;
-use crate::page::{PAGE_SIZE, Page};
+use crate::page::{AlignedPage, PAGE_SIZE};
 
 // TODO: В будущем стоило бы посмотреть на bitmap (маловероятно) или хотя бы сжать до байта гарантирванно, но это потом.
 /// Slot state: free / under a loading flight (the kernel writes the
@@ -48,7 +48,7 @@ pub(super) enum Victim {
 /// it needs — a discriminant read, the flags the states already carry,
 /// not a byte of padding beside each 4096-aligned page.
 pub(super) struct Arena {
-    pages: Rc<[UnsafeCell<Page>]>,
+    pages: Rc<[UnsafeCell<AlignedPage>]>,
     slots: Vec<SlotSt>,
     clock: usize,
 }
@@ -57,7 +57,7 @@ impl Arena {
     /// The arena takes its pages as given — born at the store's top,
     /// shared with flights (see the struct docs). The slot count is the
     /// page count.
-    pub(super) fn new(pages: Rc<[UnsafeCell<Page>]>) -> Self {
+    pub(super) fn new(pages: Rc<[UnsafeCell<AlignedPage>]>) -> Self {
         Self {
             slots: (0..pages.len()).map(|_| SlotSt::Free).collect(),
             pages,
@@ -81,7 +81,7 @@ impl Arena {
     /// borrows the whole arena, so it cannot live past the next arena
     /// call — there is no holding it across a transition.
     #[allow(unsafe_code)]
-    pub(super) fn page_mut(&mut self, s: SlotId) -> &mut Page {
+    pub(super) fn page_mut(&mut self, s: SlotId) -> &mut AlignedPage {
         assert!(
             matches!(self.slots[s], SlotSt::Resident { .. }),
             "write of a non-resident slot"
@@ -308,8 +308,8 @@ impl Arena {
 /// which the Loading state vouches for while the lease lives.
 pub(super) struct LoadPage {
     s: SlotId,
-    page: &'static mut Page,
-    _keep: Rc<[UnsafeCell<Page>]>,
+    page: &'static mut AlignedPage,
+    _keep: Rc<[UnsafeCell<AlignedPage>]>,
 }
 
 /// A save's lease of a slot: the kernel reads the bytes — the sole
@@ -318,14 +318,14 @@ pub(super) struct LoadPage {
 /// flight, so read-write causality holds through a save).
 pub(super) struct SavePage {
     s: SlotId,
-    page: &'static Page,
-    _keep: Rc<[UnsafeCell<Page>]>,
+    page: &'static AlignedPage,
+    _keep: Rc<[UnsafeCell<AlignedPage>]>,
 }
 
 impl LoadPage {
     /// Take the write lease of a slot just turned Loading.
     #[allow(unsafe_code)]
-    fn take(cells: &Rc<[UnsafeCell<Page>]>, s: SlotId) -> Self {
+    fn take(cells: &Rc<[UnsafeCell<AlignedPage>]>, s: SlotId) -> Self {
         Self {
             s,
             // SAFETY: unique for the whole flight — the slot is Loading
@@ -340,7 +340,7 @@ impl LoadPage {
 impl SavePage {
     /// Take the read lease of a slot just turned Saving.
     #[allow(unsafe_code)]
-    fn take(cells: &Rc<[UnsafeCell<Page>]>, s: SlotId) -> Self {
+    fn take(cells: &Rc<[UnsafeCell<AlignedPage>]>, s: SlotId) -> Self {
         Self {
             s,
             // SAFETY: the Saving state keeps every writer out while the

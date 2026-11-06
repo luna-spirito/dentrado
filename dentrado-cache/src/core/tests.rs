@@ -121,7 +121,7 @@ fn a_bad_seal_refuses_whole() {
         Err(StoreError::ConsumedVanished)
     );
     assert!(seal(&mut c, 0, b"k", b"m", &[a], &[]).is_ok());
-    assert!(c.pages_of(&[a]).is_none()); // consumed — gone from the arena
+    assert!(c.draft(&a).is_none()); // consumed — gone from the arena
 }
 
 /// A draft dies once: an unknown key and a second death are honest

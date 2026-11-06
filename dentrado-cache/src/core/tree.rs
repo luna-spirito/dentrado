@@ -8,25 +8,26 @@
 //! the leaf holds the records.
 
 use crate::error::StoreError;
-use crate::page::{Cur, PAGE_SIZE, Page, PageId};
+use crate::page::{AlignedPage, Cur, PAGE_SIZE, PageId};
 
-/// A record: the key, the inline bytes, the value chain's first page
-/// (0 — inline only).
-pub type Item = (Vec<u8>, Vec<u8>, PageId);
+/// A record: the key, the inline bytes. The bytes are the owner's —
+/// the store neither parses them nor sizes them beyond the leaf bound;
+/// a record whose pages live elsewhere names them through its schema.
+pub type Item = (Vec<u8>, Vec<u8>);
 
 /// A node's payload: the page minus the 8-byte header.
 const PAYLOAD: usize = PAGE_SIZE - 8;
 /// The parse's leaf bound — and the pack's: a record costs at least
-/// its root slot and two lengths — 16 bytes.
-pub const LEAF_MAX: usize = (PAGE_SIZE - 8) / 16;
+/// two lengths — 8 bytes.
+pub const LEAF_MAX: usize = (PAGE_SIZE - 8) / 8;
 /// The parse's interior bound — and the pack's: a route costs at least
 /// its child slot and two lengths — 16 bytes.
 pub const NODE_MAX: usize = (PAGE_SIZE - 8) / 16;
 
-/// A parsed node: `level` 0 — a leaf, its entries `(key, inline)`
-/// zipped with the value roots in `ids`; a level above — interior, its
-/// entries the routing keys (each subtree's smallest), `ids` the
-/// children.
+/// A parsed node: `level` 0 — a leaf, `es` its records in key order,
+/// `ids` empty; a level above — interior, `es` the routing entries
+/// (each subtree's smallest key, inline bytes empty), `ids` the
+/// children beside them.
 pub struct Node {
     pub level: u32,
     pub es: Vec<(Vec<u8>, Vec<u8>)>,
@@ -34,8 +35,8 @@ pub struct Node {
 }
 
 /// Write a node: `es` in key order (the caller's — packing produces
-/// it), `ids` beside the entries (the value roots / the children).
-pub fn write_node(p: &mut Page, level: u32, es: &[(Vec<u8>, Vec<u8>)], ids: &[PageId]) {
+/// it), `ids` beside the entries (interior only — a leaf writes none).
+pub fn write_node(p: &mut AlignedPage, level: u32, es: &[(Vec<u8>, Vec<u8>)], ids: &[PageId]) {
     let mut c = Cur::at(p);
     c.u32(es.len() as u32);
     c.u32(level);
@@ -53,11 +54,15 @@ pub fn write_node(p: &mut Page, level: u32, es: &[(Vec<u8>, Vec<u8>)], ids: &[Pa
 
 /// Parse a node; counts and lengths clamp to the page — noise does not
 /// inflate the parse.
-pub fn parse_node(b: &Page) -> Node {
+pub fn parse_node(b: &AlignedPage) -> Node {
     let level = b.u32_at(4);
     let n = (b.u32_at(0) as usize).min(if level == 0 { LEAF_MAX } else { NODE_MAX });
-    let ids: Vec<PageId> = (0..n).map(|i| b.u64_at(8 + 8 * i)).collect();
-    let mut off = 8 + 8 * n;
+    let (ids, off0) = if level == 0 {
+        (Vec::new(), 8)
+    } else {
+        ((0..n).map(|i| b.u64_at(8 + 8 * i)).collect(), 8 + 8 * n)
+    };
+    let mut off = off0;
     let mut es = Vec::with_capacity(n);
     for _ in 0..n {
         let kl = (b.u32_at(off) as usize).min(PAYLOAD);
@@ -71,12 +76,11 @@ pub fn parse_node(b: &Page) -> Node {
     Node { level, es, ids }
 }
 
-/// The leaf's exact record — its inline bytes and chain head.
-pub fn leaf_find<'a>(n: &'a Node, k: &[u8]) -> Option<(&'a [u8], PageId)> {
+/// The leaf's exact record — its inline bytes.
+pub fn leaf_find<'a>(n: &'a Node, k: &[u8]) -> Option<&'a [u8]> {
     n.es.iter()
-        .zip(&n.ids)
-        .find(|((lk, _), _)| lk.as_slice() == k)
-        .map(|((_, mt), &vr)| (mt.as_slice(), vr))
+        .find(|(lk, _)| lk.as_slice() == k)
+        .map(|(_, mt)| mt.as_slice())
 }
 
 /// The interior's child index for `k` — the last routing key at or
@@ -95,22 +99,21 @@ pub fn route(n: &Node, k: &[u8]) -> Option<PageId> {
 
 // ## The geometry
 
-/// A leaf record's cost in the page: the value-root slot, two lengths,
-/// the bytes.
-pub fn leaf_e((k, mt, _): &Item) -> usize {
-    16 + k.len() + mt.len()
+/// A leaf record's cost in the page: two lengths, the bytes.
+pub fn leaf_e((k, mt): &Item) -> usize {
+    8 + k.len() + mt.len()
 }
 
 /// Could any leaf hold this record — the record surface's `BadKey`
 /// line (a bigger one no page could hold, and the flush would refuse
 /// the whole round).
 pub fn leaf_holds(k: &[u8], mt: &[u8]) -> bool {
-    16 + k.len() + mt.len() <= PAYLOAD
+    8 + k.len() + mt.len() <= PAYLOAD
 }
 
 /// A route's cost: the child slot, two lengths, the key — the length
 /// word of the (always empty) inline bytes is still written.
-pub fn route_e((k, _, _): &Item) -> usize {
+pub fn route_e((k, _): &Item) -> usize {
     16 + k.len()
 }
 
@@ -190,7 +193,7 @@ pub fn plan(sorted: &[Item]) -> Result<Vec<usize>, StoreError> {
 /// Build the whole tree bottom-up over the stock `ids` — a level's
 /// pages in a row, the leaves first — returning the pages in the same
 /// order, the root last. The stock's length must be the plan's sum.
-pub fn build(sorted: &[Item], ids: &[PageId]) -> Result<Vec<Page>, StoreError> {
+pub fn build(sorted: &[Item], ids: &[PageId]) -> Result<Vec<AlignedPage>, StoreError> {
     let levels = spans(sorted)?;
     debug_assert_eq!(
         ids.len(),
@@ -205,20 +208,12 @@ pub fn build(sorted: &[Item], ids: &[PageId]) -> Result<Vec<Page>, StoreError> {
             Some(b)
         })
         .collect();
-    let mut out: Vec<Page> = Vec::with_capacity(ids.len());
+    let mut out: Vec<AlignedPage> = Vec::with_capacity(ids.len());
     for (h, lv) in levels.iter().enumerate() {
         for sp in lv.iter() {
-            let mut p = Page::zeroed();
+            let mut p = AlignedPage::zeroed();
             if h == 0 {
-                let es: Vec<(Vec<u8>, Vec<u8>)> = sorted[sp.at..sp.at + sp.len]
-                    .iter()
-                    .map(|(k, mt, _)| (k.clone(), mt.clone()))
-                    .collect();
-                let vrs: Vec<PageId> = sorted[sp.at..sp.at + sp.len]
-                    .iter()
-                    .map(|(_, _, vr)| *vr)
-                    .collect();
-                write_node(&mut p, 0, &es, &vrs);
+                write_node(&mut p, 0, &sorted[sp.at..sp.at + sp.len], &[]);
             } else {
                 let cb = bases[h - 1];
                 let es: Vec<(Vec<u8>, Vec<u8>)> = below_keys(levels[h - 1].as_slice(), sp, sorted);

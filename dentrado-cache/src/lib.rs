@@ -20,13 +20,14 @@
 //! store's flush-agnostic core: the machines (`freelist` — the
 //! two-pool page dispenser, `ebr` — deaths), the drafts arena and the
 //! named tables (each a B-tree plus its delta; the set unions at open,
-//! tables enumerate and drop), and the page codecs beside them (`val`,
-//! `tree`, `sb`, `freelist::chunk`); [`persist`] — the persistence
-//! overlay (the round agent and its mailbox, the generation, the
-//! poison flag), the flush round, recovery; [`store`] — the async
-//! surface: drafts and the cache, the read guard. Semantics and the
-//! derived loop bounds live in the doc comments — ported from the
-//! model.
+//! tables enumerate and drop), and the store's own page codecs beside
+//! them (`tree`, `sb`, `freelist::chunk` — a record's pages are the
+//! owner's bytes, parsed only through its [`schema`]); [`persist`] —
+//! the persistence overlay (the round agent and its mailbox, the
+//! generation, the poison flag), the flush round, recovery;
+//! [`storage`] — the async surface: records, drafts, page reads, the
+//! read guard. Semantics and the derived loop bounds live in the doc
+//! comments — ported from the model.
 //!
 //! The store is a component, not a trust boundary: any error or panic
 //! inside the plumbing poisons it terminally (every semantic op refuses
@@ -50,11 +51,11 @@ mod persist;
 pub mod schema;
 pub mod storage;
 
+pub use crate::core::DraftId;
 pub use crate::core::freelist::ChainEntry;
 pub use crate::core::sb::Sb;
-pub use crate::core::{CacheValue, DraftId};
 pub use disk::{Fault, FsDisk, IsFilesystem, MemDisk, MemFile};
 pub use error::StoreError;
-pub use page::{Page, PageId};
-pub use schema::{NO_DEPS, NO_DEPS_PAGE, NoDeps, PageSchema, TableSchema, TableSpec};
-pub use storage::{DebugState, INLINE_MAX, Rec, Storage, Violation};
+pub use page::{AlignedPage, PageId};
+pub use schema::{Dep, NO_DEPS, NO_DEPS_PAGE, PageSchema, TableSchema, TableSpec};
+pub use storage::{DebugState, Rec, Storage, Violation};

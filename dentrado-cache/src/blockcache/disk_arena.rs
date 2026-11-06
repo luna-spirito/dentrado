@@ -10,7 +10,7 @@ use std::rc::Rc;
 use super::SlotId;
 use super::arena::{Arena, LoadPage, SavePage, SlotSt, Victim};
 use crate::disk::IsFilesystem;
-use crate::page::{OptionPageId, Page, PageId};
+use crate::page::{AlignedPage, OptionPageId, PageId};
 
 /// The disk side of the cache: an [`Arena`] of slots, the mirrors tying
 /// pages to slots (a resident/loading/saving slot is always tied — the
@@ -27,7 +27,7 @@ pub(super) struct DiskArena<D: IsFilesystem> {
 }
 
 impl<D: IsFilesystem> DiskArena<D> {
-    pub(super) fn new(file: D::File, pages: Rc<[UnsafeCell<Page>]>) -> Self {
+    pub(super) fn new(file: D::File, pages: Rc<[UnsafeCell<AlignedPage>]>) -> Self {
         let arena = Arena::new(pages);
         Self {
             backward: vec![OptionPageId::NONE; arena.len()],
@@ -80,7 +80,7 @@ impl<D: IsFilesystem> DiskArena<D> {
     }
 
     /// A resident page's bytes, for writing.
-    pub(super) fn page_mut(&mut self, s: SlotId) -> &mut Page {
+    pub(super) fn page_mut(&mut self, s: SlotId) -> &mut AlignedPage {
         self.arena.page_mut(s)
     }
 

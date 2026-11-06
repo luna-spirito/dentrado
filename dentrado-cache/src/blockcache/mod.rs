@@ -82,7 +82,7 @@ use self::flights::{FlDone, Flights, Wings};
 use self::seq::{Claim, Room, SeqArena, Step};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
-use crate::page::{Page, PageId};
+use crate::page::{AlignedPage, PageId};
 
 pub(crate) use self::seq::Submit;
 
@@ -92,7 +92,7 @@ pub(crate) type SlotId = usize;
 /// `submit`'s own wrapping of the caller's `f` (the answer policy is
 /// the wrapper's: `Ok` with the dirt flag, a refusal by the oneshot);
 /// `true` — the write left the page dirty.
-pub(super) type PostFn = Box<dyn FnOnce(Result<&mut Page, StoreError>) -> bool>;
+pub(super) type PostFn = Box<dyn FnOnce(Result<&mut AlignedPage, StoreError>) -> bool>;
 
 /// The settle answer's channel — a persist's or a checkpoint barrier's:
 /// `Ok` when the last marker fired, `Err` from a failed save.
@@ -117,7 +117,7 @@ impl<D: IsFilesystem> BlockCache<D> {
     /// The pages come ready-made from the store's top — born in
     /// `PersistentCore::fresh` and shared with flights from their first
     /// breath (see the arena's docs).
-    pub(crate) fn new(file: D::File, pages: Rc<[UnsafeCell<Page>]>) -> Self {
+    pub(crate) fn new(file: D::File, pages: Rc<[UnsafeCell<AlignedPage>]>) -> Self {
         Self {
             seq: SeqArena::new(file, pages),
             pending: VecDeque::new(),
@@ -139,7 +139,7 @@ impl<D: IsFilesystem> BlockCache<D> {
         &mut self,
         id: PageId,
         load: bool,
-        f: impl FnOnce(&mut Page) -> (bool, R) + 'static,
+        f: impl FnOnce(&mut AlignedPage) -> (bool, R) + 'static,
     ) -> Submit<R>
     where
         R: 'static,

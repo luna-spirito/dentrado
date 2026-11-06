@@ -15,8 +15,8 @@ fn run<F: Future>(f: F) -> F::Output {
 
 const KEY7: &[u8] = &[7];
 
-/// The three-act values: a full kilobyte each — over the inline bound,
-/// so every record rides a chain of value pages through the acts.
+/// The three-act values: a full kilobyte each — a leaf-sized inline
+/// record every act.
 const V1: &[u8] = &[1u8; 1000];
 const V2: &[u8] = &[2u8; 1000];
 
@@ -24,14 +24,23 @@ fn specs(ids: &[&[u8]]) -> Vec<TableSpec> {
     ids.iter().map(|i| TableSpec::flat(i.to_vec())).collect()
 }
 
-/// Публикация значения: стор сам держит цепочку и считает замыкания.
+/// Публикация значения: инлайн-запись, никаких страниц.
 async fn put_v<D: IsFilesystem>(
     st: &Storage<D>,
     table: &[u8],
     key: &[u8],
     val: &[u8],
 ) -> Result<(), StoreError> {
-    st.put_many(table, &[Rec::Put { key, val }]).await
+    st.put_many(
+        table,
+        &[Rec::Put {
+            key,
+            val,
+            take: &[],
+            free: &[],
+        }],
+    )
+    .await
 }
 
 // ## Замена значения на живом сторе
@@ -51,7 +60,7 @@ fn repl_flow() {
             Some(V1.to_vec()),
             "miss-after-commit"
         );
-        // замена на v2 — страницы v1 умирают замыканием, без слова звонящего
+        // замена на v2 — старое дерево умирает прививкой, без слова звонящего
         put_v(&st, b"t0", KEY7, V2).await.unwrap();
         // дельта прежде дерева: свежая замена видна до flush'а
         assert_eq!(st.get(b"t0", KEY7).await.unwrap(), Some(V2.to_vec()));
@@ -164,21 +173,14 @@ fn three_act_quiet_commit() {
 // ## Ствол-планировщик: работники × flush
 
 /// Работник: раунды «запись-замена» своего ключа; килобайт значения —
-/// каждый раунд свежая цепочка страниц.
+/// каждый раунд свежая инлайн-запись.
 async fn worker(st: Rc<Storage<MemDisk>>, kb: u8, rounds: u8) -> Result<(), StoreError> {
     let key = [kb];
     for r in 1..=rounds {
         let mut val = vec![0u8; 1000];
         val[0] = kb;
         val[1] = r;
-        st.put_many(
-            b"t0",
-            &[Rec::Put {
-                key: &key,
-                val: &val,
-            }],
-        )
-        .await?;
+        put_v(&st, b"t0", &key, &val).await?;
     }
     Ok(())
 }
@@ -330,7 +332,7 @@ fn dealloc_returns_page() {
             .await
             .unwrap();
         let k: DraftId = st.alloc_draft_page().await.unwrap();
-        st.write_draft_page(k, |_| (vec![1], ())).await.unwrap();
+        st.write_draft_page(k, |p| p.0[0] = 1).await.unwrap();
         st.dealloc_draft_page(k).await.unwrap();
         assert!(matches!(
             st.dealloc_draft_page(k).await,

@@ -9,8 +9,11 @@
 //!   opens a new table; the opener's startup GC drops every other identity
 //!   this file carries — an old version's orphans);
 //! * key — `postcard(gear_id)`;
-//! * value — the [`CacheSer`] image whole: the store itself splits an
-//!   oversized value into a page chain and reassembles it on read;
+//! * value — the image postcard([`blob::ImgRef`]): at or under
+//!   [`blob::INLINE_MAX`] it rides the record itself, bigger ones take
+//!   a page chain — chunking is this layer's job (the store neither
+//!   knows nor parses what a page holds), and the schema (the
+//!   `next`-header shape) lets the store's audits walk the chains;
 //! * deletion — the record dies, really.
 //!
 //! The image is hashed, and an unchanged image skips the rewrite — the
@@ -18,7 +21,11 @@
 //! gear would churn pages and disk forever. Reads seed the same map, so a
 //! post-restart run of an unchanged gear never touches the store at all.
 //! `flush` is dirty-gated the same way (an idle round still rewrites the
-//! superblock and syncs).
+//! superblock and syncs). The map also carries each image's page ledger:
+//! the store's batches take the dying pages as the caller's explicit
+//! `free` list (no traversal inside the store), so overwrites and
+//! erasures vouch from here; a key unseen since open learns its standing
+//! record with one read before the first overwrite vouches.
 //!
 //! ## The poison boundary
 //!
@@ -40,6 +47,7 @@
 //! (RAM-only mode) — a cache backend must not brick the core by retrying a
 //! broken disk on every op.
 
+mod blob;
 mod disk;
 
 use std::{
@@ -50,7 +58,7 @@ use std::{
     path::PathBuf,
 };
 
-use dentrado_cache::Rec;
+use dentrado_cache::{PageId, Rec};
 
 use crate::{
     core::{
@@ -72,9 +80,10 @@ pub struct PagedStorage<R: IsRuntime> {
     file: Option<PathBuf>,
     disk: RefCell<Disk>,
     dirty: Cell<bool>,
-    /// Gear key → hash of the last disk-bound image. A matching hash makes
-    /// `put_cache` a no-op; a `remove` means "erase on disk".
-    seen: RefCell<HashMap<Vec<u8>, [u8; 32]>>,
+    /// Gear key → (hash of the last disk-bound image, its page ledger).
+    /// A matching hash makes `put_cache` a no-op; a `remove` means
+    /// "erase on disk"; the pages vouch the next batch's `free` list.
+    seen: RefCell<HashMap<Vec<u8>, ([u8; 32], Vec<PageId>)>>,
 }
 
 impl<R: IsRuntime> Default for PagedStorage<R> {
@@ -113,10 +122,9 @@ impl<R: IsRuntime> PagedStorage<R> {
         postcard::to_stdvec(gear).ok()
     }
 
-    fn remember(&self, key: &[u8], image: &[u8]) {
-        self.seen
-            .borrow_mut()
-            .insert(key.to_vec(), *blake3::hash(image).as_bytes());
+    fn remember(&self, key: &[u8], image: &[u8], pages: Vec<PageId>) {
+        let hash = *blake3::hash(image).as_bytes();
+        self.seen.borrow_mut().insert(key.to_vec(), (hash, pages));
     }
 }
 
@@ -220,17 +228,20 @@ where
                 return self.ram.get_cache(gear).await;
             };
             let table = disk::cache_table();
-            let read = store.get(&table, &key);
+            let read = blob::read_image(&*store, &table, &key);
             // A read failure degrades but needs no tombstone: nothing was
             // written, the entry on disk stays whatever it was.
-            let Some(image) = self.boundary(file, read).await? else {
+            let Some((image, pages)) = self.boundary(file, read).await? else {
                 return self.ram.get_cache(gear).await;
             };
             let mut cache = R::make_cache(gear);
-            if !cache.de_image(&image) {
+            let decoded = cache.de_image(&image);
+            // the ledger seeds even on an unreadable image: the record
+            // occupies real pages, the next overwrite vouches them
+            self.remember(&key, &image, pages);
+            if !decoded {
                 return None;
             }
-            self.remember(&key, &image);
             Some(cache)
         }
     }
@@ -246,23 +257,49 @@ where
             match cache.ser_image() {
                 Some(image) => {
                     let hash = *blake3::hash(&image).as_bytes();
-                    if self.seen.borrow().get(&key) == Some(&hash) {
+                    if self
+                        .seen
+                        .borrow()
+                        .get(&key)
+                        .is_some_and(|(h, _)| *h == hash)
+                    {
                         return; // unchanged since the last disk-bound image
                     }
                     let Some(store) = self.ensure().await else {
                         return self.ram.put_cache(gear, cache).await;
                     };
-                    // one record: the store builds the value chain and
-                    // frees the superseded closure itself
                     let table = disk::cache_table();
-                    let batch = [Rec::Put {
-                        key: &key,
-                        val: &image,
-                    }];
-                    let put = store.put_many(&table, &batch);
-                    if self.boundary(file, put).await.is_some() {
+                    // The caller vouches the free list: a key unseen since
+                    // open (a put without a preceding get) reads its standing
+                    // record once — then the ledger is whole, and an image
+                    // equal to the standing one skips the write entirely.
+                    if !self.seen.borrow().contains_key(&key) {
+                        let read = blob::read_image(&*store, &table, &key);
+                        // the op may degrade (outer None) or simply find
+                        // no record (inner None) — both leave the ledger
+                        // as it is
+                        if let Some(Some((old, pages))) = self.boundary(file, read).await {
+                            self.remember(&key, &old, pages);
+                        }
+                        if self
+                            .seen
+                            .borrow()
+                            .get(&key)
+                            .is_some_and(|(h, _)| *h == hash)
+                        {
+                            return;
+                        }
+                    }
+                    let old = self
+                        .seen
+                        .borrow()
+                        .get(&key)
+                        .map(|(_, p)| p.clone())
+                        .unwrap_or_default();
+                    let put = blob::put_image(&*store, &table, &key, &image, &old);
+                    if let Some(pages) = self.boundary(file, put).await {
                         self.dirty.set(true);
-                        self.seen.borrow_mut().insert(key, hash);
+                        self.remember(&key, &image, pages);
                     }
                 }
                 // A non-persisting cache erases only what this process (or a
@@ -270,14 +307,18 @@ where
                 // code is unread (`de_image` fails) and dies at the next
                 // overwrite.
                 None => {
-                    if self.seen.borrow_mut().remove(&key).is_some() {
-                        if let Some(store) = self.ensure().await {
-                            let table = disk::cache_table();
-                            let batch = [Rec::Del { key: &key }];
-                            let del = store.put_many(&table, &batch);
-                            if self.boundary(file, del).await.is_some() {
-                                self.dirty.set(true);
-                            }
+                    let Some((_, old)) = self.seen.borrow_mut().remove(&key) else {
+                        return; // erases only what this process stored
+                    };
+                    if let Some(store) = self.ensure().await {
+                        let table = disk::cache_table();
+                        let batch = [Rec::Del {
+                            key: &key,
+                            free: &old,
+                        }];
+                        let del = store.put_many(&table, &batch);
+                        if self.boundary(file, del).await.is_some() {
+                            self.dirty.set(true);
                         }
                     }
                 }

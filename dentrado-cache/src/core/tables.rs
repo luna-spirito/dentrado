@@ -7,14 +7,15 @@
 
 use std::collections::HashMap;
 
-use super::CacheValue;
 use crate::page::PageId;
 use crate::schema::{TableSchema, TableSpec};
 
-/// One delta entry: a value on its way in, a key on its way out.
+/// One delta entry: a record's inline bytes on their way in, a key on
+/// its way out. The record's pages the delta does not know — the
+/// schema (and the caller's own bookkeeping) says what they are.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum DeltaV {
-    Put(CacheValue),
+    Put(Vec<u8>),
     Del,
 }
 
@@ -35,7 +36,7 @@ pub(crate) struct Tables {
     /// opener didn't name gets [`crate::schema::NO_DEPS`]: its bytes
     /// cannot be trusted to follow any schema the opener knows, so a
     /// dropped orphan frees only its own pages.
-    schemas: Vec<&'static dyn TableSchema>,
+    schemas: Vec<TableSchema>,
     /// Each table's tree root; 0 — empty.
     pub(crate) roots: Vec<PageId>, // TODO: pub(crate) should be avoided on fields.
     deltas: Vec<Delta>,
@@ -81,7 +82,12 @@ impl Tables {
         self.index.get(id).copied()
     }
 
-    pub(crate) fn schema(&self, t: usize) -> &'static dyn TableSchema {
+    /// A slot's id (empty — a dropped slot's tombstone).
+    pub(crate) fn name(&self, t: usize) -> &[u8] {
+        &self.names[t]
+    }
+
+    pub(crate) fn schema(&self, t: usize) -> TableSchema {
         self.schemas[t]
     }
 
@@ -89,8 +95,8 @@ impl Tables {
         self.deltas[t].get(k).cloned()
     }
 
-    pub(crate) fn put(&mut self, t: usize, k: &[u8], v: CacheValue) {
-        self.deltas[t].insert(k.to_vec(), DeltaV::Put(v));
+    pub(crate) fn put(&mut self, t: usize, k: &[u8], mt: Vec<u8>) {
+        self.deltas[t].insert(k.to_vec(), DeltaV::Put(mt));
     }
 
     pub(crate) fn del(&mut self, t: usize, k: &[u8]) {
@@ -134,27 +140,13 @@ impl Tables {
             .collect()
     }
 
-    /// A slot's delta value pages — the uncommitted half of one table
-    /// (a drop must free them with the tree). A delta deletion names no
-    /// pages: its record's closure was freed the moment it registered.
-    pub(crate) fn delta_pages(&self, t: usize) -> Vec<PageId> {
-        self.deltas[t]
-            .values()
-            .filter_map(|v| match v {
-                DeltaV::Put(cv) => Some(cv.pages.iter().copied()),
-                DeltaV::Del => None,
-            })
-            .flatten()
-            .collect()
-    }
-
-    /// A slot's delta records' inline bytes — a drop must free the
-    /// pages their schemas name too.
+    /// A slot's delta records' inline bytes — a drop (and the
+    /// partition's exactness) walks the pages their schemas name.
     pub(crate) fn delta_inline(&self, t: usize) -> Vec<Vec<u8>> {
         self.deltas[t]
             .values()
             .filter_map(|v| match v {
-                DeltaV::Put(cv) => Some(cv.mt.clone()),
+                DeltaV::Put(mt) => Some(mt.clone()),
                 DeltaV::Del => None,
             })
             .collect()
@@ -188,18 +180,5 @@ impl Tables {
 
     pub(crate) fn len(&self) -> usize {
         self.deltas.iter().map(|d| d.len()).sum()
-    }
-
-    /// The deltas' value pages — the uncommitted half of the tables.
-    pub(crate) fn pages(&self) -> impl Iterator<Item = PageId> + '_ {
-        self.deltas
-            .iter()
-            .flat_map(|d| {
-                d.values().filter_map(|v| match v {
-                    DeltaV::Put(cv) => Some(cv.pages.iter().copied()),
-                    DeltaV::Del => None,
-                })
-            })
-            .flatten()
     }
 }

@@ -11,10 +11,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use dentrado_cache::{Storage, StoreError, TableSpec, disk::FsDisk};
+use dentrado_cache::{Storage, StoreError, disk::FsDisk};
 use futures::{FutureExt, channel::oneshot};
 
-use super::PagedStorage;
+use super::{PagedStorage, blob};
 use crate::core::gear::IsRuntime;
 
 /// The gear-cache table's identity: the format's name and version — a new
@@ -164,7 +164,7 @@ impl<R: IsRuntime> PagedStorage<R> {
 /// failure falls back to the plain open — its error decides RAM-only mode.
 async fn open_quarantining(file: &Path) -> Result<Storage<FsDisk>, StoreError> {
     let path = file.display().to_string();
-    let spec = dentrado_cache::TableSpec::flat(cache_table());
+    let spec = blob::cache_spec(cache_table());
     match Storage::open(&FsDisk, &path, BLOCK_CACHE, &[spec]).await {
         Err(StoreError::CorruptImage) => {
             let stamp = SystemTime::now()
@@ -191,7 +191,7 @@ async fn open_quarantining(file: &Path) -> Result<Storage<FsDisk>, StoreError> {
                 &FsDisk,
                 &path,
                 BLOCK_CACHE,
-                &[TableSpec::flat(cache_table())],
+                &[blob::cache_spec(cache_table())],
             )
             .await
         }
@@ -210,16 +210,4 @@ fn wake(waiters: Vec<oneshot::Sender<()>>) {
     for tx in waiters {
         let _ = tx.send(());
     }
-}
-
-/// Return allocated drafts to the pool, then surface the original error.
-async fn undraft(
-    store: &Storage<FsDisk>,
-    drafts: Vec<dentrado_cache::DraftId>,
-    e: StoreError,
-) -> Result<(), StoreError> {
-    for k in drafts {
-        let _ = store.dealloc_draft_page(k).await;
-    }
-    Err(e)
 }

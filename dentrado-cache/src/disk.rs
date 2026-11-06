@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use compio::buf::{IoBuf, IoBufMut};
 
-use crate::page::{PAGE_SIZE, Page, PageId, TORN_BYTE};
+use crate::page::{AlignedPage, PAGE_SIZE, PageId, TORN_BYTE};
 
 /// A compio file — `!Send`/`!Sync` by construction (`SharedFd = Rc`,
 /// thread-per-core): the store and its tasks live on one runtime
@@ -69,7 +69,7 @@ pub enum Fault {
 }
 
 struct MemState {
-    pages: Vec<Option<Page>>,
+    pages: Vec<Option<AlignedPage>>,
     uncommitted: Vec<PageId>,
     ops: u64,
     fault: Fault,
@@ -109,7 +109,7 @@ impl MemFile {
         for id in ids {
             if torn(id) {
                 if let Some(slot) = st.pages.get_mut(id as usize) {
-                    *slot = Some(Page([TORN_BYTE; PAGE_SIZE]));
+                    *slot = Some(AlignedPage([TORN_BYTE; PAGE_SIZE]));
                 }
             }
         }
@@ -117,7 +117,7 @@ impl MemFile {
     }
 
     /// The page by number (test inspection).
-    pub fn page(&self, id: PageId) -> Option<Page> {
+    pub fn page(&self, id: PageId) -> Option<AlignedPage> {
         self.st
             .lock()
             .unwrap()
@@ -210,7 +210,7 @@ impl IsFilesystem for MemDisk {
                         _ => b[half..].fill(TORN_BYTE),
                     }
                 }
-                st.pages[id as usize] = Some(Page(b));
+                st.pages[id as usize] = Some(AlignedPage(b));
                 st.uncommitted.push(id);
                 Ok(())
             });

@@ -2,10 +2,11 @@
 //! All integers are little-endian; a page is always exactly
 //! [`PAGE_SIZE`] bytes. Reads past the page edge give zeros (like the
 //! model's `byteAt`): lengths from disk are clamped by callers, noise
-//! does not inflate parsing. The page kinds' codecs live with their
-//! machines: value, tree node and superblock — in `core::val`,
-//! `core::tree` and `core::sb`; the freelist's chunk — in
-//! `core::freelist::chunk`.
+//! does not inflate parsing. The store's own page kinds' codecs live
+//! with their machines — the tree node in `core::tree`, the
+//! superblock in `core::sb`, the freelist's chunk in
+//! `core::freelist::chunk`; a record's pages are the owner's bytes —
+//! the store parses them only through its schema.
 
 /// The file page size.
 pub const PAGE_SIZE: usize = 4096;
@@ -52,9 +53,9 @@ impl OptionPageId {
 /// in place, `zeroed` is the only constructor (arena, tests).
 #[repr(align(4096))]
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Page(pub [u8; PAGE_SIZE]);
+pub struct AlignedPage(pub [u8; PAGE_SIZE]);
 
-impl Page {
+impl AlignedPage {
     // TODO: Page должны существовать исключительно внутри Pool. Факт присутствования этого конструктора здесь сильно пугает.
     pub fn zeroed() -> Self {
         Self([0; PAGE_SIZE])
@@ -109,13 +110,13 @@ impl Page {
 /// bytes — no staging buffer; past the edge nothing sticks (like
 /// [`Page::put_u32_at`]), and the unwritten tail zeroes at [`Cur::fin`].
 pub(crate) struct Cur<'a> {
-    p: &'a mut Page,
+    p: &'a mut AlignedPage,
     i: usize,
 }
 
 impl<'a> Cur<'a> {
     /// Start at the page's beginning.
-    pub(crate) fn at(p: &'a mut Page) -> Self {
+    pub(crate) fn at(p: &'a mut AlignedPage) -> Self {
         Self { p, i: 0 }
     }
 

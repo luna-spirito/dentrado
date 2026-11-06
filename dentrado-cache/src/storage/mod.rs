@@ -1,9 +1,12 @@
-//! The store's async surface: the record surface (reads, scans, batched
-//! writes — [`records`]) and the drafts beneath it (allocation, the
-//! writes — the escape hatch for a future page-valued record). Under
-//! it: [`crate::core`] — the flush-agnostic machines the sections
-//! drive, [`crate::persist`] — the persistence overlay, the flush
-//! round, recovery.
+//! The store's async surface: the record surface (reads, scans,
+//! batched writes — [`records`]) and the raw page surface beneath it —
+//! drafts (allocation, the writes) and page reads. A record's value is
+//! the caller's inline bytes; anything bigger the caller pages itself
+//! (the drafts are its pages, the schema its declaration of what a
+//! record names), and reads of those pages go by reference — bytes
+//! never leave the arena. Under it: [`crate::core`] — the
+//! flush-agnostic machines the sections drive, [`crate::persist`] —
+//! the persistence overlay, the flush round, recovery.
 //!
 //! The state is the [`PersistentCore`] under a single `RefCell` (the
 //! store is single-threaded by construction — compio thread-per-core,
@@ -22,7 +25,9 @@
 
 mod records;
 
-pub use records::{INLINE_MAX, Rec};
+// TODO: REALLY TODO: Safe interface.
+
+pub use records::Rec;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -31,11 +36,10 @@ use compio::runtime::JoinHandle;
 
 use crate::blockcache;
 use crate::core::freelist::{ChainEntry, chunk_cells, chunk_next};
-use crate::core::val::{val_split, write_val};
 use crate::core::{AllocAct, DraftId};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
-use crate::page::{Page, PageId};
+use crate::page::{AlignedPage, PageId};
 use crate::persist::PersistentCore;
 
 // ## The read guard
@@ -210,13 +214,28 @@ impl<D: IsFilesystem> Storage<D> {
         }
     }
 
-    /// A write into a draft: `f` — over the payload (the children's
-    /// header is ours); a fresh page is not read from disk (we write
-    /// over the slot's garbage).
+    /// A draft's locus: its page — a draft is a key, the page it names
+    /// is the store's own bookkeeping. The caller needs the id to
+    /// build its own references (a chain head in a record's bytes).
+    pub async fn draft_page(&self, k: &DraftId) -> Result<PageId, StoreError> {
+        let (p, _) = {
+            let inner = self.inner.borrow();
+            if inner.poisoned {
+                return Err(StoreError::Poisoned);
+            }
+            inner.core.draft(k).ok_or(StoreError::UnknownDraft)?
+        };
+        Ok(p)
+    }
+
+    /// A write into a draft: the closure gets the page's bytes in the
+    /// arena and shapes them as the owner's format pleases — the store
+    /// writes nothing itself. A fresh page is not read from disk (the
+    /// write lands over the slot's garbage).
     pub async fn write_draft_page<R>(
         &self,
         k: DraftId,
-        f: impl Fn(&[u8]) -> (Vec<u8>, R) + 'static,
+        f: impl Fn(&mut AlignedPage) -> R + 'static,
     ) -> Result<R, StoreError>
     where
         R: 'static,
@@ -228,15 +247,10 @@ impl<D: IsFilesystem> Storage<D> {
             }
             inner.core.draft(&k).ok_or(StoreError::UnknownDraft)?
         };
-        let g = move |b: &mut Page| {
-            let (pl, r) = f(val_split(b).1);
-            write_val(b, 0, true, &pl);
-            r
-        };
         let r = if fresh {
-            blockcache::init::<D, _>(&self.inner, p, g).await?
+            blockcache::init::<D, _>(&self.inner, p, f).await?
         } else {
-            blockcache::update::<D, _>(&self.inner, p, g).await?
+            blockcache::update::<D, _>(&self.inner, p, f).await?
         };
         if fresh {
             let mut inner = self.inner.borrow_mut();
@@ -249,7 +263,7 @@ impl<D: IsFilesystem> Storage<D> {
     pub async fn overwrite_draft_page<R>(
         &self,
         k: DraftId,
-        f: impl Fn(&[u8]) -> (Vec<u8>, R) + 'static,
+        f: impl Fn(&mut AlignedPage) -> R + 'static,
     ) -> Result<R, StoreError>
     where
         R: 'static,
@@ -261,11 +275,26 @@ impl<D: IsFilesystem> Storage<D> {
             }
             inner.core.draft(&k).ok_or(StoreError::UnknownDraft)?.0
         };
-        blockcache::init::<D, _>(&self.inner, p, move |b| {
-            let (pl, r) = f(val_split(b).1);
-            write_val(b, 0, true, &pl);
-            r
-        })
-        .await
+        blockcache::init::<D, _>(&self.inner, p, f).await
+    }
+
+    /// A page's bytes by reference — the read half of the drafts'
+    /// write half: the closure runs against the page in the arena, the
+    /// bytes never leave it. The caller reads only pages it owns (the
+    /// ones its own records and schemas brought into the world); the
+    /// store does not police the id.
+    pub async fn read_page<R>(
+        &self,
+        p: PageId,
+        f: impl Fn(&AlignedPage) -> R + 'static,
+    ) -> Result<R, StoreError>
+    where
+        R: 'static,
+    {
+        let poisoned = { self.inner.borrow().poisoned };
+        if poisoned {
+            return Err(StoreError::Poisoned);
+        }
+        blockcache::read::<D, _>(&self.inner, p, f).await
     }
 }

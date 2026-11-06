@@ -32,11 +32,14 @@ pub(super) enum Op {
 impl Op {
     pub(super) fn key(&self) -> &[u8] {
         match self {
-            Op::Put((k, _, _)) => k,
+            Op::Put((k, _)) => k,
             Op::Del(k) => k,
         }
     }
 }
+
+/// An interior route mid-rewrite: the child's smallest key, the child.
+type Rt = (Vec<u8>, PageId);
 
 /// The graft's outcome: the new drafts — children before parents, the
 /// new root last, `tree::build`'s order (empty — nothing changed, or
@@ -145,9 +148,17 @@ pub(super) async fn run<D: IsFilesystem>(
         if level > 64 {
             return Err(StoreError::Steps("tree: crown"));
         }
-        let mut ts = vec![(up.lo.clone(), Vec::new(), up.id)];
-        ts.extend(up.cuts.drain(..).map(|(id, lo)| (lo, Vec::new(), id)));
-        up = repack(level, ts, tree::NODE_MAX, tree::route_e, &mut drafts)?;
+        let mut ts: Vec<Rt> = vec![(up.lo.clone(), up.id)];
+        ts.extend(up.cuts.drain(..).map(|(id, lo)| (lo, id)));
+        up = repack(
+            level,
+            ts,
+            tree::NODE_MAX,
+            |(k, _): &Rt| 16 + k.len(),
+            |(k, _): &Rt| k,
+            |lv, s| interior(lv, s),
+            &mut drafts,
+        )?;
     }
     Ok(Grafted {
         drafts,
@@ -177,7 +188,15 @@ fn rewrite(
             return Ok((dropped(), true));
         }
         Ok((
-            repack(0, merged, tree::LEAF_MAX, tree::leaf_e, drafts)?,
+            repack(
+                0,
+                merged,
+                tree::LEAF_MAX,
+                tree::leaf_e,
+                |(k, _): &Item| k,
+                |lv, s| leaf(lv, s),
+                drafts,
+            )?,
             true,
         ))
     } else {
@@ -189,7 +208,15 @@ fn rewrite(
             return Ok((dropped(), true));
         }
         Ok((
-            repack(f.node.level, ts, tree::NODE_MAX, tree::route_e, drafts)?,
+            repack(
+                f.node.level,
+                ts,
+                tree::NODE_MAX,
+                |(k, _): &Rt| 16 + k.len(),
+                |(k, _): &Rt| k,
+                |lv, s| interior(lv, s),
+                drafts,
+            )?,
             true,
         ))
     }
@@ -219,56 +246,65 @@ fn same_records(node: &tree::Node, ts: &[Item]) -> bool {
         && node
             .es
             .iter()
-            .zip(&node.ids)
             .zip(ts)
-            .all(|(((k, mt), &vr), (tk, tmt, tvr))| k == tk && mt == tmt && vr == *tvr)
+            .all(|((k, mt), (tk, tmt))| k == tk && mt == tmt)
 }
 
 /// Did a re-pointed interior land on exactly the node's own routes?
-fn same_routes(node: &tree::Node, ts: &[Item]) -> bool {
+fn same_routes(node: &tree::Node, ts: &[Rt]) -> bool {
     node.es.len() == ts.len()
         && node
             .es
             .iter()
             .zip(&node.ids)
             .zip(ts)
-            .all(|(((lo, _), &id), (tlo, _, tid))| lo == tlo && id == *tid)
+            .all(|(((lo, _), &id), (tlo, tid))| lo == tlo && id == *tid)
 }
 
-/// The packed records as drafts — one node, or a run of siblings born
+/// A leaf draft over its records: the entries whole, no children.
+fn leaf(level: u32, ts: &[Item]) -> tree::Node {
+    tree::Node {
+        level,
+        es: ts.to_vec(),
+        ids: Vec::new(),
+    }
+}
+
+/// An interior draft over its routes: the routing keys, the children.
+fn interior(level: u32, ts: &[Rt]) -> tree::Node {
+    tree::Node {
+        level,
+        es: ts.iter().map(|(lo, _)| (lo.clone(), Vec::new())).collect(),
+        ids: ts.iter().map(|(_, id)| *id).collect(),
+    }
+}
+
+/// The packed entries as drafts — one node, or a run of siblings born
 /// of the repack; the report goes up. Never called on an empty `ts` —
 /// the rewrite reports the emptied node before this.
-fn repack(
+fn repack<T>(
     level: u32,
-    ts: Vec<Item>,
+    ts: Vec<T>,
     cap: usize,
-    cost: impl Fn(&Item) -> usize,
+    cost: impl Fn(&T) -> usize,
+    lo: impl Fn(&T) -> &[u8],
+    mut emit: impl FnMut(u32, &[T]) -> tree::Node,
     drafts: &mut Vec<tree::Node>,
 ) -> Result<Up, StoreError> {
     let mut runs = tree::pack(&ts, cap, cost)?.into_iter();
     let (at, len) = runs.next().expect("a visited node holds a record");
     let mut up = Up {
         id: tree::virt(drafts.len()),
-        lo: ts[at].0.clone(),
+        lo: lo(&ts[at]).to_vec(),
         cuts: Vec::new(),
     };
-    emit(drafts, level, &ts[at..at + len]);
+    drafts.push(emit(level, &ts[at..at + len]));
     for (at, len) in runs {
-        up.cuts.push((tree::virt(drafts.len()), ts[at].0.clone()));
-        emit(drafts, level, &ts[at..at + len]);
+        up.cuts
+            .push((tree::virt(drafts.len()), lo(&ts[at]).to_vec()));
+        drafts.push(emit(level, &ts[at..at + len]));
     }
     Ok(up)
-}
-
-fn emit(drafts: &mut Vec<tree::Node>, level: u32, ts: &[Item]) {
-    drafts.push(tree::Node {
-        level,
-        es: ts
-            .iter()
-            .map(|(k, mt, _)| (k.clone(), mt.clone()))
-            .collect(),
-        ids: ts.iter().map(|t| t.2).collect(),
-    });
 }
 
 /// The leaf's records with its share merged in — both sides sorted; an
@@ -284,7 +320,7 @@ fn merge(node: &tree::Node, batch: &[Op]) -> Vec<Item> {
             _ => false,
         };
         if old {
-            out.push((es[i].0.clone(), es[i].1.clone(), node.ids[i]));
+            out.push((es[i].0.clone(), es[i].1.clone()));
             i += 1;
         } else {
             match &batch[j] {
@@ -307,19 +343,19 @@ fn merge(node: &tree::Node, batch: &[Op]) -> Vec<Item> {
 /// replaced child's report from below — its draft, its subtree's lo,
 /// the right siblings born under it; an emptied child (id 0) drops its
 /// route.
-fn repoint(node: &tree::Node, ups: &HashMap<PageId, Up>) -> Vec<Item> {
+fn repoint(node: &tree::Node, ups: &HashMap<PageId, Up>) -> Vec<Rt> {
     let mut out = Vec::with_capacity(node.ids.len());
     for ((lo, _), &id) in node.es.iter().zip(&node.ids) {
         if let Some(up) = ups.get(&id) {
             if up.id == 0 {
                 continue; // the dropped route
             }
-            out.push((up.lo.clone(), Vec::new(), up.id));
+            out.push((up.lo.clone(), up.id));
             for (cid, clo) in &up.cuts {
-                out.push((clo.clone(), Vec::new(), *cid));
+                out.push((clo.clone(), *cid));
             }
         } else {
-            out.push((lo.clone(), Vec::new(), id));
+            out.push((lo.clone(), id));
         }
     }
     out

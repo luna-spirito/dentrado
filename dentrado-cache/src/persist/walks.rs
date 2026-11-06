@@ -1,8 +1,8 @@
 //! The image's walks — every multi-page traversal the store performs
 //! outside a live tree descent: whole trees (the drops, the
-//! invariants), ranged trees (the scans), value chains, and the
-//! schema-aware dependency closures. All reads go through the pool —
-//! pages live only there.
+//! invariants), ranged trees (the scans), the pools' chunk chains, and
+//! the schema-aware dependency closures. All reads go through the
+//! pool — pages live only there.
 
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
@@ -12,11 +12,10 @@ use super::PersistentCore;
 use crate::blockcache;
 use crate::core::freelist::{ChainEntry, chunk_cells, chunk_next};
 use crate::core::tree::{Item, parse_node};
-use crate::core::val::val_split;
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::PageId;
-use crate::schema::{PageSchema, TableSchema};
+use crate::schema::{Dep, TableSchema};
 
 /// Walk a table's tree breadth-first: its records in key order (the
 /// leaves come out left to right) and all its pages.
@@ -39,7 +38,7 @@ pub(crate) async fn walk_tree<D: IsFilesystem>(
         fuel -= 1;
         let n = blockcache::read::<D, _>(inner, p, parse_node).await?;
         if n.level == 0 {
-            es.extend(n.es.into_iter().zip(n.ids).map(|((k, mt), vr)| (k, mt, vr)));
+            es.extend(n.es);
         } else {
             q.extend(n.ids);
         }
@@ -74,9 +73,9 @@ pub(crate) async fn walk_range<D: IsFilesystem>(
         fuel -= 1;
         let node = blockcache::read::<D, _>(inner, p, parse_node).await?;
         if node.level == 0 {
-            for ((k, mt), &vr) in node.es.iter().zip(&node.ids) {
+            for (k, mt) in &node.es {
                 if k.as_slice() >= lo && hi.is_none_or(|h| k.as_slice() < h) {
-                    out.push((k.clone(), mt.clone(), vr));
+                    out.push((k.clone(), mt.clone()));
                 }
             }
             continue;
@@ -137,50 +136,22 @@ pub(crate) async fn walk_chain_raw<D: IsFilesystem>(
         .collect())
 }
 
-/// Walk a value's chain (pages by their `next` headers). The bound is
-/// the world's pages: a longer value chain can only be corruption.
-pub(crate) async fn walk_value<D: IsFilesystem>(
-    inner: &Rc<RefCell<PersistentCore<D>>>,
-    first: PageId,
-    bound: u64,
-) -> Result<Vec<PageId>, StoreError> {
-    let mut out = Vec::new();
-    let mut p = first;
-    let mut fuel = bound;
-    loop {
-        if fuel == 0 {
-            return Err(StoreError::Steps("value: steps"));
-        }
-        fuel -= 1;
-        out.push(p);
-        let next = blockcache::read::<D, _>(inner, p, |b| val_split(b).0).await?;
-        if next == 0 {
-            return Ok(out);
-        }
-        p = next;
-    }
-}
-
-/// A record's full page closure beyond its own bytes: its value chain
-/// (when `vr` names one) plus, recursively, every page the schema
-/// names from the record's inline bytes and each dependent page's
-/// payload. Shared pages are walked once; the fuel bounds the walk —
-/// a schema naming more pages than the world holds is corruption, as
-/// is a schema that cannot parse what it is handed.
+/// A record's full page closure beyond its own bytes: recursively,
+/// every page the schema names from the record's inline bytes and each
+/// named page's bytes. Shared pages are walked once (a content cycle
+/// rides the set); the fuel bounds the walk — a schema naming more
+/// pages than the world holds is corruption, as is a schema that
+/// cannot parse what it is handed. The pages reach the store through
+/// the pool only — a read per page, no bytes copied out.
 pub(crate) async fn walk_deps<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
-    schema: &'static dyn TableSchema,
+    schema: TableSchema,
     mt: &[u8],
-    vr: PageId,
     fuel0: u64,
 ) -> Result<Vec<PageId>, StoreError> {
-    let mut out = if vr != 0 {
-        walk_value::<D>(inner, vr, fuel0).await?
-    } else {
-        Vec::new()
-    };
-    let mut seen: HashSet<PageId> = out.iter().copied().collect();
-    let mut q: VecDeque<(PageId, &'static dyn PageSchema)> = schema.val_deps(mt)?.into();
+    let mut out = Vec::new();
+    let mut seen: HashSet<PageId> = HashSet::new();
+    let mut q: VecDeque<Dep> = (schema.val_deps)(mt)?.into();
     let mut fuel = fuel0;
     while let Some((p, ps)) = q.pop_front() {
         if !seen.insert(p) {
@@ -193,7 +164,7 @@ pub(crate) async fn walk_deps<D: IsFilesystem>(
         }
         fuel -= 1;
         out.push(p);
-        let deps = blockcache::read::<D, _>(inner, p, move |b| ps.deps(val_split(b).1)).await??;
+        let deps = blockcache::read::<D, _>(inner, p, move |b| (ps.deps)(&b.0)).await??;
         q.extend(deps);
     }
     Ok(out)

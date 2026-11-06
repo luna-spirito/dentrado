@@ -22,7 +22,7 @@ use crate::core::sb::write_sb;
 use crate::core::tree;
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
-use crate::page::{Page, PageId, fnv_id};
+use crate::page::{AlignedPage, PageId, fnv_id};
 use crate::storage::Storage;
 
 // ## The agent
@@ -177,11 +177,7 @@ async fn engrave<D: IsFilesystem>(
         let mut batch: Vec<graft::Op> = fl.snaps[t]
             .iter()
             .map(|(k, v)| match v {
-                DeltaV::Put(cv) => graft::Op::Put((
-                    k.clone(),
-                    cv.mt.clone(),
-                    cv.pages.first().copied().unwrap_or(0),
-                )),
+                DeltaV::Put(mt) => graft::Op::Put((k.clone(), mt.clone())),
                 DeltaV::Del => graft::Op::Del(k.clone()),
             })
             .collect();
@@ -336,7 +332,7 @@ async fn engrave<D: IsFilesystem>(
                 .iter()
                 .map(|d| {
                     let rid: Vec<PageId> = d.ids.iter().map(|&c| tree::real(c, ids)).collect();
-                    let mut p = Page::zeroed();
+                    let mut p = AlignedPage::zeroed();
                     tree::write_node(&mut p, d.level, &d.es, &rid);
                     p
                 })

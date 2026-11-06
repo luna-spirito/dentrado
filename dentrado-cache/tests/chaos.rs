@@ -4,42 +4,43 @@
 //! краш с порванной записью в полёта.
 
 mod common;
+mod util;
 
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::task::Poll;
 
 use common::{expect_turns, race_turns};
-use dentrado_cache::core::val::VAL_PAYLOAD;
-use dentrado_cache::{Fault, MemDisk, Rec, Storage, StoreError, TableSpec};
-
-fn run<F: Future>(f: F) -> F::Output {
-    compio::runtime::Runtime::new().unwrap().block_on(f)
-}
+use dentrado_cache::{Fault, MemDisk, Rec, Storage, StoreError};
+use util::{PAYLOAD, chain_specs, put, put_big, run, specs};
 
 const KEY: &[u8] = b"k";
 const KEY2: &[u8] = b"j";
 
-fn specs(ids: &[&[u8]]) -> Vec<TableSpec> {
-    ids.iter().map(|i| TableSpec::flat(i.to_vec())).collect()
-}
-
 /// Публикация значения из трёх байт.
 async fn put_v(st: &Storage<MemDisk>, key: &[u8], val: u8) {
-    st.put_many(
-        b"t0",
-        &[Rec::Put {
-            key,
-            val: &[val; 3],
-        }],
-    )
-    .await
-    .unwrap();
+    st.put_many(b"t0", &[put(key, &[val; 3])]).await.unwrap();
 }
 
 /// Прочитать первый байт значения (со сверкой по теневой версии).
 async fn first_byte(st: &Storage<MemDisk>, key: &[u8]) -> Option<u8> {
     st.get(b"t0", key).await.unwrap().map(|v| v[0])
+}
+
+/// Страницы живой цепи ключа — по `mt`, ходом `next`-заголовков, без
+/// чтения содержимого: список для `free`.
+async fn chain_pages(st: &Storage<MemDisk>, key: &[u8]) -> Vec<dentrado_cache::PageId> {
+    let mt = st.get(b"t0", key).await.unwrap().expect("ключ есть");
+    let mut head = u64::from_le_bytes(mt[..8].try_into().unwrap());
+    let mut ps = Vec::new();
+    while head != 0 {
+        ps.push(head);
+        head = st
+            .read_page(head, |pg| u64::from_le_bytes(pg.0[..8].try_into().unwrap()))
+            .await
+            .unwrap();
+    }
+    ps
 }
 
 /// Харнесс жив: обычные операции проходят под бюджетом оборотов, биекция
@@ -97,24 +98,34 @@ fn flush_cancel_recovers() {
 fn alloc_cancel_recovers() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+        let st = Storage::open(&disk, "db", 4, &chain_specs(&[b"t0"]))
             .await
             .unwrap();
         // 1100 смертей (рецепт multi_chunk_flush): запас уезжает в цепь
         // своего пула, головы пусты — первый аллок обязан читать чанк
         let key = b"tail";
-        let big = vec![1u8; 1100 * VAL_PAYLOAD];
-        st.put_many(b"t0", &[Rec::Put { key, val: &big }])
-            .await
-            .unwrap();
+        let big = vec![1u8; 1100 * PAYLOAD];
+        put_big(&st, b"t0", key, &big, &[]).await.unwrap();
         st.flush().await.unwrap();
-        put_v(&st, key, 9).await; // замена: цепь умирает замыканием
+        // замена на инлайн: 1100 страниц цепи — во free
+        let pages = chain_pages(&st, key).await;
+        st.put_many(
+            b"t0",
+            &[Rec::Put {
+                key,
+                val: &[9; 3],
+                take: &[],
+                free: &pages,
+            }],
+        )
+        .await
+        .unwrap();
         st.flush().await.unwrap();
         drop(st);
         // рестарт с кэшем в одну страницу: проход загрузки вымывает чанк
         // из резидента, первый аллок обязан лететь в диск; Fault валит
         // его, `?` бросает хвост в Busy
-        let st = Storage::open(&disk, "db", 1, &specs(&[b"t0"]))
+        let st = Storage::open(&disk, "db", 1, &chain_specs(&[b"t0"]))
             .await
             .unwrap();
         disk.file("db").set_fault(Fault::At(1));
@@ -145,22 +156,32 @@ fn alloc_cancel_recovers() {
 fn alloc_reader_cancel_recovers() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+        let st = Storage::open(&disk, "db", 4, &chain_specs(&[b"t0"]))
             .await
             .unwrap();
         let key = b"tail";
-        let big = vec![1u8; 1100 * VAL_PAYLOAD];
-        st.put_many(b"t0", &[Rec::Put { key, val: &big }])
-            .await
-            .unwrap();
+        let big = vec![1u8; 1100 * PAYLOAD];
+        put_big(&st, b"t0", key, &big, &[]).await.unwrap();
         st.flush().await.unwrap();
-        put_v(&st, key, 9).await;
+        // замена на инлайн: цепь умирает списком звонящего
+        let pages = chain_pages(&st, key).await;
+        st.put_many(
+            b"t0",
+            &[Rec::Put {
+                key,
+                val: &[9; 3],
+                take: &[],
+                free: &pages,
+            }],
+        )
+        .await
+        .unwrap();
         st.flush().await.unwrap();
         drop(st);
         // рестарт с кэшем в одну страницу: головы пусты, хвост чётного
         // пула — на диске; первый опрос алока делает Free→Busy и паркует
         // на чтении — дроп. Хвост обязан вернуться в Free.
-        let st = Storage::open(&disk, "db", 1, &specs(&[b"t0"]))
+        let st = Storage::open(&disk, "db", 1, &chain_specs(&[b"t0"]))
             .await
             .unwrap();
         assert!(race_turns(st.alloc_draft_page(), 0).await.is_none());
@@ -249,15 +270,7 @@ fn transient_flush_failure_keeps_partition() {
                 .unwrap();
             put_v(&st, KEY, 1).await;
             st.flush().await.unwrap();
-            st.put_many(
-                b"t0",
-                &[Rec::Put {
-                    key: KEY,
-                    val: &[2u8; 3],
-                }],
-            )
-            .await
-            .unwrap();
+            st.put_many(b"t0", &[put(KEY, &[2u8; 3])]).await.unwrap();
             disk.file("db").set_fault(Fault::Once(f));
             let _ = st.flush().await; // transient отказ пережит
             disk.file("db").set_fault(Fault::None);
@@ -317,15 +330,7 @@ fn torn_write_recovery_is_binary() {
                 .unwrap();
             put_v(&st, KEY, 1).await;
             st.flush().await.unwrap();
-            st.put_many(
-                b"t0",
-                &[Rec::Put {
-                    key: KEY,
-                    val: &[2u8; 3],
-                }],
-            )
-            .await
-            .unwrap();
+            st.put_many(b"t0", &[put(KEY, &[2u8; 3])]).await.unwrap();
             disk.file("db").set_fault(Fault::Torn(f));
             let _ = st.flush().await; // запись в полёте порвана, далее — смерть
             drop(st); // краш
@@ -365,21 +370,13 @@ async fn worker(st: Rc<Storage<MemDisk>>, kb: u8, mut seed: u64, rounds: u8) -> 
             0..=1 => {
                 let v = ver.wrapping_add(1);
                 let cell = vec![kb, v];
-                st.put_many(
-                    b"t0",
-                    &[Rec::Put {
-                        key: &key,
-                        val: &cell,
-                    }],
-                )
-                .await
-                .unwrap();
+                st.put_many(b"t0", &[put(&key, &cell)]).await.unwrap();
                 ver = v;
             }
             2 => {
                 // черновик в никуда: страница домой, посреди круга в том числе
                 let k = st.alloc_draft_page().await.unwrap();
-                st.write_draft_page(k, |_| (vec![0; 8], ())).await.unwrap();
+                st.write_draft_page(k, |pg| pg.0[0] = 0).await.unwrap();
                 st.dealloc_draft_page(k).await.unwrap();
             }
             _ => {

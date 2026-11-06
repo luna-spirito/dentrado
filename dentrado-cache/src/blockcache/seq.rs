@@ -15,7 +15,7 @@ use super::disk_arena::DiskArena;
 use super::{PostFn, Reply, SlotId};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
-use crate::page::{Page, PageId};
+use crate::page::{AlignedPage, PageId};
 
 // ## The queue's kinds
 
@@ -138,7 +138,7 @@ enum Where {
 }
 
 impl<D: IsFilesystem> SeqArena<D> {
-    pub(super) fn new(file: D::File, pages: Rc<[std::cell::UnsafeCell<Page>]>) -> Self {
+    pub(super) fn new(file: D::File, pages: Rc<[std::cell::UnsafeCell<AlignedPage>]>) -> Self {
         Self {
             disk: DiskArena::new(file, pages),
             queues: HashMap::new(),
@@ -164,7 +164,7 @@ impl<D: IsFilesystem> SeqArena<D> {
         &mut self,
         id: PageId,
         load: bool,
-        f: impl FnOnce(&mut Page) -> (bool, R) + 'static,
+        f: impl FnOnce(&mut AlignedPage) -> (bool, R) + 'static,
     ) -> Submit<R>
     where
         R: 'static,
