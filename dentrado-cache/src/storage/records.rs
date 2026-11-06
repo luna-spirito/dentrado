@@ -10,10 +10,10 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use super::{Guard, Storage};
+use super::{Guard, Session, Storage};
 use crate::blockcache;
-use crate::core::StepHit;
 use crate::core::tree::{leaf_find, parse_node, route};
+use crate::core::{DeltaV, StepHit};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::PageId;
@@ -33,11 +33,12 @@ fn table_at<D: IsFilesystem>(s: &Storage<D>, id: &[u8]) -> Result<(usize, u64), 
 }
 
 impl<D: IsFilesystem> Storage<D> {
-    /// Read one record's value whole: the delta first, the standing
-    /// tree second. The bytes are the record's inline half — pages a
-    /// record names are read through [`Storage::read_page`] by the
-    /// owner's own codec. The EBR pin lives inside the walk; the
-    /// answer is owned bytes, no page references out.
+    /// Read one record's value whole from the live world: the delta
+    /// first, the standing tree second. The bytes are the record's
+    /// inline half — pages a record names are read through
+    /// [`Session::read`] by the owner's own codec. The EBR pin lives
+    /// inside the walk; the answer is owned bytes, no page references
+    /// out.
     pub async fn get(&self, id: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         let (t, bound) = table_at(self, id)?;
         let (bucket, hit, root) = {
@@ -66,10 +67,11 @@ impl<D: IsFilesystem> Storage<D> {
         r
     }
 
-    /// Scan a table: the records under `prefix`, strictly past `after`,
-    /// in key order — the standing tree pruned to the range, the delta
-    /// overlaid on it (a delta put replaces, a delta deletion hides).
-    /// The EBR pin lives inside the walk; the answer is owned bytes.
+    /// Scan a table's live world: the records under `prefix`, strictly
+    /// past `after`, in key order — the standing tree pruned to the
+    /// range, the delta overlaid on it (a delta put replaces, a delta
+    /// deletion hides). The EBR pin lives inside the walk; the answer
+    /// is owned bytes.
     pub async fn scan(
         &self,
         id: &[u8],
@@ -94,31 +96,84 @@ impl<D: IsFilesystem> Storage<D> {
             inner: self.inner.clone(),
             bucket,
         };
-        let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-        for (k, mt) in walk_range::<D>(&self.inner, root, lo, end.as_deref(), bound).await? {
-            merged.insert(k, Some(mt));
-        }
-        for (k, v) in overlay {
-            merged.insert(
-                k,
-                match v {
-                    crate::core::DeltaV::Put(mt) => Some(mt),
-                    crate::core::DeltaV::Del => None,
-                },
-            );
-        }
-        let mut out = Vec::new();
-        for (k, mt) in merged {
-            if k.as_slice() <= after {
-                continue;
-            }
-            if let Some(mt) = mt {
-                out.push((k, mt));
-            }
-        }
+        let walked = walk_range::<D>(&self.inner, root, lo, end.as_deref(), bound).await?;
         drop(guard);
-        Ok(out)
+        Ok(merge_range(walked, overlay, after))
     }
+}
+
+impl<D: IsFilesystem> Session<D> {
+    /// Read one record from the session's snapshot: the delta first,
+    /// the standing tree second. The snapshot's pin — taken at the
+    /// first read — keeps the tree's pages alive; the answer is owned
+    /// bytes, no page references out.
+    pub async fn get(&mut self, id: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        self.ensure_snapshot()?;
+        let (root, bound) = {
+            let snap = self.snap.as_ref().expect("the snapshot was just ensured");
+            let t = snap.table(id).ok_or(StoreError::NoTable)?;
+            match snap.delta(t, key) {
+                Some(DeltaV::Put(mt)) => return Ok(Some(mt.clone())),
+                Some(DeltaV::Del) => return Ok(None),
+                None => {}
+            }
+            (snap.root(t), snap.bound())
+        };
+        descend::<D>(&self.inner, root, key, bound).await
+    }
+
+    /// Scan the session's snapshot: the records under `prefix`, strictly
+    /// past `after`, in key order — the snapshot's tree pruned to the
+    /// range, its delta overlaid (a put replaces, a deletion hides).
+    pub async fn scan(
+        &mut self,
+        id: &[u8],
+        prefix: &[u8],
+        after: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+        self.ensure_snapshot()?;
+        let end = prefix_end(prefix);
+        let lo: &[u8] = if after > prefix { after } else { prefix };
+        let (root, bound, overlay) = {
+            let snap = self.snap.as_ref().expect("the snapshot was just ensured");
+            let t = snap.table(id).ok_or(StoreError::NoTable)?;
+            (
+                snap.root(t),
+                snap.bound(),
+                snap.delta_range(t, lo, end.as_deref()),
+            )
+        };
+        let walked = walk_range::<D>(&self.inner, root, lo, end.as_deref(), bound).await?;
+        Ok(merge_range(walked, overlay, after))
+    }
+}
+
+/// The scan's merged answer: the tree's walk overlaid with delta entries
+/// (a put replaces, a deletion hides), strictly past `after`, in key
+/// order.
+fn merge_range(
+    walked: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+    overlay: impl IntoIterator<Item = (Vec<u8>, DeltaV)>,
+    after: &[u8],
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+    for (k, mt) in walked {
+        merged.insert(k, Some(mt));
+    }
+    for (k, v) in overlay {
+        merged.insert(
+            k,
+            match v {
+                DeltaV::Put(mt) => Some(mt),
+                DeltaV::Del => None,
+            },
+        );
+    }
+    merged
+        .into_iter()
+        .filter(|(k, _)| k.as_slice() > after)
+        .filter_map(|(k, mt)| mt.map(|mt| (k, mt)))
+        .collect()
 }
 
 /// The standing tree's record for `key` — a root-to-leaf descent, its

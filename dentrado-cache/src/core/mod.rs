@@ -61,6 +61,52 @@ pub(crate) enum StepHit {
     Tree,
 }
 
+/// A reader's world at a pin — the tables' names, roots and deltas
+/// copied under an EBR pin, plus the page bound for the descent's
+/// fuel. The pin keeps every page the snapshot's trees can reach from
+/// dying and being reused; [`Core::unsnap`] releases it.
+pub(crate) struct Snap {
+    bucket: usize,
+    names: Vec<Vec<u8>>,
+    roots: Vec<PageId>,
+    deltas: Vec<Delta>,
+    bound: u64,
+}
+
+impl Snap {
+    /// A live id's slot in this snapshot (a tombstone never matches).
+    pub(crate) fn table(&self, id: &[u8]) -> Option<usize> {
+        self.names
+            .iter()
+            .position(|n| !n.is_empty() && n.as_slice() == id)
+    }
+
+    /// A slot's standing tree root.
+    pub(crate) fn root(&self, t: usize) -> PageId {
+        self.roots[t]
+    }
+
+    /// A slot's delta entry for a key.
+    pub(crate) fn delta(&self, t: usize, k: &[u8]) -> Option<&DeltaV> {
+        self.deltas[t].get(k)
+    }
+
+    /// A slot's delta entries in a key range — a scan's overlay half.
+    pub(crate) fn delta_range(
+        &self,
+        t: usize,
+        lo: &[u8],
+        hi: Option<&[u8]>,
+    ) -> Vec<(Vec<u8>, DeltaV)> {
+        tables::delta_range(&self.deltas[t], lo, hi)
+    }
+
+    /// The world's page bound at the snapshot — the descent's fuel.
+    pub(crate) fn bound(&self) -> u64 {
+        self.bound
+    }
+}
+
 /// One record at a commit's seal: the key, the record's inline bytes
 /// (`None` — a deletion), and the draft pages it publishes (empty for
 /// an inline-only record or a deletion).
@@ -263,6 +309,27 @@ impl<D: IsFilesystem> Core<D> {
     /// The guard away.
     pub(crate) fn drop_step(&mut self, b: usize) {
         self.deaths.unpin(b);
+    }
+
+    /// A reader's snapshot: the EBR pin plus the tables' names, roots,
+    /// deltas and page bound copied under it. The copies and the pin
+    /// share one section, so the snapshot is exactly the world the pin
+    /// protects. A write-only session never calls this — no pin, no
+    /// pending churn.
+    pub(crate) fn snap(&mut self) -> Snap {
+        Snap {
+            bucket: self.deaths.pin(),
+            names: self.tables.names_all(),
+            roots: self.tables.roots.clone(),
+            deltas: self.tables.snap(),
+            bound: self.bound(),
+        }
+    }
+
+    /// The snapshot away: its pin releases and the deaths it held
+    /// drain.
+    pub(crate) fn unsnap(&mut self, snap: Snap) {
+        self.deaths.unpin(snap.bucket);
     }
 
     // ## The tables' verbs (the named-set surface)

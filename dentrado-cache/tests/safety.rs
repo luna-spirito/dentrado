@@ -115,8 +115,8 @@ fn a_draft_dies_once() {
 }
 
 /// A leak, not a laundering: a live draft no staged record takes
-/// refuses the commit — the session stays whole, and its drop is the
-/// clean abort (the page home, nothing landed).
+/// refuses the commit — which consumes the session, and that drop is
+/// the clean abort (the page home, nothing landed).
 #[test]
 fn an_untaken_draft_refuses_the_commit() {
     run(async {
@@ -131,7 +131,6 @@ fn an_untaken_draft_refuses_the_commit() {
             s.commit(),
             Err(StoreError::BadSeal("an untaken draft at the commit"))
         ));
-        drop(s); // the page goes home; the record never ran
         assert_eq!(st.get(b"t0", b"k").await.unwrap(), None);
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();

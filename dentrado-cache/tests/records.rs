@@ -234,7 +234,6 @@ fn a_shared_closure_dies_once() {
         s.put(b"t0", b"h", &namer(2), &[], &[]).unwrap();
         s.put(b"t0", b"t", &namer(4), &[], &[]).unwrap();
         s.commit().unwrap();
-        drop(s);
         st.flush().await.unwrap();
         // the world: tree {3}, the pair {2, 4} — one set of three deaths
         st.drop_table(b"t0").await.unwrap();
@@ -312,7 +311,6 @@ fn untaken_pages_show_in_the_partition() {
         let p = s.page(k).unwrap();
         s.put(b"t0", b"kk", b"v", &[k], &[]).unwrap();
         s.commit().unwrap();
-        drop(s);
         st.flush().await.unwrap();
         let v = st.partition_exact().await.expect_err("orphaned page");
         assert!(

@@ -1,6 +1,8 @@
-//! The store's async surface: the reads ([`records`]) and the write
-//! session ([`session`]) — the one door to the store's pages. A
-//! record's value is the caller's inline bytes; anything bigger the
+//! The store's async surface: the reads ([`records`]) — the live
+//! world's point reads and scans, and the session's coherent snapshot
+//! reads — and the write session ([`session`]), the one door to the
+//! store's pages. A record's value is the caller's inline bytes;
+//! anything bigger the
 //! caller pages itself (the session's drafts are its pages, the schema
 //! its declaration of what a record names), and reads of those pages
 //! go by reference — bytes never leave the arena. Under it:

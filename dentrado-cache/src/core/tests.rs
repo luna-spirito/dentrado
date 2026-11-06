@@ -147,6 +147,26 @@ fn a_second_seal_is_caught() {
     let _ = c.seal_round();
 }
 
+/// A snapshot holds its epoch's deaths: they sit undrained in the
+/// pending bucket (`held` sees them, the pile does not) and drain only
+/// when the snapshot lets go.
+#[test]
+fn a_snapshot_holds_its_epoch_deaths() {
+    let mut c = core();
+    let j = draft(&mut c); // page 2
+    assert!(seal(&mut c, 0, b"j", b"", &[j], &[]).is_ok());
+    let snap = c.snap();
+    let k = draft(&mut c); // page 4
+    assert!(seal(&mut c, 0, b"k", b"", &[k], &[2]).is_ok());
+    let ram = c.ram();
+    assert!(ram.held.contains(&2));
+    assert_eq!(ram.dying, 0); // pending, undrained
+    c.unsnap(snap);
+    let ram = c.ram();
+    assert!(ram.held.contains(&2));
+    assert_eq!(ram.dying, 1);
+}
+
 /// A failed round's rollback restores the seal-time world whole — the
 /// pools, the containers, the deaths pile, the drafts, the delta.
 #[test]

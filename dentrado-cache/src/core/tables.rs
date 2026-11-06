@@ -129,6 +129,12 @@ impl Tables {
             .collect()
     }
 
+    /// Every slot's id, tombstones included — a snapshot's
+    /// slot-parallel copy (the roots and deltas line up with it).
+    pub(crate) fn names_all(&self) -> Vec<Vec<u8>> {
+        self.names.clone()
+    }
+
     /// The live `(id, root)` pairs over a roots vector (the flush's
     /// new roots) — the SB's table set.
     pub(crate) fn live_with(&self, roots: &[PageId]) -> Vec<(Vec<u8>, PageId)> {
@@ -159,11 +165,7 @@ impl Tables {
         lo: &[u8],
         hi: Option<&[u8]>,
     ) -> Vec<(Vec<u8>, DeltaV)> {
-        self.deltas[t]
-            .iter()
-            .filter(|(k, _)| k.as_slice() >= lo && hi.is_none_or(|h| k.as_slice() < h))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+        delta_range(&self.deltas[t], lo, hi)
     }
 
     /// A slot's death: the id and delta go, the root zeroes — the
@@ -181,4 +183,13 @@ impl Tables {
     pub(crate) fn len(&self) -> usize {
         self.deltas.iter().map(|d| d.len()).sum()
     }
+}
+
+/// A delta's entries in a key range — the scan overlay's filter. The
+/// range is half-open: `k >= lo`, `k < hi` when `hi` is named.
+pub(crate) fn delta_range(d: &Delta, lo: &[u8], hi: Option<&[u8]>) -> Vec<(Vec<u8>, DeltaV)> {
+    d.iter()
+        .filter(|(k, _)| k.as_slice() >= lo && hi.is_none_or(|h| k.as_slice() < h))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }

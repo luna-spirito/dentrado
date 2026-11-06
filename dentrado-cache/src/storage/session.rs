@@ -6,12 +6,24 @@
 //! or not at all. A session dropped uncommitted is a clean abort: its
 //! drafts go back to their pools whole, nothing it staged ever ran.
 //!
-//! A session holds no pins and no snapshots: the store is
-//! single-threaded by construction, a commit is atomic in itself, and
-//! a pin held across a session's life would stall the death drain for
-//! the session's whole duration (every flush of a long session would
-//! pile pendings). Uncommitted stages are invisible to the store's
-//! reads — the standing world is the only world until the commit.
+//! A session that reads takes a snapshot at its first read: an EBR pin
+//! plus the tables' roots and deltas copied under it. Every later
+//! [`get`](Session::get) and [`scan`](Session::scan) answers from that
+//! snapshot — one coherent world even as other sessions commit and
+//! flushes rebuild the trees. The pin keeps the snapshot's pages from
+//! dying and being reused; deaths registered while it is held sit in
+//! the EBR's pending buckets until the session lets go (a long reader
+//! makes each flush re-copy them as limbo — churn, not a break). The
+//! snapshot is lazy: a write-only session never pins, so the common
+//! `put`/`del`/`commit` path pays nothing. A commit consumes the
+//! session — there is no later read of it — so the snapshot needs no
+//! forward move: the commit's seal and the session's drop release it.
+//! [`read`](Session::read) is the physical page read, not a snapshot
+//! read: it serves the session's drafts and the pages its snapshot
+//! names, by reference.
+//!
+//! Uncommitted stages are invisible to the store's reads — the standing
+//! world is the only world until the commit.
 //!
 //! [`DraftPageId`] is an index into the session's own ledger, checked
 //! at every use — a dead or twice-taken draft refuses honestly. (A
@@ -25,7 +37,7 @@ use std::rc::Rc;
 use super::Storage;
 use crate::blockcache;
 use crate::core::tree::leaf_holds;
-use crate::core::{AllocAct, SealBatch, SealRec};
+use crate::core::{AllocAct, SealBatch, SealRec, Snap};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{AlignedPage, PageId};
@@ -52,7 +64,7 @@ struct Staged {
 
 /// A write session over the store — see the [module doc](self).
 pub struct Session<D: IsFilesystem> {
-    inner: Rc<RefCell<PersistentCore<D>>>,
+    pub(super) inner: Rc<RefCell<PersistentCore<D>>>,
     /// The session's drafts: index → (page, written at least once).
     /// A dead draft (discarded, or a replaced record's take) keeps its
     /// index — the ids already handed out stay honest.
@@ -63,6 +75,10 @@ pub struct Session<D: IsFilesystem> {
     /// The staged records — one per (table, key): a later stage of the
     /// same key replaces the earlier (its takes die, the frees union).
     staged: Vec<Staged>,
+    /// The read snapshot — taken at the first read, released at the
+    /// drop (the commit's own drop included). `None` for a write-only
+    /// session.
+    pub(super) snap: Option<Snap>,
 }
 
 /// A tail-read's rollback, RAII: a Busy tail without its reader bricks
@@ -113,6 +129,7 @@ impl<D: IsFilesystem> Storage<D> {
             drafts: Vec::new(),
             taken: Vec::new(),
             staged: Vec::new(),
+            snap: None,
         }
     }
 }
@@ -204,9 +221,12 @@ impl<D: IsFilesystem> Session<D> {
         Ok(r)
     }
 
-    /// Read a page by reference — the session's own drafts or a page
-    /// its records own (the store does not police the id; reading a
-    /// never-written draft is the caller's nonsense — pool noise).
+    /// Read a page by reference — a physical read, not the snapshot's:
+    /// the session's own drafts or a page its records own. The store
+    /// does not police the id (a never-written draft is pool noise). A
+    /// page id obtained from [`get`](Session::get)/[`scan`](Session::scan)
+    /// is held by the snapshot's pin; any other id is the caller's
+    /// business.
     pub async fn read<R>(
         &self,
         p: PageId,
@@ -219,6 +239,20 @@ impl<D: IsFilesystem> Session<D> {
             return Err(StoreError::Poisoned);
         }
         blockcache::read::<D, _>(&self.inner, p, f).await
+    }
+
+    /// The session's snapshot, taken at its first read: a pin plus the
+    /// tables' roots and deltas copied under it. A write-only session
+    /// never calls this.
+    pub(super) fn ensure_snapshot(&mut self) -> Result<(), StoreError> {
+        let mut inner = self.inner.borrow_mut();
+        if inner.poisoned {
+            return Err(StoreError::Poisoned);
+        }
+        if self.snap.is_none() {
+            self.snap = Some(inner.core.snap());
+        }
+        Ok(())
     }
 
     /// A draft dies before its publication: its page goes back to its
@@ -309,48 +343,42 @@ impl<D: IsFilesystem> Session<D> {
         Ok(())
     }
 
-    /// Commit: everything staged lands in one atomic section — every
-    /// table's deltas, the drafts' publication, the deaths. Every
-    /// live draft must be published by some staged record or already
-    /// dead (an untaken draft at the commit is the caller's leak —
-    /// refused, not laundered). A refusal lands nothing; the session
-    /// stays whole for a retry or a clean abort.
-    pub fn commit(&mut self) -> Result<(), StoreError> {
+    /// Commit, consuming the session: everything staged lands in one
+    /// atomic section — every table's deltas, the drafts' publication,
+    /// the deaths. Every live draft must be published by some staged
+    /// record or already dead (an untaken draft at the commit is the
+    /// caller's leak — refused, not laundered). A refusal lands nothing
+    /// and aborts the session: its unpublished drafts go home, nothing
+    /// it staged ever ran.
+    pub fn commit(self) -> Result<(), StoreError> {
         let leak = |(i, d): (usize, &Option<(PageId, bool)>)| d.is_some() && !self.taken[i];
         if self.drafts.iter().enumerate().any(leak) {
             return Err(StoreError::BadSeal("an untaken draft at the commit"));
         }
-        let r = {
-            let mut inner = self.inner.borrow_mut();
-            if inner.poisoned {
-                return Err(StoreError::Poisoned);
-            }
-            let batches: Vec<SealBatch> = self
-                .staged
-                .iter()
-                .map(|s| {
-                    Ok(SealBatch {
-                        t: inner.core.table_index(&s.t).ok_or(StoreError::NoTable)?,
-                        recs: vec![SealRec {
-                            k: s.k.clone(),
-                            put: s.put.clone(),
-                            consumed: self.pages_of(&s.take),
-                        }],
-                    })
+        let mut inner = self.inner.borrow_mut();
+        if inner.poisoned {
+            return Err(StoreError::Poisoned);
+        }
+        let batches: Vec<SealBatch> = self
+            .staged
+            .iter()
+            .map(|s| {
+                Ok(SealBatch {
+                    t: inner.core.table_index(&s.t).ok_or(StoreError::NoTable)?,
+                    recs: vec![SealRec {
+                        k: s.k.clone(),
+                        put: s.put.clone(),
+                        consumed: self.pages_of(&s.take),
+                    }],
                 })
-                .collect::<Result<Vec<_>, StoreError>>()?;
-            let freed: Vec<PageId> = self
-                .staged
-                .iter()
-                .flat_map(|s| s.free.iter().copied())
-                .collect();
-            inner.core.seal(&batches, &freed)
-        };
-        r?;
-        self.drafts.clear();
-        self.taken.clear();
-        self.staged.clear();
-        Ok(())
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        let freed: Vec<PageId> = self
+            .staged
+            .iter()
+            .flat_map(|s| s.free.iter().copied())
+            .collect();
+        inner.core.seal(&batches, &freed)
     }
 
     // ## The ledger
@@ -379,10 +407,16 @@ impl<D: IsFilesystem> Session<D> {
 }
 
 impl<D: IsFilesystem> Drop for Session<D> {
-    /// The uncommitted session is a clean abort: every live draft goes
-    /// back to its pool whole, nothing staged ever ran.
+    /// Drop is the session's release: an uncommitted session aborts
+    /// cleanly (every live draft goes home, nothing staged ran), while
+    /// a committed one already published its drafts (the seal took them
+    /// out of the arena, so this frees none) — either way the
+    /// snapshot's pin goes.
     fn drop(&mut self) {
         let mut inner = self.inner.borrow_mut();
+        if let Some(snap) = self.snap.take() {
+            inner.core.unsnap(snap);
+        }
         for d in self.drafts.drain(..) {
             if let Some((p, _)) = d {
                 inner.core.dealloc(p);
