@@ -10,7 +10,7 @@ use dentrado::{
     core::{
         core_ctx::{Core, GearCtx},
         gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime},
-        storage::{CacheSer, InMemoryStorage, IsStorage},
+        storage::{InMemoryStorage, IsStorage},
     },
     types::*,
 };
@@ -46,11 +46,6 @@ pub enum SharedOut {
     SrcOut(String),
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct SharedCache;
-
-impl CacheSer for SharedCache {}
-
 #[derive(Debug, Clone)]
 pub struct SharedRuntime;
 
@@ -63,7 +58,6 @@ impl IsRuntime for SharedRuntime {
     type Group = i64;
     type Body = ();
     type Data = ();
-    type GearCache = SharedCache;
 
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
@@ -80,14 +74,10 @@ impl IsRuntime for SharedRuntime {
         }
     }
 
-    fn make_cache(_gear: &Self::GearId) -> Self::GearCache {
-        SharedCache
-    }
-
     async fn run_step<S: IsStorage<Self>>(
         ctx: &mut GearCtx<Self, S>,
         _input: GearInput<Self>,
-        _cache: &mut Self::GearCache,
+        _view: &mut S::View<'_>,
     ) -> GearProduce<Self> {
         match ctx.gear() {
             SharedGear::Src { bucket } => {

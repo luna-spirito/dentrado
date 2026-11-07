@@ -577,7 +577,7 @@ async fn core_event_loop<R: IsRuntime, S: IsStorage<R>>(
                 }
                 Ok(CoordCmd::Shutdown) => {
                     // Graceful stop: best-effort final durability point for
-                    // restart-surviving gear caches. A crash (or a dead peer
+                    // restart-surviving gear views. A crash (or a dead peer
                     // below) falls back to the last throttled epoch flush.
                     if let Err(e) = state.storage().flush().await {
                         log::warn!("core {} final storage flush: {e}", state.core_id());

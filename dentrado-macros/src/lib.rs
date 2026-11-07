@@ -15,7 +15,7 @@ mod gears;
 ///
 /// Generates an impl that calls `.localize(r).await?` on every field. Use
 /// `#[localizable(skip)]` on a field to leave it untouched (for plain-data
-/// leaves that are not — and should not be — `Localizable`, e.g. a cache
+/// leaves that are not — and should not be — `Localizable`, e.g. a persisted
 /// payload wrapped in `Arc`).
 ///
 /// Every type parameter gets a `T: Localizable` bound on the generated impl.

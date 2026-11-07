@@ -46,8 +46,12 @@
 // generated `GearOut::is_exposed` filter the push bridge applies).
 
 #[dentrado::gear(timer(period = crate::globals::interval()), local, name = Repo)]
-pub(crate) async fn repo(tick: bool, cache: &mut RepoCache) -> Rc<RepoSnapshot> {
-    crate::wikidot_page::repo(crate::globals::repo(), tick, cache).await
+pub(crate) async fn repo<S: IsStorage<KolorinkoRT>>(
+    tick: bool,
+    ctx: &mut GearCtx<KolorinkoRT, S>,
+    view: &mut S::View<'_>,
+) -> RepoState {
+    crate::wikidot_page::repo(ctx, view, tick).await
 }
 
 /// The `repo` core's snapshot as a cross-core `shared` value: an O(1)
@@ -60,8 +64,11 @@ pub(crate) async fn repo(tick: bool, cache: &mut RepoCache) -> Rc<RepoSnapshot> 
     shared,
     name = RepoSnap,
 )]
-pub(crate) fn repo_snap(repo_data: Rc<RepoSnapshot>, _cache: &mut RepoSnapCache) -> RepoSnapshot {
-    crate::wikidot_page::repo_snap(&repo_data)
+pub(crate) fn repo_snap<S: IsStorage<KolorinkoRT>>(
+    repo_state: RepoState,
+    _view: &mut S::View<'_>,
+) -> RepoSnapshot {
+    crate::wikidot_page::repo_snap(&repo_state)
 }
 
 #[dentrado::gear(event, shared, name = Asset)]
@@ -69,7 +76,7 @@ pub(crate) async fn asset<S: IsStorage<KolorinkoRT>>(
     site: SafePathComponent,
     hash: String,
     ctx: &mut GearCtx<KolorinkoRT, S>,
-    _cache: &mut AssetCache,
+    _view: &mut S::View<'_>,
 ) -> Option<ServedBlob> {
     crate::wikidot_page::asset(&site, &hash, ctx).await
 }
@@ -85,12 +92,12 @@ pub(crate) async fn asset<S: IsStorage<KolorinkoRT>>(
     shared,
     name = CodeBlock,
 )]
-pub(crate) fn code_block(
+pub(crate) fn code_block<S: IsStorage<KolorinkoRT>>(
     space: SpaceId,
     local: LocalId,
     n: u32,
     parsed: &ArticleView,
-    _cache: &mut CodeBlockCache,
+    _view: &mut S::View<'_>,
 ) -> Option<CodeBlock> {
     crate::wikidot_page::code_block(space, local, n, parsed)
 }
@@ -103,11 +110,12 @@ pub(crate) fn code_block(
 )]
 pub(crate) async fn shell<S: IsStorage<KolorinkoRT>>(
     space: SpaceId,
-    repo_data: Rc<RepoSnapshot>,
+    repo_state: RepoState,
     ctx: &mut GearCtx<KolorinkoRT, S>,
-    _cache: &mut ShellCache,
+    _view: &mut S::View<'_>,
 ) -> SiteShell {
-    crate::wikidot_page::shell(&repo_data, space, ctx).await
+    let data = repo_state.snapshot().clone();
+    crate::wikidot_page::shell(&data, space, ctx).await
 }
 
 // Parses a page's latest body (read out of the one `repo_snap` snapshot
@@ -119,9 +127,9 @@ pub(crate) async fn article_latest_parsed<S: IsStorage<KolorinkoRT>>(
     space: SpaceId,
     local: LocalId,
     ctx: &mut GearCtx<KolorinkoRT, S>,
-    cache: &mut ParsedCache,
+    view: &mut S::View<'_>,
 ) -> ArticleView {
-    crate::wikidot_page::article_latest_parsed(space, local, ctx, cache).await
+    crate::wikidot_page::article_latest_parsed(space, local, ctx, view).await
 }
 
 #[dentrado::gear(
@@ -135,7 +143,7 @@ pub(crate) async fn article_latest<S: IsStorage<KolorinkoRT>>(
     local: LocalId,
     parsed: &ArticleView,
     ctx: &mut GearCtx<KolorinkoRT, S>,
-    cache: &mut LatestCache,
+    view: &mut S::View<'_>,
 ) -> ArticleView {
-    crate::wikidot_page::article_latest(space, local, parsed, ctx, cache).await
+    crate::wikidot_page::article_latest(space, local, parsed, ctx, view).await
 }

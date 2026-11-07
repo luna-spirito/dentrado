@@ -1920,6 +1920,7 @@ dependencies = [
  "kolorinko-wikitext",
  "leptos",
  "log",
+ "postcard",
  "rcgen",
  "ring",
  "rustls-pki-types",

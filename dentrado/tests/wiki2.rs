@@ -1,10 +1,10 @@
-use std::{fmt::Debug, num::NonZero};
+use std::{cell::RefCell, collections::HashMap, fmt::Debug, num::NonZero};
 
 use dentrado::{
     core::{
         core_ctx::GearCtx,
         gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime},
-        storage::{CacheSer, InMemoryStorage, IsStorage, Watermark},
+        storage::{InMemoryStorage, IsStorage, Watermark},
     },
     types::*,
     utils::{
@@ -168,7 +168,36 @@ pub enum Wiki2Cache {
     DocContent(DocContentCache),
 }
 
-impl CacheSer for Wiki2Cache {}
+thread_local! {
+    /// TODO: `StateGraph` has no serialization, so it cannot live in the gear
+    /// view yet. This is test-local process state, keyed by gear: taken out
+    /// for the duration of one run and put back afterwards (a cancelled run
+    /// simply cold-starts next time — the graph is recomputable).
+    static WIKI2_STATE: RefCell<HashMap<Wiki2Gear, Wiki2Cache>> =
+        RefCell::new(HashMap::new());
+}
+
+fn take_cache(gear: &Wiki2Gear) -> Wiki2Cache {
+    WIKI2_STATE
+        .with(|m| m.borrow_mut().remove(gear))
+        .unwrap_or_else(|| match gear {
+            Wiki2Gear::Invited { .. } => Wiki2Cache::Invited(InvitedCache {
+                watermark: Watermark::default(),
+                sg: StateGraph::new(),
+            }),
+            Wiki2Gear::DocContent { .. } => Wiki2Cache::DocContent(DocContentCache {
+                watermark: Watermark::default(),
+                anchors: AnchorAgg::new(),
+                sg: StateGraph::new(),
+            }),
+        })
+}
+
+fn put_cache(gear: Wiki2Gear, cache: Wiki2Cache) {
+    WIKI2_STATE.with(|m| {
+        m.borrow_mut().insert(gear, cache);
+    });
+}
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Wiki2Group {
@@ -214,7 +243,6 @@ impl IsRuntime for Wiki2Runtime {
     type Group = Wiki2Group;
     type Body = Wiki2Body;
     type Data = BranchData;
-    type GearCache = Wiki2Cache;
 
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
@@ -229,24 +257,24 @@ impl IsRuntime for Wiki2Runtime {
         }
     }
 
-    fn make_cache(gear: &Self::GearId) -> Self::GearCache {
-        match gear {
-            Wiki2Gear::Invited { .. } => Wiki2Cache::Invited(InvitedCache {
-                watermark: Watermark::default(),
-                sg: StateGraph::new(),
-            }),
-            Wiki2Gear::DocContent { .. } => Wiki2Cache::DocContent(DocContentCache {
-                watermark: Watermark::default(),
-                anchors: AnchorAgg::new(),
-                sg: StateGraph::new(),
-            }),
-        }
-    }
-
     async fn run_step<S: IsStorage<Self>>(
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
-        cache: &mut Self::GearCache,
+        _view: &mut S::View<'_>,
+    ) -> GearProduce<Self> {
+        let gear = ctx.gear().clone();
+        let mut cache = take_cache(&gear);
+        let produce = Self::run_gear(ctx, input, &mut cache).await;
+        put_cache(gear, cache);
+        produce
+    }
+}
+
+impl Wiki2Runtime {
+    async fn run_gear<S: IsStorage<Self>>(
+        ctx: &mut GearCtx<Self, S>,
+        input: GearInput<Self>,
+        cache: &mut Wiki2Cache,
     ) -> GearProduce<Self> {
         let GearInput::Events(group) = input else {
             return match cache {

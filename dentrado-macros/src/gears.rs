@@ -1,8 +1,8 @@
 //! The `#[gears]` module attribute + `#[gear]` fn marker: define a runtime's
 //! gears as plain `async fn`s and let the macro generate the `GearId` /
-//! `GearOut` / `GearCache` / `Group` enums, the `IsRuntime` impl, the
-//! `GlobalHash` impl for `Group`, and the per-gear `GearQuery` builders (the
-//! typed dependency layer).
+//! `GearOut` / `Group` enums, the `IsRuntime` impl, the `GlobalHash` impl for
+//! `Group`, and the per-gear `GearQuery` builders (the typed dependency
+//! layer).
 //!
 //! Each gear is one function — its signature *is* the gear spec:
 //!
@@ -11,17 +11,17 @@
 //! pub(crate) mod gears {
 //!     #[gear(timer(period = secs(900)), local, name = Repo)]
 //!     pub(crate) async fn repo<S: IsStorage<KolorinkoRT>>(
-//!         repo_meta: RepoMeta,   // id field → GearId::Repo(RepoMeta)
-//!         tick: bool,            // timer tick
-//!         cache: &mut RepoCache, // → GearCache::Repo(RepoCache)
-//!     ) -> Arc<RepoData> {}      // → GearOutLocal::RepoOut(Arc<RepoData>)
+//!         repo_meta: RepoMeta,        // id field → GearId::Repo(RepoMeta)
+//!         tick: bool,                 // timer tick
+//!         view: &mut S::View<'_>,     // the gear's private store view
+//!     ) -> Arc<RepoData> {}           // → GearOutLocal::RepoOut(Arc<RepoData>)
 //! }
 //! ```
 //!
 //! The `#[gear]` marker carries only the metadata the signature cannot express
 //! (kind: timer/event/follow, the period expression, `local`/`exposed`, and
-//! the enum *variant* base name). The id fields, cache type, and output type
-//! are all read straight off the `fn`, so there is no DSL restating them.
+//! the enum *variant* base name). The id fields, view, and output type are
+//! all read straight off the `fn`, so there is no DSL restating them.
 //!
 //! `local` marks a gear whose output is pinned to its owning core: it goes to
 //! `GearOutLocal` (not `Send`/`Localizable`), gets no `GearQuery` builder, and
@@ -220,8 +220,8 @@ enum ParamRole {
     FollowOut { name: Ident },
     /// `ctx: &mut GearCtx<…>`. The run call forwards `run_step`'s `ctx`.
     Ctx,
-    /// `cache: &mut T`. The match binds `&mut T` from `GearCache`.
-    Cache { ty: Type },
+    /// `view: &mut S::View<'_>`. The run call forwards `run_step`'s `view`.
+    View,
 }
 
 struct GearSpec {
@@ -247,6 +247,9 @@ struct GearSpec {
     /// schema's `GearId`/builders, its output passing the `is_exposed` filter.
     is_exposed: bool,
     params: Vec<ParamRole>,
+    /// The fn is generic over the storage type `S` — `run_step` must
+    /// turbofish it, since `S::View<'_>` alone does not determine `S`.
+    has_storage_generic: bool,
     out_ty: Type,
     kind: KindSpec,
     /// Follow gears only: the target's `GearOut` variant (`RepoOut`), used to
@@ -278,13 +281,6 @@ impl GearSpec {
                 _ => None,
             })
             .collect()
-    }
-
-    fn cache_ty(&self) -> Option<&Type> {
-        self.params.iter().find_map(|p| match p {
-            ParamRole::Cache { ty } => Some(ty),
-            _ => None,
-        })
     }
 }
 
@@ -415,8 +411,13 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
         if let Some(elem) = as_mut_ref_elem(ty) {
             if path_last_ident(elem) == Some(&format_ident!("GearCtx")) {
                 params.push(ParamRole::Ctx);
+            } else if path_last_ident(elem) == Some(&format_ident!("View")) {
+                params.push(ParamRole::View);
             } else {
-                params.push(ParamRole::Cache { ty: elem.clone() });
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "gear fn's `&mut` param must be `GearCtx` or `S::View<'_>`",
+                ));
             }
         } else {
             // By value: either a `tick: bool` or a named id field.
@@ -460,11 +461,16 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
         _ => {}
     }
 
-    // Every gear needs a cache.
-    if !params.iter().any(|p| matches!(p, ParamRole::Cache { .. })) {
+    // Every gear needs exactly one private view.
+    if params
+        .iter()
+        .filter(|p| matches!(p, ParamRole::View))
+        .count()
+        != 1
+    {
         return Err(syn::Error::new_spanned(
             &fn_item.sig,
-            "gear fn must take a `&mut <CacheType>` param",
+            "gear fn must take exactly one `view: &mut S::View<'_>` param",
         ));
     }
 
@@ -476,6 +482,12 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
         is_local,
         is_shared,
         is_exposed,
+        has_storage_generic: fn_item
+            .sig
+            .generics
+            .params
+            .iter()
+            .any(|p| matches!(p, syn::GenericParam::Type(t) if t.ident == "S")),
         params,
         out_ty,
         kind,
@@ -870,27 +882,6 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         quote! {}
     };
 
-    let cache_variants = specs.iter().map(|g| {
-        let v = &g.name;
-        let t = g.cache_ty().expect("validated above");
-        quote! { #v(#t) }
-    });
-
-    // CacheSer (de)serialization: per-variant delegation to the gear's cache
-    // type (fully-qualified — the expansion site need not import CacheSer).
-    let cache_ser_arms = specs.iter().map(|g| {
-        let v = &g.name;
-        quote! {
-            Self::#v(c) => ::dentrado::core::storage::CacheSer::ser_image(c)
-        }
-    });
-    let cache_de_arms = specs.iter().map(|g| {
-        let v = &g.name;
-        quote! {
-            Self::#v(c) => ::dentrado::core::storage::CacheSer::de_image(c, bytes)
-        }
-    });
-
     // meta() arms.
     let meta_arms = specs.iter().map(|g| {
         let id_variant = &g.name;
@@ -979,20 +970,6 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         }
     });
 
-    // make_cache arms.
-    let make_cache_arms = specs.iter().map(|g| {
-        let id_variant = &g.name;
-        let cv = &g.name;
-        let ct = g.cache_ty().expect("validated above");
-        let fields = g.id_fields();
-        let pat: TokenStream2 = if fields.len() == 1 {
-            quote! { GearId::#id_variant(..) }
-        } else {
-            quote! { GearId::#id_variant { .. } }
-        };
-        quote! { #pat => GearCache::#cv(#ct::default()) }
-    });
-
     // run_step arms.
     let run_arms = specs.iter().map(|g| {
         let id_variant = &g.name;
@@ -1004,8 +981,6 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             let names: Vec<Ident> = fields.iter().map(|(n, _)| n.clone()).collect();
             (quote! { GearId::#id_variant { #( #names ),* } }, ())
         };
-        let cv = &g.name;
-        let cache_binding = format_ident!("{}_cache", g.name.to_string().to_lowercase());
         let out_v = format_ident!("{}Out", g.name);
 
         // Build the call argument list in the fn's declared param order.
@@ -1014,11 +989,16 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             ParamRole::Tick => quote! { tick },
             ParamRole::FollowOut { name, .. } => quote! { #name },
             ParamRole::Ctx => quote! { ctx },
-            ParamRole::Cache { .. } => quote! { #cache_binding },
+            ParamRole::View => quote! { view },
         });
         let step_ident = format_ident!("{}_step", g.fn_name);
+        let step_ref = if g.has_storage_generic {
+            quote! { #step_ident::<S> }
+        } else {
+            quote! { #step_ident }
+        };
         let await_dot = g.is_async.then(|| quote! { .await });
-        let run_call = quote! { #step_ident(#( #call_args ),*) #await_dot };
+        let run_call = quote! { #step_ref(#( #call_args ),*) #await_dot };
 
         let tick_bind = matches!(g.kind, KindSpec::Timer { .. }).then(|| {
             quote! { let tick = ::core::matches!(input, ::dentrado::core::gear::GearInput::Timer { tick: true }); }
@@ -1092,7 +1072,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         };
 
         quote! {
-            (#id_pat, GearCache::#cv(#cache_binding)) => {
+            #id_pat => {
                 #tick_bind
                 #follow_bind
                 #result
@@ -1191,9 +1171,8 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         // callers can never name it — gear ids are constructed only through the
         // per-gear `GearQuery` builders below. It stays `pub(crate)`-declared
         // because `IsRuntime`'s associated type is reached through pub(crate)
-        // APIs (`Core::subscribe_gear`, `GearResult`, …). `Serialize` keys
-        // `PagedStorage`'s cache entries — every id field type must implement
-        // it, and the invoking crate must depend on `serde`.
+        // APIs (`Core::subscribe_gear`, `GearResult`, …). Its `Hash` is the
+        // stable per-gear view subkey — no serialization bound.
         #[derive(
             Debug,
             Clone,
@@ -1201,7 +1180,6 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             Eq,
             Hash,
             dentrado_types::Localizable,
-            ::serde::Serialize,
         )]
         pub(crate) enum GearId {
             #( #id_variants, )*
@@ -1239,25 +1217,6 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
 
         const PHANTOM_MSG: ::dentrado::types::LocMsgTypeId = ::dentrado::types::LocMsgTypeId(0);
 
-        #[derive(Debug, Clone)]
-        pub(crate) enum GearCache {
-            #( #cache_variants, )*
-        }
-
-        impl ::dentrado::core::storage::CacheSer for GearCache {
-            fn ser_image(&self) -> ::core::option::Option<::std::vec::Vec<u8>> {
-                match self {
-                    #( #cache_ser_arms, )*
-                }
-            }
-
-            fn de_image(&mut self, bytes: &[u8]) -> bool {
-                match self {
-                    #( #cache_de_arms, )*
-                }
-            }
-        }
-
         impl ::dentrado::core::gear::IsRuntime for #runtime {
             type GearId = GearId;
             type GearOut = GearOut;
@@ -1267,7 +1226,6 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             type Group = Group;
             type Body = ();
             type Data = ();
-            type GearCache = GearCache;
 
             fn meta(gear: &Self::GearId) -> ::dentrado::core::gear::GearMeta<Self> {
                 match gear {
@@ -1275,20 +1233,13 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
                 }
             }
 
-            fn make_cache(gear: &Self::GearId) -> Self::GearCache {
-                match gear {
-                    #( #make_cache_arms ),*
-                }
-            }
-
             async fn run_step<S: ::dentrado::core::storage::IsStorage<Self>>(
                 ctx: &mut ::dentrado::core::core_ctx::GearCtx<Self, S>,
                 input: ::dentrado::core::gear::GearInput<Self>,
-                cache: &mut Self::GearCache,
+                view: &mut S::View<'_>,
             ) -> ::dentrado::core::gear::GearProduce<Self> {
-                match (ctx.gear().clone(), cache) {
+                match ctx.gear().clone() {
                     #( #run_arms )*
-                    _ => ::core::unreachable!("gear id and cache variants always agree"),
                 }
             }
         }

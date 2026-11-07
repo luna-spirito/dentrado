@@ -3,11 +3,11 @@
 //! Behaviorally identical to the structures it replaces in `loc_ctx.rs` /
 //! `core_ctx.rs`: the localization `HashMap`s, the per-group event shards
 //! ([`EventGroup`]: bodies + `(sender, tx_id)` dedup + changelog), and the
-//! gear cache — just lifted behind the trait. Used as the test backend and
+//! per-gear view — just lifted behind the trait. Used as the test backend and
 //! the baseline a disk backend is validated against.
 //!
 //! Like any RAM-only backend, NOTHING here survives process death — not just
-//! the gear cache, but events and localization too. That is a property of
+//! the gear views, but events and localization too. That is a property of
 //! the backend, not of any one layer; the `Storage` contract treats all of it
 //! as restart-surviving state, satisfied here in the (only) trivial sense RAM
 //! allows: live for the lifetime of this object.
@@ -16,13 +16,17 @@
 //! future — there is no IO to await — so no `RefCell` borrow is ever held
 //! across an `.await`. Typed end-to-end: zero serialization.
 
-use std::{cell::RefCell, collections::HashMap, future::ready};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    future::ready,
+};
 
 use crate::{
     core::{
         gear::IsRuntime,
         loc_ctx::{EventGroup, StoreResultSuccess, StoredEvent},
-        storage::{GroupDiff, IsStorage, Watermark},
+        storage::{GroupDiff, IsStorage, RamView, Watermark, view::gear_key},
     },
     types::{
         DataId, DataVerifyError, GlobalHash, GlobalResolver, GroupEventId, GroupRouteError,
@@ -44,8 +48,6 @@ struct Inner<R: IsRuntime> {
     data_id_to_local: HashMap<DataId, LocDataId>,
     // group localization
     group_by_key: HashMap<(LocMsgTypeId, R::Group), LocGroupId>,
-    // gear cache: typed cache per stable R::GearId.
-    gear_cache: HashMap<R::GearId, R::GearCache>,
 }
 
 impl<R: IsRuntime> Inner<R> {
@@ -60,7 +62,6 @@ impl<R: IsRuntime> Inner<R> {
             data_by_id: Vec::new(),
             data_id_to_local: HashMap::new(),
             group_by_key: HashMap::new(),
-            gear_cache: HashMap::new(),
         }
     }
 }
@@ -68,12 +69,15 @@ impl<R: IsRuntime> Inner<R> {
 /// In-memory typed `Storage`.
 pub struct InMemoryStorage<R: IsRuntime> {
     inner: RefCell<Inner<R>>,
+    /// The gear views: full (prefixed) key → flat value.
+    gear_data: RefCell<BTreeMap<Vec<u8>, Vec<u8>>>,
 }
 
 impl<R: IsRuntime> Default for InMemoryStorage<R> {
     fn default() -> Self {
         Self {
             inner: RefCell::new(Inner::new()),
+            gear_data: RefCell::new(BTreeMap::new()),
         }
     }
 }
@@ -82,6 +86,14 @@ impl<R: IsRuntime> InMemoryStorage<R> {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The backing map of every gear view — used by [`PagedStorage`]'s
+    /// RAM mode.
+    ///
+    /// [`PagedStorage`]: crate::core::storage::PagedStorage
+    pub(crate) fn gear_data(&self) -> &RefCell<BTreeMap<Vec<u8>, Vec<u8>>> {
+        &self.gear_data
     }
 }
 
@@ -300,14 +312,15 @@ impl<R: IsRuntime> IsStorage<R> for InMemoryStorage<R> {
         })
     }
 
-    // ── gear cache (keyed by stable R::GearId) ────────────────────────────
+    // ── the gear's private view ───────────────────────────────────────────
 
-    fn get_cache(&self, gear: &R::GearId) -> impl Future<Output = Option<R::GearCache>> {
-        ready(self.inner.borrow().gear_cache.get(gear).cloned())
-    }
+    type View<'a>
+        = RamView<'a>
+    where
+        Self: 'a;
 
-    fn put_cache(&self, gear: R::GearId, cache: R::GearCache) -> impl Future<Output = ()> {
-        ready(drop(self.inner.borrow_mut().gear_cache.insert(gear, cache)))
+    fn gear_view(&self, gear: &R::GearId) -> impl Future<Output = Self::View<'_>> {
+        ready(RamView::new(self.gear_data(), gear_key::<R>(gear).to_vec()))
     }
 
     // ── durability ────────────────────────────────────────────────────────

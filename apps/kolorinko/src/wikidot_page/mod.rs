@@ -87,7 +87,11 @@
 
 use crate::wikidot_parser::{parse, parse_link_target, wikidot_verbatim};
 use compio::fs;
-use dentrado::core::{core_ctx::GearCtx, gear::GearResult, storage::IsStorage};
+use dentrado::core::{
+    core_ctx::GearCtx,
+    gear::GearResult,
+    storage::{GearView, IsStorage},
+};
 use imbl::HashMap as ImHashMap;
 use kolorinko_render::{http_refs, http_tail, rewrite_with};
 use kolorinko_rt::{
@@ -102,7 +106,6 @@ use kolorinko_wikitext::{
 };
 use log::error;
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
@@ -110,7 +113,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::runtime::{GearOutShared, KolorinkoRT};
+use crate::runtime::{GearOutLocal, GearOutShared, KolorinkoRT};
 
 // The body is split across the submodules below. Shared crate imports live
 // here and reach each submodule via `use super::*`. Internal items are
@@ -119,6 +122,7 @@ use crate::runtime::{GearOutShared, KolorinkoRT};
 // `crate::wikidot_page::…` API is re-exported `pub(crate)`.
 mod article_latest;
 mod assets_gear;
+mod chunked;
 mod code_block;
 mod config;
 mod dataset;
@@ -150,13 +154,15 @@ use out_worker::*;
 use resources::*;
 use vars::*;
 
-pub(crate) use article_latest::{LatestCache, ParsedCache, article_latest, article_latest_parsed};
-pub(crate) use assets_gear::{AssetCache, asset, ca_url};
-pub(crate) use code_block::{CodeBlockCache, code_block};
+pub(crate) use article_latest::{article_latest, article_latest_parsed};
+pub(crate) use assets_gear::{asset, ca_url};
+pub(crate) use code_block::code_block;
 pub(crate) use config::OutMeta;
 pub(crate) use dataset::{article, latest, list_pages, local_id, query_pages};
-pub(crate) use lenses::{RepoSnapCache, ShellCache, repo_snap, shell};
-pub(crate) use repo_gear::{RepoCache, repo};
+pub(crate) use lenses::{repo_snap, shell};
+#[cfg(test)]
+pub(crate) use repo_gear::repo_step;
+pub(crate) use repo_gear::{RepoState, repo};
 
 /// Resolve a canonical address `(space, local)` to the dataset location that
 /// serves it: the registered site for the space, plus the page's current slug

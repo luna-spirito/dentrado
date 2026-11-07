@@ -15,41 +15,43 @@ pub(crate) struct ParsedCache {
     pub(super) view: Option<ArticleView>,
 }
 
-/// The persisted image of [`ParsedCache`] for `CacheSer`: `Arc` sharing
-/// flattens to plain strings (serde's `rc` support stays off).
-#[derive(serde::Serialize)]
-struct ParsedImageRef<'a> {
-    body: Option<&'a str>,
-    view: Option<&'a ArticleView>,
-}
-
-#[derive(serde::Deserialize)]
-struct ParsedImageOwned {
+/// The persisted form of [`ParsedCache`]: `Arc` sharing flattens to a plain
+/// string; the image rides the gear view as zstd blocks.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ParsedImage {
     body: Option<String>,
     view: Option<ArticleView>,
 }
 
-impl dentrado::core::storage::CacheSer for ParsedCache {
-    fn ser_image(&self) -> Option<Vec<u8>> {
-        serde_json::to_vec(&ParsedImageRef {
-            body: self.body.as_deref(),
-            view: self.view.as_ref(),
-        })
-        .ok()
-    }
+/// The gear-view key of the persisted parse image.
+const PARSED_KEY: &[u8] = b"parsed";
 
-    fn de_image(&mut self, bytes: &[u8]) -> bool {
-        match serde_json::from_slice::<ParsedImageOwned>(bytes) {
-            Ok(img) => {
-                *self = ParsedCache {
-                    body: img.body.map(Arc::from),
-                    view: img.view,
-                };
-                true
-            }
-            Err(_) => false,
+/// Load the parse cache from the view; an absent or unreadable image is a
+/// cold start (the parse is recomputable, never authoritative).
+async fn load_parsed<V: GearView>(view: &mut V) -> ParsedCache {
+    let Some(bytes) = chunked::load(view, PARSED_KEY).await else {
+        return ParsedCache::default();
+    };
+    match postcard::from_bytes::<ParsedImage>(&bytes) {
+        Ok(img) => ParsedCache {
+            body: img.body.map(Arc::from),
+            view: img.view,
+        },
+        Err(e) => {
+            error!("discarding an unreadable parse cache: {e}");
+            ParsedCache::default()
         }
     }
+}
+
+/// Stage the parse cache as a chunked image in the view.
+async fn store_parsed<V: GearView>(view: &mut V, cache: &ParsedCache) {
+    let image = ParsedImage {
+        body: cache.body.as_deref().map(str::to_owned),
+        view: cache.view.clone(),
+    };
+    let bytes = postcard::to_stdvec(&image).expect("a parse cache image serializes");
+    chunked::store(view, PARSED_KEY, &bytes).await;
 }
 
 /// Parse a page's latest body into an [`ArticleView`] **without** resolving
@@ -62,46 +64,42 @@ pub(crate) async fn article_latest_parsed<S: IsStorage<KolorinkoRT>>(
     space: SpaceId,
     local: LocalId,
     ctx: &mut GearCtx<KolorinkoRT, S>,
-    cache: &mut ParsedCache,
+    view: &mut S::View<'_>,
 ) -> ArticleView {
+    let cache = load_parsed(view).await;
     let snap = crate::runtime::repo_snap().secondary_get(ctx).await;
     let latest = latest(&snap, space, local);
     let latest = latest.as_ref();
     let body: Arc<str> = latest.map_or_else(|| Arc::from(""), |p| Arc::clone(p.body));
     if cache.body.as_deref() == Some(&*body)
-        && let Some(view) = &cache.view
+        && let Some(parsed) = &cache.view
     {
-        return view.clone();
+        return parsed.clone();
     }
     let (meta, revisions) = latest.map_or_else(
         || (ArticleMeta::default(), Vec::new()),
         |p| (p.meta.clone(), p.revisions.to_vec()),
     );
-    let view = ArticleView {
+    let parsed = ArticleView {
         meta,
         revisions,
         content: parse(&body),
         deps: Vec::new(),
     };
-    *cache = ParsedCache {
-        body: Some(body),
-        view: Some(view.clone()),
-    };
-    view
+    store_parsed(
+        view,
+        &ParsedCache {
+            body: Some(body),
+            view: Some(parsed.clone()),
+        },
+    )
+    .await;
+    parsed
 }
 
 // =========================================================================
 // `article_latest` gear — the canonical-address resolution pipeline
 // =========================================================================
-
-/// No carry-over state: the result is fully re-derived each run from the
-/// follow target and the snapshot it reads (which the framework re-runs on
-/// any change).
-#[derive(Default, Clone, Debug)]
-pub(crate) struct LatestCache;
-
-// No carried state, nothing to persist.
-impl dentrado::core::storage::CacheSer for LatestCache {}
 
 /// Render a page's final [`ArticleView`] by running [`resolve_full`] — the
 /// `[[include]]` / `[[module ListPages]]` / `[[iftags]]` / link / resource
@@ -125,7 +123,7 @@ pub(crate) async fn article_latest<S: IsStorage<KolorinkoRT>>(
     local: LocalId,
     _parsed: &ArticleView,
     ctx: &mut GearCtx<KolorinkoRT, S>,
-    _cache: &mut LatestCache,
+    _view: &mut S::View<'_>,
 ) -> ArticleView {
     let Some(site) = crate::globals::site_of(&space).cloned() else {
         return ArticleView::default();

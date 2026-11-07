@@ -132,27 +132,91 @@ const HASH: &str = "d1f69a9854765a4f1e7c8b1e8a9e5c9bd1e0a2f3c4b5a6978899aabbccdd
 const HASH2: &str = "e2f69a9854765a4f1e7c8b1e8a9e5c9bd1e0a2f3c4b5a6978899aabbccddeef0";
 const HASH3: &str = "f3f69a9854765a4f1e7c8b1e8a9e5c9bd1e0a2f3c4b5a6978899aabbccddee11";
 
-/// Regression: `repo()`'s cold start spawns the worker and re-borrows the
-/// cache `RefCell` in its `None` arm. A `borrow()` left in the `match`
-/// scrutinee used to live through the arms and panic ("RefCell already
-/// borrowed"). Pointing at an unreachable source keeps the worker
-/// publication-less (empty dataset) while still exercising that path, and
-/// proves the unchanged-publication path keeps the same `Rc`.
+/// A cold start spawns the worker (empty publication), persists its image
+/// into the gear view, and serves the empty snapshot; an unchanged tick
+/// keeps the same `Rc` so dependents aren't re-run for nothing.
 #[test]
-fn repo_cold_start_reborrows_without_panic() {
+fn repo_cold_start_serves_and_keeps_unchanged_snapshot() {
     use compio::runtime::Runtime;
+    use dentrado::core::storage::InMemoryStorage;
     let dir = std::env::temp_dir().join(format!("kolorinko_repo_nopath_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     let path: &'static Path = Box::leak(dir.clone().into_boxed_path());
     let meta = OutMeta::new(path, 900);
-    let mut cache = RepoCache::default();
     let rt = Runtime::new().unwrap();
-    // Cold start (non-tick): the `None` arm — the original panic site.
-    let first = rt.block_on(repo(&meta, false, &mut cache));
-    assert!(find_article(&first.sites, &site("nope"), &root_slug("nope")).is_none());
-    // Nothing on disk → worker returns None → the prior `Rc` is kept.
-    let second = rt.block_on(repo(&meta, true, &mut cache));
-    assert!(Rc::ptr_eq(&first, &second));
+    let storage: InMemoryStorage<KolorinkoRT> = InMemoryStorage::new();
+    let mut view = rt.block_on(storage.gear_view(&crate::runtime::GearId::Repo {}));
+    // Cold start (non-tick): the worker builds the empty dataset.
+    let first = rt.block_on(repo_step(&meta, None, &mut view, false));
+    assert!(find_article(&first.snapshot().sites, &site("nope"), &root_slug("nope")).is_none());
+    view.commit();
+    // Nothing on disk → the tick adopts nothing → the prior `Rc` is kept.
+    let second = rt.block_on(repo_step(&meta, Some(first.clone()), &mut view, true));
+    assert!(Rc::ptr_eq(&first.data, &second.data));
+}
+
+/// The persisted worker image survives a restart: a fresh worker (no
+/// process-local mailbox) restores the dataset from the view instead of
+/// rescanning. Removing the publication between runs makes the difference
+/// observable — a rebuild would come up empty.
+#[test]
+fn repo_restores_worker_state_from_the_view() {
+    use compio::runtime::Runtime;
+    use dentrado::core::storage::InMemoryStorage;
+    let dir = std::env::temp_dir().join(format!("kolorinko_repo_restore_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    one_page_publication(&dir);
+    let path: &'static Path = Box::leak(dir.join("out").into_boxed_path());
+    let meta = OutMeta::new(path, 900);
+    let rt = Runtime::new().unwrap();
+    let storage: InMemoryStorage<KolorinkoRT> = InMemoryStorage::new();
+    let mut view = rt.block_on(storage.gear_view(&crate::runtime::GearId::Repo {}));
+    let first = rt.block_on(repo_step(&meta, None, &mut view, false));
+    let foo = find_article(&first.snapshot().sites, &site("scp"), &root_slug("foo"))
+        .expect("the cold start reads the publication");
+    assert_eq!(
+        &**first.snapshot().bodies.get(&foo.latest_body).unwrap(),
+        "Foo body\n"
+    );
+    view.commit();
+
+    // Wipe the publication: only a restored worker still has the page.
+    fs::remove_dir_all(&dir).unwrap();
+    let mut view = rt.block_on(storage.gear_view(&crate::runtime::GearId::Repo {}));
+    let restored = rt.block_on(repo_step(&meta, None, &mut view, false));
+    let foo = find_article(&restored.snapshot().sites, &site("scp"), &root_slug("foo"))
+        .expect("the worker state was restored from the view");
+    assert_eq!(
+        &**restored.snapshot().bodies.get(&foo.latest_body).unwrap(),
+        "Foo body\n"
+    );
+}
+
+/// The chunked layer splits a blob across records and reassembles it;
+/// overwriting with a shorter image drops the stale tail blocks.
+#[test]
+fn chunked_round_trips_and_drops_stale_blocks() {
+    use compio::runtime::Runtime;
+    use dentrado::core::storage::InMemoryStorage;
+    let rt = Runtime::new().unwrap();
+    let storage: InMemoryStorage<KolorinkoRT> = InMemoryStorage::new();
+    let mut view = rt.block_on(storage.gear_view(&crate::runtime::GearId::Repo {}));
+    let big: Vec<u8> = (0..20_000).map(|i| (i % 251) as u8).collect();
+    rt.block_on(chunked::store(&mut view, b"k", &big));
+    view.commit();
+    let mut view = rt.block_on(storage.gear_view(&crate::runtime::GearId::Repo {}));
+    assert_eq!(rt.block_on(chunked::load(&mut view, b"k")).unwrap(), big);
+
+    let small = b"small".to_vec();
+    rt.block_on(chunked::store(&mut view, b"k", &small));
+    view.commit();
+    let mut view = rt.block_on(storage.gear_view(&crate::runtime::GearId::Repo {}));
+    assert_eq!(rt.block_on(chunked::load(&mut view, b"k")).unwrap(), small);
+    assert_eq!(
+        rt.block_on(view.scan(b"k/b/")).len(),
+        1,
+        "stale blocks were dropped"
+    );
 }
 
 /// A one-page publication built the way the worker's first scan builds it.

@@ -103,11 +103,16 @@ impl<D: IsFilesystem> Storage<D> {
 }
 
 impl<D: IsFilesystem> Session<D> {
-    /// Read one record from the session's snapshot: the delta first,
+    /// Read one **old** record: the session's snapshot, deliberately
+    /// bypassing everything this session has staged. The delta first,
     /// the standing tree second. The snapshot's pin — taken at the
     /// first read — keeps the tree's pages alive; the answer is owned
     /// bytes, no page references out.
-    pub async fn get(&mut self, id: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+    ///
+    /// The name is the contract: a `put`/`del` staged in this session
+    /// is invisible here. Use it when you need the record you are about
+    /// to replace (its page closure, its old value), not the new one.
+    pub async fn get_old(&mut self, id: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         self.ensure_snapshot()?;
         let (root, bound) = {
             let snap = self.snap.as_ref().expect("the snapshot was just ensured");
@@ -122,10 +127,12 @@ impl<D: IsFilesystem> Session<D> {
         descend::<D>(&self.inner, root, key, bound).await
     }
 
-    /// Scan the session's snapshot: the records under `prefix`, strictly
-    /// past `after`, in key order — the snapshot's tree pruned to the
-    /// range, its delta overlaid (a put replaces, a deletion hides).
-    pub async fn scan(
+    /// Scan the session's **old** snapshot: the records under `prefix`,
+    /// strictly past `after`, in key order — the snapshot's tree pruned
+    /// to the range, its delta overlaid (a put replaces, a deletion
+    /// hides). Like [`get_old`](Session::get_old), this bypasses the
+    /// session's own staged records.
+    pub async fn scan_old(
         &mut self,
         id: &[u8],
         prefix: &[u8],

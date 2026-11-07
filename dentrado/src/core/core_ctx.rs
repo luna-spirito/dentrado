@@ -24,7 +24,7 @@ use crate::{
         gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime},
         shared::{RemoteShared, Shared, SharedArena, SharedBus, SharedData, SharedKey},
         stats::CoreStats,
-        storage::{GroupStore, IsStorage},
+        storage::{GearView, GroupStore, IsStorage},
         subscription::Epoch,
     },
     types::{GlobalCoreId, GlobalHash, LocGroupId, NodeId},
@@ -353,7 +353,7 @@ pub struct Core<R: IsRuntime, S: IsStorage<R>> {
     /// Typed per-core storage backend. Lives **outside** the `inner` `RefCell`
     /// (it is interior-mutable, mirroring `fs::Fs`), so an `.await` on a storage
     /// op never holds `inner` and never collides with arena mutations. Carries
-    /// localization, the event log, and the gear cache (keyed by `R::GearId`).
+    /// localization, the event log, and the gear views (keyed by `R::GearId`).
     storage: S,
     inner: RefCell<CoreLocCtx<R>>,
     /// Owner-local generational arena of cross-core refcounts for [`Shared`]
@@ -588,7 +588,7 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
     ///
     /// Every [`FLUSH_EPOCHS`] ticks it also drives a (throttled, dirty-gated
     /// by the backend) storage flush — the periodic durability point for
-    /// restart-surviving gear caches.
+    /// restart-surviving gear views.
     pub(crate) async fn epoch_ticker_task(self: Rc<Self>) {
         let mut ticks_since_flush = 0u32;
         loop {
@@ -677,25 +677,24 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
                 self.core_id, gear_id
             );
 
-            // Load this gear's working state from storage (cold start ⇒ fresh).
-            let mut cache = self
-                .storage
-                .get_cache(&gear_id)
-                .await
-                .unwrap_or_else(|| R::make_cache(&gear_id));
+            // The gear's private view over the store. Reads see the old
+            // world; writes are staged until the commit below.
+            let mut view = self.storage.gear_view(&gear_id).await;
 
             let mut ctx = GearCtx {
                 core: Rc::clone(&self),
                 gear: gear_id.clone(),
                 deps: RefCell::new(HashSet::new()),
             };
-            let produce = R::run_step(&mut ctx, input, &mut cache).await;
+            let produce = R::run_step(&mut ctx, input, &mut view).await;
 
-            // Persist the cache, then install the fresh output (a `Shared`
-            // produce is boxed + refcounted here; `Ship`/`Local` pass through)
-            // and reconcile dep edges.
-            self.storage.put_cache(gear_id.clone(), cache).await;
+            // Install the fresh output (a `Shared` produce is boxed +
+            // refcounted here; `Ship`/`Local` pass through), then commit the
+            // view. A cancelled commit leaves the cache behind the output —
+            // the gear recomputes; the reverse order would let a watermark
+            // run ahead of the output it was meant to describe.
             let output = self.install_produce(produce);
+            view.commit();
 
             let (removed_deps, dependents, remote_subs, do_rerun) = {
                 let mut inner = self.inner.borrow_mut();
@@ -1826,6 +1825,20 @@ impl<R: IsRuntime, S: IsStorage<R>> GearCtx<R, S> {
     /// The per-core storage backend.
     pub fn storage(&self) -> &S {
         &self.core.storage
+    }
+
+    /// TODO: This is a temporary hack because we need to make proper lens ASAP.
+    /// The gear's previous output, if it is still active on this core.
+    ///
+    /// This is the place for process-local state that does not belong in
+    /// the view: `repo` keeps its worker mailbox and last snapshot in a
+    /// cheap `Local` output and reads them back here instead of persisting
+    /// them. A `Ship` output is cloned; use a `Local` output when the
+    /// clone would be expensive.
+    pub fn previous_output(&self) -> Option<GearResult<R>> {
+        let inner = self.core.inner.borrow();
+        let key = inner.gear_index.get(&self.gear)?;
+        inner.gears.get(*key)?.output.clone()
     }
 
     /// Declare a dependency on `dep`'s output and pull its current value

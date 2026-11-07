@@ -4,7 +4,7 @@ use dentrado::{
     core::{
         core_ctx::{Core, GearCtx},
         gear::{GearInput, GearMeta, GearProduce, IsRuntime},
-        storage::{CacheSer, InMemoryStorage, IsStorage, Watermark},
+        storage::{GearView, InMemoryStorage, IsStorage, Watermark},
     },
     types::*,
     wire::WireEventBody,
@@ -38,13 +38,18 @@ impl Localizable for MulSumBody {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct MulSumCache {
-    pub watermark: Watermark,
-    pub agg: i64,
+/// The gear's private state, flattened into the view: `(watermark, agg)`.
+const CACHE_KEY: &[u8] = b"state";
+
+type CacheState = ((u64, u64), i64);
+
+fn decode(bytes: &[u8]) -> CacheState {
+    postcard::from_bytes(bytes).expect("a valid mulsum cache record")
 }
 
-impl CacheSer for MulSumCache {}
+fn encode(state: &CacheState) -> Vec<u8> {
+    postcard::to_stdvec(state).expect("a flat tuple serializes")
+}
 
 #[derive(Debug, Clone)]
 pub struct MulSumRuntime;
@@ -58,7 +63,6 @@ impl IsRuntime for MulSumRuntime {
     type Group = i64;
     type Body = MulSumBody;
     type Data = ();
-    type GearCache = MulSumCache;
 
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
@@ -69,38 +73,34 @@ impl IsRuntime for MulSumRuntime {
         }
     }
 
-    fn make_cache(_gear: &Self::GearId) -> Self::GearCache {
-        MulSumCache {
-            watermark: Watermark::default(),
-            agg: 0,
-        }
-    }
-
     async fn run_step<S: IsStorage<Self>>(
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
-        cache: &mut Self::GearCache,
+        view: &mut S::View<'_>,
     ) -> GearProduce<Self> {
+        let ((a, r), mut agg) = view
+            .get(CACHE_KEY)
+            .await
+            .map_or(((0, 0), 0), |b| decode(&b));
+        let watermark = Watermark(a, r);
         let GearInput::Events(group) = input else {
-            return GearProduce::Ship(cache.agg);
+            return GearProduce::Ship(agg);
         };
         let core = ctx.core();
-        let diff = ctx
-            .storage()
-            .diff_group(group, cache.watermark.clone())
-            .await;
+        let diff = ctx.storage().diff_group(group, watermark).await;
         let store = core.group_store(group);
 
         for eid in &diff.added {
             let body = store.stored_event(*eid).await.unwrap().body;
-            cache.agg += body.a * body.b;
+            agg += body.a * body.b;
         }
         for eid in &diff.removed {
             let body = store.stored_event(*eid).await.unwrap().body;
-            cache.agg -= body.a * body.b;
+            agg -= body.a * body.b;
         }
-        cache.watermark = diff.watermark;
-        GearProduce::Ship(cache.agg)
+        let wm = diff.watermark;
+        view.put(CACHE_KEY, &encode(&((wm.0, wm.1), agg)));
+        GearProduce::Ship(agg)
     }
 }
 

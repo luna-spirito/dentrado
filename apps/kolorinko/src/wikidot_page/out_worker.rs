@@ -8,14 +8,21 @@ use super::*;
 /// reply channel; the oracle core sends one and `.await`s the reply, so it
 /// never blocks while the worker decompresses archives on its own thread.
 pub(super) enum OutReq {
-    /// Rescan the publication and rebuild what drifted. The reply is `Some`
-    /// only when the dataset actually changed; `None` lets the caller keep
-    /// its cached `Rc`.
-    Tick {
-        reply: flume::Sender<Option<RepoSnapshot>>,
-    },
+    /// Rescan the publication and rebuild what drifted. `changed` is
+    /// `false` when nothing drifted; the caller then keeps its cached
+    /// `Rc` (the data is still the worker's current snapshot).
+    Tick { reply: flume::Sender<OutReply> },
     /// The current dataset without rescanning (cold start / first non-tick run).
-    Snapshot { reply: flume::Sender<RepoSnapshot> },
+    Snapshot { reply: flume::Sender<OutReply> },
+}
+
+/// One worker reply: the current dataset, whether a `Tick` adopted
+/// anything, and — when the worker's state changed since the last reply —
+/// its freshly serialized [`PersistedWorker`] image for the gear view.
+pub(super) struct OutReply {
+    pub(super) data: RepoSnapshot,
+    pub(super) changed: bool,
+    pub(super) image: Option<Vec<u8>>,
 }
 
 /// Cloneable, `Send` handle to the publication worker thread, held by the
@@ -29,29 +36,32 @@ pub(super) enum OutReq {
 pub(crate) struct OutMailbox(pub(super) flume::Sender<OutReq>);
 
 impl OutMailbox {
-    /// Rescan + rebuild what drifted; `Some` only when the dataset changed.
-    pub(super) async fn tick(&self) -> Option<RepoSnapshot> {
-        let (tx, rx) = flume::bounded(1);
-        if self.0.send_async(OutReq::Tick { reply: tx }).await.is_err() {
-            return None;
-        }
-        rx.recv_async().await.unwrap_or(None)
+    /// Rescan + rebuild what drifted.
+    pub(super) async fn tick(&self) -> OutReply {
+        self.request(|reply| OutReq::Tick { reply }).await
     }
 
     /// Current dataset without rescanning.
-    pub(super) async fn snapshot(&self) -> RepoSnapshot {
+    pub(super) async fn snapshot(&self) -> OutReply {
+        self.request(|reply| OutReq::Snapshot { reply }).await
+    }
+
+    async fn request(&self, req: impl FnOnce(flume::Sender<OutReply>) -> OutReq) -> OutReply {
         let (tx, rx) = flume::bounded(1);
-        if self
-            .0
-            .send_async(OutReq::Snapshot { reply: tx })
-            .await
-            .is_err()
-        {
-            return RepoSnapshot::default();
+        if self.0.send_async(req(tx)).await.is_err() {
+            return OutReply::default();
         }
-        rx.recv_async()
-            .await
-            .unwrap_or_else(|_| RepoSnapshot::default())
+        rx.recv_async().await.unwrap_or_default()
+    }
+}
+
+impl Default for OutReply {
+    fn default() -> Self {
+        Self {
+            data: RepoSnapshot::default(),
+            changed: false,
+            image: None,
+        }
     }
 }
 
@@ -60,7 +70,7 @@ impl OutMailbox {
 /// stamp triple drifts; the publisher's write-if-changed discipline keeps
 /// untouched files' mtimes stable, so an idle daemon costs three `stat`s per
 /// site per tick.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct SiteStamps {
     pages: Option<Stamp>,
     files: Option<Stamp>,
@@ -79,6 +89,7 @@ impl SiteStamps {
 
 /// The last-adopted per-site state: the change-detection stamps plus the
 /// manifest rows the next diff runs against.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct SiteState {
     pub(super) stamps: SiteStamps,
     pub(super) rows: HashMap<u64, PageRow>,
@@ -94,9 +105,24 @@ pub(super) struct SiteState {
 pub(super) struct OutWorker {
     pub(super) dir: &'static Path,
     pub(super) built: bool,
+    /// The state changed since the last [`PersistedWorker`] image — the
+    /// next reply carries a fresh one.
+    pub(super) dirty: bool,
     pub(super) sites: ImHashMap<SafePathComponent, WDWebsite>,
     pub(super) states: HashMap<SafePathComponent, SiteState>,
     pub(super) bodies: ImHashMap<BlobId, Arc<str>>,
+}
+
+/// The worker state the gear view persists: everything a cold start needs
+/// to skip the corpus rebuild — the adopted dataset and the per-site
+/// change-detection base. `built` distinguishes "empty publication" from
+/// "never scanned".
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct PersistedWorker {
+    built: bool,
+    sites: ImHashMap<SafePathComponent, WDWebsite>,
+    states: HashMap<SafePathComponent, SiteState>,
+    bodies: ImHashMap<BlobId, Arc<str>>,
 }
 
 impl OutWorker {
@@ -104,10 +130,45 @@ impl OutWorker {
         Self {
             dir,
             built: false,
+            dirty: false,
             sites: ImHashMap::new(),
             states: HashMap::new(),
             bodies: ImHashMap::new(),
         }
+    }
+
+    /// Adopt a persisted image (cold start). An unreadable image is a cold
+    /// start in full: the cache is recomputable, never authoritative.
+    pub(super) fn restore(mut self, image: Option<Vec<u8>>) -> Self {
+        let Some(bytes) = image else {
+            return self;
+        };
+        match postcard::from_bytes::<PersistedWorker>(&bytes) {
+            Ok(p) => {
+                self.built = p.built;
+                self.sites = p.sites;
+                self.states = p.states;
+                self.bodies = p.bodies;
+            }
+            Err(e) => error!("discarding an unreadable repo worker image: {e}"),
+        }
+        self
+    }
+
+    /// Serialize the state if it changed since the last image.
+    pub(super) fn persist(&mut self) -> Option<Vec<u8>> {
+        if !self.dirty {
+            return None;
+        }
+        self.dirty = false;
+        postcard::to_stdvec(&PersistedWorker {
+            built: self.built,
+            sites: self.sites.clone(),
+            states: self.states.clone(),
+            bodies: self.bodies.clone(),
+        })
+        .map_err(|e| error!("serializing the repo worker state: {e}"))
+        .ok()
     }
 
     /// Service [`OutReq`]s until the mailbox closes. Runs on the worker
@@ -116,11 +177,20 @@ impl OutWorker {
         while let Ok(req) = rx.recv() {
             match req {
                 OutReq::Tick { reply } => {
-                    let _ = reply.send(self.tick());
+                    let changed = self.tick().is_some();
+                    let _ = reply.send(OutReply {
+                        data: self.data(),
+                        changed,
+                        image: self.persist(),
+                    });
                 }
                 OutReq::Snapshot { reply } => {
                     self.snapshot();
-                    let _ = reply.send(self.data());
+                    let _ = reply.send(OutReply {
+                        data: self.data(),
+                        changed: true,
+                        image: self.persist(),
+                    });
                 }
             }
         }
@@ -166,6 +236,7 @@ impl OutWorker {
             }
         }
         if first || changed {
+            self.dirty = true;
             retain_latest(&self.sites, &mut self.bodies);
             Some(self.data())
         } else {
@@ -247,13 +318,13 @@ impl OutWorker {
 /// Spawn the dedicated publication worker for `meta` and return its mailbox.
 /// The worker services [`OutReq`]s for the gear's life — keeping all
 /// synchronous publication work off the async core.
-pub(super) fn spawn_worker(meta: &OutMeta) -> OutMailbox {
+pub(super) fn spawn_worker(meta: &OutMeta, image: Option<Vec<u8>>) -> OutMailbox {
     let (tx, rx) = flume::unbounded::<OutReq>();
     let mailbox = OutMailbox(tx);
     let dir = meta.dir();
     std::thread::Builder::new()
         .name("kolorinko-out".into())
-        .spawn(move || OutWorker::new(dir).run(rx))
+        .spawn(move || OutWorker::new(dir).restore(image).run(rx))
         .expect("spawn publication worker thread");
     mailbox
 }

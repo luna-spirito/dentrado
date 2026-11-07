@@ -14,23 +14,14 @@
 //! without `R`" flexibility is worthless; a typed trait gives zero-overhead
 //! in-memory, a self-documenting spec, and type safety.
 //!
-//! ## Durability of the gear cache
+//! ## Durability of the gear view
 //!
-//! The gear cache (`get_cache` / `put_cache` below) is restart-surviving state
-//! on the same footing as everything else in this trait: a disk backend
-//! persists it via `flush` so a gear resumes from its old working state after
-//! a restart (in particular, the event watermark it stores — losing it would
-//! mean re-processing the group's entire history on every cold start, which
-//! is correct but O(history) slow, and for oracle gears means re-hitting
-//! outside systems). It is *recomputable* from the event log (so correctness
-//! holds even when a backend cannot persist it), but that is an availability
-//! fallback, not a reason to skip persistence where it's feasible.
-//!
-//! (It is on this trait at all — rather than a separate field on `Core` — so
-//! that `Core<R, S: Storage>` reaches it through a single `storage` field.
-//! It can be `async` because the `Drop`-driven eviction path no longer touches
-//! it: `evict_gear` leaves the cache intact and it is keyed by the stable
-//! `R::GearId`.)
+//! A gear's working state is not interpreted by dentrado: the gear gets a
+//! [`GearView`](view::GearView) — a flat key-value overlay scoped to its
+//! stable id — and stores whatever it wants there. A disk backend persists
+//! the view through `flush`; a RAM backend loses it with everything else on
+//! process death. The view is recomputable from the event log, so a lost
+//! view is a cold start, never a correctness break.
 //!
 //! ## Flush ordering
 //!
@@ -39,9 +30,7 @@
 //!
 //! 1. **localization** — every durable event's `LocSenderId` resolves;
 //! 2. **event log** — the dedup index + log itself commit atomically;
-//! 3. **gear cache** — carries each gear's event watermark, so it must land
-//!    strictly *after* the log (a watermark surviving past its events would
-//!    point past the tail).
+//! 3. **gear view** — a gear's watermark must not survive past its events.
 //!
 //! Everything in this trait is restart-surviving state. A *RAM-only* backend
 //! like [`InMemoryStorage`](crate::core::storage::in_memory::InMemoryStorage)
@@ -61,9 +50,9 @@
 //! obstacles that previously forced localization to stay synchronous are now
 //! resolved:
 //!
-//! 1. **Gear cache** is keyed by `R::GearId` and no longer touched by
+//! 1. **Gear views** are keyed by `R::GearId` and never touched by
 //!    `evict_gear`, so the sync `Drop for Subscription` path never reaches
-//!    storage on its behalf.
+//!    storage on their behalf.
 //! 2. **Subscription stop** carries only an opaque session token
 //!    (`InterCoreMsg::StopSubscription { session, from_core }`), so
 //!    `evict_gear` → `send_stop` no longer reads localization to build a wire
@@ -78,9 +67,11 @@
 
 pub mod in_memory;
 pub mod paged;
+pub mod view;
 
 pub use in_memory::InMemoryStorage;
 pub use paged::PagedStorage;
+pub use view::{DiskView, GearView, RamView};
 
 use std::{fmt::Debug, future::Future, io, marker::PhantomData};
 
@@ -112,30 +103,6 @@ pub struct GroupDiff {
 /// "from the beginning".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Watermark(pub u64, pub u64);
-
-/// (De)serialization interface a gear cache (`R::GearCache`) implements so a
-/// restart-surviving backend
-/// ([`PagedStorage`](crate::core::storage::PagedStorage)) can persist it:
-/// `ser_image`/`de_image` spill the cache as one self-contained byte image; a
-/// cache that leaves them at the default simply cold-starts after a restart —
-/// correct, only slower (the cache is recomputable from the event log).
-pub trait CacheSer {
-    /// The cache as one self-contained byte image, or `None` if this cache
-    /// does not persist. The image must round-trip through [`de_image`] into
-    /// an equivalent cache.
-    fn ser_image(&self) -> Option<Vec<u8>> {
-        None
-    }
-
-    /// Rebuild in place from a prior [`ser_image`](Self::ser_image) of this
-    /// same cache type; `false` marks the image unusable (version skew,
-    /// corruption) — the caller starts from a fresh cache instead.
-    fn de_image(&mut self, _bytes: &[u8]) -> bool {
-        false
-    }
-}
-
-impl CacheSer for () {}
 
 /// Typed physical storage for one core. `Watermark::default()` means
 /// "from the beginning".
@@ -203,19 +170,23 @@ pub trait IsStorage<R: IsRuntime>: GlobalResolver /* TODO: Remove this, unviable
         since: Watermark,
     ) -> impl Future<Output = GroupDiff>;
 
-    // ── Layer 3: gear cache ───────────────────────────────────────────────
+    // ── Layer 3: the gear's private view ──────────────────────────────────
 
-    /// Получить cache по id. Десериализует и возвращает typed cache.
-    fn get_cache(&self, gear: &R::GearId) -> impl Future<Output = Option<R::GearCache>>;
+    /// The view type this backend hands to a gear. Disk and RAM backends
+    /// differ in representation, not in contract.
+    type View<'a>: GearView
+    where
+        Self: 'a;
 
-    /// Перезаписать cache.
-    fn put_cache(&self, gear: R::GearId, cache: R::GearCache) -> impl Future<Output = ()>;
+    /// Open a view scoped to `gear`. The view stages writes; the runtime
+    /// commits it after the gear run.
+    fn gear_view(&self, gear: &R::GearId) -> impl Future<Output = Self::View<'_>>;
 
     // ── Durability ────────────────────────────────────────────────────────
 
     /// Commit point: после успешного `flush` всё, записанное до него,
     /// переживает крах процесса. Порядок внутри: layer 1 → layer 2 →
-    /// gear cache.
+    /// gear view.
     fn flush(&self) -> impl Future<Output = io::Result<()>>;
 }
 

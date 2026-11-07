@@ -262,8 +262,8 @@ pub(crate) fn core_count() -> NonZero<u32> {
     .unwrap()
 }
 
-/// Build a single-node [`DbConfig`] for `cores` cores, persisting gear caches
-/// under `storage_dir` (one page-store file per core) or RAM-only when
+/// Build a single-node [`DbConfig`] for `cores` cores, persisting the gear
+/// views under `storage_dir` (one page-store file per core) or RAM-only when
 /// `None`. Shared by the server ([`run_server`]) and the render CLI
 /// ([`render_cli`]).
 fn db_config(

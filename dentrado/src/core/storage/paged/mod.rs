@@ -1,70 +1,47 @@
-//! Gear-cache persistence over [`dentrado_cache`].
+//! The disk-backed [`IsStorage`]: localization and the event log stay in
+//! RAM; the gear views spill into one [`dentrado_cache`] table.
 //!
-//! [`PagedStorage`] wraps [`InMemoryStorage`]: localization and the event log
-//! stay in RAM and are delegated verbatim; only the gear cache
-//! (`get_cache`/`put_cache`) spills into the store's table — one record per
-//! gear:
-//!
-//! * table — the postcard of the format's name and version (a format change
-//!   opens a new table; the opener's startup GC drops every other identity
-//!   this file carries — an old version's orphans);
-//! * key — `postcard(gear_id)`;
-//! * value — the image postcard([`blob::ImgRef`]): at or under
-//!   [`blob::INLINE_MAX`] it rides the record itself, bigger ones take
-//!   a page chain — chunking is this layer's job (the store neither
-//!   knows nor parses what a page holds), and the schema (the
-//!   `next`-header shape) lets the store's audits walk the chains;
-//! * deletion — the record dies, really.
-//!
-//! The image is hashed, and an unchanged image skips the rewrite — the
-//! engine puts the cache after *every* gear run, so without this an idle
-//! gear would churn pages and disk forever. Reads seed the same map, so a
-//! post-restart run of an unchanged gear never touches the store at all.
-//! `flush` is dirty-gated the same way (an idle round still rewrites the
-//! superblock and syncs). The map also carries each image's page ledger:
-//! the store's batches take the dying pages as the caller's explicit
-//! `free` list (no traversal inside the store), so overwrites and
-//! erasures vouch from here; a key unseen since open learns its standing
-//! record with one read before the first overwrite vouches.
+//! A view is a flat key-value overlay scoped to one gear (see
+//! [`GearView`]). The disk view is one `Session` over the store: reads use
+//! the session's old snapshot, writes are staged by the session, and the
+//! runtime commits the whole batch after the gear run. There is no image
+//! envelope and no chunking here — a gear that needs bigger values stores
+//! several records itself.
 //!
 //! ## The poison boundary
 //!
-//! The store is a component the core cannot trust: any error, and any panic
-//! the store does not already contain itself, fails the disk **permanently**
-//! — the backend degrades to [`InMemoryStorage`] semantics for the rest of
-//! the process rather than failing the core. Gear caches are recomputable
-//! from the event log, so the degradation is silent to correctness (an idle
-//! gear re-warms on its next run). A corrupt image at open is quarantined
-//! (the file renamed aside, kept for inspection) and a fresh store opens in
-//! its place — corruption must neither crashloop the process nor be
-//! silently rewritten. The disk lifecycle ([`Disk`], open, quarantine, the
-//! boundary) is [`disk`]'s; this module is the [`IsStorage`] contract.
+//! A store error is fatal: the view panics rather than silently degrading
+//! to RAM. The process is expected to restart against a fresh store (the
+//! cache is recomputable). A corrupt image is quarantined (renamed aside,
+//! kept for inspection) and a fresh store opens in its place; a failed
+//! open is a panic, never a silent RAM fallback.
 //!
-//! The store opens lazily on the first cache op: `make_storage` runs before
-//! the core's runtime exists, and opening spawns the store's driver task —
-//! both need runtime context. Concurrent first-touchers park on a oneshot
-//! while one of them opens; a failed open is terminal for the process
-//! (RAM-only mode) — a cache backend must not brick the core by retrying a
-//! broken disk on every op.
+//! The store opens lazily on the first view: `make_storage` runs before the
+//! core's runtime exists, and opening spawns the store's driver task — both
+//! need runtime context. Concurrent first-touchers park on a oneshot while
+//! one of them opens.
 
-mod blob;
 mod disk;
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
     future::Future,
     io,
     path::PathBuf,
+    rc::Rc,
 };
 
-use dentrado_cache::PageId;
+use dentrado_cache::{Storage, disk::FsDisk};
 
 use crate::{
     core::{
         gear::IsRuntime,
         loc_ctx::{StoreResultSuccess, StoredEvent},
-        storage::{CacheSer, GroupDiff, IsStorage, Watermark, in_memory::InMemoryStorage},
+        storage::{
+            GroupDiff, IsStorage, Watermark,
+            in_memory::InMemoryStorage,
+            view::{DiskView, GearView, RamView, gear_key},
+        },
     },
     types::{
         DataId, DataVerifyError, GlobalResolver, GroupEventId, GroupRouteError, LocDataId,
@@ -73,17 +50,13 @@ use crate::{
 };
 use disk::Disk;
 
-/// [`Storage`] that persists gear caches into a dentrado-cache table.
-/// `ram()` behaves exactly like [`InMemoryStorage`] — the toggle.
+/// [`IsStorage`] whose gear views live in a [`dentrado_cache`] file.
+/// `ram()` is the runtime toggle: no file, views in a `BTreeMap`.
 pub struct PagedStorage<R: IsRuntime> {
     ram: InMemoryStorage<R>,
     file: Option<PathBuf>,
     disk: RefCell<Disk>,
     dirty: Cell<bool>,
-    /// Gear key → (hash of the last disk-bound image, its page ledger).
-    /// A matching hash makes `put_cache` a no-op; a `remove` means
-    /// "erase on disk"; the pages vouch the next batch's `free` list.
-    seen: RefCell<HashMap<Vec<u8>, ([u8; 32], Vec<PageId>)>>,
 }
 
 impl<R: IsRuntime> Default for PagedStorage<R> {
@@ -100,13 +73,12 @@ impl<R: IsRuntime> PagedStorage<R> {
             file: None,
             disk: RefCell::new(Disk::Closed),
             dirty: Cell::new(false),
-            seen: RefCell::new(HashMap::new()),
         }
     }
 
-    /// Disk mode: cache images live (after [`IsStorage::flush`]) in one
+    /// Disk mode: gear views live (after [`IsStorage::flush`]) in one
     /// page-store file. The parent directory must already exist; the store
-    /// opens lazily inside the core's runtime on the first cache op.
+    /// opens lazily inside the core's runtime on the first view.
     #[must_use]
     pub fn on_disk(file: PathBuf) -> Self {
         Self {
@@ -115,16 +87,10 @@ impl<R: IsRuntime> PagedStorage<R> {
         }
     }
 
-    fn key(gear: &R::GearId) -> Option<Vec<u8>>
-    where
-        R::GearId: serde::Serialize,
-    {
-        postcard::to_stdvec(gear).ok()
-    }
-
-    fn remember(&self, key: &[u8], image: &[u8], pages: Vec<PageId>) {
-        let hash = *blake3::hash(image).as_bytes();
-        self.seen.borrow_mut().insert(key.to_vec(), (hash, pages));
+    /// The opened store, or a panic. A missing file means [`Self::ram`];
+    /// disk mode always has one.
+    pub(super) async fn ensure(&self) -> Rc<Storage<FsDisk>> {
+        self.disk_open().await.expect("open the gear view store")
     }
 }
 
@@ -138,11 +104,54 @@ impl<R: IsRuntime> GlobalResolver for PagedStorage<R> {
     }
 }
 
+/// The two representations a [`PagedStorage`] view can take. The disk
+/// branch is a `Session` + gear prefix; the RAM branch is the same
+/// contract over a `BTreeMap` (the `ram()` toggle).
+pub enum PagedView<'a> {
+    Disk(DiskView<'a>),
+    Ram(RamView<'a>),
+}
+
+impl GearView for PagedView<'_> {
+    async fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+        match self {
+            Self::Disk(view) => view.get(key).await,
+            Self::Ram(view) => view.get(key).await,
+        }
+    }
+
+    async fn scan(&mut self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self {
+            Self::Disk(view) => view.scan(prefix).await,
+            Self::Ram(view) => view.scan(prefix).await,
+        }
+    }
+
+    fn put(&mut self, key: &[u8], value: &[u8]) {
+        match self {
+            Self::Disk(view) => view.put(key, value),
+            Self::Ram(view) => view.put(key, value),
+        }
+    }
+
+    fn del(&mut self, key: &[u8]) {
+        match self {
+            Self::Disk(view) => view.del(key),
+            Self::Ram(view) => view.del(key),
+        }
+    }
+
+    fn commit(&mut self) {
+        match self {
+            Self::Disk(view) => view.commit(),
+            Self::Ram(view) => view.commit(),
+        }
+    }
+}
+
 impl<R> IsStorage<R> for PagedStorage<R>
 where
     R: IsRuntime,
-    R::GearId: serde::Serialize,
-    R::GearCache: CacheSer,
 {
     // ── Layers 1–2: delegated to RAM ───────────────────────────────────────
 
@@ -214,114 +223,22 @@ where
         self.ram.diff_group(group, since)
     }
 
-    // ── Layer 3: gear cache → records ──────────────────────────────────────
+    // ── Layer 3: the gear's private view ──────────────────────────────────
 
-    fn get_cache(&self, gear: &R::GearId) -> impl Future<Output = Option<R::GearCache>> {
-        async move {
-            let Some(file) = &self.file else {
-                return self.ram.get_cache(gear).await;
-            };
-            let Some(key) = Self::key(gear) else {
-                return self.ram.get_cache(gear).await;
-            };
-            let Some(store) = self.ensure().await else {
-                return self.ram.get_cache(gear).await;
-            };
-            let table = disk::cache_table();
-            let read = blob::read_image(&*store, &table, &key);
-            // A read failure degrades but needs no tombstone: nothing was
-            // written, the entry on disk stays whatever it was.
-            let Some((image, pages)) = self.boundary(file, read).await? else {
-                return self.ram.get_cache(gear).await;
-            };
-            let mut cache = R::make_cache(gear);
-            let decoded = cache.de_image(&image);
-            // the ledger seeds even on an unreadable image: the record
-            // occupies real pages, the next overwrite vouches them
-            self.remember(&key, &image, pages);
-            if !decoded {
-                return None;
-            }
-            Some(cache)
-        }
-    }
+    type View<'a>
+        = PagedView<'a>
+    where
+        Self: 'a;
 
-    fn put_cache(&self, gear: R::GearId, cache: R::GearCache) -> impl Future<Output = ()> {
+    fn gear_view(&self, gear: &R::GearId) -> impl Future<Output = Self::View<'_>> {
+        let prefix = gear_key::<R>(gear).to_vec();
         async move {
-            let Some(file) = &self.file else {
-                return self.ram.put_cache(gear, cache).await;
-            };
-            let Some(key) = Self::key(&gear) else {
-                return self.ram.put_cache(gear, cache).await;
-            };
-            match cache.ser_image() {
-                Some(image) => {
-                    let hash = *blake3::hash(&image).as_bytes();
-                    if self
-                        .seen
-                        .borrow()
-                        .get(&key)
-                        .is_some_and(|(h, _)| *h == hash)
-                    {
-                        return; // unchanged since the last disk-bound image
-                    }
-                    let Some(store) = self.ensure().await else {
-                        return self.ram.put_cache(gear, cache).await;
-                    };
-                    let table = disk::cache_table();
-                    // The caller vouches the free list: a key unseen since
-                    // open (a put without a preceding get) reads its standing
-                    // record once — then the ledger is whole, and an image
-                    // equal to the standing one skips the write entirely.
-                    if !self.seen.borrow().contains_key(&key) {
-                        let read = blob::read_image(&*store, &table, &key);
-                        // the op may degrade (outer None) or simply find
-                        // no record (inner None) — both leave the ledger
-                        // as it is
-                        if let Some(Some((old, pages))) = self.boundary(file, read).await {
-                            self.remember(&key, &old, pages);
-                        }
-                        if self
-                            .seen
-                            .borrow()
-                            .get(&key)
-                            .is_some_and(|(h, _)| *h == hash)
-                        {
-                            return;
-                        }
-                    }
-                    let old = self
-                        .seen
-                        .borrow()
-                        .get(&key)
-                        .map(|(_, p)| p.clone())
-                        .unwrap_or_default();
-                    let put = blob::put_image(&*store, &table, &key, &image, &old);
-                    if let Some(pages) = self.boundary(file, put).await {
-                        self.dirty.set(true);
-                        self.remember(&key, &image, pages);
-                    }
+            match &self.file {
+                Some(_) => {
+                    let store = self.ensure().await;
+                    PagedView::Disk(DiskView::new(store, prefix, &self.dirty))
                 }
-                // A non-persisting cache erases only what this process (or a
-                // same-shape predecessor) stored; a stale entry left by older
-                // code is unread (`de_image` fails) and dies at the next
-                // overwrite.
-                None => {
-                    let Some((_, old)) = self.seen.borrow_mut().remove(&key) else {
-                        return; // erases only what this process stored
-                    };
-                    if let Some(store) = self.ensure().await {
-                        let table = disk::cache_table();
-                        let del = async {
-                            let mut s = store.session();
-                            s.del(&table, &key, &old)?;
-                            s.commit()
-                        };
-                        if self.boundary(file, del).await.is_some() {
-                            self.dirty.set(true);
-                        }
-                    }
-                }
+                None => PagedView::Ram(RamView::new(self.ram.gear_data(), prefix)),
             }
         }
     }
@@ -331,17 +248,11 @@ where
     fn flush(&self) -> impl Future<Output = io::Result<()>> {
         async move {
             self.ram.flush().await?;
-            if !self.dirty.get() {
-                return Ok(());
+            if self.dirty.get() {
+                let store = self.ensure().await;
+                store.flush().await.expect("flush the gear view store");
+                self.dirty.set(false);
             }
-            let Some(store) = self.ensure().await else {
-                return Ok(());
-            };
-            store
-                .flush()
-                .await
-                .map_err(|e| io::Error::other(format!("page store flush: {e:?}")))?;
-            self.dirty.set(false);
             Ok(())
         }
     }

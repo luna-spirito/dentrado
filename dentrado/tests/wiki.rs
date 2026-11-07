@@ -4,7 +4,7 @@ use dentrado::{
     core::{
         core_ctx::GearCtx,
         gear::{GearInput, GearMeta, GearProduce, IsRuntime},
-        storage::{CacheSer, InMemoryStorage, IsStorage, Watermark},
+        storage::{GearView, InMemoryStorage, IsStorage, Watermark},
     },
     types::*,
     wire::WireEventBody,
@@ -30,13 +30,18 @@ impl Localizable for WikiGear {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct CounterCache {
-    pub watermark: Watermark,
-    pub out: i64,
+/// The gear's private state, flattened into the view: `(watermark, out)`.
+const CACHE_KEY: &[u8] = b"state";
+
+type CacheState = ((u64, u64), i64);
+
+fn decode(bytes: &[u8]) -> CacheState {
+    postcard::from_bytes(bytes).expect("a valid counter cache record")
 }
 
-impl CacheSer for CounterCache {}
+fn encode(state: &CacheState) -> Vec<u8> {
+    postcard::to_stdvec(state).expect("a flat tuple serializes")
+}
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct BranchData {
@@ -76,7 +81,6 @@ impl IsRuntime for WikiCounterRuntime {
     type Group = LocDataId;
     type Body = LocUserId;
     type Data = BranchData;
-    type GearCache = CounterCache;
 
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
@@ -87,29 +91,25 @@ impl IsRuntime for WikiCounterRuntime {
         }
     }
 
-    fn make_cache(_gear: &Self::GearId) -> Self::GearCache {
-        CounterCache {
-            watermark: Watermark::default(),
-            out: 0,
-        }
-    }
-
     async fn run_step<S: IsStorage<Self>>(
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
-        cache: &mut Self::GearCache,
+        view: &mut S::View<'_>,
     ) -> GearProduce<Self> {
+        let ((a, r), mut out) = view
+            .get(CACHE_KEY)
+            .await
+            .map_or(((0, 0), 0), |b| decode(&b));
+        let watermark = Watermark(a, r);
         let GearInput::Events(group) = input else {
-            return GearProduce::Ship(cache.out);
+            return GearProduce::Ship(out);
         };
-        let diff = ctx
-            .storage()
-            .diff_group(group, cache.watermark.clone())
-            .await;
-        cache.out += diff.added.len() as i64;
-        cache.out -= diff.removed.len() as i64;
-        cache.watermark = diff.watermark;
-        GearProduce::Ship(cache.out)
+        let diff = ctx.storage().diff_group(group, watermark).await;
+        out += diff.added.len() as i64;
+        out -= diff.removed.len() as i64;
+        let wm = diff.watermark;
+        view.put(CACHE_KEY, &encode(&((wm.0, wm.1), out)));
+        GearProduce::Ship(out)
     }
 }
 

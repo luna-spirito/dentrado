@@ -4,35 +4,18 @@ use super::*;
 // `repo_snap` — the one cross-core bridge
 // =========================================================================
 
-/// Trivial lens cache: [`repo_snap`] is an O(1) structural clone of the
-/// followed snapshot, recomputed on every `follow` kick.
-#[derive(Default, Clone, Debug)]
-pub(crate) struct RepoSnapCache;
-
-// No carried state, nothing to persist.
-impl dentrado::core::storage::CacheSer for RepoSnapCache {}
-
 /// The `repo` core's snapshot as a cross-core `shared` value: an O(1)
 /// clone of the followed `Rc`, so every consumer core holds the whole
 /// corpus by reference and reads pages, slugs, selections, and bodies
 /// locally — the single bridge that replaces the whole `repo_l_*` lens
 /// family (one cross-core read per consuming gear *run*, none per hop).
-pub(crate) fn repo_snap(data: &RepoSnapshot) -> RepoSnapshot {
-    data.clone()
+pub(crate) fn repo_snap(state: &RepoState) -> RepoSnapshot {
+    state.snapshot().clone()
 }
 
 // =========================================================================
 // `shell` gear
 // =========================================================================
-
-/// Per-instance cache for [`shell`]: a pure aggregation re-derived each run
-/// from its `article_latest` dependencies and the live [`RepoSnapshot`], so it
-/// carries no state between runs.
-#[derive(Default, Clone, Debug)]
-pub(crate) struct ShellCache;
-
-// No carried state, nothing to persist.
-impl dentrado::core::storage::CacheSer for ShellCache {}
 
 /// The space's whole chrome in one shot: the fully include-resolved `nav:top`
 /// and `nav:side` pages, the theme-root URLs, and the landing page's

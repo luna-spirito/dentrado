@@ -353,3 +353,10 @@ CA-URL отдаёт 302, а в HTML ссылки остались оригина
   
 * I believe something's fishy with `repo` gear, and it's probably being awaited on the hot path?
 Whatever, it needs caching and proper background update smeanics
+
+----
+- Proper lens
+- Rererere-review contact APIs...
+- zeropool...
+- sure blake3 for gear keys?
+- multiple tables for different gear cache kinds.

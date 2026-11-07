@@ -39,18 +39,18 @@ fn session_reads_one_world() {
             .unwrap();
         put(&st, b"t0", b"a", b"one").unwrap();
         let mut s = st.session();
-        assert_eq!(s.get(b"t0", b"a").await.unwrap(), Some(b"one".to_vec()));
-        let scan = s.scan(b"t0", b"", b"").await.unwrap();
+        assert_eq!(s.get_old(b"t0", b"a").await.unwrap(), Some(b"one".to_vec()));
+        let scan = s.scan_old(b"t0", b"", b"").await.unwrap();
         assert_eq!(scan, [(b"a".to_vec(), b"one".to_vec())]);
 
         // The live world moves on; the session does not.
         put(&st, b"t0", b"a", b"two").unwrap();
         put(&st, b"t0", b"b", b"new").unwrap();
         put(&st, b"t1", b"a", b"other").unwrap();
-        assert_eq!(s.get(b"t0", b"a").await.unwrap(), Some(b"one".to_vec()));
-        assert_eq!(s.get(b"t0", b"b").await.unwrap(), None);
-        assert_eq!(s.scan(b"t0", b"", b"").await.unwrap(), scan);
-        assert_eq!(s.get(b"t1", b"a").await.unwrap(), None);
+        assert_eq!(s.get_old(b"t0", b"a").await.unwrap(), Some(b"one".to_vec()));
+        assert_eq!(s.get_old(b"t0", b"b").await.unwrap(), None);
+        assert_eq!(s.scan_old(b"t0", b"", b"").await.unwrap(), scan);
+        assert_eq!(s.get_old(b"t1", b"a").await.unwrap(), None);
 
         // The commit consumes the session; the next session sees its
         // records at once, alongside everything committed before it.
@@ -58,8 +58,11 @@ fn session_reads_one_world() {
         s.commit().unwrap();
 
         let mut s = st.session();
-        assert_eq!(s.get(b"t0", b"a").await.unwrap(), Some(b"three".to_vec()));
-        assert_eq!(s.get(b"t0", b"b").await.unwrap(), Some(b"new".to_vec()));
+        assert_eq!(
+            s.get_old(b"t0", b"a").await.unwrap(),
+            Some(b"three".to_vec())
+        );
+        assert_eq!(s.get_old(b"t0", b"b").await.unwrap(), Some(b"new".to_vec()));
         st.partition_exact().await.unwrap();
     });
 }
@@ -80,7 +83,11 @@ fn a_snapshot_survives_flush_and_reuse() {
         st.flush().await.unwrap();
 
         let mut s = st.session();
-        let old_mt = s.get(b"t0", b"k").await.unwrap().expect("the old record");
+        let old_mt = s
+            .get_old(b"t0", b"k")
+            .await
+            .unwrap()
+            .expect("the old record");
         assert_eq!(read_chain(&mut s, &old_mt).await, old);
 
         // A foreign replacement kills the old chain; the flush packs the
@@ -92,7 +99,7 @@ fn a_snapshot_survives_flush_and_reuse() {
         st.flush().await.unwrap();
 
         // The session still reads the old world, pages included.
-        assert_eq!(s.get(b"t0", b"k").await.unwrap(), Some(old_mt.clone()));
+        assert_eq!(s.get_old(b"t0", b"k").await.unwrap(), Some(old_mt.clone()));
         assert_eq!(read_chain(&mut s, &old_mt).await, old);
 
         // Letting go releases the deaths; the next flush spends them.

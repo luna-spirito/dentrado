@@ -11,7 +11,7 @@ use tar::Archive;
 /// when its stored-revision count drifts, and only rewrites the manifest
 /// when a row does, so an unchanged row names a byte-identical archive
 /// (deterministic tar+zst, write-if-changed).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct PageRow {
     pub slug: String,
     pub title: String,
@@ -48,7 +48,7 @@ pub(super) fn archive_rel(page_id: &str) -> String {
 /// `(mtime, size)` of one file — the site-level change gate. The publisher
 /// writes tmp+rename and skips byte-identical rewrites, so an untouched
 /// publication keeps its stamp however often the daemon republishes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct Stamp(std::time::SystemTime, u64);
 
 pub(super) fn stamp(path: &Path) -> Option<Stamp> {

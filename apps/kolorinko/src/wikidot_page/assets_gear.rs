@@ -4,14 +4,6 @@ use super::*;
 // `asset` gear — content-addressed blob serving
 // =========================================================================
 
-/// No carry-over state: a run reads the blob fresh; the compressed bytes are
-/// cached by the runtime (`shared`: one allocation, refcounted across cores).
-#[derive(Default, Clone, Debug)]
-pub(crate) struct AssetCache;
-
-// No persisted image: the MIME sniff + CSS rewrite re-run from disk.
-impl dentrado::core::storage::CacheSer for AssetCache {}
-
 /// **PURE-FUNCTION ASSUMPTION (known to be wrong).** The gear's output — the
 /// MIME, and the CSS rewrite, which resolves each `url()`/`@import` (relative
 /// ones against the blob's original URL) through a **non-tracking** (stale)

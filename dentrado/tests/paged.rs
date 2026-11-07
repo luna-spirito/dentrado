@@ -1,7 +1,10 @@
-//! `PagedStorage` round-trip: gear-cache images survive flush + reopen
-//! (small ones as their records, big ones as page chains), are fetched
-//! back on demand, overwrites vouch their predecessors' pages free,
-//! and a cache that stops persisting erases its record.
+//! `PagedStorage` gear-view round-trip: staged writes become visible only
+//! after `commit`, survive flush + reopen, overwrite and delete behave, and
+//! `scan` walks one gear's prefix without leaking another gear's records.
+//!
+//! The base view is flat — a value must fit one leaf record — so a gear
+//! that needs bigger values stores several records itself. This test only
+//! exercises the flat contract.
 
 use std::fmt::Debug;
 
@@ -9,12 +12,12 @@ use dentrado::{
     core::{
         core_ctx::GearCtx,
         gear::{GearInput, GearMeta, GearProduce, IsRuntime},
-        storage::{CacheSer, IsStorage, PagedStorage, Watermark},
+        storage::{GearView, IsStorage, PagedStorage},
     },
     types::*,
 };
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum BlobGear {
     Blob { key: u64 },
 }
@@ -22,30 +25,6 @@ enum BlobGear {
 impl Localizable for BlobGear {
     async fn localize<Rm: Remapper>(self, _remapper: &mut Rm) -> Result<Self, Rm::Err> {
         Ok(self)
-    }
-}
-
-/// A cache whose image is the blob verbatim; an empty blob means "do not
-/// persist" (the None image → tombstone path).
-#[derive(Debug, Clone)]
-struct BlobCache {
-    watermark: Watermark,
-    blob: String,
-}
-
-impl CacheSer for BlobCache {
-    fn ser_image(&self) -> Option<Vec<u8>> {
-        (!self.blob.is_empty()).then(|| self.blob.clone().into_bytes())
-    }
-
-    fn de_image(&mut self, bytes: &[u8]) -> bool {
-        match String::from_utf8(bytes.to_vec()) {
-            Ok(blob) => {
-                self.blob = blob;
-                true
-            }
-            Err(_) => false,
-        }
     }
 }
 
@@ -61,7 +40,6 @@ impl IsRuntime for BlobRuntime {
     type Group = i64;
     type Body = ();
     type Data = ();
-    type GearCache = BlobCache;
 
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
@@ -72,17 +50,10 @@ impl IsRuntime for BlobRuntime {
         }
     }
 
-    fn make_cache(_gear: &Self::GearId) -> Self::GearCache {
-        BlobCache {
-            watermark: Watermark::default(),
-            blob: String::new(),
-        }
-    }
-
     async fn run_step<S: IsStorage<Self>>(
         _ctx: &mut GearCtx<Self, S>,
         _input: GearInput<Self>,
-        _cache: &mut Self::GearCache,
+        _view: &mut S::View<'_>,
     ) -> GearProduce<Self> {
         unreachable!("this test drives storage directly")
     }
@@ -92,75 +63,81 @@ async fn roundtrip(file: &std::path::Path) {
     let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.to_path_buf());
     let gear = BlobGear::Blob { key: 7 };
 
-    // Absent before the first write.
-    assert!(st.get_cache(&gear).await.is_none());
+    let mut view = st.gear_view(&gear).await;
+    assert!(view.get(b"k").await.is_none());
 
-    // An image spanning three chunks (2×4088 payload + a tail) rides a
-    // page chain: chunking is this layer's job now.
-    let big = format!("{}+tail", "x".repeat(9000));
-    st.put_cache(
-        gear.clone(),
-        BlobCache {
-            watermark: Watermark(0, 0),
-            blob: big.clone(),
-        },
-    )
-    .await;
+    // A write is staged: the gear's reads still see the old world until
+    // `commit` publishes the batch.
+    view.put(b"k", b"one");
+    assert!(view.get(b"k").await.is_none());
+    view.commit();
+    assert_eq!(view.get(b"k").await.unwrap(), b"one");
+
+    // A value may fill most of a leaf record (the view does not chunk).
+    let big = vec![b'x'; 4000];
+    view.put(b"big", &big);
+    view.commit();
     st.flush().await.unwrap();
-    assert_eq!(st.get_cache(&gear).await.unwrap().blob, big);
+    assert_eq!(view.get(b"big").await.unwrap(), big);
 
-    // Reopen from disk: the image is fetched back on demand.
+    // Reopen from disk: the record is fetched back on demand.
+    drop(view);
     drop(st);
     let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.to_path_buf());
-    assert_eq!(st.get_cache(&gear).await.unwrap().blob, big);
+    let mut view = st.gear_view(&gear).await;
+    assert_eq!(view.get(b"k").await.unwrap(), b"one");
+    assert_eq!(view.get(b"big").await.unwrap(), big);
 
-    // Overwrite, reopen: the new image wins (the old chain's pages ride
-    // the ledger's `free` list).
-    let small = "y".to_string();
-    st.put_cache(
-        gear.clone(),
-        BlobCache {
-            watermark: Watermark(1, 0),
-            blob: small.clone(),
-        },
-    )
-    .await;
+    // Overwrite, reopen: the new value wins.
+    view.put(b"k", b"two");
+    view.commit();
     st.flush().await.unwrap();
+    drop(view);
     drop(st);
     let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.to_path_buf());
-    assert_eq!(st.get_cache(&gear).await.unwrap().blob, small);
+    let mut view = st.gear_view(&gear).await;
+    assert_eq!(view.get(b"k").await.unwrap(), b"two");
 
-    // A cache that stops persisting (empty image) erases its record.
-    st.put_cache(
-        gear.clone(),
-        BlobCache {
-            watermark: Watermark(2, 0),
-            blob: String::new(),
-        },
-    )
-    .await;
-    st.flush().await.unwrap();
-    drop(st);
-    let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.to_path_buf());
-    assert!(st.get_cache(&gear).await.is_none());
-
-    // RAM mode (`file = None`) stays a plain in-memory backend.
-    let ram: PagedStorage<BlobRuntime> = PagedStorage::ram();
-    ram.put_cache(
-        gear,
-        BlobCache {
-            watermark: Watermark(0, 0),
-            blob: "z".into(),
-        },
-    )
-    .await;
+    // `scan` returns this gear's records under the prefix, in key order,
+    // with the gear prefix stripped.
+    view.put(b"row/1", b"a");
+    view.put(b"row/2", b"b");
+    view.commit();
     assert_eq!(
-        ram.get_cache(&BlobGear::Blob { key: 7 })
-            .await
-            .unwrap()
-            .blob,
-        "z"
+        view.scan(b"row/").await,
+        [
+            (b"row/1".to_vec(), b"a".to_vec()),
+            (b"row/2".to_vec(), b"b".to_vec()),
+        ]
     );
+
+    // Another gear is a separate namespace over the same store.
+    let other = BlobGear::Blob { key: 8 };
+    let mut other_view = st.gear_view(&other).await;
+    assert!(other_view.get(b"k").await.is_none());
+    assert!(other_view.scan(b"").await.is_empty());
+
+    // `del` stages a deletion; it lands with the commit.
+    view.del(b"k");
+    assert_eq!(view.get(b"k").await.unwrap(), b"two");
+    view.commit();
+    assert!(view.get(b"k").await.is_none());
+    st.flush().await.unwrap();
+    drop(other_view);
+    drop(view);
+    drop(st);
+    let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.to_path_buf());
+    let mut view = st.gear_view(&gear).await;
+    assert!(view.get(b"k").await.is_none());
+    assert_eq!(view.get(b"big").await.unwrap(), big);
+
+    // RAM mode (`file = None`) is the same contract over a `BTreeMap`.
+    let ram: PagedStorage<BlobRuntime> = PagedStorage::ram();
+    let mut view = ram.gear_view(&gear).await;
+    view.put(b"k", b"z");
+    assert!(view.get(b"k").await.is_none());
+    view.commit();
+    assert_eq!(view.get(b"k").await.unwrap(), b"z");
 }
 
 #[test]
@@ -190,16 +167,12 @@ fn paged_storage_quarantines_corruption() {
             std::fs::write(&file, [0x5Au8; 8192]).unwrap();
             let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.clone());
             let gear = BlobGear::Blob { key: 7 };
-            assert!(st.get_cache(&gear).await.is_none());
-            st.put_cache(
-                gear.clone(),
-                BlobCache {
-                    watermark: Watermark::default(),
-                    blob: "fresh".into(),
-                },
-            )
-            .await;
+            let mut view = st.gear_view(&gear).await;
+            assert!(view.get(b"k").await.is_none());
+            view.put(b"k", b"fresh");
+            view.commit();
             st.flush().await.unwrap();
+            drop(view);
             drop(st);
             // The corrupt file was renamed aside; the new one is a working
             // store.
@@ -212,11 +185,12 @@ fn paged_storage_quarantines_corruption() {
                 .collect();
             assert_eq!(quarantined.len(), 1, "the corrupt file was renamed aside");
             let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file);
-            assert_eq!(st.get_cache(&gear).await.unwrap().blob, "fresh");
+            let mut view = st.gear_view(&gear).await;
+            assert_eq!(view.get(b"k").await.unwrap(), b"fresh");
         });
 }
 
-/// The startup GC: a table left by an older cache-format version is dropped
+/// The startup GC: a table left by an older view-format version is dropped
 /// on open; the current version's table survives.
 #[test]
 fn paged_storage_gcs_old_versions() {
@@ -229,8 +203,8 @@ fn paged_storage_gcs_old_versions() {
             let dir = tempfile::tempdir().unwrap();
             let file = dir.path().join("core-0.dstore");
             let path = file.display().to_string();
-            let old_id = postcard::to_stdvec(&("dentrado/gear-cache", 1u64)).unwrap();
-            let cur_id = postcard::to_stdvec(&("dentrado/gear-cache", 0u64)).unwrap();
+            let old_id = postcard::to_stdvec(&("dentrado/gear-view", 1u64)).unwrap();
+            let cur_id = postcard::to_stdvec(&("dentrado/gear-view", 0u64)).unwrap();
             // An old-version store with one live entry.
             {
                 let old = Storage::open(&FsDisk, &path, 4, &[TableSpec::flat(old_id.clone())])
@@ -244,8 +218,11 @@ fn paged_storage_gcs_old_versions() {
             // Opening through PagedStorage drops the orphan…
             let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.clone());
             let gear = BlobGear::Blob { key: 7 };
-            assert!(st.get_cache(&gear).await.is_none());
+            let mut view = st.gear_view(&gear).await;
+            assert!(view.get(b"k").await.is_none());
+            view.commit();
             st.flush().await.unwrap();
+            drop(view);
             drop(st);
             // …and a raw reopen sees only the current version's table.
             let raw = Storage::open(&FsDisk, &path, 4, &[TableSpec::flat(cur_id.clone())])

@@ -195,28 +195,21 @@ pub trait IsRuntime: Debug + Send + Sync + Sized + 'static {
 
     type Data: Debug + Clone + Hash + Eq + Send + Sync + 'static + GlobalHash;
 
-    /// Per-gear working state carried across `run_step` invocations.
-    ///
-    /// A concrete runtime (e.g. `FadenoRuntime`) may set this to a single concrete
-    /// type and skip all type erasure. A runtime whose gears need heterogeneous
-    /// cache payloads can instead erase them, e.g. `type GearCache = Box<dyn Any>`
-    /// (or a tagged pointer) and downcast inside `run_step`.
-    type GearCache: Debug + Clone + 'static;
-
     fn meta(gear: &Self::GearId) -> GearMeta<Self>;
-
-    fn make_cache(gear: &Self::GearId) -> Self::GearCache;
 
     /// Compute (or incrementally update) the gear's output.
     ///
     /// `ctx` carries the gear's id, the live `Core` (via `Deref`), and the
     /// `secondary_get` entry point for declaring gear→gear dependencies.
-    /// Must not hold any `inner` borrow across `.await` (the core's `RefCell`
-    /// is shared between all concurrently-polled gears on this core).
+    /// `view` is the gear's private flat key-value overlay over the store:
+    /// reads see the old world, writes are staged and committed by the
+    /// runtime after the run. Must not hold any `inner` borrow across
+    /// `.await` (the core's `RefCell` is shared between all concurrently
+    /// polled gears on this core).
     async fn run_step<S: IsStorage<Self>>(
         ctx: &mut GearCtx<Self, S>,
         input: GearInput<Self>,
-        cache: &mut Self::GearCache,
+        view: &mut S::View<'_>,
     ) -> GearProduce<Self>;
 }
 
@@ -408,7 +401,6 @@ impl IsRuntime for EmptyRuntime {
     type Group = ();
     type Body = ();
     type Data = ();
-    type GearCache = ();
 
     fn meta(_gear: &Self::GearId) -> GearMeta<Self> {
         GearMeta::Event {
@@ -417,12 +409,10 @@ impl IsRuntime for EmptyRuntime {
         }
     }
 
-    fn make_cache(_gear: &Self::GearId) -> Self::GearCache {}
-
     async fn run_step<S: IsStorage<Self>>(
         _ctx: &mut crate::core::core_ctx::GearCtx<Self, S>,
         _input: GearInput<Self>,
-        _cache: &mut Self::GearCache,
+        _view: &mut S::View<'_>,
     ) -> GearProduce<Self> {
         GearProduce::Ship(())
     }

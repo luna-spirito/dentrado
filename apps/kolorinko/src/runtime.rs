@@ -1,8 +1,4 @@
-use std::rc::Rc;
-
-use crate::wikidot_page::{
-    AssetCache, CodeBlockCache, LatestCache, ParsedCache, RepoCache, RepoSnapCache, ShellCache,
-};
+use crate::wikidot_page::RepoState;
 use dentrado::core::{core_ctx::GearCtx, storage::IsStorage};
 use kolorinko_rt::{
     CodeBlock, LocalId, RepoSnapshot, SafePathComponent, ServedBlob, SiteShell, SpaceId,
@@ -14,8 +10,8 @@ use kolorinko_wikitext::ArticleView;
 /// This file is now a thin **skeleton**: the gear declarations live in
 /// [`kolorinko_rt`]'s `gears.def.rs`, read by *two* macros so each gear is
 /// declared exactly once — this `#[gears]` (the native dentrado runtime: impl
-/// fns + generated `GearId`/`GearOut`/`GearCache`/`IsRuntime`/`GearQuery`
-/// builders) and the client's `#[gears_schema]` (the wasm wire schema). The
+/// fns + generated `GearId`/`GearOut`/`IsRuntime`/`GearQuery` builders) and
+/// the client's `#[gears_schema]` (the wasm wire schema). The
 /// impl fn bodies (`crate::wikidot_page::…`) resolve here; the implementations
 /// themselves live in [`wikidot_page`].
 ///
@@ -36,9 +32,18 @@ mod gears {
     use super::*;
 }
 
-// `GearId` stays internal: gear ids are constructed only through the generated
-// `GearQuery` builders — the one exception is the generated wire→runtime
-// `From`, which a client-supplied wire id crosses at the subscription
-// boundary. `GearOutShared` (an alias of `kolorinko_rt::wire::GearOut`) and
-// the builders are re-exported for the server's dispatch/stale-read code.
-pub(crate) use gears::{GearOutShared, article_latest, asset, code_block, repo_snap, shell};
+// `GearId` stays internal to production code: gear ids are constructed only
+// through the generated `GearQuery` builders — the one exception is the
+// generated wire→runtime `From`, which a client-supplied wire id crosses at
+// the subscription boundary. (`GearId` itself is re-exported under `cfg(test)`
+// so the view round-trip tests can name a gear's view.) `GearOutShared` (an
+// alias of `kolorinko_rt::wire::GearOut`) and the builders are re-exported for
+// the server's dispatch/stale-read code.
+pub(crate) use gears::{
+    GearOutLocal, GearOutShared, article_latest, asset, code_block, repo_snap, shell,
+};
+
+// The concrete id is otherwise unreachable outside the generated module; the
+// view round-trip tests open a gear view by id.
+#[cfg(test)]
+pub(crate) use gears::GearId;
