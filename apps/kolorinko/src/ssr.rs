@@ -52,8 +52,8 @@ pub(crate) async fn document(
 }
 
 /// Resolve the page and shell for one canonical address. Subscribes both
-/// before reading either — holding both keeps the shared `repo` oracle active
-/// across the two queries (one clone total), exactly as the render CLI does.
+/// before reading either — holding both keeps the per-site metadata gear
+/// active across the two queries, exactly as the render CLI does.
 /// Awaits the gears' current outputs: the same resolution a CSR boot blocks
 /// on over WebTransport, just server-side. The hashes are of the wire
 /// encodings — exactly what a push would carry — so a hydrating client can

@@ -11,25 +11,25 @@
 //! Both modes spin up the gear runtime (no network servers) and resolve pages
 //! plus the site shell via `GearQuery::subscribe` (the same path the live
 //! server's SSR response and [`crate::server::run_session`] use, so the whole
-//! `repo → repo_snap → article_latest_parsed → article_latest` cone runs —
-//! git clone, parse, `[[include]]` resolution — exactly as in production),
-//! SSR-render each result through [`kolorinko_render`] into a self-contained
-//! HTML document, and exit.
+//! `Repo { site } → article_latest_parsed → article_latest` cone runs — HEAD
+//! read, archive read, parse, `[[include]]` resolution — exactly as in
+//! production), SSR-render each result through [`kolorinko_render`] into a
+//! self-contained HTML document, and exit.
 //!
-//! Subscriptions stay live until every output is read, so the shared `repo`
-//! oracle is computed once (one `git clone`) rather than re-cloned per page:
-//! the single-page render holds page + shell; the mass render holds one
-//! `repo_snap` snapshot (the whole corpus — every latest body materialised
-//! in RAM) plus the shell across the whole run.
+//! Subscriptions stay live until every output is read, so the shared per-site
+//! metadata gears are computed once rather than re-read per page: the
+//! single-page render holds page + shell; the mass render holds the site's
+//! metadata (paths and indexes, never page bodies) plus the shell across the
+//! whole run.
 //!
 //! The mass render is multi-core: parallelism rides the gear runtime's own
 //! routing (each page's `article_latest` gear has a deterministic owner core
 //! — group hash → jump-consistent hash), so every core's worker renders
 //! exactly the pages it owns and the parse/`[[include]]` work spreads across
-//! cores, while the `repo` oracle, the snapshot bridge, and the shell stay
-//! single shared instances wherever routing puts them. Within one core the
-//! worker walks its pages sequentially — page resolution reads the local
-//! snapshot and has no cross-core await phases left to overlap.
+//! cores, while the per-site metadata gears and the shell stay single shared
+//! instances wherever routing puts them. Within one core the worker walks its
+//! pages sequentially — page resolution reads the local metadata and its
+//! archive from disk, with only the metadata fetch as a cross-core await.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -80,7 +80,7 @@ fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
     crate::init_globals(&config)?;
     let space = space_of_site(&site)?;
 
-    // One core is enough for a single render; it keeps the `repo` oracle,
+    // One core is enough for a single render; it keeps the metadata gear,
     // every lens, and the parse gears co-located, so the follow/secondary_get
     // cone never crosses a thread.
     let cores = std::num::NonZero::new(1).unwrap();
@@ -95,11 +95,11 @@ fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
         async move {
             // The page is named by its slug on the CLI: bridge to the
             // canonical `(space, local)` identity the gears address, then
-            // subscribe page + shell (holding both keeps the shared `repo`
-            // oracle active across the queries — one clone total).
-            let snap_q = crate::runtime::repo_snap();
-            let snap = (*snap_q.subscribe(&core).await.current()).clone();
-            let Some((local, _title)) = local_id(&snap, &site, &slug) else {
+            // subscribe page + shell (holding both keeps the site's metadata
+            // gear active across the queries).
+            let meta_q = crate::runtime::repo(site.clone());
+            let meta = (*meta_q.subscribe(&core).await.current()).clone();
+            let Some((local, _title)) = local_id(&meta, &slug) else {
                 let _ = tx.send(Err(anyhow::anyhow!("page {slug:?} not found in {site:?}")));
                 return;
             };
@@ -166,11 +166,12 @@ enum Out {
 
 /// Pages kept in flight per core during a mass render. Parallelism *across*
 /// cores already rides deterministic gear routing; the window only overlaps
-/// each page's await phases (the `repo_snap` hop to the oracle's core, shared
-/// output deliveries) with the parse and render CPU of neighbouring pages on
-/// this core — CPU work stays serial on the core's single-threaded runtime
-/// either way, and the window bounds how much per-page state (pinned gear
-/// outputs, views, rendered documents) is alive at once.
+/// each page's await phases (the metadata `secondary_get` hop to the owning
+/// core, shared output deliveries) with the parse and render CPU of
+/// neighbouring pages on this core — CPU work stays serial on the core's
+/// single-threaded runtime either way, and the window bounds how much
+/// per-page state (pinned gear outputs, views, rendered documents) is alive
+/// at once.
 const IN_FLIGHT_PAGES: usize = 4;
 
 /// `kolorinko render <site>` — render every page of one site into a directory
@@ -301,14 +302,14 @@ fn coordinate(
 }
 
 /// One core's worker: the two site-level shared gears (the shell and the
-/// whole-corpus snapshot — one instance wherever routing puts them, however
-/// many workers subscribe), then exactly the pages whose `article_latest`
-/// gear this core owns ([`Core::owns`] — the same deterministic routing every
-/// core computes, so the shards partition the site with no coordination).
-/// Each owned page is resolved, SSR-rendered through
-/// [`render_page_document`], and streamed to the coordinator; a page's
-/// subscription is dropped after reading, so per-page state never outlives
-/// the current page over a long run.
+/// site's publication metadata — one instance wherever routing puts them,
+/// however many workers subscribe), then exactly the pages whose
+/// `article_latest` gear this core owns ([`Core::owns`] — the same
+/// deterministic routing every core computes, so the shards partition the
+/// site with no coordination). Each owned page is resolved, SSR-rendered
+/// through [`render_page_document`], and streamed to the coordinator; a
+/// page's subscription is dropped after reading, so per-page state never
+/// outlives the current page over a long run.
 async fn render_owned(
     core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     shared: &Shared,
@@ -316,12 +317,11 @@ async fn render_owned(
     let shell_q = crate::runtime::shell(shared.space);
     let shell: SiteShell = (*shell_q.subscribe(core).await.current()).clone();
 
-    // The whole corpus in RAM — every latest body materialised once (see
-    // `repo_snap`); holding both subscriptions for the whole run keeps the
-    // shared `repo` oracle active (one git clone total).
-    let snap_q = crate::runtime::repo_snap();
-    let snap_sub = snap_q.subscribe(core).await;
-    let listed: ListPagesResult = list_pages(&snap_sub.current(), &shared.site, &enumerate_query());
+    // The site's metadata, held for the whole run so the timer oracle stays
+    // active while every owned page is rendered.
+    let meta_q = crate::runtime::repo(shared.site.clone());
+    let meta_sub = meta_q.subscribe(core).await;
+    let listed: ListPagesResult = list_pages(&meta_sub.current(), &enumerate_query());
 
     // Read the site title out up front: the render loop borrows `shell`
     // until it is dropped at the end of the function.
@@ -329,7 +329,7 @@ async fn render_owned(
 
     // Exactly this core's owned pages, each as an independent
     // resolve-render-send future, driven with a bounded window: while one
-    // page's subscription awaits its gear (the `repo_snap` cross-core hop,
+    // page's subscription awaits its gear (the metadata cross-core hop,
     // shared output delivery), other pages' parse and render CPU keeps this
     // core busy instead of idling. A future dropped mid-await cancels
     // cleanly (subscription `Drop` releases interest), so erroring out of

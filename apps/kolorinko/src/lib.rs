@@ -1,6 +1,6 @@
-// Evaluating `Send` for the publication worker's spawn closure recurses
-// through flume's `Hook<T>` → `Option<T>` → the carried `RepoSnapshot` (deep
-// imbl/wikitext nesting) and brushes the default limit; harmless to raise.
+// Evaluating `Send` for spawn closures that carry the gear outputs recurses
+// through deeply nested imbl/wikitext types and brushes the default limit;
+// harmless to raise.
 #![recursion_limit = "256"]
 
 use clap::Parser;
@@ -26,7 +26,6 @@ use std::{
 };
 
 use crate::runtime::KolorinkoRT;
-mod repo_state;
 mod assets;
 mod globals;
 mod metrics;

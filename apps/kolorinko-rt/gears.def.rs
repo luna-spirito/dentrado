@@ -8,7 +8,8 @@
 //   builders. `wire = …` additionally aliases the wire schema's `GearOut` as
 //   the runtime's `GearOut`/`GearOutShared` (one payload enum for both sides,
 //   no per-variant relabel at the wire boundary) and generates the
-//   field-for-field `From<wire::GearId>` id bridge.// - `#[gears_schema(file = "...")]` (in this crate's `lib.rs`) emits a
+//   field-for-field `From<wire::GearId>` id bridge.
+// - `#[gears_schema(file = "...")]` (in this crate's `lib.rs`) emits a
 //   wasm-safe, dentrado-free wire schema (serde `GearId` / `GearOut` /
 //   `GearQuery`) for the client. It reads only the signatures; the bodies are
 //   dropped.
@@ -16,25 +17,21 @@
 // Gear identity is purely content addressing, and the *client-facing* gears
 // are addressed by the canonical URL identity (`space`, `local`): what a URL
 // names is exactly what a subscription names. The export repo (url, dir,
-// interval) lives in the process-global config ([`crate::globals`]) — the
-// `repo` oracle below is a singleton with no id fields, its timer reads the
-// interval from the globals.
+// interval) lives in the process-global config ([`crate::globals`]).
 //
-// The page pipeline is split across cores: `repo` is a `local` oracle pinned
-// to its own core, and its [`repo_snap`] follow lens — the *only* cross-core
-// bridge — publishes the whole-corpus snapshot (`Arc`-shared bodies and all)
-// as one `shared` value. Every consumer off the `repo` core reads the
-// dataset through one `secondary_get` per gear *run* and resolves pages,
-// includes, selections, links, and resources by local lookups thereafter:
+// The publication is read as one immutable generation per site. Each site's
+// [`Repo`] gear decodes the generation's `pages`/`files`/`shell` sections and
+// publishes [`RepoMeta`] — paths and metadata, never page bodies — as a
+// `shared` value. Every consumer reads the site's metadata through one
+// `secondary_get` per gear run, then reads the actual page archive or blob
+// directly from the immutable object store:
 //
-//   repo (local oracle, own core; git worker thread below it)
-//     → repo_snap (the one bridge: snapshot → every core)
-//        → article_latest_parsed (event; one `repo_snap` read per run,
-//          lives off the `repo` core)
-//        → article_latest (follows `ArticleLatestParsed { space, local }`,
-//          co-located with the parse; one `repo_snap` read per run, then the
-//          whole include/ListPages/link/resource resolution is local)
-//        → code_block (follows the same parse: a lens over its output)
+//   Repo { site } (timer oracle, shared; one per site)
+//     → ArticleLatestParsed (event; metadata read + archive body read/parse)
+//     → ArticleLatest (follows the parse; metadata for every configured site
+//       plus archive body reads resolve includes/ListPages/links/resources)
+//     → CodeBlock (follows the same parse: a lens over its output)
+//     → Shell (event; site metadata + resolved nav pages)
 //
 // `asset` stays site/hash-keyed and reads blobs lazily from the
 // publication's content-addressed `files_ca/` store; the reverse index's
@@ -45,30 +42,18 @@
 // default (unnamed on the wire, and its output variants gated by the
 // generated `GearOut::is_exposed` filter the push bridge applies).
 
-#[dentrado::gear(timer(period = crate::globals::interval()), local, name = Repo)]
+/// One site's immutable publication metadata. A timer oracle per site: a
+/// tick re-reads the `HEAD` generation, reusing the prior output's revision
+/// frontmatter for unchanged archive hashes. The output is `shared`, so every
+/// core holds one reference to the same [`RepoMeta`].
+#[dentrado::gear(timer(period = crate::globals::interval()), shared, name = Repo)]
 pub(crate) async fn repo<S: IsStorage<KolorinkoRT>>(
+    site: SafePathComponent,
     tick: bool,
     ctx: &mut GearCtx<KolorinkoRT, S>,
     view: &mut S::View<'_>,
-) -> RepoState {
-    crate::wikidot_page::repo(ctx, view, tick).await
-}
-
-/// The `repo` core's snapshot as a cross-core `shared` value: an O(1)
-/// structural clone of the followed `Rc`, so every consumer core holds the
-/// whole corpus by reference and reads pages, slugs, selections, and bodies
-/// locally — the single bridge that replaced the whole `repo_l_*` lens
-/// family (one cross-core read per consuming gear *run*, none per hop).
-#[dentrado::gear(
-    follow(target = GearId::Repo {}),
-    shared,
-    name = RepoSnap,
-)]
-pub(crate) fn repo_snap<S: IsStorage<KolorinkoRT>>(
-    repo_state: RepoState,
-    _view: &mut S::View<'_>,
-) -> RepoSnapshot {
-    crate::wikidot_page::repo_snap(&repo_state)
+) -> RepoMeta {
+    crate::wikidot_page::repo(site, tick, ctx, view).await
 }
 
 #[dentrado::gear(event, shared, name = Asset)]
@@ -102,25 +87,22 @@ pub(crate) fn code_block<S: IsStorage<KolorinkoRT>>(
     crate::wikidot_page::code_block(space, local, n, parsed)
 }
 
-#[dentrado::gear(
-    follow(target = GearId::Repo {}),
-    shared,
-    exposed,
-    name = Shell,
-)]
+/// The whole site chrome in one shot: title/subtitle, the theme-root URL, the
+/// landing page's canonical address, and the resolved `nav:top` / `nav:side`
+/// pages. Reads the site's [`Repo`] metadata and resolves each nav page
+/// through an `article_latest` dependency.
+#[dentrado::gear(event, shared, exposed, name = Shell)]
 pub(crate) async fn shell<S: IsStorage<KolorinkoRT>>(
     space: SpaceId,
-    repo_state: RepoState,
     ctx: &mut GearCtx<KolorinkoRT, S>,
     _view: &mut S::View<'_>,
 ) -> SiteShell {
-    let data = repo_state.snapshot().clone();
-    crate::wikidot_page::shell(&data, space, ctx).await
+    crate::wikidot_page::shell(space, ctx).await
 }
 
-// Parses a page's latest body (read out of the one `repo_snap` snapshot
-// dependency per run) into an unresolved `ArticleView`. Keyed by the
-// canonical address, so it lives on its own core — off `repo`'s — and its
+// Parses a page's latest body (read directly from the immutable archive named
+// by its site's `Repo` metadata) into an unresolved `ArticleView`. Keyed by
+// the canonical address, so it lives on its own core — off `Repo`'s — and its
 // output is what `article_latest` / `code_block` statically follow.
 #[dentrado::gear(event, shared, name = ArticleLatestParsed)]
 pub(crate) async fn article_latest_parsed<S: IsStorage<KolorinkoRT>>(

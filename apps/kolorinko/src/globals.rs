@@ -37,7 +37,7 @@ use serde::Deserialize;
 /// daemon's `out/` directory — the one holding `<site>/` publications) and how
 /// often to rescan it. Held `&'static` (process-global via this module,
 /// leaked once at initialization) because the values name the directory the
-/// publication worker thread reads for the whole process lifetime.
+/// metadata gears read for the whole process lifetime.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct OutMeta {
     dir: &'static Path,
@@ -53,11 +53,6 @@ impl OutMeta {
     #[must_use]
     pub(crate) const fn interval(&self) -> u32 {
         self.interval
-    }
-
-    #[must_use]
-    pub(crate) const fn dir(&self) -> &'static Path {
-        self.dir
     }
 
     /// The published artifact of one site: `<dir>/<site>`.
@@ -81,7 +76,7 @@ pub(crate) struct SiteCfg {
 /// One registered content space: the export dataset site that serves it and
 /// the source site's alias domains. The landing page a bare `/SPACE` resolves
 /// to is not part of the registration — it lives in the site's publication
-/// ([`kolorinko_rt::WDWebsite::landing`]).
+/// ([`kolorinko_rt::RepoMeta::landing`]).
 pub(crate) struct SpaceReg {
     pub site: SafePathComponent,
     /// The source site's custom domains: URLs on these hosts (CSS `url()`,
@@ -192,7 +187,7 @@ pub(crate) fn repo() -> &'static OutMeta {
     &g().repo
 }
 
-/// The rescan interval for the `repo` oracle's timer (never zero).
+/// The rescan interval for each site's metadata gear timer (never zero).
 pub(crate) fn interval() -> NonZero<u64> {
     NonZero::new(u64::from(g().repo.interval()))
         .unwrap_or_else(|| NonZero::new(u64::from(DEFAULT_INTERVAL)).expect("900 != 0"))
@@ -206,6 +201,13 @@ pub(crate) fn reg_of(space: &SpaceId) -> Option<&'static SpaceReg> {
 /// Which dataset site serves this space (`None`: unregistered id).
 pub(crate) fn site_of(space: &SpaceId) -> Option<&'static SafePathComponent> {
     reg_of(space).map(|r| &r.site)
+}
+
+/// Every registered dataset site, in config order. The article pipeline
+/// prefetches each site's metadata so cross-site includes resolve without a
+/// per-include cross-core hop.
+pub(crate) fn sites() -> impl Iterator<Item = &'static SafePathComponent> {
+    g().spaces.iter().map(|(_, r)| &r.site)
 }
 
 /// Which registered space a dataset site is served under (`None`: the site

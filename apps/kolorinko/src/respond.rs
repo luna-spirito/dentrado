@@ -70,7 +70,7 @@ use kolorinko_rt::{
 
 use crate::assets::{Served, compress, looks_like_asset, mime_for, serve_body};
 use crate::repo::{self, RepoResp};
-use crate::runtime::{KolorinkoRT, repo_snap};
+use crate::runtime::{KolorinkoRT, repo};
 use crate::wikidot_page::local_id;
 use kolorinko_rt::Slug;
 
@@ -322,18 +322,15 @@ async fn landing_redirect(
 }
 
 /// The space's landing slug — the site shell's `landing` key ([`start_slug`]
-/// when the shell carries none), read through the [`repo_snap`] gear.
-/// `None`: an unregistered space, or one whose publication carries no site
-/// entry (nothing for the landing redirect to resolve against).
-///
-/// [`repo_snap`]: crate::wikidot_page::repo_snap
+/// when the shell carries none), read through the per-site [`repo`] metadata
+/// gear. `None`: an unregistered space.
 async fn landing_slug(
     core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
     space: &SpaceId,
 ) -> Option<Slug> {
-    let site = crate::globals::site_of(space)?;
-    let snap = repo_snap().subscribe(core).await;
-    Some(snap.current().sites.get(site)?.landing.clone())
+    let site = crate::globals::site_of(space)?.clone();
+    let meta = repo(site).subscribe(core).await;
+    Some(meta.current().landing.clone())
 }
 
 /// The slug-family tail of a `…/code/N` request: the segments naming the
@@ -366,9 +363,9 @@ async fn code_reply(
     let Some(site) = crate::globals::site_of(&space) else {
         return Reply::not_found();
     };
-    // The slug family bridges to the canonical parse through the snapshot.
-    let snap = repo_snap().subscribe(core).await;
-    let Some((local, _)) = local_id(&snap.current(), site, &slug) else {
+    // The slug family bridges to the canonical parse through site metadata.
+    let meta = repo(site.clone()).subscribe(core).await;
+    let Some((local, _)) = local_id(&meta.current(), &slug) else {
         return Reply::not_found();
     };
     let block = crate::runtime::code_block(space, local, n)
@@ -417,8 +414,8 @@ async fn page_local(
     slug: &Slug,
 ) -> Option<(LocalId, String)> {
     let site = crate::globals::site_of(space)?.clone();
-    let snap = repo_snap().subscribe(core).await;
-    local_id(&snap.current(), &site, slug)
+    let meta = repo(site).subscribe(core).await;
+    local_id(&meta.current(), slug)
 }
 
 /// SSR the page at a canonical address. The 404 check is part of the deal: an

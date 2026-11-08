@@ -17,11 +17,10 @@ pub(super) struct HostCtx {
 
 /// Resolve every `[[module ListPages]]` in `content`: each distinct module
 /// selection (context selectors resolved against the rendering page) is
-/// projected straight off the local snapshot
-/// ([`RepoSnapshot::list_pages`]), and every module node is replaced by its
-/// instantiated template: prepend, one repeat per matching page with that
-/// page's `%%vars%%` bound, append, wrapped in Wikidot's `list-pages-box` /
-/// `list-pages-item` containers.
+/// projected straight off the site's [`RepoMeta`], and every module node is
+/// replaced by its instantiated template: prepend, one repeat per matching
+/// page with that page's `%%vars%%` bound, append, wrapped in Wikidot's
+/// `list-pages-box` / `list-pages-item` containers.
 pub(super) fn resolve_listpages(
     content: Content,
     state: &mut ResolveState,
@@ -33,8 +32,10 @@ pub(super) fn resolve_listpages(
         return (content, Vec::new());
     }
     let mut results: HashMap<ListPagesQuery, ListPagesResult> = HashMap::new();
-    for query in &queries {
-        results.insert(query.clone(), list_pages(&state.snap, &state.site, query));
+    if let Some(meta) = state.meta(&state.site) {
+        for query in &queries {
+            results.insert(query.clone(), list_pages(meta, query));
+        }
     }
     // A template referencing `%%content%%` embeds each listed page's rendered
     // body, fetched and resolved below.
@@ -62,13 +63,15 @@ fn resolve_content_bodies(
 ) -> Vec<PageDep> {
     let pages = content_needing_bodies(content, &state.site, host, results);
     let mut deps = Vec::new();
+    let site = state.site.clone();
     for (key, slug, page) in pages {
         if state.bodies.contains_key(&page.fullname()) || !state.resolved.insert(key.clone()) {
             continue;
         }
         let raw = LocalId::from_page_id(&page.page_id)
-            .and_then(|local| latest(&state.snap, state.space, local))
-            .map_or_else(|| Arc::from(""), |p| Arc::clone(p.body));
+            .map(|local| local.page_id())
+            .and_then(|id| state.body_by_id(&site, id))
+            .unwrap_or_else(|| Arc::from(""));
         let host = HostCtx {
             fullname: page.fullname(),
             category: page.category.clone(),
@@ -292,22 +295,21 @@ fn class_div(class: &str, content: Content) -> Node {
 }
 
 // =========================================================================
-// ListPages selection (the `RepoSnapshot::list_pages` core)
+// ListPages selection (the `RepoMeta` core)
 // =========================================================================
 
 /// Project a resolved [`ListPagesQuery`] over one site: filter the site's pages
 /// by the selection parameters, order them, and truncate to the first
 /// pagination page. `%%total%%` counts the matches before truncation.
-pub(super) fn select(w: &WDWebsite, params: &ListPagesParams) -> ListPagesResult {
+pub(super) fn select(meta: &RepoMeta, params: &ListPagesParams) -> ListPagesResult {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
-    let mut pages: Vec<ListedPage> = w
-        .articles
-        .iter()
-        .flat_map(|(cat, by_name)| by_name.iter().map(move |(name, a)| (cat, name, a)))
-        .filter(|&(_, _, a)| matches_page(a, params, now))
-        .map(|(cat, name, a)| listed_page(cat, name, a))
+    let mut pages: Vec<ListedPage> = meta
+        .pages
+        .values()
+        .filter(|a| matches_page(a, params, now))
+        .map(listed_page)
         .collect();
     pages.sort_by(|a, b| cmp_order(&params.order, a, b));
     let total = pages.len() as i64;
@@ -323,30 +325,30 @@ pub(super) fn select(w: &WDWebsite, params: &ListPagesParams) -> ListPagesResult
 }
 
 /// One matching page as the template-visible [`ListedPage`]: creation/update
-/// are the first/last revision by number.
-fn listed_page(
-    cat: &Option<SafePathComponent>,
-    name: &SafePathComponent,
-    a: &Article,
-) -> ListedPage {
+/// are the first/last stored revision by number.
+fn listed_page(a: &PageMeta) -> ListedPage {
+    let (category, name) = a
+        .slug
+        .split_once(':')
+        .map_or((None, a.slug.as_str()), |(c, n)| (Some(c.to_string()), n));
     let (created, updated) = first_last_revisions(a);
     ListedPage {
-        name: (**name).clone(),
-        category: cat.as_ref().map(|c| (**c).clone()),
-        page_id: a.meta.page_id.clone(),
-        title: a.meta.title.clone(),
-        tags: a.meta.tags.clone(),
+        name: name.to_string(),
+        category,
+        page_id: a.id.to_string(),
+        title: a.title.clone(),
+        tags: a.tags.clone(),
         created_by: created.map_or_else(String::new, |r| r.author.clone()),
         created_at: created.map_or(0, |r| r.timestamp),
         updated_by: updated.map_or_else(String::new, |r| r.author.clone()),
         updated_at: updated.map_or(0, |r| r.timestamp),
-        revisions: a.revisions.len() as u64,
+        revisions: a.revisions_stored,
     }
 }
 
 /// The first and last revision of a page (by revision number, in case the
-/// `_meta` rows are unordered).
-fn first_last_revisions(a: &Article) -> (Option<&RevMeta>, Option<&RevMeta>) {
+/// archive entries are unordered).
+fn first_last_revisions(a: &PageMeta) -> (Option<&RevMeta>, Option<&RevMeta>) {
     let mut first: Option<&RevMeta> = None;
     let mut last: Option<&RevMeta> = None;
     for r in &a.revisions {
@@ -363,8 +365,8 @@ fn first_last_revisions(a: &Article) -> (Option<&RevMeta>, Option<&RevMeta>) {
 /// Does one page pass every supported selector? Unsupported selectors with no
 /// data behind them (`rating`, `votes`, `parent`, `link_to`, …) are not
 /// filtered at all.
-fn matches_page(a: &Article, params: &ListPagesParams, now: i64) -> bool {
-    let name = a.meta.slug.rsplit(':').next().unwrap_or(&a.meta.slug);
+fn matches_page(a: &PageMeta, params: &ListPagesParams, now: i64) -> bool {
+    let name = a.slug.rsplit(':').next().unwrap_or(&a.slug);
     match params.pagetype.as_deref() {
         Some("hidden") if !name.starts_with('_') => return false,
         Some("*") => {}
@@ -375,7 +377,7 @@ fn matches_page(a: &Article, params: &ListPagesParams, now: i64) -> bool {
         return false;
     }
     if let Some(fullname) = &params.fullname
-        && !fullname.eq_ignore_ascii_case(&a.meta.slug)
+        && !fullname.eq_ignore_ascii_case(&a.slug)
     {
         return false;
     }
@@ -403,9 +405,9 @@ fn matches_page(a: &Article, params: &ListPagesParams, now: i64) -> bool {
         return true;
     };
     if tags.no_tags {
-        return a.meta.tags.is_empty();
+        return a.tags.is_empty();
     }
-    let has = |t: &str| a.meta.tags.iter().any(|pt| pt.eq_ignore_ascii_case(t));
+    let has = |t: &str| a.tags.iter().any(|pt| pt.eq_ignore_ascii_case(t));
     tags.all.iter().all(|t| has(t))
         && (tags.any.is_empty() || tags.any.iter().any(|t| has(t)))
         && tags.none.iter().all(|t| !has(t))
@@ -417,7 +419,7 @@ enum End {
     Last,
 }
 
-fn author_of(a: &Article, end: End) -> &str {
+fn author_of(a: &PageMeta, end: End) -> &str {
     let (f, l) = first_last_revisions(a);
     match end {
         End::First => f.map_or("", |r| &r.author),
@@ -425,7 +427,7 @@ fn author_of(a: &Article, end: End) -> &str {
     }
 }
 
-fn timestamp_of(a: &Article, end: End) -> i64 {
+fn timestamp_of(a: &PageMeta, end: End) -> i64 {
     let (f, l) = first_last_revisions(a);
     match end {
         End::First => f.map_or(0, |r| r.timestamp),
@@ -437,14 +439,14 @@ fn timestamp_of(a: &Article, end: End) -> i64 {
 /// category; otherwise a token list where `-cat` excludes and plain cats are
 /// additive (OR). `_default` is the Wikidot name of the root (no-category)
 /// pages.
-fn matches_category(a: &Article, selector: Option<&str>) -> bool {
+fn matches_category(a: &PageMeta, selector: Option<&str>) -> bool {
     let Some(selector) = selector.filter(|s| !s.is_empty()) else {
         return true;
     };
     if selector == "*" {
         return true;
     }
-    let slug_cat = a.meta.slug.split_once(':').map_or("_default", |(c, _)| c);
+    let slug_cat = a.slug.split_once(':').map_or("_default", |(c, _)| c);
     let mut included = false;
     for token in selector.split([',', ' ']).filter(|t| !t.is_empty()) {
         match token.strip_prefix('-') {

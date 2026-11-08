@@ -1,97 +1,47 @@
 use super::*;
 
 // =========================================================================
-// Dataset projections (the snapshot's data live in `kolorinko_rt`)
+// Dataset projections over one site's `RepoMeta`
 // =========================================================================
 
 /// `(site, Option<category>, name)` — the full address of a page within the
-/// dataset. Used both as the include-resolution visited key and as the
-/// incremental-update reverse-index value (`_meta` path → its nested-map key).
+/// dataset. Used as the include-resolution visited key.
 pub(super) type Key = (
     SafePathComponent,
     Option<SafePathComponent>,
     SafePathComponent,
 );
 
-/// One page's latest projection, borrowed straight out of a [`RepoSnapshot`].
-pub(crate) struct PageLatest<'a> {
-    pub(crate) meta: &'a ArticleMeta,
-    pub(crate) revisions: &'a [RevMeta],
-    pub(crate) body: &'a Arc<str>,
+/// Look up one page by its slug.
+pub(crate) fn article<'a>(meta: &'a RepoMeta, slug: &Slug) -> Option<&'a PageMeta> {
+    meta.by_slug.get(slug).and_then(|id| meta.pages.get(id))
 }
 
-/// Look up one page by `(site, slug)` — the nested-map core of every other
-/// projection below.
-pub(crate) fn article<'a>(
-    snap: &'a RepoSnapshot,
-    site: &SafePathComponent,
-    slug: &Slug,
-) -> Option<&'a Article> {
-    find_article(&snap.sites, site, slug)
+/// Look up one page by its canonical numeric id.
+pub(crate) fn latest<'a>(meta: &'a RepoMeta, local: LocalId) -> Option<&'a PageMeta> {
+    meta.pages.get(&local.page_id())
 }
 
-/// Project one page out of the snapshot by canonical address — the body of
-/// the old `repo_l_article_latest` lens, now a local read. `None` when the
-/// space is unregistered, the address names no page, or the body failed to
-/// materialise (the old failed-RPC blank-page convention).
-pub(crate) fn latest<'a>(
-    snap: &'a RepoSnapshot,
-    space: SpaceId,
-    local: LocalId,
-) -> Option<PageLatest<'a>> {
-    let (site, slug) = super::page_slug(snap, space, local)?;
-    let a = article(snap, &site, &slug)?;
-    Some(PageLatest {
-        meta: &a.meta,
-        revisions: &a.revisions,
-        body: snap.bodies.get(&a.latest_body)?,
-    })
-}
-
-/// The slug-family → canonical bridge — the body of the old `repo_l_local_id`
-/// lens: the `(local id, title)` a legacy `(site, slug)` address names (HTTP
-/// slug redirects, the `/code/N` endpoint, the render CLI, and the include
-/// cone).
-pub(crate) fn local_id(
-    snap: &RepoSnapshot,
-    site: &SafePathComponent,
-    slug: &Slug,
-) -> Option<(LocalId, String)> {
-    let a = article(snap, site, slug)?;
+/// The slug-family → canonical bridge: the `(local id, title)` a legacy
+/// `(site, slug)` address names (HTTP slug redirects, the `/code/N` endpoint,
+/// the render CLI, and the include cone).
+pub(crate) fn local_id(meta: &RepoMeta, slug: &Slug) -> Option<(LocalId, String)> {
+    let page = article(meta, slug)?;
     Some((
-        LocalId::from_page_id(&a.meta.page_id)?,
-        a.meta.title.clone(),
+        LocalId::from_page_id(&page.id.to_string())?,
+        page.title.clone(),
     ))
 }
 
 /// The batched [`local_id`]: a page's whole (sorted, deduplicated) link set
 /// answered in one pass.
-pub(crate) fn query_pages(
-    snap: &RepoSnapshot,
-    site: &SafePathComponent,
-    query: &PageQuery,
-) -> PageQueryResult {
-    query
-        .0
-        .iter()
-        .map(|slug| local_id(snap, site, slug))
-        .collect()
+pub(crate) fn query_pages(meta: &RepoMeta, query: &PageQuery) -> PageQueryResult {
+    query.0.iter().map(|slug| local_id(meta, slug)).collect()
 }
 
-/// Project one ListPages selection over one site — the body of the old
-/// `repo_l_list_pages` lens. An unknown site yields an empty selection.
-pub(crate) fn list_pages(
-    snap: &RepoSnapshot,
-    site: &SafePathComponent,
-    query: &ListPagesQuery,
-) -> ListPagesResult {
-    match snap.sites.get(site) {
-        Some(w) => select(w, &query.0),
-        None => ListPagesResult {
-            pages: Vec::new(),
-            total: 0,
-        },
-    }
+/// Project one ListPages selection over one site.
+pub(crate) fn list_pages(meta: &RepoMeta, query: &ListPagesQuery) -> ListPagesResult {
+    select(meta, &query.0)
 }
 
 /// Resolve one mirrored attachment — the canonical `host/path` key
@@ -99,22 +49,20 @@ pub(crate) fn list_pages(
 /// to its CA hash and reverse-index entry (the recorded `content_type` plus
 /// the original URL). Three lookups, in order: the key as named (the index
 /// preserves custom hosts verbatim); the canonical `<site>.wikidot.com`
-/// spelling when the host is one of the site's alias domains (the two hosts
-/// name one file space, and the publisher collapses only the wikidot
-/// spellings); and, for a `local--resized-images/…` variant (which the
-/// export never saved), the original `local--files/…` file under the same
-/// host. `None` when the URL is not mirrored (a hotlink).
+/// spelling when the host is one of the site's alias domains; and, for a
+/// `local--resized-images/…` variant (which the export never saved), the
+/// original `local--files/…` file under the same host. `None` when the URL is
+/// not mirrored (a hotlink).
 pub(crate) fn resource<'a>(
-    snap: &'a RepoSnapshot,
+    meta: &'a RepoMeta,
     site: &SafePathComponent,
     path: &RepoAssetPath,
 ) -> Option<(&'a str, &'a CaFile)> {
-    let w = snap.sites.get(site)?;
-    ca_of(w, site, path).or_else(|| {
+    ca_of(meta, site, path).or_else(|| {
         let (host, rest) = path.as_str().split_once("local--resized-images/")?;
         let (orig, _variant) = rest.rsplit_once('/')?;
         ca_of(
-            w,
+            meta,
             site,
             &RepoAssetPath::new(format!("{host}local--files/{orig}"))?,
         )
@@ -125,28 +73,27 @@ pub(crate) fn resource<'a>(
 /// through [`ca_url`]. The one lookup the page pipeline's resource
 /// substitution and the served CSS blobs' ref rewriting share.
 pub(crate) fn resource_url(
-    snap: &RepoSnapshot,
+    meta: &RepoMeta,
     site: &SafePathComponent,
     path: &RepoAssetPath,
 ) -> Option<String> {
-    resource(snap, site, path).map(|(hash, file)| ca_url(site, hash, file))
+    resource(meta, site, path).map(|(hash, file)| ca_url(site, hash, file))
 }
 
 /// The reverse-index entry a forward-index hit names (every forward value
 /// keys the reverse map by construction).
 fn ca_of<'a>(
-    w: &'a WDWebsite,
+    meta: &'a RepoMeta,
     site: &SafePathComponent,
     path: &RepoAssetPath,
 ) -> Option<(&'a str, &'a CaFile)> {
-    keyed(&w.files, site, path)
-        .and_then(|hash| w.files_ca.get(hash).map(|file| (hash.as_str(), file)))
+    keyed(&meta.files, site, path)
+        .and_then(|hash| meta.files_ca.get(hash).map(|file| (hash.as_str(), file)))
 }
 
 /// One key against the forward index: the direct lookup, then the alias
 /// retry — a configured custom domain (± `www.` / `files.`, matched by
-/// [`same_file_host`]) names the same files `<site>.wikidot.com` does, and
-/// the publisher collapses only the wikidot spellings.
+/// [`same_file_host`]) names the same files `<site>.wikidot.com` does.
 fn keyed<'a>(
     files: &'a ImHashMap<RepoAssetPath, String>,
     site: &SafePathComponent,
@@ -192,30 +139,4 @@ fn same_file_host(domain: &str, host: &str) -> bool {
         s.strip_prefix("www.").unwrap_or(s)
     }
     base(domain).eq_ignore_ascii_case(base(host))
-}
-
-/// The nested-map lookup underlying [`article`], factored out so the
-/// build/incremental tests can resolve a page from a bare sites map.
-pub(super) fn find_article<'a>(
-    sites: &'a ImHashMap<SafePathComponent, WDWebsite>,
-    site: &SafePathComponent,
-    slug: &Slug,
-) -> Option<&'a Article> {
-    sites.get(site)?.articles.get(&slug.0)?.get(&slug.1)
-}
-
-/// Drop materialised bodies no longer referenced as any page's latest —
-/// bounds [`RepoSnapshot::bodies`] to the corpus's live set however long the
-/// process runs and however the tip moves (a force-push re-mirror included).
-pub(super) fn retain_latest(
-    sites: &ImHashMap<SafePathComponent, WDWebsite>,
-    bodies: &mut ImHashMap<BlobId, Arc<str>>,
-) {
-    let live: HashSet<BlobId> = sites
-        .values()
-        .flat_map(|w| w.articles.values())
-        .flat_map(|by_name| by_name.values())
-        .map(|a| a.latest_body)
-        .collect();
-    bodies.retain(|oid, _| live.contains(oid));
 }

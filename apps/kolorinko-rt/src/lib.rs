@@ -231,100 +231,85 @@ pub struct ServedBlob {
     pub body: Body,
 }
 
-/// A content-addressed body id: the SHA-256 of the materialised body text,
-/// truncated to 20 bytes — the body-store key of [`RepoSnapshot`]. The
-/// snapshot stays content-addressed (a changed body is a new id, so nothing
-/// is ever invalidated, only added; identical bodies dedup to one entry)
-/// without dragging the storage format into this crate (it must build for
-/// wasm).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct BlobId(pub [u8; 20]);
-
-impl BlobId {
-    /// From a `git2::Oid`'s raw bytes (the server-side boundary conversion).
-    pub const fn from_bytes(bytes: [u8; 20]) -> Self {
-        Self(bytes)
-    }
-
-    /// The raw bytes (for a `git2::Oid::from_bytes` round-trip).
-    pub const fn bytes(&self) -> [u8; 20] {
-        self.0
-    }
+/// One immutable page archive named by a publication's pages section.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PageArchive {
+    /// Site-relative path (`objects/archives/aa/bb/<sha>.zst`).
+    pub path: String,
+    /// The archive object's SHA-256 (the pages section's `archive_sha256`).
+    pub sha256: String,
 }
 
-/// The whole-corpus snapshot the publication worker builds and every consumer core
-/// reads: each site's metadata and `files/` index, plus **every latest page
-/// body materialised exactly once** (`Arc<str>`: frontmatter stripped,
-/// NBSP-normalised) — RAM is the cheaper currency, and the lazy per-visit
-/// odb reads this replaced measured as roughly half the CPU of a
-/// full-corpus render. Persistent [`imbl::HashMap`]s throughout, so cloning
-/// (the `repo` → `repo_snap` bridge, and once per page resolution) is O(1)
-/// and an update is non-destructive. `Send + Sync`: no repository handle,
-/// no `Rc` — it crosses the worker→core channel once, then crosses cores by
-/// reference. The serde impls exist only because the gear-output enums
-/// derive them; an internal snapshot is never serialized in practice
-/// (never exposed, never pushed).
-#[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct RepoSnapshot {
-    /// The mirrored sites, nested by slug family.
-    pub sites: imbl::HashMap<SafePathComponent, WDWebsite>,
-    /// Materialised latest bodies by content-addressed blob id.
-    pub bodies: imbl::HashMap<BlobId, std::sync::Arc<str>>,
-}
-
-/// One mirrored site: its pages nested by category; the site chrome from
-/// `<site>/shell` (title, subtitle, the theme-root path into `files/`, and
-/// `landing` — the slug a bare site root resolves to, [`start_slug`] unless
-/// the shell names one); and the content-addressed `files/` index in both
-/// halves — the forward map (each mirrored attachment's `<host>/<path>` tail,
-/// percent-decoded → its CA hash) that substitution walks, and the reverse
-/// (each hash → the file's recorded type + original URL) that a
-/// `/-/repo/…/<hash>` request walks.
+/// One page's metadata from a publication's pages section, enriched with the
+/// stored revisions' frontmatter (revision ids, timestamps, authors) so
+/// ListPages can select and order without reading page bodies.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct WDWebsite {
-    pub articles:
-        imbl::HashMap<Option<SafePathComponent>, imbl::HashMap<SafePathComponent, Article>>,
-    /// Wikidot numeric page id → the page's current slug. Page ids are stable
-    /// across renames (the slug is not), so this index stays authoritative
-    /// while `articles` re-keys — the incremental update maintains both.
-    pub by_page_id: imbl::HashMap<u64, Slug>,
-    pub title: Option<String>,
-    pub subtitle: Option<String>,
-    /// The theme stylesheet's `<host>/<path>` tail (`files/` prefix stripped);
-    /// resolved against [`WDWebsite::files`] to a CA URL by the `shell` gear.
-    pub theme_root: Option<RepoAssetPath>,
-    /// The landing slug — the shell's `landing` key (`start` by default;
-    /// always present, like the landing itself).
-    pub landing: Slug,
-    pub files: imbl::HashMap<RepoAssetPath, String>,
-    pub files_ca: imbl::HashMap<String, CaFile>,
+pub struct PageMeta {
+    pub id: u64,
+    /// Wikidot's `category:name` spelling (`name` for a root page).
+    pub slug: String,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub revisions_stored: u64,
+    pub revisions_known: u64,
+    pub max_rev: u64,
+    /// `None` exactly when the page has no stored revisions.
+    pub archive: Option<PageArchive>,
+    /// The stored revisions' frontmatter, oldest first.
+    pub revisions: Vec<kolorinko_wikitext::RevMeta>,
 }
 
-impl Default for WDWebsite {
-    fn default() -> Self {
-        Self {
-            articles: imbl::HashMap::new(),
-            by_page_id: imbl::HashMap::new(),
-            title: None,
-            subtitle: None,
-            theme_root: None,
-            landing: start_slug(),
-            files: imbl::HashMap::new(),
-            files_ca: imbl::HashMap::new(),
+impl PageMeta {
+    /// The page identity the article pipeline's views carry.
+    #[must_use]
+    pub fn article_meta(&self) -> kolorinko_wikitext::ArticleMeta {
+        kolorinko_wikitext::ArticleMeta {
+            title: self.title.clone(),
+            tags: self.tags.clone(),
+            slug: self.slug.clone(),
+            page_id: self.id.to_string(),
         }
     }
 }
 
-/// One page: metadata, the full revision-history summary, and the
-/// content-addressed id of the latest body. The latest body's text lives
-/// materialised once in the owning [`RepoSnapshot`]; older revisions stay
-/// in the per-page archive on disk for a revision-serving gear to page in
-/// later.
+/// One site's publication metadata — the pages section (by numeric id and by
+/// slug), the attachment index in both directions, and the shell chrome. It
+/// names archive and blob paths but never carries a page body: content gears
+/// read those directly from the immutable publication on disk.
+///
+/// Persistent [`imbl::HashMap`]s throughout, so cloning (the metadata gear's
+/// cross-core bridge, and once per page resolution) is O(1).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct Article {
-    pub meta: kolorinko_wikitext::ArticleMeta,
-    pub latest_body: BlobId,
-    pub revisions: Vec<kolorinko_wikitext::RevMeta>,
+pub struct RepoMeta {
+    /// Pages by their stable numeric id.
+    pub pages: imbl::HashMap<u64, PageMeta>,
+    /// Current slug → numeric id (rename-reactive through the id).
+    pub by_slug: imbl::HashMap<Slug, u64>,
+    /// Mirrored attachment `host/path` → CA hash.
+    pub files: imbl::HashMap<RepoAssetPath, String>,
+    /// CA hash → recorded content type + original URL.
+    pub files_ca: imbl::HashMap<String, CaFile>,
+    pub title: Option<String>,
+    pub subtitle: Option<String>,
+    /// The theme stylesheet's canonical `files/` key.
+    pub theme_root: Option<RepoAssetPath>,
+    /// The landing slug — the shell's `landing` key ([`start_slug`] by default).
+    pub landing: Slug,
+}
+
+impl Default for RepoMeta {
+    fn default() -> Self {
+        Self {
+            pages: imbl::HashMap::new(),
+            by_slug: imbl::HashMap::new(),
+            files: imbl::HashMap::new(),
+            files_ca: imbl::HashMap::new(),
+            title: None,
+            subtitle: None,
+            theme_root: None,
+            landing: start_slug(),
+        }
+    }
 }
 
 /// One `[[code]]` block served through Wikidot's `/code/N` endpoint shape —
@@ -538,7 +523,7 @@ impl SsrState {
 /// in `Subscribe`, and the server pushes only when the output's hash differs.
 #[dentrado_macros::gears_schema(file = "gears.def.rs")]
 pub mod wire {
-    use crate::{CodeBlock, LocalId, RepoSnapshot, ServedBlob, SiteShell, SpaceId};
+    use crate::{CodeBlock, LocalId, RepoMeta, ServedBlob, SiteShell, SpaceId};
     use kolorinko_wikitext::ArticleView;
 
     /// Client → server: subscribe to a gear. This is the stream's only
@@ -597,7 +582,7 @@ mod tests {
         // a `GearOut` variant that a push bridge must drop).
         let internal = r#"{\"RepoLListPages\":{\"site\":\"x\",\"query\":{}}}"#;
         assert!(serde_json::from_str::<wire::GearId>(internal).is_err());
-        assert!(!GearOut::RepoSnapOut(RepoSnapshot::default()).is_exposed());
+        assert!(!GearOut::RepoOut(RepoMeta::default()).is_exposed());
         assert!(GearOut::ShellOut(SiteShell::default()).is_exposed());
     }
 }

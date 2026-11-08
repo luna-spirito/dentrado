@@ -3,69 +3,70 @@ use std::io::Read;
 use tar::Archive;
 
 // =========================================================================
-// out/ publication readers (the evakuilo layout)
+// out/ publication readers (the evakuilo immutable generation)
 // =========================================================================
 
-/// One `pages.json` row — the fields the incremental diff keys on. Row
-/// equality implies archive equality: the publisher only rewrites an archive
-/// when its stored-revision count drifts, and only rewrites the manifest
-/// when a row does, so an unchanged row names a byte-identical archive
-/// (deterministic tar+zst, write-if-changed).
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(super) struct PageRow {
-    pub slug: String,
-    pub title: String,
-    pub tags: Vec<String>,
-    /// Revisions with stored content (pages with none have no archive).
-    pub stored: i64,
-    pub max_rev: i64,
-    /// Site-relative archive path (`pages_by_id/ab/cd/<rest>.zst`).
-    pub archive: String,
+/// A SHA-256 hex string long enough to shard (`aa/bb/rest`).
+fn valid_sha(sha: &str) -> bool {
+    sha.len() >= 4 && sha.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// `pages_by_id` sharding, matching the publisher exactly: 2/2/rest of a
-/// zero-padded (≥5-digit) page id. (Test fixtures lay archives down by it;
-/// the walker itself trusts the manifest's `archive` path.)
-#[cfg(test)]
-fn page_id_shards(page_id: &str) -> (String, String, String) {
-    let padded = format!("{page_id:0>5}");
-    (
-        padded[..2].to_string(),
-        padded[2..4].to_string(),
-        padded[4..].to_string(),
+/// One immutable object under `<site>/objects/<kind>/aa/bb/<sha><ext>`.
+/// The JSON sections carry a `.json` suffix; the shell object is raw bytes.
+fn object_path(site_dir: &Path, kind: &str, sha: &str) -> Option<PathBuf> {
+    if !valid_sha(sha) {
+        return None;
+    }
+    let name = match kind {
+        "pages" | "files" => format!("{sha}.json"),
+        _ => sha.to_string(),
+    };
+    Some(
+        site_dir
+            .join("objects")
+            .join(kind)
+            .join(&sha[..2])
+            .join(&sha[2..4])
+            .join(name),
     )
 }
 
-/// The site-relative archive path for a page id.
-#[cfg(test)]
-pub(super) fn archive_rel(page_id: &str) -> String {
-    let (a, b, rest) = page_id_shards(page_id);
-    format!("pages_by_id/{a}/{b}/{rest}.zst")
+/// One immutable root under `<site>/roots/aa/bb/<sha>.json`.
+fn root_path(site_dir: &Path, sha: &str) -> Option<PathBuf> {
+    if !valid_sha(sha) {
+        return None;
+    }
+    Some(
+        site_dir
+            .join("roots")
+            .join(&sha[..2])
+            .join(&sha[2..4])
+            .join(format!("{sha}.json")),
+    )
 }
 
-// ── Change detection stamps ──
-
-/// `(mtime, size)` of one file — the site-level change gate. The publisher
-/// writes tmp+rename and skips byte-identical rewrites, so an untouched
-/// publication keeps its stamp however often the daemon republishes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(super) struct Stamp(std::time::SystemTime, u64);
-
-pub(super) fn stamp(path: &Path) -> Option<Stamp> {
-    let md = std::fs::metadata(path).ok()?;
-    Some(Stamp(md.modified().ok()?, md.len()))
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
-// ── pages.json ──
+/// A publication root: the three section hashes of one generation.
+#[derive(serde::Deserialize)]
+struct RootDoc {
+    pages: String,
+    files: String,
+    shell: String,
+}
+
+// ── pages section ──
 
 #[derive(serde::Deserialize)]
-struct ManifestDoc {
+struct PagesDoc {
     #[serde(default)]
-    pages: Vec<ManifestPage>,
+    pages: Vec<PageEntry>,
 }
 
 #[derive(serde::Deserialize)]
-struct ManifestPage {
+struct PageEntry {
     id: String,
     slug: String,
     #[serde(default)]
@@ -73,60 +74,148 @@ struct ManifestPage {
     #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
-    revisions_stored: i64,
+    revisions_stored: u64,
     #[serde(default)]
-    max_rev: i64,
+    revisions_known: u64,
     #[serde(default)]
-    archive: String,
+    max_rev: u64,
+    #[serde(default)]
+    archive: Option<String>,
+    #[serde(default)]
+    archive_sha256: Option<String>,
 }
 
-/// Parse a site's `pages.json` into `{page id → row}`. `None` on any read or
-/// parse error (the caller keeps serving the last adopted rows).
-pub(super) fn read_pages_manifest(site_dir: &Path) -> Option<HashMap<u64, PageRow>> {
-    let bytes = std::fs::read(site_dir.join("pages.json")).ok()?;
-    let doc: ManifestDoc = serde_json::from_slice(&bytes).ok()?;
-    let mut rows = HashMap::with_capacity(doc.pages.len());
-    for p in doc.pages {
-        let Ok(id) = p.id.parse::<u64>() else {
+// ── files section ──
+
+#[derive(serde::Deserialize)]
+struct FilesDoc {
+    #[serde(default)]
+    files: Vec<FileEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct FileEntry {
+    path: String,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    status: String,
+}
+
+// ── Whole-generation reader ──
+
+/// Decode the generation named by `<site_dir>/HEAD` into [`RepoMeta`].
+///
+/// A missing `HEAD` means the site has no publication and yields the empty
+/// metadata; any other read failure yields `None` (the caller keeps its
+/// previous output rather than flapping on a transient I/O error). Revision
+/// frontmatter is reused from `previous` for archives whose SHA-256 did not
+/// change, so a tick only decompresses new archives.
+pub(super) fn read_repo_meta(
+    site: &SafePathComponent,
+    site_dir: &Path,
+    previous: Option<&RepoMeta>,
+) -> Option<RepoMeta> {
+    if !site_dir.join("HEAD").is_file() {
+        return Some(RepoMeta::default());
+    }
+    let head = std::fs::read_to_string(site_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    let root: RootDoc = read_json(&root_path(site_dir, head)?)?;
+    let pages: PagesDoc = read_json(&object_path(site_dir, "pages", &root.pages)?)?;
+    let files: FilesDoc = read_json(&object_path(site_dir, "files", &root.files)?)?;
+    let shell = std::fs::read_to_string(object_path(site_dir, "shell", &root.shell)?).ok()?;
+    let chrome = parse_shell(&shell);
+
+    let mut meta = RepoMeta {
+        title: chrome.title,
+        subtitle: chrome.subtitle,
+        theme_root: chrome.theme_root,
+        landing: chrome.landing,
+        ..RepoMeta::default()
+    };
+    for entry in pages.pages {
+        let Ok(id) = entry.id.parse::<u64>() else {
             continue;
         };
-        rows.insert(
+        let Some(slug) = parse_slug(&entry.slug) else {
+            continue;
+        };
+        let archive = match (entry.archive, entry.archive_sha256) {
+            (Some(path), Some(sha256)) => Some(PageArchive { path, sha256 }),
+            _ => None,
+        };
+        let revisions = archive
+            .as_ref()
+            .map(|a| {
+                previous
+                    .and_then(|p| p.pages.get(&id))
+                    .filter(|p| p.archive.as_ref().is_some_and(|pa| pa.sha256 == a.sha256))
+                    .map(|p| p.revisions.clone())
+                    .or_else(|| archive_revisions(site_dir, &a.path))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        meta.by_slug.insert(slug, id);
+        meta.pages.insert(
             id,
-            PageRow {
-                slug: p.slug,
-                title: p.title,
-                tags: p.tags,
-                stored: p.revisions_stored,
-                max_rev: p.max_rev,
-                archive: p.archive,
+            PageMeta {
+                id,
+                slug: entry.slug,
+                title: entry.title,
+                tags: entry.tags,
+                revisions_stored: entry.revisions_stored,
+                revisions_known: entry.revisions_known,
+                max_rev: entry.max_rev,
+                archive,
+                revisions,
             },
         );
     }
-    Some(rows)
+    let (files, files_ca) = files_index(site, files);
+    meta.files = files.into_iter().collect();
+    meta.files_ca = files_ca.into_iter().collect();
+    Some(meta)
 }
 
-// ── Page archives ──
-
-/// Read one page's tar+zst archive: every `rNNN.txt` entry contributes its
-/// frontmatter to the revision table, and the highest revision's body is
-/// materialised into `bodies` (frontmatter stripped, NBSP-normalised,
-/// content-addressed). Page identity comes from the manifest row, not the
-/// frontmatter (the row is the fresher half of the same publication).
-/// `None` when the archive is missing or unreadable — the page reads as
-/// gone, matching the stored-count-0 convention.
-pub(super) fn read_page(
-    site_dir: &Path,
-    page_id: &str,
-    row: &PageRow,
-    bodies: &mut ImHashMap<BlobId, Arc<str>>,
-) -> Option<Article> {
-    let bytes = std::fs::read(site_dir.join(&row.archive)).ok()?;
+/// Read every `rNNN.txt` entry's frontmatter out of one page archive.
+fn archive_revisions(site_dir: &Path, archive: &str) -> Option<Vec<RevMeta>> {
+    let bytes = std::fs::read(site_dir.join(archive)).ok()?;
     let raw = zstd::stream::decode_all(&bytes[..]).ok()?;
     let mut revisions = Vec::new();
+    let mut archive = Archive::new(&raw[..]);
+    for entry in archive.entries().ok()? {
+        let mut entry = entry.ok()?;
+        let Ok(name) = entry.path() else {
+            continue;
+        };
+        if rev_number(&name.to_string_lossy()).is_none() {
+            continue;
+        }
+        let mut text = String::new();
+        if entry.read_to_string(&mut text).is_err() {
+            continue;
+        }
+        if let Some(rev) = parse_rev_meta(&text) {
+            revisions.push(rev);
+        }
+    }
+    revisions.sort_unstable_by_key(|r| r.revision);
+    Some(revisions)
+}
+
+/// Read one page's latest body out of its immutable archive: the highest
+/// `rNNN.txt` entry, frontmatter stripped and NBSP-normalised. `None` when
+/// the page has no archive or the archive is unreadable.
+pub(super) fn read_latest_body_at(site_dir: &Path, page: &PageMeta) -> Option<Arc<str>> {
+    let archive = page.archive.as_ref()?;
+    let bytes = std::fs::read(site_dir.join(&archive.path)).ok()?;
+    let raw = zstd::stream::decode_all(&bytes[..]).ok()?;
     let mut latest: Option<(u64, String)> = None;
     let mut archive = Archive::new(&raw[..]);
-    let entries = archive.entries().ok()?;
-    for entry in entries {
+    for entry in archive.entries().ok()? {
         let mut entry = entry.ok()?;
         let Ok(name) = entry.path() else {
             continue;
@@ -138,34 +227,25 @@ pub(super) fn read_page(
         if entry.read_to_string(&mut text).is_err() {
             continue;
         }
-        let Some(rev) = parse_rev_meta(&text) else {
-            continue;
-        };
         if latest.as_ref().is_none_or(|(n, _)| no >= *n) {
             latest = Some((no, revision_body(&text).to_string()));
         }
-        revisions.push(rev);
     }
-    let (_, body_text) = latest?;
-    let (body_id, body) = materialize_body(&body_text);
-    bodies.insert(body_id, body);
-    revisions.sort_unstable_by_key(|r| r.revision);
-    Some(Article {
-        meta: ArticleMeta {
-            title: row.title.clone(),
-            tags: row.tags.clone(),
-            slug: row.slug.clone(),
-            page_id: page_id.to_string(),
-        },
-        latest_body: body_id,
-        revisions,
-    })
+    let (_, body) = latest?;
+    Some(Arc::from(body.replace('\u{a0}', " ")))
+}
+
+/// [`read_latest_body_at`] for a page on a registered site, resolving the
+/// publication directory through the process globals.
+pub(super) fn read_latest_body(site: &SafePathComponent, page: &PageMeta) -> Option<Arc<str>> {
+    let site_dir = crate::globals::repo().site_dir(site);
+    read_latest_body_at(&site_dir, page)
 }
 
 /// The `rNNN.txt` frontmatter's revision row: `revision`/`revision_id`/
 /// `timestamp`/`author` (identity keys only — the page-level title/tags/slug
-/// come from the manifest). `None` when the frontmatter is absent or carries
-/// no revision number (the entry is skipped).
+/// come from the pages section). `None` when the frontmatter is absent or
+/// carries no revision number.
 fn parse_rev_meta(text: &str) -> Option<RevMeta> {
     let rest = text.strip_prefix("---\n")?;
     let header = rest.split("\n---\n").next()?;
@@ -193,69 +273,16 @@ fn parse_rev_meta(text: &str) -> Option<RevMeta> {
     })
 }
 
-/// Materialise one body as its [`RepoSnapshot`] entry: every NBSP (U+00A0)
-/// rewritten to a plain space, then content-addressed by SHA-256 (truncated
-/// to the 20-byte [`BlobId`]). The rewrite is the dataset-boundary
-/// normalisation Wikidot exports lean on NBSP for (list indentation, trailing
-/// whitespace); the content addressing is what makes an update additive — a
-/// changed body is a new id, and identical bodies dedup to one entry.
-pub(super) fn materialize_body(body: &str) -> (BlobId, Arc<str>) {
-    let normalized: Arc<str> = Arc::from(body.replace('\u{a0}', " "));
-    let sum = ring::digest::digest(&ring::digest::SHA256, normalized.as_bytes());
-    let mut id = [0u8; 20];
-    id.copy_from_slice(&sum.as_ref()[..20]);
-    (BlobId(id), normalized)
-}
-
-// ── files.json ──
-
-#[derive(serde::Deserialize)]
-struct FilesDoc {
-    #[serde(default)]
-    files: Vec<FileRow>,
-}
-
-#[derive(serde::Deserialize)]
-struct FileRow {
-    /// The URL the bytes came from — the publisher's canonical absolute form
-    /// (`http://<sub>.wikidot.com/…` for the wikidot family, any other host
-    /// verbatim); the previous format also keyed a site's own files by their
-    /// site-relative path (`local--files/…`).
-    path: String,
-    /// What the origin server answered for the bytes (`text/css`,
-    /// `image/png`, …; `application/octet-stream` when it answered nothing
-    /// specific). Lands raw in the reverse index, from which both the CA
-    /// URL's extension and the served MIME derive — see
-    /// [`crate::assets::ca_ext`] for the precedence.
-    #[serde(default)]
-    content_type: Option<String>,
-    sha256: Option<String>,
-    status: String,
-}
-
-/// Parse `files.json` into the site's `files/` index, both halves: the
-/// forward map (each *saved* row keyed by [`canon_file_key`] — so the
-/// previous format's site-relative rows (still on disk for sites the daemon
-/// hasn't republished since the format change) lift onto the site's
-/// canonical host, and its `wdfiles`/`www.`/`%3A` spellings collapse into
-/// the same key the canonical form writes, exactly like the publisher's own
-/// dedup) and the reverse map (each CA hash → the row's recorded
-/// `content_type` and original URL — the last row wins when several URLs
-/// name one hash). Pending and missing entries stay unindexed (a request
-/// for them misses, then falls back to the source site — same as an
-/// un-mirrored hotlink).
-pub(super) fn read_files_index(
+/// Parse a files section into the site's `files/` index, both halves: the
+/// forward map (each *saved* row keyed by [`canon_file_key`]) and the reverse
+/// map (each CA hash → the row's recorded `content_type` and original URL).
+/// Pending and missing entries stay unindexed.
+fn files_index(
     site: &SafePathComponent,
-    site_dir: &Path,
+    doc: FilesDoc,
 ) -> (HashMap<RepoAssetPath, String>, HashMap<String, CaFile>) {
     let mut files = HashMap::new();
     let mut files_ca = HashMap::new();
-    let Ok(bytes) = std::fs::read(site_dir.join("files.json")) else {
-        return (files, files_ca);
-    };
-    let Ok(doc) = serde_json::from_slice::<FilesDoc>(&bytes) else {
-        return (files, files_ca);
-    };
     for f in doc.files {
         if f.status != "saved" {
             continue;
@@ -287,7 +314,7 @@ pub(super) fn read_files_index(
     (files, files_ca)
 }
 
-/// Canonicalise one file URL — a `files.json` row `path`, the shell's
+/// Canonicalise one file URL — a files-section `path`, the shell's
 /// `theme_root`, or the `host/path` tail [`http_tail`] yields from an
 /// in-article reference — into the `files/` index key `host/path`:
 /// - the scheme drops (a key never carries it);
@@ -327,75 +354,72 @@ pub(super) fn canon_file_key(url: &str) -> Option<RepoAssetPath> {
 
 // ── shell ──
 
-/// Read the site chrome (`shell`) — see [`parse_shell`] for the format. A
-/// missing or unreadable file parses as the empty shell (all-`None` chrome,
-/// the default landing).
-pub(super) fn read_shell(site_dir: &Path) -> SiteChrome {
-    parse_shell(&std::fs::read_to_string(site_dir.join("shell")).unwrap_or_default())
+/// The parsed `shell` object — one site's chrome. The `landing` slug is always
+/// present ([`start_slug`] unless the shell names one); everything else is
+/// `Option` because the shell may omit it.
+pub(super) struct SiteChrome {
+    pub(super) title: Option<String>,
+    pub(super) subtitle: Option<String>,
+    pub(super) theme_root: Option<RepoAssetPath>,
+    pub(super) landing: Slug,
 }
 
-// ── Whole-corpus build ──
-
-/// Build one site's [`WDWebsite`] out of its publication: every stored page
-/// read and materialised, the `files/` index and shell folded in. Returns
-/// the adopted manifest rows alongside (the diff base for later ticks).
-/// `None` when `pages.json` is unreadable (nothing servable).
-pub(super) fn build_site(
-    site: &SafePathComponent,
-    site_dir: &Path,
-    bodies: &mut ImHashMap<BlobId, Arc<str>>,
-) -> Option<(HashMap<u64, PageRow>, WDWebsite)> {
-    let rows = read_pages_manifest(site_dir)?;
-    let mut w = WDWebsite::default();
-    for (id, row) in &rows {
-        let Some(article) = read_stored_page(site_dir, id, row, bodies) else {
-            continue;
-        };
-        let Some((cat, name)) = parse_slug(&article.meta.slug) else {
-            continue;
-        };
-        w.by_page_id.insert(*id, (cat.clone(), name.clone()));
-        w.articles.entry(cat).or_default().insert(name, article);
-    }
-    let (files, files_ca) = read_files_index(site, site_dir);
-    w.files = files.into_iter().collect();
-    w.files_ca = files_ca.into_iter().collect();
-    let chrome = read_shell(site_dir);
-    w.title = chrome.title;
-    w.subtitle = chrome.subtitle;
-    w.theme_root = chrome.theme_root;
-    w.landing = chrome.landing;
-    Some((rows, w))
-}
-
-/// [`read_page`] behind the stored-count gate: a page whose revisions are
-/// all still unfetched has no archive on disk.
-pub(super) fn read_stored_page(
-    site_dir: &Path,
-    id: &u64,
-    row: &PageRow,
-    bodies: &mut ImHashMap<BlobId, Arc<str>>,
-) -> Option<Article> {
-    if row.stored == 0 {
-        return None;
-    }
-    read_page(site_dir, &id.to_string(), row, bodies)
-}
-
-/// Every published site directory under the publication root (`<dir>/<site>/`
-/// — the daemon's `out/`); site name → path. A missing or unreadable root
-/// yields an empty map — an empty corpus, same as an absent clone before it.
-pub(super) fn site_dirs(out_dir: &Path) -> HashMap<String, PathBuf> {
-    let Ok(rd) = std::fs::read_dir(out_dir) else {
-        return HashMap::new();
+/// Parse a `shell` object: `title`, `subtitle` (both quoted), `theme_root`,
+/// and `landing` (a quoted `cat:name` slug). Returns the title/subtitle
+/// verbatim and the theme root as the canonical [`canon_file_key`] index key.
+/// Unknown keys are ignored; a missing `theme_root` — or one with no mirrored
+/// identity (e.g. a site-relative CSS path, no host) — yields `None`; a
+/// missing or unparsable `landing` falls back to [`start_slug`].
+pub(super) fn parse_shell(text: &str) -> SiteChrome {
+    let mut chrome = SiteChrome {
+        title: None,
+        subtitle: None,
+        theme_root: None,
+        landing: start_slug(),
     };
-    rd.filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            Some((name, e.path()))
-        })
-        .collect()
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let v = v.trim();
+        match k.trim() {
+            "title" => chrome.title = Some(quoted_scalar(v)),
+            "subtitle" => chrome.subtitle = Some(quoted_scalar(v)),
+            "theme_root" => chrome.theme_root = canon_file_key(v),
+            "landing" => chrome.landing = parse_slug(strip_quotes(v)).unwrap_or_else(start_slug),
+            _ => {}
+        }
+    }
+    chrome
+}
+
+/// Decode a YAML double-quoted scalar (the `shell` object quotes title and
+/// subtitle): the archiver escapes embedded quotes, and WikiDot serves the
+/// decoded text — `\"` is a literal quote, `\\` a backslash, `\n`/`\t` the
+/// control characters. Escapes beyond those don't occur in the corpus and
+/// pass through verbatim.
+fn quoted_scalar(s: &str) -> String {
+    let body = strip_quotes(s);
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Parse the revision number out of an archive entry name: `r12.txt` → `12`.
@@ -406,7 +430,7 @@ pub(super) fn rev_number(name: &str) -> Option<u64> {
 }
 
 /// Percent-decode `%XX` escapes (e.g. the publisher's `component%3Atheme` →
-/// `component:theme`). Used to normalise `files.json` keys to the same form
+/// `component:theme`). Used to normalise files-section keys to the same form
 /// [`http_tail`] yields from an in-article URL (which carries the literal
 /// character), so a lookup matches regardless of which side encoded it.
 pub(super) fn percent_decode(s: &str) -> String {

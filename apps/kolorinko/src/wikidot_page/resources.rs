@@ -16,21 +16,24 @@ use super::*;
 pub(super) fn resolve_resources(
     content: Content,
     site: &SafePathComponent,
-    snap: &RepoSnapshot,
+    meta: Option<&RepoMeta>,
 ) -> Content {
+    let Some(meta) = meta else {
+        return content;
+    };
     let mut tails: Vec<String> = Vec::new();
     collect_external_refs(&content, &mut tails);
     if tails.is_empty() {
         return content;
     }
-    let resolved = resolve_tails(&tails, |path| resource_url(snap, site, path));
+    let resolved = resolve_tails(&tails, |path| resource_url(meta, site, path));
     substitute_resources(content, &resolved)
 }
 
 /// The one substitution decision every mirrored reference goes through —
 /// page content here, served CSS blobs in [`crate::wikidot_page::asset`]:
 /// a `host/path` tail becomes its content-addressed URL when the file is
-/// mirrored (`lookup`, against a [`RepoSnapshot`]), else Wikidot's `/code/N`
+/// mirrored (`lookup`, against a [`RepoMeta`]), else Wikidot's `/code/N`
 /// local route ([`code_url_for_tail`]); anything else stays absent (a
 /// hotlink the client loads straight from the origin).
 pub(super) fn resolve_tails(

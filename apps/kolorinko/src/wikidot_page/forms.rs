@@ -19,7 +19,7 @@ pub(super) fn expand_form<'a>(
     body: &'a str,
     origin: &Key,
     slug: &Slug,
-    state: &ResolveState,
+    state: &mut ResolveState,
 ) -> (Cow<'a, str>, Vec<PageDep>) {
     // The page's own category template first, then `_default`'s — Wikidot's
     // category-over-default precedence.
@@ -41,15 +41,16 @@ pub(super) fn expand_form<'a>(
 }
 
 /// The `(key, body)` of `<cat>:_template` on the resolving site, out of the
-/// run's snapshot. `None` when the site has no such page.
-fn template_of(state: &ResolveState, cat: &str) -> Option<(Key, Arc<str>)> {
+/// run's metadata and archive store. `None` when the site has no such page.
+fn template_of(state: &mut ResolveState, cat: &str) -> Option<(Key, Arc<str>)> {
     let slug = (
         Some(SafePathComponent::new(cat.to_string())?),
         SafePathComponent::new("_template".to_string())?,
     );
-    let (local, _) = local_id(&state.snap, &state.site, &slug)?;
-    let body = latest(&state.snap, state.space, local).map(|p| Arc::clone(&p.body))?;
-    Some(((state.site.clone(), slug.0, slug.1), body))
+    let key = (state.site.clone(), slug.0.clone(), slug.1.clone());
+    let site = state.site.clone();
+    let body = state.body(&site, &slug)?;
+    Some((key, body))
 }
 
 /// Expand `body` as the form data of `tpl`: the template's layout half with

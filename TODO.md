@@ -360,3 +360,5 @@ Whatever, it needs caching and proper background update smeanics
 - zeropool...
 - sure blake3 for gear keys?
 - multiple tables for different gear cache kinds.
+
+- Currently gears that perform IO can fail, and that poisons the cache since they're total. Probably need to mark gears as poisoned, idk... And make a new pass to raise alarms.

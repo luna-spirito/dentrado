@@ -1,7 +1,6 @@
-use crate::repo_state::RepoState;
 use dentrado::core::{core_ctx::GearCtx, gear::GearResult, storage::IsStorage};
 use kolorinko_rt::{
-    CodeBlock, LocalId, RepoSnapshot, SafePathComponent, ServedBlob, SiteShell, SpaceId, wire,
+    CodeBlock, LocalId, RepoMeta, SafePathComponent, ServedBlob, SiteShell, SpaceId, wire,
 };
 use kolorinko_wikitext::ArticleView;
 
@@ -39,9 +38,7 @@ mod gears {
 // so the view round-trip tests can name a gear's view.) `GearOutShared` (an
 // alias of `kolorinko_rt::wire::GearOut`) and the builders are re-exported for
 // the server's dispatch/stale-read code.
-pub(crate) use gears::{
-    GearOutLocal, GearOutShared, article_latest, asset, code_block, repo_snap, shell,
-};
+pub(crate) use gears::{GearOutShared, article_latest, asset, code_block, repo, shell};
 
 // The concrete id is otherwise unreachable outside the generated module; the
 // view round-trip tests open a gear view by id.

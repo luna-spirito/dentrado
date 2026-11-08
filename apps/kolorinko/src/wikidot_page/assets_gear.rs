@@ -44,19 +44,19 @@ pub(crate) async fn asset<S: IsStorage<KolorinkoRT>>(
         .join(&hash[2..4])
         .join(&hash[4..]);
     let bytes = fs::read(&file).await.ok()?;
-    // The one stale snapshot read of the run (see the PURE-FUNCTION note).
-    let id = crate::runtime::repo_snap().id().clone();
+    // The one stale metadata read of the run (see the PURE-FUNCTION note).
+    let id = crate::runtime::repo(site.clone()).id().clone();
     match ctx.core().read_gear_stale(id).await {
         GearResult::Shared(s) => match &*s {
-            GearOutShared::RepoSnapOut(snap) => {
-                let entry = snap.sites.get(site)?.files_ca.get(hash)?;
+            GearOutShared::RepoOut(meta) => {
+                let entry = meta.files_ca.get(hash)?;
                 let mime = crate::assets::mime_for_ext(&crate::assets::ca_file_ext(entry));
                 let body = if mime == "text/css" {
                     let text = String::from_utf8_lossy(&bytes);
                     // The blob's original URL is the base its relative
                     // `url()`/`@import` refs resolve against.
                     let base = format!("http://{}", entry.path.as_str());
-                    crate::assets::compress(localize_css(&text, &base, site, snap).into_bytes())
+                    crate::assets::compress(localize_css(&text, &base, site, meta).into_bytes())
                 } else {
                     crate::assets::compress(bytes)
                 };
@@ -79,10 +79,10 @@ pub(crate) fn localize_css(
     text: &str,
     base: &str,
     site: &SafePathComponent,
-    snap: &RepoSnapshot,
+    meta: &RepoMeta,
 ) -> String {
     let resolved = resolve_tails(&http_refs(text, Some(base)), |path| {
-        resource_url(snap, site, path)
+        resource_url(meta, site, path)
     });
     rewrite_with(text, Some(base), |t| resolved.get(t).cloned())
 }

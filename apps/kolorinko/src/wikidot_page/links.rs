@@ -34,26 +34,24 @@ fn slug_key(s: &Slug) -> (String, String) {
 }
 
 /// Resolve every internal link in `content` (the whole include/listpages/
-/// iftags-expanded tree) against the local snapshot
-/// ([`RepoSnapshot::query_pages`] — the page's whole link set in one
-/// pass): found targets become [`LinkTarget::Canonical`] (the renderer
-/// builds the titled canonical route from them — what the client router
-/// intercepts, keeping navigation in the app), classified misses become
-/// [`LinkTarget::Missing`] (the renderer's red `newpage` link), and
-/// unclassifiable refs (site root, multi-segment routes) stay
-/// [`LinkTarget::Page`] untouched.
-pub(super) fn resolve_links(
-    content: Content,
-    site: &SafePathComponent,
-    snap: &RepoSnapshot,
-) -> Content {
+/// iftags-expanded tree) against the site's metadata
+/// ([`query_pages`] — the page's whole link set in one pass): found targets
+/// become [`LinkTarget::Canonical`] (the renderer builds the titled canonical
+/// route from them — what the client router intercepts, keeping navigation in
+/// the app), classified misses become [`LinkTarget::Missing`] (the renderer's
+/// red `newpage` link), and unclassifiable refs (site root, multi-segment
+/// routes) stay [`LinkTarget::Page`] untouched.
+pub(super) fn resolve_links(content: Content, meta: Option<&RepoMeta>) -> Content {
+    let Some(meta) = meta else {
+        return content;
+    };
     let mut slugs: Vec<Slug> = Vec::new();
     collect_page_refs(&content, &mut slugs);
     if slugs.is_empty() {
         return content;
     }
     let query = canonical_query(slugs);
-    let out = query_pages(snap, site, &query);
+    let out = query_pages(meta, &query);
     let resolved: HashMap<Slug, (LocalId, String)> = query
         .0
         .iter()
