@@ -30,7 +30,6 @@ socket2 = "0.6"
 dentrado = { path = "../../dentrado" }
 dentrado-types = { path = "../../dentrado-types" }
 env_logger = "0.11.10"
-flume = "0.11"
 futures = "0.3.31"
 h3 = "0.0.8"
 h3-webtransport = "0.1"

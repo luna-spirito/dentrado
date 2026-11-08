@@ -1908,7 +1908,6 @@ dependencies = [
  "dentrado",
  "dentrado-types",
  "env_logger",
- "flume 0.11.1",
  "futures",
  "h3",
  "h3-webtransport",

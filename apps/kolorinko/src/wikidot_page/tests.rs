@@ -10,6 +10,28 @@ fn site(s: &str) -> SafePathComponent {
     SafePathComponent::new(s.into()).unwrap()
 }
 
+/// Drive one async publication read (compio supplies the runtime the blocking
+/// decode pool needs).
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    compio::runtime::Runtime::new().unwrap().block_on(f)
+}
+
+/// A [`PageSource`] pinned to a fixture `out/` tree and a fixed metadata set.
+struct FixtureSource {
+    root: PathBuf,
+    metas: HashMap<SafePathComponent, RepoMeta>,
+}
+
+impl PageSource for FixtureSource {
+    async fn meta(&mut self, site: &SafePathComponent) -> Option<RepoMeta> {
+        self.metas.get(site).cloned()
+    }
+
+    async fn body(&mut self, site: &SafePathComponent, page: &PageMeta) -> Option<Arc<str>> {
+        read_latest_body_at(&self.root.join(&**site), page).await
+    }
+}
+
 fn root_slug(name: &str) -> Slug {
     (None, SafePathComponent::new(name.into()).unwrap())
 }
@@ -189,9 +211,14 @@ impl Pub {
 fn repo_missing_publication_is_empty() {
     let dir = std::env::temp_dir().join(format!("kolorinko_nopath_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
-    let meta = repo_step(&site("nope"), &dir.join("out").join("nope"), None);
+    let meta = block_on(repo_step(
+        &site("nope"),
+        &dir.join("out").join("nope"),
+        None,
+    ));
     assert!(meta.pages.is_empty());
     assert!(meta.files.is_empty());
+    assert!(meta.head.is_none());
 }
 
 /// An unchanged archive hash reuses the previous output's revision
@@ -203,16 +230,19 @@ fn repo_reuses_unchanged_revision_frontmatter() {
     let mut pub_builder = Pub::new(&dir, "scp");
     pub_builder.page("1", "foo", &[(1, "rid-1", 100, "Foo")]);
     let site_dir = pub_builder.write();
-    let first = read_repo_meta(&site("scp"), &site_dir, None).unwrap();
+    let first = block_on(read_repo_meta(&site("scp"), &site_dir, None)).unwrap();
     let archive = first.pages[&1].archive.clone().unwrap();
     fs::remove_file(site_dir.join(&archive.path)).unwrap();
 
     pub_builder.shell("title: \"T\"\n");
     pub_builder.write();
-    let second = read_repo_meta(&site("scp"), &site_dir, Some(&first)).unwrap();
+    let second = block_on(read_repo_meta(&site("scp"), &site_dir, Some(&first))).unwrap();
     assert_eq!(second.pages[&1].revisions.len(), 1);
     assert_eq!(second.pages[&1].revisions[0].revision_id, "rid-1");
     assert_eq!(second.title.as_deref(), Some("T"));
+    // The republish moved `HEAD`; the reused frontmatter came from `previous`.
+    assert!(first.head.is_some());
+    assert_ne!(first.head, second.head);
 }
 
 /// The chunked layer splits a blob across records and reassembles it;
@@ -262,8 +292,9 @@ fn read_repo_meta_reads_pages_files_and_revisions() {
             b"css",
         );
     let site_dir = pub_builder.write();
-    let meta = read_repo_meta(&site("scp"), &site_dir, None).unwrap();
+    let meta = block_on(read_repo_meta(&site("scp"), &site_dir, None)).unwrap();
 
+    assert!(meta.head.is_some(), "HEAD recorded");
     assert_eq!(meta.pages.len(), 2);
     let foo = article(&meta, &root_slug("foo")).unwrap();
     assert_eq!(foo.id, 1305054470);
@@ -275,7 +306,10 @@ fn read_repo_meta_reads_pages_files_and_revisions() {
     assert_eq!(foo.revisions[0].timestamp, 100);
     assert_eq!(foo.revisions[0].author, "7");
     let bar = article(&meta, &root_slug("bar")).unwrap();
-    assert_eq!(&*read_latest_body_at(&site_dir, bar).unwrap(), "Bar v2\n");
+    assert_eq!(
+        &*block_on(read_latest_body_at(&site_dir, bar)).unwrap(),
+        "Bar v2\n"
+    );
     assert_eq!(bar.revisions.len(), 2);
     // Canonical addressing: slug → page id.
     assert_eq!(meta.by_slug.get(&root_slug("foo")), Some(&1305054470));
@@ -315,7 +349,7 @@ fn legacy_rows_lift_and_alias_spellings_resolve() {
             b"css",
         );
     let site_dir = pub_builder.write();
-    let meta = read_repo_meta(&site("obscurative"), &site_dir, None).unwrap();
+    let meta = block_on(read_repo_meta(&site("obscurative"), &site_dir, None)).unwrap();
     // The relative row is indexed under the site's canonical host.
     let key =
         RepoAssetPath::new("obscurative.wikidot.com/local--theme/t/style.css".into()).unwrap();
@@ -362,7 +396,7 @@ fn resized_variants_resolve_to_their_originals() {
         b"png",
     );
     let site_dir = pub_builder.write();
-    let meta = read_repo_meta(&site("rpcauthority"), &site_dir, None).unwrap();
+    let meta = block_on(read_repo_meta(&site("rpcauthority"), &site_dir, None)).unwrap();
     let variant = canon_file_key(
         "http://rpcauthority.wikidot.com/local--resized-images/foo/bar.png/small.png",
     )
@@ -472,13 +506,13 @@ fn rename_moves_slug_index() {
     let mut first_pub = Pub::new(&dir, "scp");
     first_pub.page("1305054470", "foo", &[(1, "rid-1", 100, "Foo body")]);
     let site_dir = first_pub.write();
-    let first = read_repo_meta(&site("scp"), &site_dir, None).unwrap();
+    let first = block_on(read_repo_meta(&site("scp"), &site_dir, None)).unwrap();
     assert!(article(&first, &root_slug("foo")).is_some());
 
     let mut second_pub = Pub::new(&dir, "scp");
     second_pub.page("1305054470", "renamed", &[(1, "rid-1", 100, "Foo body")]);
     second_pub.write();
-    let second = read_repo_meta(&site("scp"), &site_dir, Some(&first)).unwrap();
+    let second = block_on(read_repo_meta(&site("scp"), &site_dir, Some(&first))).unwrap();
     assert!(article(&second, &root_slug("foo")).is_none());
     assert_eq!(
         article(&second, &root_slug("renamed")).map(|p| p.id),
@@ -591,21 +625,24 @@ fn cross_site_include_fetches_the_named_site() {
     let mut metas = HashMap::new();
     metas.insert(
         site("scp"),
-        read_repo_meta(&site("scp"), &scp_dir, None).unwrap(),
+        block_on(read_repo_meta(&site("scp"), &scp_dir, None)).unwrap(),
     );
     metas.insert(
         site("insurgency"),
-        read_repo_meta(&site("insurgency"), &insurgency_dir, None).unwrap(),
+        block_on(read_repo_meta(&site("insurgency"), &insurgency_dir, None)).unwrap(),
     );
-    let mut state = ResolveState::new(site("scp"), metas);
     // The gear's fetch path is the direct archive read; pin the fixture tree
-    // so `ResolveState::body` finds the published archives.
-    state.out_root = Some(dir.join("out"));
-    let (assembled, deps) = resolve_include(
+    // so the source finds the published archives.
+    let mut source = FixtureSource {
+        root: dir.join("out"),
+        metas,
+    };
+    let mut resolver = Resolver::new(site("scp"), &mut source);
+    let (assembled, deps) = block_on(resolve_include(
         "[[include :insurgency:theme:fasa]]\n",
         &key(Some("fasa"), "nav:side"),
-        &mut state,
-    );
+        &mut resolver,
+    ));
     // The stored body keeps its trailing newline; the origin's own line
     // break follows the splice.
     assert_eq!(flat(&parse(&assembled)), "FASA\n\n");
@@ -971,7 +1008,7 @@ fn relative_css_refs_localize_against_the_original_url() {
         );
     let site = site("backrooms-wiki-cn");
     let site_dir = pub_builder.write();
-    let meta = read_repo_meta(&site, &site_dir, None).unwrap();
+    let meta = block_on(read_repo_meta(&site, &site_dir, None)).unwrap();
     let out = super::assets_gear::localize_css(
         css,
         "http://github.backroomswiki.cn/Old_BHL/css/liminal-impact.css",
@@ -1080,7 +1117,8 @@ fn real_publication_indexes_files_and_shell() {
         eprintln!("skipping: real publication not present");
         return;
     }
-    let meta = read_repo_meta(&site("rpcauthority"), &root, None).expect("publication reads");
+    let meta =
+        block_on(read_repo_meta(&site("rpcauthority"), &root, None)).expect("publication reads");
     assert!(!meta.pages.is_empty(), "pages indexed");
     assert_eq!(meta.title.as_deref(), Some("RPC Authority"));
     assert!(meta.subtitle.as_ref().is_some_and(|s| !s.is_empty()));
@@ -1124,7 +1162,7 @@ fn real_publication_resolves_site_theme_root() {
         return;
     }
     let site = site("castopia.site");
-    let meta = read_repo_meta(&site, &root, None).expect("publication reads");
+    let meta = block_on(read_repo_meta(&site, &root, None)).expect("publication reads");
     let theme = meta.theme_root.clone().expect("theme_root parsed");
     let (_hash, file) = resource(&meta, &site, &theme).expect("theme resolves through the index");
     assert_eq!(crate::assets::ca_file_ext(file), "text.css");
@@ -1144,7 +1182,7 @@ fn real_publication_localizes_relative_theme_imports() {
         return;
     }
     let site = site("castopia.site");
-    let meta = read_repo_meta(&site, &root, None).expect("publication reads");
+    let meta = block_on(read_repo_meta(&site, &root, None)).expect("publication reads");
     let key = canon_file_key("https://castopia.site/-/static/scp-base.css").unwrap();
     let (hash, file) = resource(&meta, &site, &key).expect("theme row in the index");
     assert_eq!(file.content_type.as_deref(), Some("text/css"));

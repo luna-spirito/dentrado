@@ -1,5 +1,5 @@
 use super::*;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use tar::Archive;
 
 // =========================================================================
@@ -45,8 +45,8 @@ fn root_path(site_dir: &Path, sha: &str) -> Option<PathBuf> {
     )
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+async fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    serde_json::from_slice(&fs::read(path).await.ok()?).ok()
 }
 
 /// A publication root: the three section hashes of one generation.
@@ -106,6 +106,24 @@ struct FileEntry {
 
 // ── Whole-generation reader ──
 
+/// Read `<site_dir>/HEAD`: `Ok(Some(head))` for a publication, `Ok(None)`
+/// when the site has no `HEAD` file, `Err(())` on a transient read failure or
+/// a malformed `HEAD` (the caller keeps its previous output).
+pub(super) async fn read_head(site_dir: &Path) -> Result<Option<String>, ()> {
+    match fs::read(site_dir.join("HEAD")).await {
+        Ok(bytes) => {
+            let head = String::from_utf8(bytes).map_err(|_| ())?;
+            let head = head.trim();
+            if head.is_empty() {
+                return Err(());
+            }
+            Ok(Some(head.to_string()))
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
 /// Decode the generation named by `<site_dir>/HEAD` into [`RepoMeta`].
 ///
 /// A missing `HEAD` means the site has no publication and yields the empty
@@ -113,23 +131,27 @@ struct FileEntry {
 /// previous output rather than flapping on a transient I/O error). Revision
 /// frontmatter is reused from `previous` for archives whose SHA-256 did not
 /// change, so a tick only decompresses new archives.
-pub(super) fn read_repo_meta(
+pub(super) async fn read_repo_meta(
     site: &SafePathComponent,
     site_dir: &Path,
     previous: Option<&RepoMeta>,
 ) -> Option<RepoMeta> {
-    if !site_dir.join("HEAD").is_file() {
-        return Some(RepoMeta::default());
-    }
-    let head = std::fs::read_to_string(site_dir.join("HEAD")).ok()?;
-    let head = head.trim();
-    let root: RootDoc = read_json(&root_path(site_dir, head)?)?;
-    let pages: PagesDoc = read_json(&object_path(site_dir, "pages", &root.pages)?)?;
-    let files: FilesDoc = read_json(&object_path(site_dir, "files", &root.files)?)?;
-    let shell = std::fs::read_to_string(object_path(site_dir, "shell", &root.shell)?).ok()?;
+    let head = match read_head(site_dir).await {
+        Ok(Some(head)) => head,
+        Ok(None) => return Some(RepoMeta::default()),
+        Err(()) => return None,
+    };
+    let root: RootDoc = read_json(&root_path(site_dir, &head)?).await?;
+    let pages: PagesDoc = read_json(&object_path(site_dir, "pages", &root.pages)?).await?;
+    let files: FilesDoc = read_json(&object_path(site_dir, "files", &root.files)?).await?;
+    let shell = fs::read(object_path(site_dir, "shell", &root.shell)?)
+        .await
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())?;
     let chrome = parse_shell(&shell);
 
     let mut meta = RepoMeta {
+        head: Some(head),
         title: chrome.title,
         subtitle: chrome.subtitle,
         theme_root: chrome.theme_root,
@@ -147,17 +169,21 @@ pub(super) fn read_repo_meta(
             (Some(path), Some(sha256)) => Some(PageArchive { path, sha256 }),
             _ => None,
         };
-        let revisions = archive
-            .as_ref()
-            .map(|a| {
-                previous
+        let revisions = match &archive {
+            Some(a) => {
+                let reused = previous
                     .and_then(|p| p.pages.get(&id))
                     .filter(|p| p.archive.as_ref().is_some_and(|pa| pa.sha256 == a.sha256))
-                    .map(|p| p.revisions.clone())
-                    .or_else(|| archive_revisions(site_dir, &a.path))
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default();
+                    .map(|p| p.revisions.clone());
+                match reused {
+                    Some(revisions) => revisions,
+                    None => archive_revisions(site_dir, &a.path)
+                        .await
+                        .unwrap_or_default(),
+                }
+            }
+            None => Vec::new(),
+        };
         meta.by_slug.insert(slug, id);
         meta.pages.insert(
             id,
@@ -180,10 +206,16 @@ pub(super) fn read_repo_meta(
     Some(meta)
 }
 
-/// Read every `rNNN.txt` entry's frontmatter out of one page archive.
-fn archive_revisions(site_dir: &Path, archive: &str) -> Option<Vec<RevMeta>> {
-    let bytes = std::fs::read(site_dir.join(archive)).ok()?;
-    let raw = zstd::stream::decode_all(&bytes[..]).ok()?;
+/// Read every `rNNN.txt` entry's frontmatter out of one page archive. The
+/// file read is async; the zstd/tar decode is ordinary CPU work, done inline
+/// like every other parser in the crate.
+async fn archive_revisions(site_dir: &Path, archive: &str) -> Option<Vec<RevMeta>> {
+    revisions_of(&fs::read(site_dir.join(archive)).await.ok()?)
+}
+
+/// Decode one archive and collect its revision frontmatter, oldest first.
+fn revisions_of(bytes: &[u8]) -> Option<Vec<RevMeta>> {
+    let raw = zstd::stream::decode_all(bytes).ok()?;
     let mut revisions = Vec::new();
     let mut archive = Archive::new(&raw[..]);
     for entry in archive.entries().ok()? {
@@ -209,10 +241,15 @@ fn archive_revisions(site_dir: &Path, archive: &str) -> Option<Vec<RevMeta>> {
 /// Read one page's latest body out of its immutable archive: the highest
 /// `rNNN.txt` entry, frontmatter stripped and NBSP-normalised. `None` when
 /// the page has no archive or the archive is unreadable.
-pub(super) fn read_latest_body_at(site_dir: &Path, page: &PageMeta) -> Option<Arc<str>> {
+pub(super) async fn read_latest_body_at(site_dir: &Path, page: &PageMeta) -> Option<Arc<str>> {
     let archive = page.archive.as_ref()?;
-    let bytes = std::fs::read(site_dir.join(&archive.path)).ok()?;
-    let raw = zstd::stream::decode_all(&bytes[..]).ok()?;
+    let bytes = fs::read(site_dir.join(&archive.path)).await.ok()?;
+    Some(Arc::from(latest_body_of(&bytes)?))
+}
+
+/// Decode one archive and return its highest revision's body.
+fn latest_body_of(bytes: &[u8]) -> Option<String> {
+    let raw = zstd::stream::decode_all(bytes).ok()?;
     let mut latest: Option<(u64, String)> = None;
     let mut archive = Archive::new(&raw[..]);
     for entry in archive.entries().ok()? {
@@ -232,14 +269,17 @@ pub(super) fn read_latest_body_at(site_dir: &Path, page: &PageMeta) -> Option<Ar
         }
     }
     let (_, body) = latest?;
-    Some(Arc::from(body.replace('\u{a0}', " ")))
+    Some(body.replace('\u{a0}', " "))
 }
 
 /// [`read_latest_body_at`] for a page on a registered site, resolving the
 /// publication directory through the process globals.
-pub(super) fn read_latest_body(site: &SafePathComponent, page: &PageMeta) -> Option<Arc<str>> {
+pub(super) async fn read_latest_body(
+    site: &SafePathComponent,
+    page: &PageMeta,
+) -> Option<Arc<str>> {
     let site_dir = crate::globals::repo().site_dir(site);
-    read_latest_body_at(&site_dir, page)
+    read_latest_body_at(&site_dir, page).await
 }
 
 /// The `rNNN.txt` frontmatter's revision row: `revision`/`revision_id`/

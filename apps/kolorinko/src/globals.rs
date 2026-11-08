@@ -127,7 +127,7 @@ pub(crate) fn init(
     sites: &IndexMap<String, SiteCfg>,
 ) -> anyhow::Result<()> {
     // `OutMeta` fields are `&'static` by design (they name the publication
-    // directory the worker thread reads for the process lifetime); the
+    // directory the metadata gears read for the process lifetime); the
     // config's strings are leaked here — the single leak point in the crate.
     let repo = OutMeta::new(
         Box::leak(std::path::PathBuf::from(repo_dir).into_boxed_path()),
@@ -201,13 +201,6 @@ pub(crate) fn reg_of(space: &SpaceId) -> Option<&'static SpaceReg> {
 /// Which dataset site serves this space (`None`: unregistered id).
 pub(crate) fn site_of(space: &SpaceId) -> Option<&'static SafePathComponent> {
     reg_of(space).map(|r| &r.site)
-}
-
-/// Every registered dataset site, in config order. The article pipeline
-/// prefetches each site's metadata so cross-site includes resolve without a
-/// per-include cross-core hop.
-pub(crate) fn sites() -> impl Iterator<Item = &'static SafePathComponent> {
-    g().spaces.iter().map(|(_, r)| &r.site)
 }
 
 /// Which registered space a dataset site is served under (`None`: the site

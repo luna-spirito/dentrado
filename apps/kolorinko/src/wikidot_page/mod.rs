@@ -32,10 +32,10 @@
 //!   directives **left unresolved**. Kept separate from [`article_latest`] so
 //!   parse gears never depend on one another (which would let two pages that
 //!   include each other form a gear cycle).
-//! - [`article_latest`] (`follow` over [`article_latest_parsed`]): the full
-//!   resolution pipeline — includes spliced textually, then ListPages,
-//!   iftags, links, and resources resolved from every configured site's
-//!   [`RepoMeta`] plus direct archive reads.
+//! - [`article_latest`] (`event`): the full resolution pipeline — includes
+//!   spliced textually, then ListPages, iftags, links, and resources. Reads
+//!   the raw archive body directly (a parse view cannot be spliced) and
+//!   fetches each site's [`RepoMeta`] lazily, only when an include names it.
 //! - [`shell`] (`event`, `shared`): the whole site chrome in one shot —
 //!   resolved `nav:top` / `nav:side`, theme-root URL, and landing address.
 //! - [`asset`] (`event`, `shared`): content-addressed attachment blobs read

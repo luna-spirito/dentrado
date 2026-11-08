@@ -28,9 +28,9 @@
 //
 //   Repo { site } (timer oracle, shared; one per site)
 //     → ArticleLatestParsed (event; metadata read + archive body read/parse)
-//     → ArticleLatest (follows the parse; metadata for every configured site
-//       plus archive body reads resolve includes/ListPages/links/resources)
-//     → CodeBlock (follows the same parse: a lens over its output)
+//     → CodeBlock (follows the parse: a lens over its output)
+//     → ArticleLatest (event; lazily reads the sites its includes name, then
+//       archive body reads resolve includes/ListPages/links/resources)
 //     → Shell (event; site metadata + resolved nav pages)
 //
 // `asset` stays site/hash-keyed and reads blobs lazily from the
@@ -114,18 +114,15 @@ pub(crate) async fn article_latest_parsed<S: IsStorage<KolorinkoRT>>(
     crate::wikidot_page::article_latest_parsed(space, local, ctx, view).await
 }
 
-#[dentrado::gear(
-    follow(target = GearId::ArticleLatestParsed { space, local }),
-    shared,
-    exposed,
-    name = ArticleLatest,
-)]
+// Reads the raw body directly from the immutable archive (the parse view
+// cannot be reused for textual include splicing) and fetches each site's
+// metadata only when an include actually names it.
+#[dentrado::gear(event, shared, exposed, name = ArticleLatest)]
 pub(crate) async fn article_latest<S: IsStorage<KolorinkoRT>>(
     space: SpaceId,
     local: LocalId,
-    parsed: &ArticleView,
     ctx: &mut GearCtx<KolorinkoRT, S>,
     view: &mut S::View<'_>,
 ) -> ArticleView {
-    crate::wikidot_page::article_latest(space, local, parsed, ctx, view).await
+    crate::wikidot_page::article_latest(space, local, ctx, view).await
 }

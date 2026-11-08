@@ -43,9 +43,9 @@
 # `<site>/` publications kolorinko serves (relative to the workspace root,
 # cargo's CWD).
 dir = "../../wikidot-evakuilo/data/kolorinko/out"
-# Seconds between publication rescans. Cheap when idle: per site, three
-# `stat`s (pages.json / files.json / shell mtimes+sizes); only drifted
-# sites — and inside them only drifted pages — are re-read.
+# Seconds between publication rescans. Cheap when idle: per site, one read
+# of its `HEAD`; an unchanged generation is reused without decoding, and a
+# moved one reuses revision frontmatter for unchanged page archives.
 interval = 60
 
 [server]

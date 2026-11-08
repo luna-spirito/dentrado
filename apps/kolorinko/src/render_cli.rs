@@ -10,10 +10,10 @@
 //!
 //! Both modes spin up the gear runtime (no network servers) and resolve pages
 //! plus the site shell via `GearQuery::subscribe` (the same path the live
-//! server's SSR response and [`crate::server::run_session`] use, so the whole
-//! `Repo { site } → article_latest_parsed → article_latest` cone runs — HEAD
-//! read, archive read, parse, `[[include]]` resolution — exactly as in
-//! production), SSR-render each result through [`kolorinko_render`] into a
+//! server's SSR response and [`crate::server::run_session`] use, so the
+//! `Repo { site } → article_latest` cone runs — HEAD read, archive read,
+//! parse, `[[include]]` resolution — exactly as in production), SSR-render
+//! each result through [`kolorinko_render`] into a
 //! self-contained HTML document, and exit.
 //!
 //! Subscriptions stay live until every output is read, so the shared per-site

@@ -281,6 +281,11 @@ impl PageMeta {
 /// cross-core bridge, and once per page resolution) is O(1).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RepoMeta {
+    /// The `HEAD` root hash this metadata was decoded from; `None` when the
+    /// site has no publication. Lets a timer tick skip rebuilding an
+    /// unchanged generation.
+    #[serde(default)]
+    pub head: Option<String>,
     /// Pages by their stable numeric id.
     pub pages: imbl::HashMap<u64, PageMeta>,
     /// Current slug → numeric id (rename-reactive through the id).
@@ -300,6 +305,7 @@ pub struct RepoMeta {
 impl Default for RepoMeta {
     fn default() -> Self {
         Self {
+            head: None,
             pages: imbl::HashMap::new(),
             by_slug: imbl::HashMap::new(),
             files: imbl::HashMap::new(),

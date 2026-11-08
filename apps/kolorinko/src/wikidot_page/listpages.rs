@@ -21,9 +21,9 @@ pub(super) struct HostCtx {
 /// replaced by its instantiated template: prepend, one repeat per matching
 /// page with that page's `%%vars%%` bound, append, wrapped in Wikidot's
 /// `list-pages-box` / `list-pages-item` containers.
-pub(super) fn resolve_listpages(
+pub(super) async fn resolve_listpages<S: PageSource>(
     content: Content,
-    state: &mut ResolveState,
+    resolver: &mut Resolver<'_, S>,
     host: &HostCtx,
 ) -> (Content, Vec<PageDep>) {
     let mut queries: Vec<ListPagesQuery> = Vec::new();
@@ -31,54 +31,60 @@ pub(super) fn resolve_listpages(
     if queries.is_empty() {
         return (content, Vec::new());
     }
+    let site = resolver.site.clone();
     let mut results: HashMap<ListPagesQuery, ListPagesResult> = HashMap::new();
-    if let Some(meta) = state.meta(&state.site) {
+    if let Some(meta) = resolver.meta(&site).await {
         for query in &queries {
-            results.insert(query.clone(), list_pages(meta, query));
+            results.insert(query.clone(), list_pages(&meta, query));
         }
     }
     // A template referencing `%%content%%` embeds each listed page's rendered
     // body, fetched and resolved below.
-    let listed = resolve_content_bodies(&content, host, &results, state);
+    let listed = resolve_content_bodies(&content, host, &results, resolver).await;
     (
-        substitute_listpages(content, &results, &state.bodies, &state.site, host),
+        substitute_listpages(content, &results, &resolver.cache.bodies, &site, host),
         listed,
     )
 }
 
 /// Fetch and fully resolve the body of every page a `%%content%%` template in
-/// `content` needs, cached in `state.bodies` by fullname (so a page reached
-/// from several modules or transclusions is resolved once per run), together
-/// with each resolved page as a [`PageDep`] (its own resolution deps nested
-/// under it). Each body is a local snapshot read, then run through
-/// [`resolve_full`] in its own context; `state.resolved` — extended before
-/// each resolution — is what stops a transclusion cycle (a listed page
-/// embedding, transitively, a page already being resolved). The listed
-/// page's own id is already the canonical local id — no slug round-trip.
-fn resolve_content_bodies(
+/// `content` needs, cached in `resolver.cache.bodies` by fullname (so a page
+/// reached from several modules or transclusions is resolved once per run),
+/// together with each resolved page as a [`PageDep`] (its own resolution deps
+/// nested under it). Each body is a direct archive read, then run through
+/// [`resolve_full`] in its own context; `resolver.cache.transcluded` —
+/// extended before each resolution — is what stops a transclusion cycle (a
+/// listed page embedding, transitively, a page already being resolved). The
+/// listed page's own id is already the canonical local id — no slug
+/// round-trip.
+async fn resolve_content_bodies<S: PageSource>(
     content: &Content,
     host: &HostCtx,
     results: &HashMap<ListPagesQuery, ListPagesResult>,
-    state: &mut ResolveState,
+    resolver: &mut Resolver<'_, S>,
 ) -> Vec<PageDep> {
-    let pages = content_needing_bodies(content, &state.site, host, results);
+    let site = resolver.site.clone();
+    let pages = content_needing_bodies(content, &site, host, results);
     let mut deps = Vec::new();
-    let site = state.site.clone();
     for (key, slug, page) in pages {
-        if state.bodies.contains_key(&page.fullname()) || !state.resolved.insert(key.clone()) {
+        let fullname = page.fullname();
+        if resolver.cache.bodies.contains_key(&fullname)
+            || !resolver.cache.transcluded.insert(key.clone())
+        {
             continue;
         }
-        let raw = LocalId::from_page_id(&page.page_id)
-            .map(|local| local.page_id())
-            .and_then(|id| state.body_by_id(&site, id))
-            .unwrap_or_else(|| Arc::from(""));
+        let raw = match LocalId::from_page_id(&page.page_id) {
+            Some(local) => resolver.body_by_id(&site, local.page_id()).await,
+            None => None,
+        }
+        .unwrap_or_else(|| Arc::from(""));
         let host = HostCtx {
-            fullname: page.fullname(),
+            fullname: fullname.clone(),
             category: page.category.clone(),
             tags: page.tags.clone(),
         };
-        let (content, page_deps) = resolve_full(raw, slug, host, state);
-        state.bodies.insert(page.fullname(), content);
+        let (content, page_deps) = resolve_full(resolver, raw, slug, host).await;
+        resolver.cache.bodies.insert(fullname, content);
         deps.push(page_dep(&key, page_deps));
     }
     deps

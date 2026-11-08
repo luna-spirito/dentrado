@@ -15,11 +15,11 @@ use std::borrow::Cow;
 /// plus the template page as a dependency; the body passes through unchanged
 /// when the category declares no form or the body doesn't parse as its form
 /// data (every ordinary page).
-pub(super) fn expand_form<'a>(
+pub(super) async fn expand_form<'a, S: PageSource>(
     body: &'a str,
     origin: &Key,
     slug: &Slug,
-    state: &mut ResolveState,
+    resolver: &mut Resolver<'_, S>,
 ) -> (Cow<'a, str>, Vec<PageDep>) {
     // The page's own category template first, then `_default`'s — Wikidot's
     // category-over-default precedence.
@@ -27,7 +27,7 @@ pub(super) fn expand_form<'a>(
     let both = [own, "_default"];
     let cats = &both[..if own == "_default" { 1 } else { 2 }];
     for cat in cats {
-        let Some((key, tpl)) = template_of(state, cat) else {
+        let Some((key, tpl)) = template_of(resolver, cat).await else {
             continue;
         };
         if &key == origin {
@@ -42,14 +42,17 @@ pub(super) fn expand_form<'a>(
 
 /// The `(key, body)` of `<cat>:_template` on the resolving site, out of the
 /// run's metadata and archive store. `None` when the site has no such page.
-fn template_of(state: &mut ResolveState, cat: &str) -> Option<(Key, Arc<str>)> {
+async fn template_of<S: PageSource>(
+    resolver: &mut Resolver<'_, S>,
+    cat: &str,
+) -> Option<(Key, Arc<str>)> {
     let slug = (
         Some(SafePathComponent::new(cat.to_string())?),
         SafePathComponent::new("_template".to_string())?,
     );
-    let key = (state.site.clone(), slug.0.clone(), slug.1.clone());
-    let site = state.site.clone();
-    let body = state.body(&site, &slug)?;
+    let key = (resolver.site.clone(), slug.0.clone(), slug.1.clone());
+    let site = resolver.site.clone();
+    let body = resolver.body(&site, &slug).await?;
     Some((key, body))
 }
 
