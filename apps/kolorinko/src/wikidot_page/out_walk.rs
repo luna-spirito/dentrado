@@ -61,9 +61,6 @@ struct RootDoc {
 
 #[derive(serde::Deserialize)]
 struct PagesDoc {
-    /// Publication format version: 3 carries the revision summary directly.
-    #[serde(default)]
-    v: u32,
     #[serde(default)]
     pages: Vec<PageEntry>,
 }
@@ -141,10 +138,8 @@ pub(super) async fn read_head(site_dir: &Path) -> Result<Option<String>, ()> {
 /// metadata; any other read failure yields `None` (the caller keeps its
 /// previous output rather than flapping on a transient I/O error).
 ///
-/// Publication v3 carries the first/last stored revision summary in the
-/// pages section, so this never opens a page archive. A v2 publication is
-/// adapted by decoding each archive once for that summary; republishing at
-/// v3 removes that fallback.
+/// The pages section carries the first/last stored revision summary, so this
+/// never opens a page archive.
 pub(super) async fn read_repo_meta(site: &SafePathComponent, site_dir: &Path) -> Option<RepoMeta> {
     let head = match read_head(site_dir).await {
         Ok(Some(head)) => head,
@@ -168,8 +163,7 @@ pub(super) async fn read_repo_meta(site: &SafePathComponent, site_dir: &Path) ->
         landing: chrome.landing,
         ..RepoMeta::default()
     };
-    let PagesDoc { v, pages } = pages;
-    for entry in pages {
+    for entry in pages.pages {
         let Ok(id) = entry.id.parse::<u64>() else {
             continue;
         };
@@ -179,16 +173,6 @@ pub(super) async fn read_repo_meta(site: &SafePathComponent, site_dir: &Path) ->
         let archive = match (entry.archive, entry.archive_sha256) {
             (Some(path), Some(sha256)) => Some(PageArchive { path, sha256 }),
             _ => None,
-        };
-        let summary = if v >= 3 {
-            (
-                entry.created_by,
-                entry.created_at,
-                entry.updated_by,
-                entry.updated_at,
-            )
-        } else {
-            legacy_revision_summary(site_dir, archive.as_ref()).await
         };
         meta.by_slug.insert(slug, id);
         meta.pages.insert(
@@ -201,10 +185,10 @@ pub(super) async fn read_repo_meta(site: &SafePathComponent, site_dir: &Path) ->
                 revisions_stored: entry.revisions_stored,
                 revisions_known: entry.revisions_known,
                 max_rev: entry.max_rev,
-                created_by: summary.0,
-                created_at: summary.1,
-                updated_by: summary.2,
-                updated_at: summary.3,
+                created_by: entry.created_by,
+                created_at: entry.created_at,
+                updated_by: entry.updated_by,
+                updated_at: entry.updated_at,
                 archive,
             },
         );
@@ -213,32 +197,6 @@ pub(super) async fn read_repo_meta(site: &SafePathComponent, site_dir: &Path) ->
     meta.files = files.into_iter().collect();
     meta.files_ca = files_ca.into_iter().collect();
     Some(meta)
-}
-
-/// The first/last stored revision summary for a pre-v3 publication, decoded
-/// from the page archive. Returns all-`None` for a page without an archive or
-/// an unreadable one.
-async fn legacy_revision_summary(
-    site_dir: &Path,
-    archive: Option<&PageArchive>,
-) -> (Option<String>, Option<i64>, Option<String>, Option<i64>) {
-    let Some(archive) = archive else {
-        return Default::default();
-    };
-    let Some(bytes) = fs::read(site_dir.join(&archive.path)).await.ok() else {
-        return Default::default();
-    };
-    let Some(revisions) = revisions_of(&bytes) else {
-        return Default::default();
-    };
-    let first = revisions.first();
-    let last = revisions.last();
-    (
-        first.map(|r| r.author.clone()),
-        first.map(|r| r.timestamp),
-        last.map(|r| r.author.clone()),
-        last.map(|r| r.timestamp),
-    )
 }
 
 /// One archive decode's worth of page data: the highest revision's body plus
@@ -282,11 +240,6 @@ fn read_archive(bytes: &[u8], collect_revisions: bool) -> Option<ArchiveRead> {
     }
     revisions.sort_unstable_by_key(|r| r.revision);
     Some(ArchiveRead { latest, revisions })
-}
-
-/// Decode one archive and collect its revision frontmatter, oldest first.
-fn revisions_of(bytes: &[u8]) -> Option<Vec<RevMeta>> {
-    read_archive(bytes, true).map(|read| read.revisions)
 }
 
 /// Decode one archive and return its highest revision body, NBSP-normalised.

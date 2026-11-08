@@ -103,7 +103,6 @@ fn pack_page(
 struct Pub {
     root: PathBuf,
     site: String,
-    format: u32,
     pages: Vec<serde_json::Value>,
     files: Vec<serde_json::Value>,
     shell: String,
@@ -114,16 +113,10 @@ impl Pub {
         Self {
             root: root.to_path_buf(),
             site: site.to_string(),
-            format: 3,
             pages: Vec::new(),
             files: Vec::new(),
             shell: String::new(),
         }
-    }
-
-    fn format(&mut self, format: u32) -> &mut Self {
-        self.format = format;
-        self
     }
 
     fn site_dir(&self) -> PathBuf {
@@ -191,7 +184,7 @@ impl Pub {
         let dir = self.site_dir();
         fs::create_dir_all(&dir).unwrap();
         let pages = serde_json::to_vec(
-            &serde_json::json!({ "v": self.format, "site": self.site, "pages": self.pages }),
+            &serde_json::json!({ "v": 3, "site": self.site, "pages": self.pages }),
         )
         .unwrap();
         let files = serde_json::to_vec(
@@ -230,10 +223,10 @@ fn repo_missing_publication_is_empty() {
     assert!(meta.head.is_none());
 }
 
-/// A v3 publication carries the revision summary in `pages/`, so repo
-/// metadata is complete even after every archive is gone.
+/// The revision summary lives in `pages/`, so repo metadata is complete even
+/// after every archive is gone.
 #[test]
-fn repo_v3_metadata_needs_no_archives() {
+fn repo_metadata_needs_no_archives() {
     let dir = std::env::temp_dir().join(format!("kolorinko_noarch_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     let mut pub_builder = Pub::new(&dir, "scp");
@@ -255,25 +248,6 @@ fn repo_v3_metadata_needs_no_archives() {
     assert_eq!(page.created_at, Some(100));
     assert_eq!(page.updated_by.as_deref(), Some("7"));
     assert_eq!(page.updated_at, Some(200));
-}
-
-/// A v2 publication has no summary fields; the reader adapts it by decoding
-/// the page archive once (and keeps behaving after the archive disappears).
-#[test]
-fn v2_revision_summary_falls_back_to_archives() {
-    let dir = std::env::temp_dir().join(format!("kolorinko_v2sum_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    let mut pub_builder = Pub::new(&dir, "scp");
-    pub_builder
-        .format(2)
-        .page("1", "foo", &[(1, "rid-1", 100, "Foo")]);
-    let site_dir = pub_builder.write();
-    let meta = block_on(read_repo_meta(&site("scp"), &site_dir)).unwrap();
-    let page = &meta.pages[&1];
-    assert_eq!(page.created_by.as_deref(), Some("7"));
-    assert_eq!(page.created_at, Some(100));
-    assert_eq!(page.updated_by.as_deref(), Some("7"));
-    assert_eq!(page.updated_at, Some(100));
 }
 
 /// The repo generation image round-trips through the gear view (persistent
