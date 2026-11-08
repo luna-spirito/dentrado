@@ -80,15 +80,15 @@ pub(crate) async fn article_latest_parsed<S: IsStorage<KolorinkoRT>>(
     {
         let mut parsed = cached.clone();
         parsed.meta = page.article_meta();
-        parsed.revisions = page.revisions.clone();
         return parsed;
     }
-    let body = read_latest_body(&site, page)
-        .await
-        .unwrap_or_else(|| Arc::from(""));
+    let latest = read_latest_page(&site, page).await;
+    let body = latest
+        .as_ref()
+        .map_or_else(|| Arc::from(""), |page| Arc::clone(&page.body));
     let parsed = ArticleView {
         meta: page.article_meta(),
-        revisions: page.revisions.clone(),
+        revisions: latest.map(|page| page.revisions).unwrap_or_default(),
         content: parse(&body),
         deps: Vec::new(),
     };
@@ -132,10 +132,11 @@ pub(crate) async fn article_latest<S: IsStorage<KolorinkoRT>>(
     let Some(page) = latest(&meta, local) else {
         return ArticleView::default();
     };
-    let body = source
-        .body(&site, page)
-        .await
-        .unwrap_or_else(|| Arc::from(""));
+    let latest = read_latest_page(&site, page).await;
+    let body = latest
+        .as_ref()
+        .map_or_else(|| Arc::from(""), |page| Arc::clone(&page.body));
+    let revisions = latest.map(|page| page.revisions).unwrap_or_default();
     // A missing page parses to an empty view (blank slug) — the 404 shape.
     let Some(slug) = parse_slug(&page.slug) else {
         return ArticleView::default();
@@ -146,7 +147,6 @@ pub(crate) async fn article_latest<S: IsStorage<KolorinkoRT>>(
         tags: page.tags.clone(),
     };
     let page_meta = page.article_meta();
-    let revisions = page.revisions.clone();
     let mut resolver = Resolver::new(site, &mut source);
     let (mut content, deps) = resolve_full(&mut resolver, body, slug, host).await;
     kolorinko_wikitext::assign_toc_anchors(&mut content);

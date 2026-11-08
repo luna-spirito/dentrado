@@ -331,41 +331,24 @@ pub(super) fn select(meta: &RepoMeta, params: &ListPagesParams) -> ListPagesResu
 }
 
 /// One matching page as the template-visible [`ListedPage`]: creation/update
-/// are the first/last stored revision by number.
+/// come from the publication's first/last stored revision summary.
 fn listed_page(a: &PageMeta) -> ListedPage {
     let (category, name) = a
         .slug
         .split_once(':')
         .map_or((None, a.slug.as_str()), |(c, n)| (Some(c.to_string()), n));
-    let (created, updated) = first_last_revisions(a);
     ListedPage {
         name: name.to_string(),
         category,
         page_id: a.id.to_string(),
         title: a.title.clone(),
         tags: a.tags.clone(),
-        created_by: created.map_or_else(String::new, |r| r.author.clone()),
-        created_at: created.map_or(0, |r| r.timestamp),
-        updated_by: updated.map_or_else(String::new, |r| r.author.clone()),
-        updated_at: updated.map_or(0, |r| r.timestamp),
+        created_by: a.created_by.clone().unwrap_or_default(),
+        created_at: a.created_at.unwrap_or(0),
+        updated_by: a.updated_by.clone().unwrap_or_default(),
+        updated_at: a.updated_at.unwrap_or(0),
         revisions: a.revisions_stored,
     }
-}
-
-/// The first and last revision of a page (by revision number, in case the
-/// archive entries are unordered).
-fn first_last_revisions(a: &PageMeta) -> (Option<&RevMeta>, Option<&RevMeta>) {
-    let mut first: Option<&RevMeta> = None;
-    let mut last: Option<&RevMeta> = None;
-    for r in &a.revisions {
-        if first.is_none_or(|f| r.revision < f.revision) {
-            first = Some(r);
-        }
-        if last.is_none_or(|l| r.revision >= l.revision) {
-            last = Some(r);
-        }
-    }
-    (first, last)
 }
 
 /// Does one page pass every supported selector? Unsupported selectors with no
@@ -393,17 +376,17 @@ fn matches_page(a: &PageMeta, params: &ListPagesParams, now: i64) -> bool {
         return false;
     }
     if let Some(by) = &params.created_by
-        && !by.eq_ignore_ascii_case(author_of(a, End::First))
+        && !by.eq_ignore_ascii_case(a.created_by.as_deref().unwrap_or(""))
     {
         return false;
     }
     if let Some(filter) = &params.created_at
-        && !time_matches(filter, timestamp_of(a, End::First), now)
+        && !time_matches(filter, a.created_at.unwrap_or(0), now)
     {
         return false;
     }
     if let Some(filter) = &params.updated_at
-        && !time_matches(filter, timestamp_of(a, End::Last), now)
+        && !time_matches(filter, a.updated_at.unwrap_or(0), now)
     {
         return false;
     }
@@ -417,28 +400,6 @@ fn matches_page(a: &PageMeta, params: &ListPagesParams, now: i64) -> bool {
     tags.all.iter().all(|t| has(t))
         && (tags.any.is_empty() || tags.any.iter().any(|t| has(t)))
         && tags.none.iter().all(|t| !has(t))
-}
-
-#[derive(Copy, Clone)]
-enum End {
-    First,
-    Last,
-}
-
-fn author_of(a: &PageMeta, end: End) -> &str {
-    let (f, l) = first_last_revisions(a);
-    match end {
-        End::First => f.map_or("", |r| &r.author),
-        End::Last => l.map_or("", |r| &r.author),
-    }
-}
-
-fn timestamp_of(a: &PageMeta, end: End) -> i64 {
-    let (f, l) = first_last_revisions(a);
-    match end {
-        End::First => f.map_or(0, |r| r.timestamp),
-        End::Last => l.map_or(0, |r| r.timestamp),
-    }
 }
 
 /// A `category="…"` selector: `"*"` (or `None`, once resolved) keeps every

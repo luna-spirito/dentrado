@@ -240,9 +240,9 @@ pub struct PageArchive {
     pub sha256: String,
 }
 
-/// One page's metadata from a publication's pages section, enriched with the
-/// stored revisions' frontmatter (revision ids, timestamps, authors) so
-/// ListPages can select and order without reading page bodies.
+/// One page's metadata from a publication's pages section: identity, archive
+/// pointer, and the first/last stored revision summary ListPages needs to
+/// select and order without reading page bodies.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PageMeta {
     pub id: u64,
@@ -253,10 +253,16 @@ pub struct PageMeta {
     pub revisions_stored: u64,
     pub revisions_known: u64,
     pub max_rev: u64,
+    /// Author of the first stored revision, `None` when there is none.
+    pub created_by: Option<String>,
+    /// Timestamp of the first stored revision, `None` when there is none.
+    pub created_at: Option<i64>,
+    /// Author of the last stored revision, `None` when there is none.
+    pub updated_by: Option<String>,
+    /// Timestamp of the last stored revision, `None` when there is none.
+    pub updated_at: Option<i64>,
     /// `None` exactly when the page has no stored revisions.
     pub archive: Option<PageArchive>,
-    /// The stored revisions' frontmatter, oldest first.
-    pub revisions: Vec<kolorinko_wikitext::RevMeta>,
 }
 
 impl PageMeta {

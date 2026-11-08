@@ -1,3 +1,4 @@
+use super::repo_gear::{load_meta, store_meta};
 use super::*;
 use std::fs;
 
@@ -102,6 +103,7 @@ fn pack_page(
 struct Pub {
     root: PathBuf,
     site: String,
+    format: u32,
     pages: Vec<serde_json::Value>,
     files: Vec<serde_json::Value>,
     shell: String,
@@ -112,10 +114,16 @@ impl Pub {
         Self {
             root: root.to_path_buf(),
             site: site.to_string(),
+            format: 3,
             pages: Vec::new(),
             files: Vec::new(),
             shell: String::new(),
         }
+    }
+
+    fn format(&mut self, format: u32) -> &mut Self {
+        self.format = format;
+        self
     }
 
     fn site_dir(&self) -> PathBuf {
@@ -137,6 +145,8 @@ impl Pub {
             (Some(format!("objects/{rel}")), Some(sha))
         };
         let max_rev = revs.iter().map(|(n, ..)| *n).max().unwrap_or(0);
+        let first = revs.iter().min_by_key(|(n, ..)| *n);
+        let last = revs.iter().max_by_key(|(n, ..)| *n);
         self.pages.push(serde_json::json!({
             "id": id,
             "slug": slug,
@@ -145,6 +155,10 @@ impl Pub {
             "revisions_stored": revs.len(),
             "revisions_known": revs.len(),
             "max_rev": max_rev,
+            "created_by": first.map(|_| "7"),
+            "created_at": first.map(|(_, _, ts, _)| *ts),
+            "updated_by": last.map(|_| "7"),
+            "updated_at": last.map(|(_, _, ts, _)| *ts),
             "archive": archive,
             "archive_sha256": archive_sha256,
         }));
@@ -173,16 +187,11 @@ impl Pub {
         self
     }
 
-    fn shell(&mut self, text: &str) -> &mut Self {
-        self.shell = text.to_string();
-        self
-    }
-
     fn write(&self) -> PathBuf {
         let dir = self.site_dir();
         fs::create_dir_all(&dir).unwrap();
         let pages = serde_json::to_vec(
-            &serde_json::json!({ "v": 2, "site": self.site, "pages": self.pages }),
+            &serde_json::json!({ "v": self.format, "site": self.site, "pages": self.pages }),
         )
         .unwrap();
         let files = serde_json::to_vec(
@@ -221,28 +230,83 @@ fn repo_missing_publication_is_empty() {
     assert!(meta.head.is_none());
 }
 
-/// An unchanged archive hash reuses the previous output's revision
-/// frontmatter — no archive decompression on a shell-only republish.
+/// A v3 publication carries the revision summary in `pages/`, so repo
+/// metadata is complete even after every archive is gone.
 #[test]
-fn repo_reuses_unchanged_revision_frontmatter() {
-    let dir = std::env::temp_dir().join(format!("kolorinko_reuse_{}", std::process::id()));
+fn repo_v3_metadata_needs_no_archives() {
+    let dir = std::env::temp_dir().join(format!("kolorinko_noarch_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let mut pub_builder = Pub::new(&dir, "scp");
+    pub_builder.page(
+        "1",
+        "foo",
+        &[(1, "rid-1", 100, "Foo"), (2, "rid-2", 200, "Foo v2")],
+    );
+    let site_dir = pub_builder.write();
+    let archive = {
+        let meta = block_on(read_repo_meta(&site("scp"), &site_dir)).unwrap();
+        meta.pages[&1].archive.clone().unwrap()
+    };
+    fs::remove_file(site_dir.join(&archive.path)).unwrap();
+
+    let meta = block_on(read_repo_meta(&site("scp"), &site_dir)).unwrap();
+    let page = &meta.pages[&1];
+    assert_eq!(page.created_by.as_deref(), Some("7"));
+    assert_eq!(page.created_at, Some(100));
+    assert_eq!(page.updated_by.as_deref(), Some("7"));
+    assert_eq!(page.updated_at, Some(200));
+}
+
+/// A v2 publication has no summary fields; the reader adapts it by decoding
+/// the page archive once (and keeps behaving after the archive disappears).
+#[test]
+fn v2_revision_summary_falls_back_to_archives() {
+    let dir = std::env::temp_dir().join(format!("kolorinko_v2sum_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let mut pub_builder = Pub::new(&dir, "scp");
+    pub_builder
+        .format(2)
+        .page("1", "foo", &[(1, "rid-1", 100, "Foo")]);
+    let site_dir = pub_builder.write();
+    let meta = block_on(read_repo_meta(&site("scp"), &site_dir)).unwrap();
+    let page = &meta.pages[&1];
+    assert_eq!(page.created_by.as_deref(), Some("7"));
+    assert_eq!(page.created_at, Some(100));
+    assert_eq!(page.updated_by.as_deref(), Some("7"));
+    assert_eq!(page.updated_at, Some(100));
+}
+
+/// The repo generation image round-trips through the gear view (persistent
+/// imbl maps and revision frontmatter included), so a restarted process reuses
+/// it instead of decoding every archive again.
+#[test]
+fn repo_cache_round_trips_the_generation() {
+    use compio::runtime::Runtime;
+    use dentrado::core::storage::InMemoryStorage;
+    let dir = std::env::temp_dir().join(format!("kolorinko_repocache_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     let mut pub_builder = Pub::new(&dir, "scp");
     pub_builder.page("1", "foo", &[(1, "rid-1", 100, "Foo")]);
     let site_dir = pub_builder.write();
-    let first = block_on(read_repo_meta(&site("scp"), &site_dir, None)).unwrap();
-    let archive = first.pages[&1].archive.clone().unwrap();
-    fs::remove_file(site_dir.join(&archive.path)).unwrap();
+    let meta = block_on(read_repo_meta(&site("scp"), &site_dir)).unwrap();
 
-    pub_builder.shell("title: \"T\"\n");
-    pub_builder.write();
-    let second = block_on(read_repo_meta(&site("scp"), &site_dir, Some(&first))).unwrap();
-    assert_eq!(second.pages[&1].revisions.len(), 1);
-    assert_eq!(second.pages[&1].revisions[0].revision_id, "rid-1");
-    assert_eq!(second.title.as_deref(), Some("T"));
-    // The republish moved `HEAD`; the reused frontmatter came from `previous`.
-    assert!(first.head.is_some());
-    assert_ne!(first.head, second.head);
+    let rt = Runtime::new().unwrap();
+    let storage: InMemoryStorage<KolorinkoRT> = InMemoryStorage::new();
+    let mut view = rt.block_on(storage.gear_view(&crate::runtime::GearId::Repo(site("scp"))));
+    rt.block_on(store_meta(&mut view, &meta));
+    view.commit();
+
+    let mut view = rt.block_on(storage.gear_view(&crate::runtime::GearId::Repo(site("scp"))));
+    let cached = rt
+        .block_on(load_meta(&mut view))
+        .expect("cached generation");
+    assert_eq!(cached.head, meta.head);
+    assert_eq!(cached.title, meta.title);
+    assert_eq!(cached.pages.len(), meta.pages.len());
+    assert_eq!(cached.by_slug, meta.by_slug);
+    assert_eq!(cached.files, meta.files);
+    assert_eq!(cached.pages[&1].created_at, Some(100));
+    assert_eq!(cached.pages[&1].updated_at, Some(100));
 }
 
 /// The chunked layer splits a blob across records and reassembles it;
@@ -273,7 +337,7 @@ fn chunked_round_trips_and_drops_stale_blocks() {
 }
 
 #[test]
-fn read_repo_meta_reads_pages_files_and_revisions() {
+fn read_repo_meta_reads_pages_files_and_summary() {
     let dir = std::env::temp_dir().join(format!("kolorinko_out_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     let mut pub_builder = Pub::new(&dir, "scp");
@@ -292,25 +356,26 @@ fn read_repo_meta_reads_pages_files_and_revisions() {
             b"css",
         );
     let site_dir = pub_builder.write();
-    let meta = block_on(read_repo_meta(&site("scp"), &site_dir, None)).unwrap();
+    let meta = block_on(read_repo_meta(&site("scp"), &site_dir)).unwrap();
 
     assert!(meta.head.is_some(), "HEAD recorded");
     assert_eq!(meta.pages.len(), 2);
     let foo = article(&meta, &root_slug("foo")).unwrap();
     assert_eq!(foo.id, 1305054470);
     assert_eq!(foo.title, "T foo");
-    // The revision table comes from the archive entries' frontmatter.
-    assert_eq!(foo.revisions.len(), 1);
-    assert_eq!(foo.revisions[0].revision, 1);
-    assert_eq!(foo.revisions[0].revision_id, "rid-1");
-    assert_eq!(foo.revisions[0].timestamp, 100);
-    assert_eq!(foo.revisions[0].author, "7");
+    assert_eq!(foo.created_by.as_deref(), Some("7"));
+    assert_eq!(foo.created_at, Some(100));
+    assert_eq!(foo.updated_by.as_deref(), Some("7"));
+    assert_eq!(foo.updated_at, Some(100));
     let bar = article(&meta, &root_slug("bar")).unwrap();
-    assert_eq!(
-        &*block_on(read_latest_body_at(&site_dir, bar)).unwrap(),
-        "Bar v2\n"
-    );
-    assert_eq!(bar.revisions.len(), 2);
+    assert_eq!(bar.created_at, Some(101));
+    assert_eq!(bar.updated_at, Some(102));
+    // The full history stays page-local: one archive decode yields both the
+    // latest body and every stored revision.
+    let latest = block_on(read_latest_page_at(&site_dir, bar)).unwrap();
+    assert_eq!(&*latest.body, "Bar v2\n");
+    assert_eq!(latest.revisions.len(), 2);
+    assert_eq!(latest.revisions[1].revision_id, "rid-3");
     // Canonical addressing: slug → page id.
     assert_eq!(meta.by_slug.get(&root_slug("foo")), Some(&1305054470));
     // The files index maps the percent-decoded host/path tail to the CA
@@ -349,7 +414,7 @@ fn legacy_rows_lift_and_alias_spellings_resolve() {
             b"css",
         );
     let site_dir = pub_builder.write();
-    let meta = block_on(read_repo_meta(&site("obscurative"), &site_dir, None)).unwrap();
+    let meta = block_on(read_repo_meta(&site("obscurative"), &site_dir)).unwrap();
     // The relative row is indexed under the site's canonical host.
     let key =
         RepoAssetPath::new("obscurative.wikidot.com/local--theme/t/style.css".into()).unwrap();
@@ -396,7 +461,7 @@ fn resized_variants_resolve_to_their_originals() {
         b"png",
     );
     let site_dir = pub_builder.write();
-    let meta = block_on(read_repo_meta(&site("rpcauthority"), &site_dir, None)).unwrap();
+    let meta = block_on(read_repo_meta(&site("rpcauthority"), &site_dir)).unwrap();
     let variant = canon_file_key(
         "http://rpcauthority.wikidot.com/local--resized-images/foo/bar.png/small.png",
     )
@@ -506,13 +571,13 @@ fn rename_moves_slug_index() {
     let mut first_pub = Pub::new(&dir, "scp");
     first_pub.page("1305054470", "foo", &[(1, "rid-1", 100, "Foo body")]);
     let site_dir = first_pub.write();
-    let first = block_on(read_repo_meta(&site("scp"), &site_dir, None)).unwrap();
+    let first = block_on(read_repo_meta(&site("scp"), &site_dir)).unwrap();
     assert!(article(&first, &root_slug("foo")).is_some());
 
     let mut second_pub = Pub::new(&dir, "scp");
     second_pub.page("1305054470", "renamed", &[(1, "rid-1", 100, "Foo body")]);
     second_pub.write();
-    let second = block_on(read_repo_meta(&site("scp"), &site_dir, Some(&first))).unwrap();
+    let second = block_on(read_repo_meta(&site("scp"), &site_dir)).unwrap();
     assert!(article(&second, &root_slug("foo")).is_none());
     assert_eq!(
         article(&second, &root_slug("renamed")).map(|p| p.id),
@@ -625,11 +690,11 @@ fn cross_site_include_fetches_the_named_site() {
     let mut metas = HashMap::new();
     metas.insert(
         site("scp"),
-        block_on(read_repo_meta(&site("scp"), &scp_dir, None)).unwrap(),
+        block_on(read_repo_meta(&site("scp"), &scp_dir)).unwrap(),
     );
     metas.insert(
         site("insurgency"),
-        block_on(read_repo_meta(&site("insurgency"), &insurgency_dir, None)).unwrap(),
+        block_on(read_repo_meta(&site("insurgency"), &insurgency_dir)).unwrap(),
     );
     // The gear's fetch path is the direct archive read; pin the fixture tree
     // so the source finds the published archives.
@@ -890,6 +955,7 @@ fn include_vars_in_root_level_attributes_erase_to_defaults() {
 
 #[test]
 fn external_refs_are_collected_and_content_addressed() {
+    init_test_globals();
     let img_url = "https://scp.wikidot.com/local--files/foo/a.png";
     let hot = "https://i.imgur.com/x.jpg";
     let css = "a{background:url(https://scp.wikidot.com/local--files/foo/bg.png)}";
@@ -1008,7 +1074,7 @@ fn relative_css_refs_localize_against_the_original_url() {
         );
     let site = site("backrooms-wiki-cn");
     let site_dir = pub_builder.write();
-    let meta = block_on(read_repo_meta(&site, &site_dir, None)).unwrap();
+    let meta = block_on(read_repo_meta(&site, &site_dir)).unwrap();
     let out = super::assets_gear::localize_css(
         css,
         "http://github.backroomswiki.cn/Old_BHL/css/liminal-impact.css",
@@ -1117,8 +1183,7 @@ fn real_publication_indexes_files_and_shell() {
         eprintln!("skipping: real publication not present");
         return;
     }
-    let meta =
-        block_on(read_repo_meta(&site("rpcauthority"), &root, None)).expect("publication reads");
+    let meta = block_on(read_repo_meta(&site("rpcauthority"), &root)).expect("publication reads");
     assert!(!meta.pages.is_empty(), "pages indexed");
     assert_eq!(meta.title.as_deref(), Some("RPC Authority"));
     assert!(meta.subtitle.as_ref().is_some_and(|s| !s.is_empty()));
@@ -1162,7 +1227,7 @@ fn real_publication_resolves_site_theme_root() {
         return;
     }
     let site = site("castopia.site");
-    let meta = block_on(read_repo_meta(&site, &root, None)).expect("publication reads");
+    let meta = block_on(read_repo_meta(&site, &root)).expect("publication reads");
     let theme = meta.theme_root.clone().expect("theme_root parsed");
     let (_hash, file) = resource(&meta, &site, &theme).expect("theme resolves through the index");
     assert_eq!(crate::assets::ca_file_ext(file), "text.css");
@@ -1182,7 +1247,7 @@ fn real_publication_localizes_relative_theme_imports() {
         return;
     }
     let site = site("castopia.site");
-    let meta = block_on(read_repo_meta(&site, &root, None)).expect("publication reads");
+    let meta = block_on(read_repo_meta(&site, &root)).expect("publication reads");
     let key = canon_file_key("https://castopia.site/-/static/scp-base.css").unwrap();
     let (hash, file) = resource(&meta, &site, &key).expect("theme row in the index");
     assert_eq!(file.content_type.as_deref(), Some("text/css"));

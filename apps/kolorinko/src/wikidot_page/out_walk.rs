@@ -61,6 +61,9 @@ struct RootDoc {
 
 #[derive(serde::Deserialize)]
 struct PagesDoc {
+    /// Publication format version: 3 carries the revision summary directly.
+    #[serde(default)]
+    v: u32,
     #[serde(default)]
     pages: Vec<PageEntry>,
 }
@@ -79,6 +82,14 @@ struct PageEntry {
     revisions_known: u64,
     #[serde(default)]
     max_rev: u64,
+    #[serde(default)]
+    created_by: Option<String>,
+    #[serde(default)]
+    created_at: Option<i64>,
+    #[serde(default)]
+    updated_by: Option<String>,
+    #[serde(default)]
+    updated_at: Option<i64>,
     #[serde(default)]
     archive: Option<String>,
     #[serde(default)]
@@ -128,14 +139,13 @@ pub(super) async fn read_head(site_dir: &Path) -> Result<Option<String>, ()> {
 ///
 /// A missing `HEAD` means the site has no publication and yields the empty
 /// metadata; any other read failure yields `None` (the caller keeps its
-/// previous output rather than flapping on a transient I/O error). Revision
-/// frontmatter is reused from `previous` for archives whose SHA-256 did not
-/// change, so a tick only decompresses new archives.
-pub(super) async fn read_repo_meta(
-    site: &SafePathComponent,
-    site_dir: &Path,
-    previous: Option<&RepoMeta>,
-) -> Option<RepoMeta> {
+/// previous output rather than flapping on a transient I/O error).
+///
+/// Publication v3 carries the first/last stored revision summary in the
+/// pages section, so this never opens a page archive. A v2 publication is
+/// adapted by decoding each archive once for that summary; republishing at
+/// v3 removes that fallback.
+pub(super) async fn read_repo_meta(site: &SafePathComponent, site_dir: &Path) -> Option<RepoMeta> {
     let head = match read_head(site_dir).await {
         Ok(Some(head)) => head,
         Ok(None) => return Some(RepoMeta::default()),
@@ -158,7 +168,8 @@ pub(super) async fn read_repo_meta(
         landing: chrome.landing,
         ..RepoMeta::default()
     };
-    for entry in pages.pages {
+    let PagesDoc { v, pages } = pages;
+    for entry in pages {
         let Ok(id) = entry.id.parse::<u64>() else {
             continue;
         };
@@ -169,20 +180,15 @@ pub(super) async fn read_repo_meta(
             (Some(path), Some(sha256)) => Some(PageArchive { path, sha256 }),
             _ => None,
         };
-        let revisions = match &archive {
-            Some(a) => {
-                let reused = previous
-                    .and_then(|p| p.pages.get(&id))
-                    .filter(|p| p.archive.as_ref().is_some_and(|pa| pa.sha256 == a.sha256))
-                    .map(|p| p.revisions.clone());
-                match reused {
-                    Some(revisions) => revisions,
-                    None => archive_revisions(site_dir, &a.path)
-                        .await
-                        .unwrap_or_default(),
-                }
-            }
-            None => Vec::new(),
+        let summary = if v >= 3 {
+            (
+                entry.created_by,
+                entry.created_at,
+                entry.updated_by,
+                entry.updated_at,
+            )
+        } else {
+            legacy_revision_summary(site_dir, archive.as_ref()).await
         };
         meta.by_slug.insert(slug, id);
         meta.pages.insert(
@@ -195,8 +201,11 @@ pub(super) async fn read_repo_meta(
                 revisions_stored: entry.revisions_stored,
                 revisions_known: entry.revisions_known,
                 max_rev: entry.max_rev,
+                created_by: summary.0,
+                created_at: summary.1,
+                updated_by: summary.2,
+                updated_at: summary.3,
                 archive,
-                revisions,
             },
         );
     }
@@ -206,51 +215,51 @@ pub(super) async fn read_repo_meta(
     Some(meta)
 }
 
-/// Read every `rNNN.txt` entry's frontmatter out of one page archive. The
-/// file read is async; the zstd/tar decode is ordinary CPU work, done inline
-/// like every other parser in the crate.
-async fn archive_revisions(site_dir: &Path, archive: &str) -> Option<Vec<RevMeta>> {
-    revisions_of(&fs::read(site_dir.join(archive)).await.ok()?)
+/// The first/last stored revision summary for a pre-v3 publication, decoded
+/// from the page archive. Returns all-`None` for a page without an archive or
+/// an unreadable one.
+async fn legacy_revision_summary(
+    site_dir: &Path,
+    archive: Option<&PageArchive>,
+) -> (Option<String>, Option<i64>, Option<String>, Option<i64>) {
+    let Some(archive) = archive else {
+        return Default::default();
+    };
+    let Some(bytes) = fs::read(site_dir.join(&archive.path)).await.ok() else {
+        return Default::default();
+    };
+    let Some(revisions) = revisions_of(&bytes) else {
+        return Default::default();
+    };
+    let first = revisions.first();
+    let last = revisions.last();
+    (
+        first.map(|r| r.author.clone()),
+        first.map(|r| r.timestamp),
+        last.map(|r| r.author.clone()),
+        last.map(|r| r.timestamp),
+    )
 }
 
-/// Decode one archive and collect its revision frontmatter, oldest first.
-fn revisions_of(bytes: &[u8]) -> Option<Vec<RevMeta>> {
-    let raw = zstd::stream::decode_all(bytes).ok()?;
-    let mut revisions = Vec::new();
-    let mut archive = Archive::new(&raw[..]);
-    for entry in archive.entries().ok()? {
-        let mut entry = entry.ok()?;
-        let Ok(name) = entry.path() else {
-            continue;
-        };
-        if rev_number(&name.to_string_lossy()).is_none() {
-            continue;
-        }
-        let mut text = String::new();
-        if entry.read_to_string(&mut text).is_err() {
-            continue;
-        }
-        if let Some(rev) = parse_rev_meta(&text) {
-            revisions.push(rev);
-        }
-    }
-    revisions.sort_unstable_by_key(|r| r.revision);
-    Some(revisions)
+/// One archive decode's worth of page data: the highest revision's body plus
+/// every stored revision's frontmatter.
+pub(super) struct LatestPage {
+    pub body: Arc<str>,
+    pub revisions: Vec<RevMeta>,
 }
 
-/// Read one page's latest body out of its immutable archive: the highest
-/// `rNNN.txt` entry, frontmatter stripped and NBSP-normalised. `None` when
-/// the page has no archive or the archive is unreadable.
-pub(super) async fn read_latest_body_at(site_dir: &Path, page: &PageMeta) -> Option<Arc<str>> {
-    let archive = page.archive.as_ref()?;
-    let bytes = fs::read(site_dir.join(&archive.path)).await.ok()?;
-    Some(Arc::from(latest_body_of(&bytes)?))
+/// What one archive entry contributes while streaming through it.
+struct ArchiveRead {
+    latest: Option<(u64, String)>,
+    revisions: Vec<RevMeta>,
 }
 
-/// Decode one archive and return its highest revision's body.
-fn latest_body_of(bytes: &[u8]) -> Option<String> {
+/// Decode one archive once, keeping its highest revision body and (when
+/// asked) every `rNNN.txt` frontmatter row, oldest first.
+fn read_archive(bytes: &[u8], collect_revisions: bool) -> Option<ArchiveRead> {
     let raw = zstd::stream::decode_all(bytes).ok()?;
     let mut latest: Option<(u64, String)> = None;
+    let mut revisions = Vec::new();
     let mut archive = Archive::new(&raw[..]);
     for entry in archive.entries().ok()? {
         let mut entry = entry.ok()?;
@@ -264,12 +273,58 @@ fn latest_body_of(bytes: &[u8]) -> Option<String> {
         if entry.read_to_string(&mut text).is_err() {
             continue;
         }
+        if collect_revisions && let Some(rev) = parse_rev_meta(&text) {
+            revisions.push(rev);
+        }
         if latest.as_ref().is_none_or(|(n, _)| no >= *n) {
             latest = Some((no, revision_body(&text).to_string()));
         }
     }
-    let (_, body) = latest?;
-    Some(body.replace('\u{a0}', " "))
+    revisions.sort_unstable_by_key(|r| r.revision);
+    Some(ArchiveRead { latest, revisions })
+}
+
+/// Decode one archive and collect its revision frontmatter, oldest first.
+fn revisions_of(bytes: &[u8]) -> Option<Vec<RevMeta>> {
+    read_archive(bytes, true).map(|read| read.revisions)
+}
+
+/// Decode one archive and return its highest revision body, NBSP-normalised.
+fn latest_body_of(bytes: &[u8]) -> Option<Arc<str>> {
+    let (_, body) = read_archive(bytes, false)?.latest?;
+    Some(Arc::from(body.replace('\u{a0}', " ")))
+}
+
+/// Read one page's latest body and full revision history out of its immutable
+/// archive in one decode. `None` when the page has no archive or the archive
+/// is unreadable.
+pub(super) async fn read_latest_page_at(site_dir: &Path, page: &PageMeta) -> Option<LatestPage> {
+    let archive = page.archive.as_ref()?;
+    let bytes = fs::read(site_dir.join(&archive.path)).await.ok()?;
+    let read = read_archive(&bytes, true)?;
+    let (_, body) = read.latest?;
+    Some(LatestPage {
+        body: Arc::from(body.replace('\u{a0}', " ")),
+        revisions: read.revisions,
+    })
+}
+
+/// Read one page's latest body out of its immutable archive. `None` when the
+/// page has no archive or the archive is unreadable.
+pub(super) async fn read_latest_body_at(site_dir: &Path, page: &PageMeta) -> Option<Arc<str>> {
+    let archive = page.archive.as_ref()?;
+    let bytes = fs::read(site_dir.join(&archive.path)).await.ok()?;
+    latest_body_of(&bytes)
+}
+
+/// [`read_latest_page_at`] for a page on a registered site, resolving the
+/// publication directory through the process globals.
+pub(super) async fn read_latest_page(
+    site: &SafePathComponent,
+    page: &PageMeta,
+) -> Option<LatestPage> {
+    let site_dir = crate::globals::repo().site_dir(site);
+    read_latest_page_at(&site_dir, page).await
 }
 
 /// [`read_latest_body_at`] for a page on a registered site, resolving the
