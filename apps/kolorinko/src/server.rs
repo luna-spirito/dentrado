@@ -59,7 +59,7 @@ use futures::{
 };
 use log::{error, info, warn};
 
-use dentrado::core::{core_ctx::Core, gear::GearResult, storage::PagedStorage};
+use dentrado::core::{core_ctx::Core, storage::PagedStorage};
 use kolorinko_rt::{
     Body,
     wire::{self, ClientMsg, ServerMsg},
@@ -67,7 +67,7 @@ use kolorinko_rt::{
 
 use crate::metrics;
 use crate::respond;
-use crate::runtime::KolorinkoRT;
+use crate::runtime::{KolorinkoRT, out_hash, to_wire_out};
 
 /// Max concurrent WebTransport sessions advertised per HTTP/3 connection
 /// (`SETTINGS_H3_WEBTRANSPORT_MAX_SESSIONS`). Default-0 means "none", which
@@ -471,15 +471,6 @@ async fn subscription_stream<S>(
 // payload out of the allocation (one copy per push; TODO serialize from the
 // shared borrow instead — no copies), and `Local` / non-`exposed` outputs
 // never ship.
-pub(crate) fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
-    match res {
-        GearResult::Ship(out) => Some(out),
-        GearResult::Shared(s) => Some((*s).clone()),
-        GearResult::Local(_) => None,
-    }
-    .filter(|out| out.is_exposed())
-}
-
 /// Push `out` on `w` unless its hash equals `last` (the client already holds
 /// it); on push, advance `last` to the new hash.
 async fn push_if_changed<W: AsyncWrite + Unpin>(
@@ -500,19 +491,6 @@ async fn push_if_changed<W: AsyncWrite + Unpin>(
         *last = Some(hash);
     }
     Ok(())
-}
-
-/// SHA-256 (hex) of a wire `GearOut`'s JSON encoding — the content hash the
-/// protocol skips unchanged pushes by (see [`kolorinko_rt::wire`]). Shared
-/// with the SSR state embedder ([`crate::ssr`]) so a hydrated page hashes
-/// exactly like a pushed one.
-pub(crate) fn out_hash(out: &wire::GearOut) -> String {
-    let json = serde_json::to_vec(out).expect("GearOut serializes");
-    ring::digest::digest(&ring::digest::SHA256, &json)
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 // ---- newline-delimited JSON (NDJSON) framing ---------------------------------

@@ -35,7 +35,7 @@ use dentrado_cache::{Storage, disk::FsDisk};
 
 use crate::{
     core::{
-        gear::IsRuntime,
+        api::RuntimeTypes,
         loc_ctx::{StoreResultSuccess, StoredEvent},
         storage::{
             GroupDiff, IsStorage, Watermark,
@@ -52,20 +52,20 @@ use disk::Disk;
 
 /// [`IsStorage`] whose gear views live in a [`dentrado_cache`] file.
 /// `ram()` is the runtime toggle: no file, views in a `BTreeMap`.
-pub struct PagedStorage<R: IsRuntime> {
+pub struct PagedStorage<R: RuntimeTypes> {
     ram: InMemoryStorage<R>,
     file: Option<PathBuf>,
     disk: RefCell<Disk>,
     dirty: Cell<bool>,
 }
 
-impl<R: IsRuntime> Default for PagedStorage<R> {
+impl<R: RuntimeTypes> Default for PagedStorage<R> {
     fn default() -> Self {
         Self::ram()
     }
 }
 
-impl<R: IsRuntime> PagedStorage<R> {
+impl<R: RuntimeTypes> PagedStorage<R> {
     #[must_use]
     pub fn ram() -> Self {
         Self {
@@ -94,7 +94,7 @@ impl<R: IsRuntime> PagedStorage<R> {
     }
 }
 
-impl<R: IsRuntime> GlobalResolver for PagedStorage<R> {
+impl<R: RuntimeTypes> GlobalResolver for PagedStorage<R> {
     fn resolve_user(&self, lid: LocUserId) -> Result<UserId, GroupRouteError> {
         self.ram.resolve_user(lid)
     }
@@ -151,7 +151,7 @@ impl GearView for PagedView<'_> {
 
 impl<R> IsStorage<R> for PagedStorage<R>
 where
-    R: IsRuntime,
+    R: RuntimeTypes,
 {
     // ── Layers 1–2: delegated to RAM ───────────────────────────────────────
 

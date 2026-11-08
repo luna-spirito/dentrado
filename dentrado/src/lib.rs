@@ -11,8 +11,9 @@ pub extern crate self as dentrado;
 /// gears can be authored as plain `async fn`s.
 pub use dentrado_macros::{gear, gears};
 
+pub mod types;
 pub mod core;
 pub(crate) mod fs;
-pub mod types;
 pub mod utils;
-pub mod wire;
+
+pub use core::wire;

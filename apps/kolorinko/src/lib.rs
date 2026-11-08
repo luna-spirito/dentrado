@@ -26,20 +26,21 @@ use std::{
 };
 
 use crate::runtime::KolorinkoRT;
+mod repo_state;
 mod assets;
 mod globals;
 mod metrics;
-mod render_cli;
-mod repo;
-mod respond;
-mod runtime;
-mod server;
-mod ssr;
 mod steer;
 mod tls;
-mod web;
-mod wikidot_page;
 pub mod wikidot_parser;
+mod runtime;
+mod ssr;
+mod repo;
+mod wikidot_page;
+mod respond;
+mod web;
+mod server;
+mod render_cli;
 /// Process configuration, loaded once from a `.toml` file whose path is passed
 /// as the sole CLI argument. Every setting that used to live in env vars or
 /// `const`s (publication source/interval, bind address, frontend dist,

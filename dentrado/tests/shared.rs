@@ -9,7 +9,7 @@ use std::fmt::Debug;
 use dentrado::{
     core::{
         core_ctx::{Core, GearCtx},
-        gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime},
+        gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime, RuntimeTypes},
         storage::{InMemoryStorage, IsStorage},
     },
     types::*,
@@ -49,7 +49,7 @@ pub enum SharedOut {
 #[derive(Debug, Clone)]
 pub struct SharedRuntime;
 
-impl IsRuntime for SharedRuntime {
+impl RuntimeTypes for SharedRuntime {
     type GearId = SharedGear;
     type GearOut = usize;
     type GearOutShared = SharedOut;
@@ -58,7 +58,9 @@ impl IsRuntime for SharedRuntime {
     type Group = i64;
     type Body = ();
     type Data = ();
+}
 
+impl IsRuntime for SharedRuntime {
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
             SharedGear::Src { bucket } => GearMeta::Event {

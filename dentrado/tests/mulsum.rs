@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use dentrado::{
     core::{
         core_ctx::{Core, GearCtx},
-        gear::{GearInput, GearMeta, GearProduce, IsRuntime},
+        gear::{GearInput, GearMeta, GearProduce, IsRuntime, RuntimeTypes},
         storage::{GearView, InMemoryStorage, IsStorage, Watermark},
     },
     types::*,
@@ -54,7 +54,7 @@ fn encode(state: &CacheState) -> Vec<u8> {
 #[derive(Debug, Clone)]
 pub struct MulSumRuntime;
 
-impl IsRuntime for MulSumRuntime {
+impl RuntimeTypes for MulSumRuntime {
     type GearId = MulSumGear;
     type GearOut = i64;
     type GearOutShared = ();
@@ -63,7 +63,9 @@ impl IsRuntime for MulSumRuntime {
     type Group = i64;
     type Body = MulSumBody;
     type Data = ();
+}
 
+impl IsRuntime for MulSumRuntime {
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
             MulSumGear::MulSum { bucket } => GearMeta::Event {

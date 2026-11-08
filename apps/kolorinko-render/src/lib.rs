@@ -10,8 +10,8 @@
 
 mod about;
 mod css;
-pub mod layout;
 mod render;
+pub mod layout;
 
 pub use about::{ABOUT_PATH, about_page};
 pub use css::{http_refs, http_tail, rewrite_with};

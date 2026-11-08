@@ -107,7 +107,6 @@ use kolorinko_wikitext::{
 use log::error;
 use std::{
     collections::{HashMap, HashSet},
-    fmt,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -124,7 +123,6 @@ mod article_latest;
 mod assets_gear;
 mod chunked;
 mod code_block;
-mod config;
 mod dataset;
 mod forms;
 mod iftags;
@@ -154,15 +152,16 @@ use out_worker::*;
 use resources::*;
 use vars::*;
 
+pub(crate) use crate::globals::OutMeta;
+pub(crate) use crate::repo_state::RepoState;
 pub(crate) use article_latest::{article_latest, article_latest_parsed};
 pub(crate) use assets_gear::{asset, ca_url};
 pub(crate) use code_block::code_block;
-pub(crate) use config::OutMeta;
 pub(crate) use dataset::{article, latest, list_pages, local_id, query_pages};
 pub(crate) use lenses::{repo_snap, shell};
+pub(crate) use repo_gear::repo;
 #[cfg(test)]
 pub(crate) use repo_gear::repo_step;
-pub(crate) use repo_gear::{RepoState, repo};
 
 /// Resolve a canonical address `(space, local)` to the dataset location that
 /// serves it: the registered site for the space, plus the page's current slug

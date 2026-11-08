@@ -9,7 +9,6 @@ use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 
 use super::PersistentCore;
-use crate::blockcache;
 use crate::core::freelist::{ChainEntry, chunk_cells, chunk_next};
 use crate::core::tree::{Item, parse_node};
 use crate::disk::IsFilesystem;
@@ -36,7 +35,7 @@ pub(crate) async fn walk_tree<D: IsFilesystem>(
             return Err(StoreError::Steps("tree: steps"));
         }
         fuel -= 1;
-        let n = blockcache::read::<D, _>(inner, p, parse_node).await?;
+        let n = crate::persist::read::<D, _>(inner, p, parse_node).await?;
         if n.level == 0 {
             es.extend(n.es);
         } else {
@@ -71,7 +70,7 @@ pub(crate) async fn walk_range<D: IsFilesystem>(
             return Err(StoreError::Steps("tree: steps"));
         }
         fuel -= 1;
-        let node = blockcache::read::<D, _>(inner, p, parse_node).await?;
+        let node = crate::persist::read::<D, _>(inner, p, parse_node).await?;
         if node.level == 0 {
             for (k, mt) in &node.es {
                 if k.as_slice() >= lo && hi.is_none_or(|h| k.as_slice() < h) {
@@ -114,7 +113,7 @@ pub(crate) async fn walk_parts<D: IsFilesystem>(
             return Err(StoreError::Steps("walk: steps"));
         }
         fuel -= 1;
-        let (cs, nx) = blockcache::read::<D, _>(inner, e.page, move |b| {
+        let (cs, nx) = crate::persist::read::<D, _>(inner, e.page, move |b| {
             (chunk_cells(b, e.off as usize), chunk_next(b))
         })
         .await?;
@@ -164,7 +163,7 @@ pub(crate) async fn walk_deps<D: IsFilesystem>(
         }
         fuel -= 1;
         out.push(p);
-        let deps = blockcache::read::<D, _>(inner, p, move |b| (ps.deps)(&b.0)).await??;
+        let deps = crate::persist::read::<D, _>(inner, p, move |b| (ps.deps)(&b.0)).await??;
         q.extend(deps);
     }
     Ok(out)

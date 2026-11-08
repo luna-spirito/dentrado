@@ -25,7 +25,7 @@ use std::{
 
 use dentrado_cache::{Session, Storage, disk::FsDisk};
 
-use crate::core::gear::IsRuntime;
+use crate::core::api::RuntimeTypes;
 
 /// The view table's identity. One table for every gear; per-gear
 /// isolation comes from the key prefix. A future version can move to
@@ -49,7 +49,7 @@ pub(crate) fn gear_spec() -> dentrado_cache::TableSpec {
 /// to turn it into bytes without adding a serialization bound to every
 /// runtime. The key is a cache key, not a content address: a changed id
 /// simply cold-starts the gear.
-pub(crate) fn gear_key<R: IsRuntime>(gear: &R::GearId) -> [u8; 32] {
+pub(crate) fn gear_key<R: RuntimeTypes>(gear: &R::GearId) -> [u8; 32] {
     let mut hasher = GearHasher(blake3::Hasher::new());
     gear.hash(&mut hasher);
     *hasher.0.finalize().as_bytes()

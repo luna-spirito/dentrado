@@ -19,7 +19,7 @@ use futures::channel::oneshot;
 
 use super::PagedStorage;
 use crate::core::{
-    gear::IsRuntime,
+    api::RuntimeTypes,
     storage::view::{gear_spec, gear_table},
 };
 
@@ -37,7 +37,7 @@ pub(super) enum Disk {
     Failed(String),
 }
 
-impl<R: IsRuntime> PagedStorage<R> {
+impl<R: RuntimeTypes> PagedStorage<R> {
     /// The opened store, or `None` in RAM mode (`ram()`). A failed open
     /// panics.
     pub(super) fn disk_open(&self) -> impl Future<Output = Option<Rc<Storage<FsDisk>>>> {
@@ -161,9 +161,9 @@ async fn open_quarantining(file: &Path) -> Result<Storage<FsDisk>, StoreError> {
 /// Cancellation guard for the opener: if the open future is dropped before
 /// publishing `Ready`/`Failed`, the slot returns to `Closed` and the
 /// waiters retry instead of parking forever.
-struct OpenGuard<'a, R: IsRuntime>(&'a PagedStorage<R>);
+struct OpenGuard<'a, R: RuntimeTypes>(&'a PagedStorage<R>);
 
-impl<R: IsRuntime> Drop for OpenGuard<'_, R> {
+impl<R: RuntimeTypes> Drop for OpenGuard<'_, R> {
     fn drop(&mut self) {
         let waiters = {
             let mut disk = self.0.disk.borrow_mut();

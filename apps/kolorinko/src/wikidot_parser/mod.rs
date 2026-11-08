@@ -33,16 +33,16 @@ pub mod types;
 pub(crate) use crate::wikidot_parser::types::*;
 pub(crate) use std::collections::HashMap;
 
-/// The facts-guided tree builder: folds [`pairer`] intervals into nodes.
-pub(crate) mod builder;
 pub mod helpers;
 pub(crate) mod lexer;
+/// The pairing pass: opener↔closer intervals as plain facts.
+pub(crate) mod pairer;
 /// The pre-redesign single-pass merger; kept as the diff oracle until the
 /// corpus finalises the open tables, then to be dissolved.
 #[allow(dead_code)]
 pub(crate) mod merge;
-/// The pairing pass: opener↔closer intervals as plain facts.
-pub(crate) mod pairer;
+/// The facts-guided tree builder: folds [`pairer`] intervals into nodes.
+pub(crate) mod builder;
 
 pub(crate) use helpers::*;
 

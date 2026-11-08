@@ -1,34 +1,9 @@
 use super::*;
+use crate::repo_state::RepoState;
 
 // =========================================================================
 // `repo` oracle gear
 // =========================================================================
-
-/// The `repo` gear's local output: the publication worker handle (spawned
-/// lazily on the first run) and the last adopted snapshot. The worker
-/// handle is process-local and cannot be persisted, so it rides the output
-/// and is recovered through
-/// [`GearCtx::previous_output`](dentrado::core::core_ctx::GearCtx::previous_output);
-/// the worker's *data* is persisted in the gear view (see [`PersistedWorker`]).
-#[derive(Clone)]
-pub(crate) struct RepoState {
-    pub(super) mailbox: OutMailbox,
-    pub(super) data: Rc<RepoSnapshot>,
-}
-
-impl fmt::Debug for RepoState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Never print the snapshot: it is the whole corpus.
-        f.debug_struct("RepoState").finish_non_exhaustive()
-    }
-}
-
-impl RepoState {
-    /// The adopted snapshot.
-    pub(crate) fn snapshot(&self) -> &RepoSnapshot {
-        &self.data
-    }
-}
 
 /// The gear-view key of the persisted worker image.
 const STATE_KEY: &[u8] = b"repo";

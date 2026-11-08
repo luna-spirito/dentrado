@@ -42,13 +42,13 @@
 
 #![deny(unsafe_code)]
 
+pub mod page;
+mod error;
+pub mod disk;
+pub mod schema;
 mod blockcache;
 pub mod core;
-pub mod disk;
-mod error;
-pub mod page;
 mod persist;
-pub mod schema;
 pub mod storage;
 
 pub use crate::core::freelist::ChainEntry;

@@ -1,5 +1,5 @@
 use crate::{
-    core::gear::IsRuntime,
+    core::api::RuntimeTypes,
     types::{DataId, LocMsgTypeId, LocSenderId, Localizable, Remapper, SenderPk, UserId},
 };
 
@@ -33,7 +33,7 @@ impl<K: Localizable + Clone, B: Localizable + Clone> Localizable for WireEventBo
 }
 
 #[derive(Debug)]
-pub struct WireLocCtx<R: IsRuntime> {
+pub struct WireLocCtx<R: RuntimeTypes> {
     pub users: Vec<UserId>,
 
     pub senders: Vec<(SenderPk, u32)>,
@@ -41,7 +41,7 @@ pub struct WireLocCtx<R: IsRuntime> {
     pub data: Vec<(DataId, R::Data)>,
 }
 
-impl<R: IsRuntime> Clone for WireLocCtx<R>
+impl<R: RuntimeTypes> Clone for WireLocCtx<R>
 where
     R::Data: Clone,
 {
@@ -54,7 +54,7 @@ where
     }
 }
 
-impl<R: IsRuntime> Default for WireLocCtx<R> {
+impl<R: RuntimeTypes> Default for WireLocCtx<R> {
     fn default() -> Self {
         Self {
             users: Vec::new(),
@@ -64,7 +64,7 @@ impl<R: IsRuntime> Default for WireLocCtx<R> {
     }
 }
 
-impl<R: IsRuntime> crate::types::GlobalResolver for WireLocCtx<R> {
+impl<R: RuntimeTypes> crate::types::GlobalResolver for WireLocCtx<R> {
     fn resolve_user(
         &self,
         lid: crate::types::LocUserId,

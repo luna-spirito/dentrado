@@ -12,11 +12,11 @@
 
 mod drafts;
 mod ebr;
-pub mod flush_round;
 pub mod freelist;
 pub mod sb;
-pub mod tables;
 pub mod tree;
+pub mod tables;
+pub mod flush_round;
 
 #[cfg(test)]
 mod tests;

@@ -72,9 +72,9 @@ pub(crate) async fn state(
     let page: ArticleView = (*page_sub.current()).clone();
     let shell: SiteShell = (*shell_sub.current()).clone();
     SsrState {
-        page_hash: crate::server::out_hash(&GearOut::ArticleLatestOut(page.clone())),
+        page_hash: crate::runtime::out_hash(&GearOut::ArticleLatestOut(page.clone())),
         page,
-        shell_hash: crate::server::out_hash(&GearOut::ShellOut(shell.clone())),
+        shell_hash: crate::runtime::out_hash(&GearOut::ShellOut(shell.clone())),
         shell,
         space,
         local,

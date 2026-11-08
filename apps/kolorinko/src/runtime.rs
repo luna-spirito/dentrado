@@ -1,7 +1,7 @@
-use crate::wikidot_page::RepoState;
-use dentrado::core::{core_ctx::GearCtx, storage::IsStorage};
+use crate::repo_state::RepoState;
+use dentrado::core::{core_ctx::GearCtx, gear::GearResult, storage::IsStorage};
 use kolorinko_rt::{
-    CodeBlock, LocalId, RepoSnapshot, SafePathComponent, ServedBlob, SiteShell, SpaceId,
+    CodeBlock, LocalId, RepoSnapshot, SafePathComponent, ServedBlob, SiteShell, SpaceId, wire,
 };
 use kolorinko_wikitext::ArticleView;
 
@@ -47,3 +47,29 @@ pub(crate) use gears::{
 // view round-trip tests open a gear view by id.
 #[cfg(test)]
 pub(crate) use gears::GearId;
+
+/// Project a stored gear output onto the wire form, if this family is
+/// shippable. A `Ship` output already *is* a wire output, a `Shared` handle
+/// clones its payload out of the allocation (one copy per push; TODO serialize
+/// from the shared borrow instead — no copies), and `Local` / non-`exposed`
+/// outputs never ship.
+pub(crate) fn to_wire_out(res: GearResult<KolorinkoRT>) -> Option<wire::GearOut> {
+    match res {
+        GearResult::Ship(out) => Some(out),
+        GearResult::Shared(s) => Some((*s).clone()),
+        GearResult::Local(_) => None,
+    }
+    .filter(|out| out.is_exposed())
+}
+
+/// SHA-256 (hex) of a wire `GearOut`'s JSON encoding — the content hash the
+/// protocol skips unchanged pushes by (see [`kolorinko_rt::wire`]). Shared with
+/// the SSR state embedder so a hydrated page hashes exactly like a pushed one.
+pub(crate) fn out_hash(out: &wire::GearOut) -> String {
+    let json = serde_json::to_vec(out).expect("GearOut serializes");
+    ring::digest::digest(&ring::digest::SHA256, &json)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}

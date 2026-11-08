@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use dentrado::{
     core::{
         core_ctx::GearCtx,
-        gear::{GearInput, GearMeta, GearProduce, IsRuntime},
+        gear::{GearInput, GearMeta, GearProduce, IsRuntime, RuntimeTypes},
         storage::{GearView, InMemoryStorage, IsStorage, Watermark},
     },
     types::*,
@@ -72,7 +72,7 @@ impl GlobalHash for BranchData {
 #[derive(Debug, Clone)]
 pub struct WikiCounterRuntime;
 
-impl IsRuntime for WikiCounterRuntime {
+impl RuntimeTypes for WikiCounterRuntime {
     type GearId = WikiGear;
     type GearOut = i64;
     type GearOutShared = ();
@@ -81,7 +81,9 @@ impl IsRuntime for WikiCounterRuntime {
     type Group = LocDataId;
     type Body = LocUserId;
     type Data = BranchData;
+}
 
+impl IsRuntime for WikiCounterRuntime {
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
             WikiGear::InvitesCount { branch } => GearMeta::Event {

@@ -6,15 +6,14 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 
-use super::PersistentCore;
-use super::walks::{walk_chain_raw, walk_deps, walk_parts, walk_tree};
-use crate::blockcache;
+use super::{Storage, Violation};
 use crate::core::sb::{MAX_TABLE_ID, MAX_TABLES, Sb, parse_sb};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{PageId, fnv_id};
+use crate::persist::PersistentCore;
+use crate::persist::walks::{walk_chain_raw, walk_deps, walk_parts, walk_tree};
 use crate::schema::{NO_DEPS, TableSpec};
-use crate::storage::{Storage, Violation};
 
 impl<D: IsFilesystem> Storage<D> {
     /// Recovery: the newest valid SB (both chains walk through, counts
@@ -49,7 +48,7 @@ impl<D: IsFilesystem> Storage<D> {
         // An error from here on drops the handles — and with them the
         // driver and the round agent, whose `Rc`s would otherwise keep
         // the store alive forever.
-        let driver = blockcache::spawn_driver(&inner);
+        let driver = crate::persist::spawn_driver(&inner);
         let flusher = super::flush::spawn_agent(&inner);
         let (ra, sa) = sb_slot::<D>(&inner, 0).await?;
         let (rb, sb1) = sb_slot::<D>(&inner, 1).await?;
@@ -455,7 +454,7 @@ async fn sb_slot<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     id: PageId,
 ) -> Result<(bool, Option<Sb>), StoreError> {
-    match blockcache::read::<D, _>(inner, id, parse_sb).await {
+    match crate::persist::read::<D, _>(inner, id, parse_sb).await {
         Ok(sb) => Ok((true, sb)),
         Err(StoreError::Eof) => Ok((false, None)),
         Err(e) => Err(e),

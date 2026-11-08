@@ -5,11 +5,11 @@ use std::rc::Rc;
 
 use futures::channel::oneshot;
 
-use super::seq::Submit;
+use super::PersistentCore;
+use crate::blockcache::Submit;
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{AlignedPage, PageId};
-use crate::persist::PersistentCore;
 
 /// A wish's one ladder: the answer on the spot, or the queue's by the
 /// receiver — one step over the cache either way.

@@ -11,12 +11,12 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use super::{Guard, Session, Storage};
-use crate::blockcache;
 use crate::core::tree::{leaf_find, parse_node, route};
 use crate::core::{DeltaV, StepHit};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::PageId;
+use crate::persist;
 use crate::persist::PersistentCore;
 use crate::persist::walks::walk_range;
 
@@ -202,7 +202,7 @@ async fn descend<D: IsFilesystem>(
             return Err(StoreError::Steps("tree: steps"));
         }
         fuel -= 1;
-        let node = blockcache::read::<D, _>(inner, p, parse_node).await?;
+        let node = persist::read::<D, _>(inner, p, parse_node).await?;
         if node.level == 0 {
             break leaf_find(&node, key).map(|mt| mt.to_vec());
         }

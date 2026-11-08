@@ -24,7 +24,7 @@ use std::{
 
 use crate::{
     core::{
-        gear::IsRuntime,
+        api::RuntimeTypes,
         loc_ctx::{EventGroup, StoreResultSuccess, StoredEvent},
         storage::{GroupDiff, IsStorage, RamView, Watermark, view::gear_key},
     },
@@ -34,7 +34,7 @@ use crate::{
     },
 };
 
-struct Inner<R: IsRuntime> {
+struct Inner<R: RuntimeTypes> {
     // localization
     pk_to_sender: HashMap<SenderPk, LocSenderId>,
     sender_to_pk: HashMap<LocSenderId, SenderPk>,
@@ -50,7 +50,7 @@ struct Inner<R: IsRuntime> {
     group_by_key: HashMap<(LocMsgTypeId, R::Group), LocGroupId>,
 }
 
-impl<R: IsRuntime> Inner<R> {
+impl<R: RuntimeTypes> Inner<R> {
     fn new() -> Self {
         Self {
             pk_to_sender: HashMap::new(),
@@ -67,13 +67,13 @@ impl<R: IsRuntime> Inner<R> {
 }
 
 /// In-memory typed `Storage`.
-pub struct InMemoryStorage<R: IsRuntime> {
+pub struct InMemoryStorage<R: RuntimeTypes> {
     inner: RefCell<Inner<R>>,
     /// The gear views: full (prefixed) key → flat value.
     gear_data: RefCell<BTreeMap<Vec<u8>, Vec<u8>>>,
 }
 
-impl<R: IsRuntime> Default for InMemoryStorage<R> {
+impl<R: RuntimeTypes> Default for InMemoryStorage<R> {
     fn default() -> Self {
         Self {
             inner: RefCell::new(Inner::new()),
@@ -82,7 +82,7 @@ impl<R: IsRuntime> Default for InMemoryStorage<R> {
     }
 }
 
-impl<R: IsRuntime> InMemoryStorage<R> {
+impl<R: RuntimeTypes> InMemoryStorage<R> {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -99,7 +99,7 @@ impl<R: IsRuntime> InMemoryStorage<R> {
 
 // mk_data verifies content hashes by resolving embedded LocDataId refs against
 // the store, so the backend must be a GlobalResolver over its own state.
-impl<R: IsRuntime> GlobalResolver for InMemoryStorage<R> {
+impl<R: RuntimeTypes> GlobalResolver for InMemoryStorage<R> {
     fn resolve_user(&self, lid: LocUserId) -> Result<UserId, GroupRouteError> {
         let inner = self.inner.borrow();
         inner.local_to_user_id.get(&lid).copied().ok_or({
@@ -125,7 +125,7 @@ impl<R: IsRuntime> GlobalResolver for InMemoryStorage<R> {
     }
 }
 
-impl<R: IsRuntime> IsStorage<R> for InMemoryStorage<R> {
+impl<R: RuntimeTypes> IsStorage<R> for InMemoryStorage<R> {
     // ── localization: idempotent allocators ───────────────────────────────
 
     fn mk_loc_user(&self, uid: UserId) -> impl Future<Output = LocUserId> {

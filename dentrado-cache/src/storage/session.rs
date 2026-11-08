@@ -35,12 +35,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::Storage;
-use crate::blockcache;
 use crate::core::tree::leaf_holds;
 use crate::core::{AllocAct, SealBatch, SealRec, Snap};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{AlignedPage, PageId};
+use crate::persist;
 use crate::persist::PersistentCore;
 
 /// A session's own draft — an index into its ledger, checked at every
@@ -176,7 +176,7 @@ impl<D: IsFilesystem> Session<D> {
                     // reader — the guard rolls it back and wakes the
                     // parked, unless defused at the splice.
                     let rb = ReadRollback::new(self.inner.clone(), ep, e);
-                    let (cells, nx) = blockcache::read::<D, _>(&self.inner, e.page, move |b| {
+                    let (cells, nx) = persist::read::<D, _>(&self.inner, e.page, move |b| {
                         (
                             crate::core::freelist::chunk_cells(b, e.off as usize),
                             crate::core::freelist::chunk_next(b),
@@ -211,9 +211,9 @@ impl<D: IsFilesystem> Session<D> {
     {
         let (p, written) = self.slot(id)?;
         let r = if written {
-            blockcache::update::<D, _>(&self.inner, p, f).await?
+            persist::update::<D, _>(&self.inner, p, f).await?
         } else {
-            blockcache::init::<D, _>(&self.inner, p, f).await?
+            persist::init::<D, _>(&self.inner, p, f).await?
         };
         if !written {
             self.drafts[id.i].as_mut().expect("the slot was alive").1 = true;
@@ -238,7 +238,7 @@ impl<D: IsFilesystem> Session<D> {
         if self.inner.borrow().poisoned {
             return Err(StoreError::Poisoned);
         }
-        blockcache::read::<D, _>(&self.inner, p, f).await
+        persist::read::<D, _>(&self.inner, p, f).await
     }
 
     /// The session's snapshot, taken at its first read: a pin plus the

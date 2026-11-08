@@ -16,22 +16,46 @@ use compio::runtime::JoinHandle;
 use futures::FutureExt;
 use slotmap::{SlotMap, new_key_type};
 
-pub use crate::core::subscription::Subscription;
 use crate::{
     core::{
-        db,
+        api::{
+            Epoch, GearInput, GearMeta, GearProduce, GearResult, RemoteShared, RuntimeTypes,
+            Shared, SharedArena, SharedBus, SharedData, SharedKey,
+        },
         doorbell::DoorbellHandle,
-        gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime},
-        shared::{RemoteShared, Shared, SharedArena, SharedBus, SharedData, SharedKey},
+        routing,
         stats::CoreStats,
         storage::{GearView, GroupStore, IsStorage},
-        subscription::Epoch,
+        wire::{
+            MergeError, RunGearError, WireEventBody, WireLocCtx, WireLocCtxBuilder,
+            WireLocCtxMerger,
+        },
     },
     types::{GlobalCoreId, GlobalHash, LocGroupId, NodeId},
-    wire::{
-        MergeError, RunGearError, WireEventBody, WireLocCtx, WireLocCtxBuilder, WireLocCtxMerger,
-    },
 };
+
+/// The behaviour half of a runtime: how a gear is routed and how it runs.
+///
+/// The type vocabulary ([`RuntimeTypes`]) lives in [`crate::core::api`]; this
+/// trait adds the gear-facing parts, which need the gear context and storage.
+pub trait IsRuntime: RuntimeTypes {
+    fn meta(gear: &Self::GearId) -> GearMeta<Self>;
+
+    /// Compute (or incrementally update) the gear's output.
+    ///
+    /// `ctx` carries the gear's id, the live `Core` (via `Deref`), and the
+    /// `secondary_get` entry point for declaring gear→gear dependencies.
+    /// `view` is the gear's private flat key-value overlay over the store:
+    /// reads see the old world, writes are staged and committed by the
+    /// runtime after the run. Must not hold any `inner` borrow across
+    /// `.await` (the core's `RefCell` is shared between all concurrently
+    /// polled gears on this core).
+    async fn run_step<S: IsStorage<Self>>(
+        ctx: &mut GearCtx<Self, S>,
+        input: GearInput<Self>,
+        view: &mut S::View<'_>,
+    ) -> GearProduce<Self>;
+}
 
 // TODO: Crack down on clones?
 // TODO: Secondary input caching? Quite desirable to keep processing strictly local.
@@ -1655,7 +1679,7 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
             impl FnMut() -> Option<flume::Sender<Result<(), MergeError>>>,
         ),
     ) -> Result<(), MergeError> {
-        let routed = db::route_events(wire_ctx, events, self.num_cores())?;
+        let routed = routing::route_events(wire_ctx, events, self.num_cores())?;
 
         let mut our_task = None;
         for (target_core, seed_indices) in routed.core_seeds {
@@ -1702,7 +1726,7 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
         gear: R::GearId,
         wire_ctx: WireLocCtx<R>,
     ) -> Result<R::GearOut, RunGearError> {
-        let target_core = db::route_gear(&gear, &wire_ctx, self.num_cores())?;
+        let target_core = routing::route_gear(&R::meta(&gear), &wire_ctx, self.num_cores())?;
 
         if target_core == self.core_id {
             // Direct call on this core.
@@ -1987,5 +2011,51 @@ impl<R: IsRuntime> CoreLocCtx<R> {
         // NOTE: `gear_cache` is intentionally NOT touched here. It is keyed by
         // the stable `R::GearId` and persists across eviction/reactivation so a
         // returning gear resumes from its old working state (e.g. its watermark).
+    }
+}
+
+/// RAII handle for a direct, worker-side subscription to a gear's output.
+///
+/// Dropping it decrements the gear's direct-subscriber count and rebalances the
+/// gear (demoting it to limbo, or evicting it under pressure). Naturally
+/// `!Sync` via `Rc<Core>`: it must live on the owning core's thread.
+#[must_use]
+pub struct Subscription<R: IsRuntime, S: IsStorage<R>> {
+    pub(crate) core: Rc<Core<R, S>>,
+    /// The arena key, stored directly (not the `R::GearId`) so `current`/`next`/
+    /// `Drop` skip the `gear_index` lookup. Safe because a live `Subscription`
+    /// holds `direct_subscriber_count >= 1`, so `has_interest` is true and the
+    /// gear cannot be evicted (its key cannot go stale) for as long as this
+    /// handle exists.
+    pub(crate) key: GearKey,
+}
+
+impl<R: IsRuntime, S: IsStorage<R>> Subscription<R, S> {
+    /// Read the gear's currently-cached output. The value is guaranteed to be
+    /// present (subscribe awaits the first computation).
+    #[must_use]
+    pub fn current(&self) -> GearResult<R> {
+        self.core
+            .current_output_key(self.key)
+            .expect("Subscription::current: gear has no output")
+    }
+
+    /// Wait for the next output update (the gear's [`Epoch`] bumps after
+    /// each completed run / `SubscriptionUpdate`) and return the new value.
+    pub async fn next(&self) -> GearResult<R> {
+        let seen = self
+            .core
+            .change_epoch(self.key)
+            .expect("Subscription::next: gear evicted while subscribed");
+        self.core.wait_change(self.key, seen).await;
+        self.current()
+    }
+}
+
+impl<R: IsRuntime, S: IsStorage<R>> Drop for Subscription<R, S> {
+    fn drop(&mut self) {
+        if self.core.release_direct_subscriber(self.key) {
+            self.core.rebalance_key(self.key);
+        }
     }
 }

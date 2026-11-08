@@ -1,6 +1,6 @@
 //! The `#[gears]` module attribute + `#[gear]` fn marker: define a runtime's
 //! gears as plain `async fn`s and let the macro generate the `GearId` /
-//! `GearOut` / `Group` enums, the `IsRuntime` impl, the `GlobalHash` impl for
+//! `GearOut` / `Group` enums, the `RuntimeTypes` / `IsRuntime` impls, the `GlobalHash` impl for
 //! `Group`, and the per-gear `GearQuery` builders (the typed dependency
 //! layer).
 //!
@@ -1121,7 +1121,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
                     >
                 {
                     fn #project(
-                        shared: &<#runtime as ::dentrado::core::gear::IsRuntime>::GearOutShared,
+                        shared: &<#runtime as ::dentrado::core::gear::RuntimeTypes>::GearOutShared,
                     ) -> &#out_t {
                         match shared {
                             GearOutShared::#out_v(__o) => __o,
@@ -1170,7 +1170,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         // runtime: it is not re-exported (the `gears` module is private), so
         // callers can never name it — gear ids are constructed only through the
         // per-gear `GearQuery` builders below. It stays `pub(crate)`-declared
-        // because `IsRuntime`'s associated type is reached through pub(crate)
+        // because `RuntimeTypes`'s associated types are reached through pub(crate)
         // APIs (`Core::subscribe_gear`, `GearResult`, …). Its `Hash` is the
         // stable per-gear view subkey — no serialization bound.
         #[derive(
@@ -1217,7 +1217,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
 
         const PHANTOM_MSG: ::dentrado::types::LocMsgTypeId = ::dentrado::types::LocMsgTypeId(0);
 
-        impl ::dentrado::core::gear::IsRuntime for #runtime {
+        impl ::dentrado::core::gear::RuntimeTypes for #runtime {
             type GearId = GearId;
             type GearOut = GearOut;
             type GearOutShared = GearOutShared;
@@ -1226,7 +1226,9 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             type Group = Group;
             type Body = ();
             type Data = ();
+        }
 
+        impl ::dentrado::core::gear::IsRuntime for #runtime {
             fn meta(gear: &Self::GearId) -> ::dentrado::core::gear::GearMeta<Self> {
                 match gear {
                     #( #meta_arms )*

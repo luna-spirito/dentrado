@@ -27,6 +27,8 @@
 
 mod records;
 mod session;
+mod flush;
+mod image;
 
 pub use session::{DraftPageId, Session};
 

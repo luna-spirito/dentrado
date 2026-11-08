@@ -10,7 +10,6 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use super::PersistentCore;
-use crate::blockcache;
 use crate::core::Delta;
 use crate::core::freelist::{CHUNK_SLOTS, ChainEntry, chunk_cells, chunk_next};
 use crate::disk::IsFilesystem;
@@ -20,47 +19,47 @@ use crate::page::PageId;
 /// The seal-time world of the taken pool — the round's rollback
 /// restores it wholesale if the round fails; the flight's own copies
 /// (the head, the tail, the counter) evolve past it through the round.
-pub(super) struct Home {
-    pub(super) head: Vec<PageId>,
-    pub(super) tail: ChainEntry,
-    pub(super) next: PageId,
+pub(crate) struct Home {
+    pub(crate) head: Vec<PageId>,
+    pub(crate) tail: ChainEntry,
+    pub(crate) next: PageId,
 }
 
 /// A flush round's flight.
-pub(super) struct Flight {
-    pub(super) ep: usize,
+pub(crate) struct Flight {
+    pub(crate) ep: usize,
     /// A, taken whole — eaten and grown through the round: the stock
     /// head, the tail-eating position, the counter, the drains.
-    pub(super) head: Vec<PageId>,
-    pub(super) tail: ChainEntry,
-    pub(super) next: PageId,
-    pub(super) drains: Vec<PageId>,
+    pub(crate) head: Vec<PageId>,
+    pub(crate) tail: ChainEntry,
+    pub(crate) next: PageId,
+    pub(crate) drains: Vec<PageId>,
     /// The taken pool's seal-time world (the rollback's anchor).
-    pub(super) home: Home,
+    pub(crate) home: Home,
     /// The sealed world: the retiring containers, the deaths pile, the
     /// pendings and drafts copies (the limbo), the task pool's copy.
-    pub(super) spent: Vec<PageId>,
-    pub(super) dying: Vec<PageId>,
-    pub(super) pend: Vec<PageId>,
-    pub(super) drafts: Vec<PageId>,
-    pub(super) bhead: Vec<PageId>,
-    pub(super) btail: ChainEntry,
+    pub(crate) spent: Vec<PageId>,
+    pub(crate) dying: Vec<PageId>,
+    pub(crate) pend: Vec<PageId>,
+    pub(crate) drafts: Vec<PageId>,
+    pub(crate) bhead: Vec<PageId>,
+    pub(crate) btail: ChainEntry,
     /// The copied pool's seal-time bookmark (the rollback-side anchor
     /// of the round-eaten remainder move — see [`Flight::eat_remainder`]).
-    pub(super) bhome: ChainEntry,
-    pub(super) bnext: PageId,
+    pub(crate) bhome: ChainEntry,
+    pub(crate) bnext: PageId,
     /// The delta snapshots from the start, the table roots beside them.
-    pub(super) snaps: Vec<Delta>,
-    pub(super) roots: Vec<PageId>,
+    pub(crate) snaps: Vec<Delta>,
+    pub(crate) roots: Vec<PageId>,
     /// The rebuilt tables' old pages — limbo here, deaths at the commit.
-    pub(super) old_tree: Vec<PageId>,
-    pub(super) old_gen: u64,
+    pub(crate) old_tree: Vec<PageId>,
+    pub(crate) old_gen: u64,
 }
 
 impl Flight {
     /// Splice in a tail chunk: the cells into the head remainder, the
     /// emptied chunk page into the drains, the position onward.
-    pub(super) fn eat(&mut self, cells: Vec<PageId>, nx: PageId, chunk_p: PageId) {
+    pub(crate) fn eat(&mut self, cells: Vec<PageId>, nx: PageId, chunk_p: PageId) {
         self.head.extend(cells);
         self.drains.push(chunk_p);
         self.tail = ChainEntry::full(nx);
@@ -77,7 +76,7 @@ impl Flight {
     /// (both re-list as its front cells — the new chain bypasses the
     /// container, so it retires now; the runtime bookmark follows at
     /// the commit via `Frees::retask`).
-    pub(super) fn eat_remainder(&mut self, taken: bool, cells: Vec<PageId>, nx: PageId) {
+    pub(crate) fn eat_remainder(&mut self, taken: bool, cells: Vec<PageId>, nx: PageId) {
         let p = if taken { 1 - self.ep } else { self.ep };
         let listed: HashSet<PageId> = self.cells(&[], p).1.into_iter().collect();
         let page = if taken {
@@ -107,7 +106,7 @@ impl Flight {
     /// undrained deaths) — and the free — everything the round frees
     /// for good. The bag: the stock head and the husk (the taken
     /// pool), the head copy (the other one).
-    pub(super) fn cells(&self, live: &[PageId], p: usize) -> (Vec<PageId>, Vec<PageId>) {
+    pub(crate) fn cells(&self, live: &[PageId], p: usize) -> (Vec<PageId>, Vec<PageId>) {
         let par = |x: &PageId| (x % 2) as usize == p;
         let mut free: Vec<PageId> = self
             .dying
@@ -140,7 +139,7 @@ impl Flight {
 /// Take `n` pages from the flight: the head's remainder → the tail's
 /// chunks → growing the round's own counter. The flight is the
 /// accumulator (the round's locals).
-pub(super) async fn take_flight<D: IsFilesystem>(
+pub(crate) async fn take_flight<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     fl: &mut Flight,
     fuel0: u64,
@@ -166,7 +165,7 @@ pub(super) async fn take_flight<D: IsFilesystem>(
         } else {
             let tp = fl.tail.page;
             let off = fl.tail.off;
-            let (cells, nx) = blockcache::read::<D, _>(inner, tp, move |b| {
+            let (cells, nx) = crate::persist::read::<D, _>(inner, tp, move |b| {
                 (chunk_cells(b, off as usize), chunk_next(b))
             })
             .await?;
@@ -180,7 +179,7 @@ pub(super) async fn take_flight<D: IsFilesystem>(
 /// resnapshot). The snapshot's one live read is the husk — the
 /// mid-round retires into the taken pool, whose listings retire
 /// with this round's fronts.
-pub(super) async fn flip_loop<D: IsFilesystem>(
+pub(crate) async fn flip_loop<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     fl: &mut Flight,
     need_pages: usize,
@@ -228,11 +227,11 @@ pub(super) async fn flip_loop<D: IsFilesystem>(
 
 /// A flip snapshot: everything going into the new image — the stock
 /// and, per pool, the limbo and the free cells.
-pub(super) struct FlipData {
+pub(crate) struct FlipData {
     /// The tree pages + the chunk pages.
-    pub(super) stock: Vec<PageId>,
-    pub(super) limbo: [Vec<PageId>; 2],
-    pub(super) free: [Vec<PageId>; 2],
-    pub(super) ep: usize,
-    pub(super) old_gen: u64,
+    pub(crate) stock: Vec<PageId>,
+    pub(crate) limbo: [Vec<PageId>; 2],
+    pub(crate) free: [Vec<PageId>; 2],
+    pub(crate) ep: usize,
+    pub(crate) old_gen: u64,
 }

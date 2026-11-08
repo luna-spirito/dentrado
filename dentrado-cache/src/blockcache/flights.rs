@@ -2,23 +2,15 @@
 //! it. A slot travels as its own io buffer — its lease, `arena::LoadPage`
 //! or `arena::SavePage`, is the flight's sole passenger.
 
-use std::cell::RefCell;
 use std::future::Future;
-use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
-
-use compio::runtime::JoinHandle;
-use futures::FutureExt;
-use futures::future::poll_fn;
 
 use super::arena::{LoadPage, SavePage};
 use super::{BlockCache, SlotId};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::PageId;
-use crate::persist::PersistentCore;
 
 // ## Flights
 
@@ -160,42 +152,4 @@ impl<D: IsFilesystem> BlockCache<D> {
         };
         self.fl.push(f);
     }
-}
-
-// ## The driver
-
-/// The flight driver — a task owning the store whole: the registry is a
-/// field of it, every section pushes through its own borrow, the
-/// driver reaps in short ones (a borrow never lives across an await,
-/// so single-threaded no wakeup is ever lost). It never exits on its
-/// own — the store's death is its death: `Store` holds the task's
-/// [`JoinHandle`], and dropping the handle cancels the task, dropping
-/// the future with its `Rc` — the store's last reference. The
-/// in-flight ops die cancelled, and each of their buffers stays
-/// compio's until its op is reaped, so no page is ever torn from under
-/// the kernel.
-async fn drive<D: IsFilesystem>(inner: Rc<RefCell<PersistentCore<D>>>) -> ! {
-    loop {
-        // A panicking reap poisons the store (from then on every
-        // semantic op refuses) — but the loop lives on: the io plumbing
-        // must keep draining, or the readers parked before the poison
-        // would wait for flights that never land. The default panic
-        // hook has already reported the cause by the time we land here.
-        let step = poll_fn(|cx| match inner.borrow_mut().core.reap(cx) {
-            0 => Poll::Pending,
-            _ => Poll::Ready(()),
-        });
-        if AssertUnwindSafe(step).catch_unwind().await.is_err() {
-            inner.borrow_mut().poison();
-        }
-    }
-}
-
-/// Spawn the driver task at store birth: the handle goes to `Store` —
-/// its drop is the driver's death sentence. Only the spawn needs a
-/// runtime context, hence this lives here and not in the constructor.
-pub(crate) fn spawn_driver<D: IsFilesystem>(
-    inner: &Rc<RefCell<PersistentCore<D>>>,
-) -> JoinHandle<!> {
-    compio::runtime::spawn(drive(Rc::clone(inner)))
 }

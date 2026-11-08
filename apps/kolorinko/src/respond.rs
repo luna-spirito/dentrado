@@ -178,10 +178,10 @@ pub(crate) async fn legacy(
         return Reply::bad_request();
     };
     let sub = core.subscribe_gear(id.into()).await;
-    let Some(out) = crate::server::to_wire_out(sub.current()) else {
+    let Some(out) = crate::runtime::to_wire_out(sub.current()) else {
         return Reply::no_content();
     };
-    let hash_now = crate::server::out_hash(&out);
+    let hash_now = crate::runtime::out_hash(&out);
     if hash.as_deref() == Some(hash_now.as_str()) {
         return Reply::no_content();
     }

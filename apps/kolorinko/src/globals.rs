@@ -24,6 +24,7 @@
 use std::{
     collections::{HashMap, HashSet},
     num::NonZero,
+    path::{Path, PathBuf},
     sync::OnceLock,
 };
 
@@ -32,7 +33,39 @@ use kolorinko_rt::{SafePathComponent, SpaceId};
 use ring::digest::{SHA256, digest};
 use serde::Deserialize;
 
-use crate::wikidot_page::OutMeta;
+/// The evakuilo publication source configuration: the publication root (the
+/// daemon's `out/` directory — the one holding `<site>/` publications) and how
+/// often to rescan it. Held `&'static` (process-global via this module,
+/// leaked once at initialization) because the values name the directory the
+/// publication worker thread reads for the whole process lifetime.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct OutMeta {
+    dir: &'static Path,
+    interval: u32,
+}
+
+impl OutMeta {
+    #[must_use]
+    pub(crate) const fn new(dir: &'static Path, interval: u32) -> Self {
+        Self { dir, interval }
+    }
+
+    #[must_use]
+    pub(crate) const fn interval(&self) -> u32 {
+        self.interval
+    }
+
+    #[must_use]
+    pub(crate) const fn dir(&self) -> &'static Path {
+        self.dir
+    }
+
+    /// The published artifact of one site: `<dir>/<site>`.
+    #[must_use]
+    pub(crate) fn site_dir(&self, site: &str) -> PathBuf {
+        self.dir.join(site)
+    }
+}
 
 /// One `ensure-evakuilo-sites` table entry: the site's alias domains. (Its
 /// landing page is not configured — it travels with the publication, the

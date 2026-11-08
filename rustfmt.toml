@@ -1,0 +1,4 @@
+# Module declarations encode the crate's reading order; the module-order
+# checker (`tools/module_order.py`) enforces it. Sorting them alphabetically
+# would destroy that order.
+reorder_modules = false

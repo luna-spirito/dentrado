@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::HashMap, fmt::Debug, num::NonZero};
 use dentrado::{
     core::{
         core_ctx::GearCtx,
-        gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime},
+        gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime, RuntimeTypes},
         storage::{InMemoryStorage, IsStorage, Watermark},
     },
     types::*,
@@ -234,7 +234,7 @@ impl GlobalHash for Wiki2Group {
 #[derive(Debug, Clone)]
 pub struct Wiki2Runtime;
 
-impl IsRuntime for Wiki2Runtime {
+impl RuntimeTypes for Wiki2Runtime {
     type GearId = Wiki2Gear;
     type GearOut = Wiki2GearOut;
     type GearOutShared = ();
@@ -243,7 +243,9 @@ impl IsRuntime for Wiki2Runtime {
     type Group = Wiki2Group;
     type Body = Wiki2Body;
     type Data = BranchData;
+}
 
+impl IsRuntime for Wiki2Runtime {
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
             Wiki2Gear::Invited { branch } => GearMeta::Event {

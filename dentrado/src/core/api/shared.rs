@@ -1,7 +1,17 @@
-use slotmap::{SlotMap, new_key_type};
-use std::{cell::UnsafeCell, fmt::Debug, ops::Deref, ptr::NonNull, rc::Weak};
+//! The shared-output family: opaque [`Sync`] payloads read by reference across
+//! cores, plus the per-gear change signal.
 
-use crate::core::gear::IsRuntime;
+use slotmap::{SlotMap, new_key_type};
+use std::{
+    cell::UnsafeCell,
+    fmt::Debug,
+    ops::Deref,
+    ptr::NonNull,
+    rc::Weak,
+    task::{Context, Waker},
+};
+
+use super::RuntimeTypes;
 
 // ── shared-output family ───────────────────────────────────────────────────
 //
@@ -54,19 +64,19 @@ use crate::core::gear::IsRuntime;
 /// deliberately separated from any refcount, so cross-core refcount mutation
 /// on the owner never dirties this cache line. The only `unsafe` here is the
 /// `Sync` impl — sound because nothing mutates the value after construction.
-pub(crate) struct SharedData<R: IsRuntime>(pub(crate) R::GearOutShared);
+pub(crate) struct SharedData<R: RuntimeTypes>(pub(crate) R::GearOutShared);
 
 #[allow(unsafe_code)]
 // SAFETY: written once before sharing; thereafter immutable across all cores.
-unsafe impl<R: IsRuntime> Sync for SharedData<R> {}
+unsafe impl<R: RuntimeTypes> Sync for SharedData<R> {}
 
-impl<R: IsRuntime> Debug for SharedData<R> {
+impl<R: RuntimeTypes> Debug for SharedData<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(&self.0, f)
     }
 }
 
-impl<R: IsRuntime> SharedData<R> {
+impl<R: RuntimeTypes> SharedData<R> {
     /// Box the payload and return a leaked pointer; [`SharedArena::dec`] hands
     /// it back to [`SharedData::reclaim`] when the cross-core count hits zero.
     pub(crate) fn new(v: R::GearOutShared) -> NonNull<Self> {
@@ -97,7 +107,7 @@ new_key_type! {
 
 /// One slot per live shared allocation: the payload back-pointer plus its
 /// cross-core `xcount`. Lives inside the owner's [`SharedArena`].
-struct SlotEntry<R: IsRuntime> {
+struct SlotEntry<R: RuntimeTypes> {
     data: NonNull<SharedData<R>>,
     xcount: u64,
 }
@@ -106,9 +116,9 @@ struct SlotEntry<R: IsRuntime> {
 /// `slotmap`'s free-list + generational key. Never sent across a core
 /// (`!Send`); mutated only on the owner thread, behind a `RefCell`, so `xcount`
 /// is a plain `u64` — no atomics, no interior mutability, no `unsafe`.
-pub(crate) struct SharedArena<R: IsRuntime>(SlotMap<SharedKey, SlotEntry<R>>);
+pub(crate) struct SharedArena<R: RuntimeTypes>(SlotMap<SharedKey, SlotEntry<R>>);
 
-impl<R: IsRuntime> Debug for SharedArena<R> {
+impl<R: RuntimeTypes> Debug for SharedArena<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedArena")
             .field("live", &self.0.len())
@@ -116,7 +126,7 @@ impl<R: IsRuntime> Debug for SharedArena<R> {
     }
 }
 
-impl<R: IsRuntime> SharedArena<R> {
+impl<R: RuntimeTypes> SharedArena<R> {
     pub(crate) fn new() -> Self {
         Self(SlotMap::with_key())
     }
@@ -237,7 +247,7 @@ pub(crate) trait SharedBus {
 /// a core (its `lcount` → 0) crosses a boundary: an owner-local handle
 /// decrements the arena `xcount` directly; a foreign handle sends one
 /// `SharedUnref` to the owner.
-pub struct Shared<R: IsRuntime> {
+pub struct Shared<R: RuntimeTypes> {
     local: NonNull<SharedLocal>,
     data: NonNull<SharedData<R>>,
     key: SharedKey,
@@ -246,7 +256,7 @@ pub struct Shared<R: IsRuntime> {
     is_owner: bool,
 }
 
-impl<R: IsRuntime> Shared<R> {
+impl<R: RuntimeTypes> Shared<R> {
     /// Mint the **owner-local** initial handle: a fresh [`SharedLocal`] cell
     /// (`lcount = 1`) over an arena-registered payload. Only
     /// `Core::install_produce` (on the owner) calls this.
@@ -296,7 +306,7 @@ impl<R: IsRuntime> Shared<R> {
     }
 }
 
-impl<R: IsRuntime> Clone for Shared<R> {
+impl<R: RuntimeTypes> Clone for Shared<R> {
     fn clone(&self) -> Self {
         SharedLocal::lcount_inc(self.local);
         Self {
@@ -310,7 +320,7 @@ impl<R: IsRuntime> Clone for Shared<R> {
     }
 }
 
-impl<R: IsRuntime> Drop for Shared<R> {
+impl<R: RuntimeTypes> Drop for Shared<R> {
     fn drop(&mut self) {
         if !SharedLocal::lcount_dec(self.local) {
             return;
@@ -335,7 +345,7 @@ impl<R: IsRuntime> Drop for Shared<R> {
     }
 }
 
-impl<R: IsRuntime> Deref for Shared<R> {
+impl<R: RuntimeTypes> Deref for Shared<R> {
     type Target = R::GearOutShared;
     #[allow(unsafe_code)]
     fn deref(&self) -> &Self::Target {
@@ -345,8 +355,50 @@ impl<R: IsRuntime> Deref for Shared<R> {
     }
 }
 
-impl<R: IsRuntime> Debug for Shared<R> {
+impl<R: RuntimeTypes> Debug for Shared<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(&**self, f)
+    }
+}
+
+/// A minimal single-threaded change signal: a monotonic epoch plus the wakers of
+/// everyone parked waiting for the next change. Lives inside `ActiveGear` and is
+/// driven entirely under the core's `inner` borrow, so it needs no atomics.
+#[derive(Debug)]
+pub(crate) struct Epoch {
+    epoch: u64,
+    wakers: Vec<Waker>,
+}
+
+impl Epoch {
+    pub(crate) const fn new() -> Self {
+        Self {
+            epoch: 0,
+            wakers: Vec::new(),
+        }
+    }
+
+    /// Current epoch — advanced once per [`Self::bump`].
+    pub(crate) fn current(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Advance the epoch and wake every parked waiter exactly once (draining the
+    /// list, so each registered waker fires at most once per bump).
+    pub(crate) fn bump(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        for w in self.wakers.drain(..) {
+            w.wake();
+        }
+    }
+
+    /// Register `cx`'s waker for the next [`Self::bump`]. Dedups against an
+    /// identical waker already parked, so re-polling a pending waiter (the
+    /// runtime polls, sees no change, re-registers) cannot pile up clones.
+    pub(crate) fn park(&mut self, cx: &Context<'_>) {
+        let w = cx.waker();
+        if !self.wakers.iter().any(|stored| stored.will_wake(w)) {
+            self.wakers.push(w.clone());
+        }
     }
 }

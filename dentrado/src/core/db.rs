@@ -18,9 +18,10 @@ use crate::{
             broadcast_core_death,
         },
         gear::IsRuntime,
+        routing::{route_events, route_gear},
         storage::IsStorage,
     },
-    types::{GlobalCoreId, GlobalHash, NodeId},
+    types::NodeId,
     wire::{MergeError, RunGearError, WireEventBody, WireLocCtx},
 };
 use compio::runtime::JoinHandle;
@@ -83,59 +84,6 @@ pub fn create_peer_channel_pair<R: IsRuntime>(
 struct CoreHandle<R: IsRuntime> {
     cmd_tx: mpsc::Sender<CoordCmd<R>>,
     doorbell: DoorbellHandle,
-}
-
-/// Result of routing events to their target cores.
-pub(crate) struct RoutedEvents<R: IsRuntime> {
-    pub(crate) wire_ctx: Arc<WireLocCtx<R>>,
-    pub(crate) events: Arc<[WireEventBody<R::Group, R::Body>]>,
-    pub(crate) global_core_ids: Arc<[GlobalCoreId]>,
-    /// From `target_core` to `event ids`.
-    pub(crate) core_seeds: HashMap<u32, Vec<u32>>,
-}
-
-/// Shared function to route events
-pub(crate) fn route_events<R: IsRuntime>(
-    wire_ctx: WireLocCtx<R>,
-    events: Vec<WireEventBody<R::Group, R::Body>>,
-    num_cores: NonZero<u32>,
-) -> Result<RoutedEvents<R>, MergeError> {
-    let global_core_ids: Vec<GlobalCoreId> = events
-        .iter()
-        .map(|e| e.group.global_hash(&wire_ctx).map(GlobalCoreId::from_hash))
-        .collect::<Result<_, _>>()
-        .map_err(MergeError::Route)?;
-
-    let wire_ctx = Arc::new(wire_ctx);
-    let events: Arc<[WireEventBody<R::Group, R::Body>]> = Arc::from(events);
-    let global_core_ids: Arc<[GlobalCoreId]> = Arc::from(global_core_ids);
-
-    let mut core_seeds: HashMap<u32, Vec<u32>> = HashMap::new();
-    for (i, gcid) in global_core_ids.iter().enumerate() {
-        let target_core = gcid.route(num_cores);
-        core_seeds.entry(target_core).or_default().push(i as u32);
-    }
-
-    Ok(RoutedEvents {
-        wire_ctx,
-        events,
-        global_core_ids,
-        core_seeds,
-    })
-}
-
-/// Shared function to route gear to the target core
-pub(crate) fn route_gear<R: IsRuntime>(
-    gear: &R::GearId,
-    wire_ctx: &WireLocCtx<R>,
-    num_cores: NonZero<u32>,
-) -> Result<u32, RunGearError> {
-    let global_core_id = R::meta(gear)
-        .group()
-        .global_hash(wire_ctx)
-        .map(GlobalCoreId::from_hash)
-        .map_err(RunGearError::Route)?;
-    Ok(global_core_id.route(num_cores))
 }
 
 pub struct Db<R: IsRuntime> {
@@ -395,7 +343,7 @@ impl<R: IsRuntime> Db<R> {
         wire_ctx: WireLocCtx<R>,
     ) -> Result<R::GearOut, RunGearError> {
         let target_core = route_gear(
-            &gear,
+            &R::meta(&gear),
             &wire_ctx,
             NonZero::new(self.handles.len() as u32).unwrap(),
         )?;

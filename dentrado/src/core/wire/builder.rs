@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
+use super::format::WireLocCtx;
 use crate::{
-    core::{gear::IsRuntime, storage::IsStorage},
+    core::{api::RuntimeTypes, storage::IsStorage},
     types::{DataId, LocDataId, LocSenderId, LocUserId, Localizable, Remapper, SenderPk, UserId},
-    wire::format::WireLocCtx,
 };
 
 #[derive(Debug)]
@@ -25,9 +25,9 @@ impl std::fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
-pub struct WireLocCtxBuilder<'a, R: IsRuntime, S: IsStorage<R>>(BuilderInner<'a, R, S>);
+pub struct WireLocCtxBuilder<'a, R: RuntimeTypes, S: IsStorage<R>>(BuilderInner<'a, R, S>);
 
-struct BuilderInner<'a, R: IsRuntime, S: IsStorage<R>> {
+struct BuilderInner<'a, R: RuntimeTypes, S: IsStorage<R>> {
     storage: &'a S,
     users: Vec<UserId>,
     senders: Vec<(SenderPk, u32)>,
@@ -38,7 +38,7 @@ struct BuilderInner<'a, R: IsRuntime, S: IsStorage<R>> {
     data_to_wire: HashMap<u64, u32>,
 }
 
-impl<'a, R: IsRuntime, S: IsStorage<R>> WireLocCtxBuilder<'a, R, S> {
+impl<'a, R: RuntimeTypes, S: IsStorage<R>> WireLocCtxBuilder<'a, R, S> {
     #[must_use]
     pub fn new(storage: &'a S) -> Self {
         WireLocCtxBuilder(BuilderInner {
@@ -64,7 +64,7 @@ impl<'a, R: IsRuntime, S: IsStorage<R>> WireLocCtxBuilder<'a, R, S> {
     }
 }
 
-impl<R: IsRuntime, S: IsStorage<R>> Remapper for BuilderInner<'_, R, S> {
+impl<R: RuntimeTypes, S: IsStorage<R>> Remapper for BuilderInner<'_, R, S> {
     type Err = BuildError;
     async fn remap_user(&mut self, lid: LocUserId) -> Result<LocUserId, BuildError> {
         if let Some(&wire_idx) = self.user_to_wire.get(&lid.0) {

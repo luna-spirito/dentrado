@@ -11,7 +11,7 @@ use std::fmt::Debug;
 use dentrado::{
     core::{
         core_ctx::GearCtx,
-        gear::{GearInput, GearMeta, GearProduce, IsRuntime},
+        gear::{GearInput, GearMeta, GearProduce, IsRuntime, RuntimeTypes},
         storage::{GearView, IsStorage, PagedStorage},
     },
     types::*,
@@ -31,7 +31,7 @@ impl Localizable for BlobGear {
 #[derive(Debug)]
 struct BlobRuntime;
 
-impl IsRuntime for BlobRuntime {
+impl RuntimeTypes for BlobRuntime {
     type GearId = BlobGear;
     type GearOut = ();
     type GearOutShared = ();
@@ -40,7 +40,9 @@ impl IsRuntime for BlobRuntime {
     type Group = i64;
     type Body = ();
     type Data = ();
+}
 
+impl IsRuntime for BlobRuntime {
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
         match gear {
             BlobGear::Blob { key } => GearMeta::Event {

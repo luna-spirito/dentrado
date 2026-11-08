@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::PersistentCore;
-use crate::blockcache;
 use crate::core::tree::{self, Item};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
@@ -24,13 +23,13 @@ use crate::page::PageId;
 
 /// One batch element: a record going in, or a key going out.
 #[derive(Clone)]
-pub(super) enum Op {
+pub(crate) enum Op {
     Put(Item),
     Del(Vec<u8>),
 }
 
 impl Op {
-    pub(super) fn key(&self) -> &[u8] {
+    pub(crate) fn key(&self) -> &[u8] {
         match self {
             Op::Put((k, _)) => k,
             Op::Del(k) => k,
@@ -46,10 +45,10 @@ type Rt = (Vec<u8>, PageId);
 /// the tree emptied), the pages the dirty paths retired (an unchanged
 /// frame keeps its page), and whether the batch emptied the tree (the
 /// table's root becomes 0).
-pub(super) struct Grafted {
-    pub(super) drafts: Vec<tree::Node>,
-    pub(super) replaced: Vec<PageId>,
-    pub(super) emptied: bool,
+pub(crate) struct Grafted {
+    pub(crate) drafts: Vec<tree::Node>,
+    pub(crate) replaced: Vec<PageId>,
+    pub(crate) emptied: bool,
 }
 
 /// A visited node on a dirty path: its page (a death this round, if
@@ -75,7 +74,7 @@ struct Up {
 /// (never 0 — an empty table is built whole): see [`Grafted`]. `fuel0`
 /// bounds the reads: more nodes than the file holds can only be
 /// corruption.
-pub(super) async fn run<D: IsFilesystem>(
+pub(crate) async fn run<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     root: PageId,
     batch: Vec<Op>,
@@ -370,5 +369,5 @@ async fn read<D: IsFilesystem>(
         return Err(StoreError::Steps("tree: steps"));
     }
     *fuel -= 1;
-    blockcache::read::<D, _>(inner, p, tree::parse_node).await
+    crate::persist::read::<D, _>(inner, p, tree::parse_node).await
 }

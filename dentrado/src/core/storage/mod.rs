@@ -65,9 +65,9 @@
 //! as the 1:1 RAM backend); then drop the now-redundant `EventContext` trait.
 //! No new sync↔async boundary is introduced.
 
+pub mod view;
 pub mod in_memory;
 pub mod paged;
-pub mod view;
 
 pub use in_memory::InMemoryStorage;
 pub use paged::PagedStorage;
@@ -77,7 +77,7 @@ use std::{fmt::Debug, future::Future, io, marker::PhantomData};
 
 use crate::{
     core::{
-        gear::IsRuntime,
+        api::RuntimeTypes,
         loc_ctx::{StoreResultSuccess, StoredEvent},
     },
     types::{
@@ -112,7 +112,7 @@ pub struct Watermark(pub u64, pub u64);
 /// reverse lookup its sibling getter reads. Allocation of a fresh id uses an
 /// internal monotonic counter (NOT a row count) so that future sender eviction
 /// cannot alias a live id.
-pub trait IsStorage<R: IsRuntime>: GlobalResolver /* TODO: Remove this, unviable. */ + 'static {
+pub trait IsStorage<R: RuntimeTypes>: GlobalResolver /* TODO: Remove this, unviable. */ + 'static {
 
     // ── Layer 1: localization, идемпотентные аллокаторы ──────────────────
 
@@ -197,13 +197,13 @@ pub trait IsStorage<R: IsRuntime>: GlobalResolver /* TODO: Remove this, unviable
 /// Методы `async` и делегируют unboxed в [`Storage`] (без аллокаций сверх тех,
 /// что делает сам бекенд). Заменяет прежнюю синхронную пару
 /// `loc_ctx::GroupStore`/`EventStore`, теперь когда бекенд — `async`.
-pub struct GroupStore<'a, R: IsRuntime, S: IsStorage<R>> {
+pub struct GroupStore<'a, R: RuntimeTypes, S: IsStorage<R>> {
     storage: &'a S,
     group: LocGroupId,
     _r: PhantomData<fn() -> R>,
 }
 
-impl<'a, R: IsRuntime, S: IsStorage<R>> GroupStore<'a, R, S> {
+impl<'a, R: RuntimeTypes, S: IsStorage<R>> GroupStore<'a, R, S> {
     #[must_use]
     pub fn new(storage: &'a S, group: LocGroupId) -> Self {
         Self {

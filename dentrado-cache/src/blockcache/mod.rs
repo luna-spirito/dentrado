@@ -62,14 +62,10 @@
 //! checkpoint is a positional barrier in the queues, not the model's
 //! refusal with "Saving left".
 
-mod api;
 mod arena;
 mod disk_arena;
 mod flights;
 mod seq;
-
-pub(crate) use self::api::{ensure_saved, init, read, update, write_back_all};
-pub(crate) use self::flights::spawn_driver;
 
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;

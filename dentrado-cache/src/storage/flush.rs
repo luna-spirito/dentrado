@@ -11,11 +11,7 @@ use compio::runtime::JoinHandle;
 use futures::FutureExt;
 use futures::channel::oneshot;
 
-use super::PersistentCore;
-use super::flight::{Flight, FlipData, Home, flip_loop};
-use super::graft;
-use super::walks::walk_chain_raw;
-use crate::blockcache;
+use super::Storage;
 use crate::core::DeltaV;
 use crate::core::freelist::{CHUNK_SLOTS, ChainEntry, chunk_cells, chunk_next, write_chunk};
 use crate::core::sb::write_sb;
@@ -23,7 +19,10 @@ use crate::core::tree;
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{AlignedPage, PageId, fnv_id};
-use crate::storage::Storage;
+use crate::persist::PersistentCore;
+use crate::persist::flight::{Flight, FlipData, Home, flip_loop};
+use crate::persist::graft;
+use crate::persist::walks::walk_chain_raw;
 
 // ## The agent
 
@@ -339,7 +338,7 @@ async fn engrave<D: IsFilesystem>(
                 .collect()
         };
         for (&id, img) in ids.iter().zip(imgs) {
-            blockcache::init::<D, _>(inner, id, move |b| b.0.copy_from_slice(&img.0)).await?;
+            crate::persist::init::<D, _>(inner, id, move |b| b.0.copy_from_slice(&img.0)).await?;
         }
         new_roots[t] = ids[counts[t] - 1];
         at += counts[t];
@@ -347,7 +346,7 @@ async fn engrave<D: IsFilesystem>(
     init_chain::<D>(inner, &nlimbo_ps, mark, &front_cells).await?;
     init_chain::<D>(inner, &nfree_ps, ftail, &nfree).await?;
     init_chain::<D>(inner, &ep_ps, btail, &ecells).await?;
-    blockcache::write_back_all::<D>(inner).await?;
+    crate::persist::write_back_all::<D>(inner).await?;
     sync::<D>(inner).await?;
     // The walks' bound is the round's own pages — the flight
     // counter and the seal-time copy: longer chains can only be
@@ -368,13 +367,13 @@ async fn engrave<D: IsFilesystem>(
     let sb_id = old_gen % 2;
     let sb_gen = old_gen + 1;
     let sb_tables = inner.borrow().core.live_tables(&new_roots);
-    blockcache::init::<D, _>(inner, sb_id, move |b| {
+    crate::persist::init::<D, _>(inner, sb_id, move |b| {
         write_sb(
             b, sb_gen, sn0, sn1, &sb_tables, even, odd, even_cells, odd_cells, even_sum, odd_sum,
         )
     })
     .await?;
-    blockcache::ensure_saved::<D>(inner, sb_id).await?;
+    crate::persist::ensure_saved::<D>(inner, sb_id).await?;
     sync::<D>(inner).await?;
     // The RAM commit in one borrow: the copied pool's bookmark past
     // a round-eaten remainder (if the round swallowed one), then the
@@ -416,7 +415,7 @@ async fn read_chunk<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
     e: ChainEntry,
 ) -> Result<(Vec<PageId>, PageId), StoreError> {
-    blockcache::read::<D, _>(inner, e.page, move |b| {
+    crate::persist::read::<D, _>(inner, e.page, move |b| {
         (chunk_cells(b, e.off as usize), chunk_next(b))
     })
     .await
@@ -453,7 +452,7 @@ async fn init_chain<D: IsFilesystem>(
         // the chain unwritten), at the price of one hollow read on
         // its eating.
         let g = cells.chunks(CHUNK_SLOTS).nth(i).unwrap_or(empty).to_vec();
-        blockcache::init::<D, _>(inner, p, move |b| write_chunk(b, nx, &g)).await?;
+        crate::persist::init::<D, _>(inner, p, move |b| write_chunk(b, nx, &g)).await?;
     }
     Ok(())
 }

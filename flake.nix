@@ -147,6 +147,15 @@
               files = "(Cargo\\.(toml|lock)|deny\\.toml)$";
               pass_filenames = false;
             };
+            module-order = {
+              enable = true;
+              name = "Enforce module import order";
+              entry = "${pkgs.python3}/bin/python3 scripts/module_order.py";
+              files = "\\.rs$";
+              pass_filenames = false;
+              # `module_order.py` reads the workspace layout via `cargo metadata`.
+              extraPackages = [ rustToolchain ];
+            };
           };
 
           packages.kolorinko = pkgs.callPackage ./nix/kolorinko-package.nix {

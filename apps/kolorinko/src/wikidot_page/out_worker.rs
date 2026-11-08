@@ -1,69 +1,9 @@
 use super::*;
+use crate::repo_state::{OutMailbox, OutReply, OutReq};
 
 // =========================================================================
 // Publication worker thread (owns the dataset; serves the async gears)
 // =========================================================================
-
-/// A request to the publication worker thread. Each carries its own one-shot
-/// reply channel; the oracle core sends one and `.await`s the reply, so it
-/// never blocks while the worker decompresses archives on its own thread.
-pub(super) enum OutReq {
-    /// Rescan the publication and rebuild what drifted. `changed` is
-    /// `false` when nothing drifted; the caller then keeps its cached
-    /// `Rc` (the data is still the worker's current snapshot).
-    Tick { reply: flume::Sender<OutReply> },
-    /// The current dataset without rescanning (cold start / first non-tick run).
-    Snapshot { reply: flume::Sender<OutReply> },
-}
-
-/// One worker reply: the current dataset, whether a `Tick` adopted
-/// anything, and — when the worker's state changed since the last reply —
-/// its freshly serialized [`PersistedWorker`] image for the gear view.
-pub(super) struct OutReply {
-    pub(super) data: RepoSnapshot,
-    pub(super) changed: bool,
-    pub(super) image: Option<Vec<u8>>,
-}
-
-/// Cloneable, `Send` handle to the publication worker thread, held by the
-/// [`repo`] oracle's cache so all synchronous filesystem work — manifest
-/// parsing, zstd decompression, body materialisation — happens off the
-/// async core. Body text crosses this channel only inside the snapshot
-/// itself (see [`RepoSnapshot`]).
-///
-/// [`repo`]: crate::wikidot_page::repo
-#[derive(Clone)]
-pub(crate) struct OutMailbox(pub(super) flume::Sender<OutReq>);
-
-impl OutMailbox {
-    /// Rescan + rebuild what drifted.
-    pub(super) async fn tick(&self) -> OutReply {
-        self.request(|reply| OutReq::Tick { reply }).await
-    }
-
-    /// Current dataset without rescanning.
-    pub(super) async fn snapshot(&self) -> OutReply {
-        self.request(|reply| OutReq::Snapshot { reply }).await
-    }
-
-    async fn request(&self, req: impl FnOnce(flume::Sender<OutReply>) -> OutReq) -> OutReply {
-        let (tx, rx) = flume::bounded(1);
-        if self.0.send_async(req(tx)).await.is_err() {
-            return OutReply::default();
-        }
-        rx.recv_async().await.unwrap_or_default()
-    }
-}
-
-impl Default for OutReply {
-    fn default() -> Self {
-        Self {
-            data: RepoSnapshot::default(),
-            changed: false,
-            image: None,
-        }
-    }
-}
 
 /// The stamps of the three publication files (`pages.json`, `files.json`,
 /// `shell`) — the site-level change gate. A site is re-read only when its

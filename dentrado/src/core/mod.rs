@@ -1,12 +1,13 @@
-pub mod core_ctx;
-pub mod db;
+pub mod api;
 pub mod doorbell;
-pub mod gear;
 pub mod loc_ctx;
-pub mod shared;
 pub mod stats;
 pub mod storage;
-mod subscription;
+pub mod wire;
+pub mod routing;
+pub mod core_ctx;
+pub mod gear;
+pub mod db;
 
 // `InMemoryStorage` is exposed for tests / as the reference backend.
 pub use storage::in_memory::InMemoryStorage;
