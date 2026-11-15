@@ -17,8 +17,31 @@ use crate::types::{GlobalHash, LocGroupId, LocMsgTypeId, Localizable};
 pub use self::shared::Shared;
 pub(crate) use self::shared::{Epoch, RemoteShared, SharedArena, SharedBus, SharedData, SharedKey};
 
+/// Common prefix of every gear-view table id. The store's startup GC uses it
+/// to recognize (and drop) tables left by an older gear layout without
+/// touching unrelated tables in the same store.
+pub const GEAR_TABLE_PREFIX: &[u8] = b"dentrado/gear-view/";
+
+/// The single table a manual [`RuntimeTypes`] uses when it does not override
+/// [`RuntimeTypes::gear_table`] / [`RuntimeTypes::gear_tables`]. Generated
+/// runtimes emit one table per gear kind instead.
+pub const DEFAULT_GEAR_TABLE: &[u8] = b"dentrado/gear-view/0/default";
+
 pub trait RuntimeTypes: Debug + Send + Sync + Sized + 'static {
     type GearId: Debug + Hash + Eq + Clone + Send + 'static + Localizable;
+
+    /// The gear-view table that stores `gear`'s kind. One table per gear
+    /// kind, so a whole kind can be dropped without touching the others.
+    /// The generated runtimes override this with a stable per-kind id; a
+    /// manual runtime defaults to one shared table.
+    fn gear_table(_gear: &Self::GearId) -> &'static [u8] {
+        DEFAULT_GEAR_TABLE
+    }
+
+    /// Every gear-view table the store opens at startup.
+    fn gear_tables() -> &'static [&'static [u8]] {
+        &[DEFAULT_GEAR_TABLE]
+    }
 
     type GearOut: Debug + Clone + Send + 'static + Localizable;
 

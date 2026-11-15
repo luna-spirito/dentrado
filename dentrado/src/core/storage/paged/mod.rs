@@ -1,5 +1,6 @@
 //! The disk-backed [`IsStorage`]: localization and the event log stay in
-//! RAM; the gear views spill into one [`dentrado_cache`] table.
+//! RAM; the gear views spill into [`dentrado_cache`], one table per gear
+//! kind.
 //!
 //! A view is a flat key-value overlay scoped to one gear (see
 //! [`GearView`]). The disk view is one `Session` over the store: reads use
@@ -231,12 +232,13 @@ where
         Self: 'a;
 
     fn gear_view(&self, gear: &R::GearId) -> impl Future<Output = Self::View<'_>> {
+        let table = R::gear_table(gear);
         let prefix = gear_key::<R>(gear).to_vec();
         async move {
             match &self.file {
                 Some(_) => {
                     let store = self.ensure().await;
-                    PagedView::Disk(DiskView::new(store, prefix, &self.dirty))
+                    PagedView::Disk(DiskView::new(store, table, prefix, &self.dirty))
                 }
                 None => PagedView::Ram(RamView::new(self.ram.gear_data(), prefix)),
             }
@@ -248,10 +250,12 @@ where
     fn flush(&self) -> impl Future<Output = io::Result<()>> {
         async move {
             self.ram.flush().await?;
-            if self.dirty.get() {
+            // Take the flag *before* the await: a commit that lands while the
+            // store flush is in flight sets it again and gets its own round,
+            // instead of being erased by this one's clear.
+            if self.dirty.replace(false) {
                 let store = self.ensure().await;
                 store.flush().await.expect("flush the gear view store");
-                self.dirty.set(false);
             }
             Ok(())
         }

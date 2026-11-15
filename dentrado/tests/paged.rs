@@ -6,10 +6,11 @@
 //! that needs bigger values stores several records itself. This test only
 //! exercises the flat contract.
 
-use std::fmt::Debug;
+use std::{fmt::Debug, panic::AssertUnwindSafe};
 
 use dentrado::{
     core::{
+        api::GEAR_TABLE_PREFIX,
         core_ctx::GearCtx,
         gear::{GearInput, GearMeta, GearProduce, IsRuntime, RuntimeTypes},
         storage::{GearView, IsStorage, PagedStorage},
@@ -17,9 +18,15 @@ use dentrado::{
     types::*,
 };
 
+/// The two gear kinds this runtime declares, one table each (a manual
+/// stand-in for what `#[gears]` generates).
+const BLOB_TABLE: &[u8] = b"dentrado/gear-view/0/Blob";
+const NOTE_TABLE: &[u8] = b"dentrado/gear-view/0/Note";
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum BlobGear {
     Blob { key: u64 },
+    Note { key: u64 },
 }
 
 impl Localizable for BlobGear {
@@ -40,15 +47,28 @@ impl RuntimeTypes for BlobRuntime {
     type Group = i64;
     type Body = ();
     type Data = ();
+
+    fn gear_table(gear: &Self::GearId) -> &'static [u8] {
+        match gear {
+            BlobGear::Blob { .. } => BLOB_TABLE,
+            BlobGear::Note { .. } => NOTE_TABLE,
+        }
+    }
+
+    fn gear_tables() -> &'static [&'static [u8]] {
+        &[BLOB_TABLE, NOTE_TABLE]
+    }
 }
 
 impl IsRuntime for BlobRuntime {
     fn meta(gear: &Self::GearId) -> GearMeta<Self> {
-        match gear {
-            BlobGear::Blob { key } => GearMeta::Event {
-                msg_type: LocMsgTypeId(1),
-                group: i64::try_from(*key).unwrap(),
-            },
+        let (msg_type, key) = match gear {
+            BlobGear::Blob { key } => (1, key),
+            BlobGear::Note { key } => (2, key),
+        };
+        GearMeta::Event {
+            msg_type: LocMsgTypeId(msg_type),
+            group: i64::try_from(*key).unwrap(),
         }
     }
 
@@ -192,10 +212,11 @@ fn paged_storage_quarantines_corruption() {
         });
 }
 
-/// The startup GC: a table left by an older view-format version is dropped
-/// on open; the current version's table survives.
+/// The startup GC: gear-view tables this layout no longer declares — and the
+/// pre-per-kind table — are dropped on open; the current kinds and unrelated
+/// tables survive.
 #[test]
-fn paged_storage_gcs_old_versions() {
+fn paged_storage_gcs_old_gear_tables() {
     compio::runtime::RuntimeBuilder::new()
         .build()
         .unwrap()
@@ -205,32 +226,110 @@ fn paged_storage_gcs_old_versions() {
             let dir = tempfile::tempdir().unwrap();
             let file = dir.path().join("core-0.dstore");
             let path = file.display().to_string();
-            let old_id = postcard::to_stdvec(&("dentrado/gear-view", 1u64)).unwrap();
-            let cur_id = postcard::to_stdvec(&("dentrado/gear-view", 0u64)).unwrap();
-            // An old-version store with one live entry.
+            let legacy = postcard::to_stdvec(&("dentrado/gear-view", 0u64)).unwrap();
+            let orphan = b"dentrado/gear-view/0/Gone".to_vec();
+            let foreign = b"unrelated/table".to_vec();
+            // An older image with one live entry in every odd table.
             {
-                let old = Storage::open(&FsDisk, &path, 4, &[TableSpec::flat(old_id.clone())])
-                    .await
-                    .unwrap();
+                let specs = [legacy.clone(), orphan.clone(), foreign.clone()].map(TableSpec::flat);
+                let old = Storage::open(&FsDisk, &path, 4, &specs).await.unwrap();
                 let mut s = old.session();
-                s.put(&old_id, b"gear", b"ancient", &[], &[]).unwrap();
+                for id in [&legacy, &orphan, &foreign] {
+                    s.put(id, b"gear", b"ancient", &[], &[]).unwrap();
+                }
                 s.commit().unwrap();
                 old.flush().await.unwrap();
             }
-            // Opening through PagedStorage drops the orphan…
+            // Opening through PagedStorage drops our orphans…
             let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.clone());
             let gear = BlobGear::Blob { key: 7 };
             let mut view = st.gear_view(&gear).await;
-            assert!(view.get(b"k").await.is_none());
+            view.put(b"k", b"kept");
             view.commit();
             st.flush().await.unwrap();
             drop(view);
             drop(st);
-            // …and a raw reopen sees only the current version's table.
-            let raw = Storage::open(&FsDisk, &path, 4, &[TableSpec::flat(cur_id.clone())])
-                .await
-                .unwrap();
-            let names = raw.tables();
-            assert_eq!(names, [cur_id]);
+            // …and a raw reopen sees the current kinds (one table each) plus
+            // the unrelated table.
+            let raw = Storage::open(&FsDisk, &path, 4, &[]).await.unwrap();
+            let mut names = raw.tables();
+            names.sort();
+            let mut expected = [BLOB_TABLE.to_vec(), NOTE_TABLE.to_vec(), foreign];
+            expected.sort();
+            assert_eq!(names, expected);
+            drop(raw);
+            // GC never touches the live kinds' records.
+            let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file);
+            let mut view = st.gear_view(&gear).await;
+            assert_eq!(view.get(b"k").await.unwrap(), b"kept");
+        });
+}
+
+/// One table per gear kind: each kind reads back independently across a
+/// reopen, and the runtime's table ids all carry the GC's shared prefix.
+#[test]
+fn paged_storage_separates_gear_kinds() {
+    compio::runtime::RuntimeBuilder::new()
+        .build()
+        .unwrap()
+        .block_on(async {
+            assert!(
+                BlobRuntime::gear_tables()
+                    .iter()
+                    .all(|id| id.starts_with(GEAR_TABLE_PREFIX)),
+                "the startup GC recognizes tables by this prefix"
+            );
+
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("core-0.dstore");
+            let blob = BlobGear::Blob { key: 1 };
+            let note = BlobGear::Note { key: 1 };
+            let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.clone());
+            {
+                let mut view = st.gear_view(&blob).await;
+                view.put(b"k", b"blob");
+                view.commit();
+            }
+            {
+                let mut view = st.gear_view(&note).await;
+                assert!(view.get(b"k").await.is_none());
+                view.put(b"k", b"note");
+                view.commit();
+            }
+            st.flush().await.unwrap();
+            drop(st);
+
+            let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file);
+            let mut view = st.gear_view(&blob).await;
+            assert_eq!(view.get(b"k").await.unwrap(), b"blob");
+            let mut view = st.gear_view(&note).await;
+            assert_eq!(view.get(b"k").await.unwrap(), b"note");
+        });
+}
+
+/// Both backends refuse a record no leaf can hold. The disk view would fail
+/// the whole flush, so the RAM view must refuse at the same point instead of
+/// silently accepting more than the disk ever could.
+#[test]
+fn paged_storage_refuses_oversized_records() {
+    compio::runtime::RuntimeBuilder::new()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let gear = BlobGear::Blob { key: 7 };
+            let oversized = vec![0u8; 8192];
+            fn refuses(view: &mut impl GearView, value: &[u8]) -> bool {
+                std::panic::catch_unwind(AssertUnwindSafe(|| view.put(b"k", value))).is_err()
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+            let st: PagedStorage<BlobRuntime> =
+                PagedStorage::on_disk(dir.path().join("core-0.dstore"));
+            let mut disk = st.gear_view(&gear).await;
+            assert!(refuses(&mut disk, &oversized), "disk view refuses");
+
+            let ram: PagedStorage<BlobRuntime> = PagedStorage::ram();
+            let mut ram_view = ram.gear_view(&gear).await;
+            assert!(refuses(&mut ram_view, &oversized), "RAM view refuses");
         });
 }

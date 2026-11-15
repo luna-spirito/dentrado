@@ -14,6 +14,11 @@
 //! A gear that needs bigger values stores several records (e.g.
 //! `article_latest_parsed`'s zstd blocks) or builds a chunking layer on
 //! top of the raw session; the store itself does not chunk.
+//!
+//! Each gear **kind** gets its own table (see
+//! [`RuntimeTypes::gear_table`](crate::core::api::RuntimeTypes::gear_table)),
+//! so a kind can be dropped whole without walking the others. Per-gear
+//! isolation *within* a kind is still the key prefix.
 
 use std::{
     cell::{Cell, RefCell},
@@ -25,22 +30,41 @@ use std::{
 
 use dentrado_cache::{Session, Storage, disk::FsDisk};
 
-use crate::core::api::RuntimeTypes;
+use crate::core::api::{GEAR_TABLE_PREFIX, RuntimeTypes};
 
-/// The view table's identity. One table for every gear; per-gear
-/// isolation comes from the key prefix. A future version can move to
-/// one table per gear kind without changing the view contract.
-pub(crate) fn gear_table() -> &'static [u8] {
+/// The flat table spec per gear-view table. A view value names no pages.
+pub(crate) fn gear_specs<R: RuntimeTypes>() -> Vec<dentrado_cache::TableSpec> {
+    R::gear_tables()
+        .iter()
+        .map(|id| dentrado_cache::TableSpec::flat(id.to_vec()))
+        .collect()
+}
+
+/// Is `name` a gear-view table of the current id scheme? The startup GC
+/// uses this to tell our orphans from unrelated tables in the same store.
+pub(crate) fn is_gear_table(name: &[u8]) -> bool {
+    name.starts_with(GEAR_TABLE_PREFIX)
+}
+
+/// The pre-per-kind table id (`postcard(("dentrado/gear-view", 0))`). It
+/// predates [`GEAR_TABLE_PREFIX`], so the GC needs an explicit check for it.
+pub(crate) fn legacy_gear_table() -> &'static [u8] {
     static TABLE: OnceLock<Vec<u8>> = OnceLock::new();
     TABLE.get_or_init(|| {
         postcard::to_stdvec(&("dentrado/gear-view", 0u64)).expect("a flat tuple serializes")
     })
 }
 
-/// The table spec the store opens with. Flat: a view value names no
-/// pages.
-pub(crate) fn gear_spec() -> dentrado_cache::TableSpec {
-    dentrado_cache::TableSpec::flat(gear_table().to_vec())
+/// Could one leaf hold this record? The disk view would refuse the whole
+/// flush on `put`; the RAM view must refuse it at the same point, or the two
+/// backends disagree on what a gear may store.
+pub(crate) fn check_leaf(key: &[u8], value: &[u8]) {
+    assert!(
+        dentrado_cache::core::tree::leaf_holds(key, value),
+        "gear view record ({} byte key, {} byte value) does not fit one leaf; chunk it",
+        key.len(),
+        value.len(),
+    );
 }
 
 /// A stable per-gear subkey: `blake3` over the gear id's `Hash`.
@@ -111,8 +135,8 @@ pub trait GearView {
     /// can be passed straight back to [`del`](GearView::del).
     async fn scan(&mut self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)>;
 
-    /// Stage a value. It must fit one leaf record; the view does not
-    /// chunk.
+    /// Stage a value. It must fit one leaf record (the view panics
+    /// otherwise, in both backends); the view does not chunk.
     fn put(&mut self, key: &[u8], value: &[u8]);
 
     /// Stage a deletion.
@@ -129,15 +153,23 @@ pub struct DiskView<'a> {
     /// `None` between a commit and the next touch: the commit consumes the
     /// session, and a fresh one (seeing the commit) opens on demand.
     session: Option<Session<FsDisk>>,
+    /// The gear kind's table; the key prefix only separates gears within it.
+    table: &'static [u8],
     prefix: Vec<u8>,
     dirty: &'a Cell<bool>,
 }
 
 impl<'a> DiskView<'a> {
-    pub(crate) fn new(store: Rc<Storage<FsDisk>>, prefix: Vec<u8>, dirty: &'a Cell<bool>) -> Self {
+    pub(crate) fn new(
+        store: Rc<Storage<FsDisk>>,
+        table: &'static [u8],
+        prefix: Vec<u8>,
+        dirty: &'a Cell<bool>,
+    ) -> Self {
         Self {
             session: Some(store.session()),
             store,
+            table,
             prefix,
             dirty,
         }
@@ -149,29 +181,30 @@ impl<'a> DiskView<'a> {
         full.extend_from_slice(key);
         full
     }
+}
 
-    fn session(&mut self) -> &mut Session<FsDisk> {
-        if self.session.is_none() {
-            self.session = Some(self.store.session());
-        }
-        self.session.as_mut().expect("just opened")
-    }
+/// The session, opening a fresh one (seeing the last commit) on demand. A free
+/// function so the caller can keep borrowing `self.table`/`self.store`.
+fn session<'s>(
+    slot: &'s mut Option<Session<FsDisk>>,
+    store: &Rc<Storage<FsDisk>>,
+) -> &'s mut Session<FsDisk> {
+    slot.get_or_insert_with(|| store.session())
 }
 
 impl GearView for DiskView<'_> {
     async fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         let full = self.full(key);
-        self.session()
-            .get_old(gear_table(), &full)
+        session(&mut self.session, &self.store)
+            .get_old(self.table, &full)
             .await
             .expect("gear view get")
     }
 
     async fn scan(&mut self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         let full = self.full(prefix);
-        let rows = self
-            .session()
-            .scan_old(gear_table(), &full, &[])
+        let rows = session(&mut self.session, &self.store)
+            .scan_old(self.table, &full, &[])
             .await
             .expect("gear view scan");
         let strip = self.prefix.len();
@@ -182,15 +215,16 @@ impl GearView for DiskView<'_> {
 
     fn put(&mut self, key: &[u8], value: &[u8]) {
         let full = self.full(key);
-        self.session()
-            .put(gear_table(), &full, value, &[], &[])
+        check_leaf(&full, value);
+        session(&mut self.session, &self.store)
+            .put(self.table, &full, value, &[], &[])
             .expect("gear view put");
     }
 
     fn del(&mut self, key: &[u8]) {
         let full = self.full(key);
-        self.session()
-            .del(gear_table(), &full, &[])
+        session(&mut self.session, &self.store)
+            .del(self.table, &full, &[])
             .expect("gear view del");
     }
 
@@ -245,7 +279,9 @@ impl GearView for RamView<'_> {
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) {
-        self.staged.insert(self.full(key), Some(value.to_vec()));
+        let full = self.full(key);
+        check_leaf(&full, value);
+        self.staged.insert(full, Some(value.to_vec()));
     }
 
     fn del(&mut self, key: &[u8]) {

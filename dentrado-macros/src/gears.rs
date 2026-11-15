@@ -45,7 +45,7 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    FnArg, Ident, Item, ItemMod, LitStr, Pat, ReturnType, Token, Type, Visibility,
+    FnArg, Ident, Item, ItemMod, LitByteStr, LitStr, Pat, ReturnType, Token, Type, Visibility,
     parse::{Parse, ParseStream, Parser},
     punctuated::Punctuated,
 };
@@ -1164,6 +1164,21 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         }
     });
 
+    let table_ids: Vec<LitByteStr> = specs
+        .iter()
+        .map(|g| {
+            LitByteStr::new(
+                format!("dentrado/gear-view/0/{}", g.name).as_bytes(),
+                g.name.span(),
+            )
+        })
+        .collect();
+
+    let table_arms = specs.iter().zip(&table_ids).map(|(g, id)| {
+        let v = &g.name;
+        quote! { GearId::#v { .. } => #id, }
+    });
+
     let generated = quote! {
         #track
         // The concrete `GearId` is an internal implementation detail of the
@@ -1226,6 +1241,20 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             type Group = Group;
             type Body = ();
             type Data = ();
+
+            // One table per gear kind, named `dentrado/gear-view/0/<Kind>` —
+            // the prefix must match `dentrado::core::api::GEAR_TABLE_PREFIX`,
+            // which the store's startup GC matches against to drop kinds this
+            // layout no longer declares.
+            fn gear_table(gear: &Self::GearId) -> &'static [u8] {
+                match gear {
+                    #( #table_arms )*
+                }
+            }
+
+            fn gear_tables() -> &'static [&'static [u8]] {
+                &[ #( #table_ids as &'static [u8] ),* ]
+            }
         }
 
         impl ::dentrado::core::gear::IsRuntime for #runtime {

@@ -20,7 +20,7 @@ use futures::channel::oneshot;
 use super::PagedStorage;
 use crate::core::{
     api::RuntimeTypes,
-    storage::view::{gear_spec, gear_table},
+    storage::view::{gear_specs, is_gear_table, legacy_gear_table},
 };
 
 /// Page-cache arena slots per core (1024 pages = 4 MiB).
@@ -105,15 +105,16 @@ impl<R: RuntimeTypes> PagedStorage<R> {
     }
 
     /// Open the store, then the startup table GC: this file holds only
-    /// gear-view tables, so every identity that is not the current one is
-    /// an orphan an older build left — dropped at rest, before the first
-    /// view (and the drop marked dirty, so the next `flush` engraves it
-    /// into the image).
+    /// gear-view tables, so a gear-view identity outside the current set is an
+    /// orphan an older build left — dropped at rest, before the first view
+    /// (and the drop marked dirty, so the next `flush` engraves it into the
+    /// image). Unrelated tables are never touched.
     async fn open(&self, file: &Path) -> Result<Storage<FsDisk>, StoreError> {
-        let store = open_quarantining(file).await?;
-        let id = gear_table();
+        let store = open_quarantining::<R>(file).await?;
+        let keep = R::gear_tables();
         for name in store.tables() {
-            if name != id {
+            let ours = is_gear_table(&name) || name == legacy_gear_table();
+            if ours && !keep.contains(&name.as_slice()) {
                 match store.drop_table(&name).await {
                     Ok(()) => self.dirty.set(true),
                     Err(e) => log::warn!("page store: GC of table {name:?} failed: {e:?}"),
@@ -127,9 +128,10 @@ impl<R: RuntimeTypes> PagedStorage<R> {
 /// Open the store, quarantining a corrupt image: the file is renamed aside
 /// (kept for inspection) and a fresh store opens in its place. A rename
 /// failure falls back to the plain open — its error is fatal.
-async fn open_quarantining(file: &Path) -> Result<Storage<FsDisk>, StoreError> {
+async fn open_quarantining<R: RuntimeTypes>(file: &Path) -> Result<Storage<FsDisk>, StoreError> {
     let path = file.display().to_string();
-    match Storage::open(&FsDisk, &path, BLOCK_CACHE, &[gear_spec()]).await {
+    let specs = gear_specs::<R>();
+    match Storage::open(&FsDisk, &path, BLOCK_CACHE, &specs).await {
         Err(StoreError::CorruptImage) => {
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -152,7 +154,7 @@ async fn open_quarantining(file: &Path) -> Result<Storage<FsDisk>, StoreError> {
                     );
                 }
             }
-            Storage::open(&FsDisk, &path, BLOCK_CACHE, &[gear_spec()]).await
+            Storage::open(&FsDisk, &path, BLOCK_CACHE, &specs).await
         }
         other => other,
     }
