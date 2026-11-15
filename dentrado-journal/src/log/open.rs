@@ -38,6 +38,11 @@ pub(super) async fn open(dir: impl AsRef<Path>, options: Options) -> Result<Jour
     if journal.last.is_some() && ids.contains(&segment::DECL) {
         journal.load_decls().await?;
     }
+    for id in &ids {
+        if *id != segment::DECL && Some(*id) != journal.last {
+            journal.check_sealed(*id).await?;
+        }
+    }
     match journal.last {
         Some(segment::DECL) => journal.last_end = journal.decl_end.unwrap_or_default(),
         Some(last) => journal.load_tail(last).await?,
@@ -167,14 +172,27 @@ impl Journal {
         )
         .await?;
         self.last_end = walked.end;
-        let closed = walked.end != len
-            && walked.end.saturating_add(segment::FOOTER_LEN as u64) == len
-            && segment::decode_footer(reader.at(walked.end, segment::FOOTER_LEN).await?)
-                .is_some_and(|footer| {
-                    footer.count == walked.count
-                        && footer.digest == *walked.digest.finalize().as_bytes()
-                });
-        if closed {
+        // A footer at the end of the file is the seal: this segment is closed,
+        // so nothing past the last good frame may be forgiven — a walk that
+        // stopped early, or a footer that disagrees, is damage, not a tail
+        // still being written. Only an unsealed file is a torn tail.
+        let sealed = match len.checked_sub(segment::FOOTER_LEN as u64) {
+            Some(at) => segment::decode_footer(reader.at(at, segment::FOOTER_LEN).await?)
+                .map(|footer| (at, footer)),
+            None => None,
+        };
+        if let Some((at, footer)) = sealed {
+            if walked.end != at {
+                return Err(Error::corrupt(
+                    segment,
+                    walked.end,
+                    "damage inside a sealed segment",
+                ));
+            }
+            if footer.count != walked.count || footer.digest != *walked.digest.finalize().as_bytes()
+            {
+                return Err(Error::corrupt(segment, at, "the footer disagrees"));
+            }
             return Ok(());
         }
         if walked.end < len {
@@ -182,6 +200,38 @@ impl Journal {
             file.set_len(walked.end).await?;
         }
         self.active = Some(segment::Writer::resume(file, segment, &walked));
+        Ok(())
+    }
+
+    /// Checks that an interior segment is structurally sealed: its header names
+    /// that segment, and a footer closes the file. Its frames are verified as
+    /// they are replayed, never at open.
+    async fn check_sealed(&self, segment: u64) -> Result<(), Error> {
+        let path = self.dir.join(segment::file_name(segment));
+        let file = OpenOptions::new().read(true).open(&path).await?;
+        let len = file.metadata().await?.len();
+        let mut reader = Reader::new(file);
+        match segment::decode_header(reader.at(0, segment::HEADER_LEN).await?) {
+            Ok(header) if header.segment == segment => {}
+            Ok(_) => {
+                return Err(Error::corrupt(
+                    segment,
+                    0,
+                    "segment header names another segment",
+                ));
+            }
+            Err(fault) => return Err(fault.error(segment)),
+        }
+        let Some(at) = len.checked_sub(segment::FOOTER_LEN as u64) else {
+            return Err(Error::corrupt(
+                segment,
+                len,
+                "a sealed segment is too short",
+            ));
+        };
+        if segment::decode_footer(reader.at(at, segment::FOOTER_LEN).await?).is_none() {
+            return Err(Error::corrupt(segment, at, "no footer"));
+        }
         Ok(())
     }
 }

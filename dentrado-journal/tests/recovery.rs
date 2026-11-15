@@ -223,6 +223,59 @@ fn damage_in_a_closed_segment_is_fatal() {
 }
 
 #[test]
+fn damage_inside_a_sealed_tail_is_fatal_not_a_torn_tail() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Journal::open(dir.path()).await.unwrap();
+        let schema = counter(&mut log).await;
+        for round in 0..4u8 {
+            log.append(&[Frame::new(schema, &[round; 16])])
+                .await
+                .unwrap();
+        }
+        log.close().await.unwrap();
+        drop(log);
+
+        let files = segments(dir.path());
+        flip(&files[1], 32);
+
+        let opened = Journal::open(dir.path()).await.map(|_| ());
+        assert!(
+            matches!(opened, Err(Error::Corrupt { .. })),
+            "a sealed segment with a damaged frame must abort, not lose its tail: {opened:?}"
+        );
+    });
+}
+
+#[test]
+fn an_interior_segment_without_a_footer_is_refused_at_open() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap();
+        let options = Options { rotate_bytes: 128 };
+        let mut log = Journal::open_with(dir.path(), options).await.unwrap();
+        let schema = counter(&mut log).await;
+        for round in 0..20u8 {
+            log.append(&[Frame::new(schema, &[round; 16])])
+                .await
+                .unwrap();
+        }
+        log.close().await.unwrap();
+        drop(log);
+
+        let files = segments(dir.path());
+        assert!(files.len() > 2);
+        let len = std::fs::metadata(&files[1]).unwrap().len();
+        truncate(&files[1], len - 44);
+
+        let opened = Journal::open(dir.path()).await.map(|_| ());
+        assert!(
+            matches!(opened, Err(Error::Corrupt { .. })),
+            "a sealed interior segment that lost its footer must be refused: {opened:?}"
+        );
+    });
+}
+
+#[test]
 fn a_footer_that_disagrees_is_fatal() {
     run(async {
         let dir = tempfile::tempdir().unwrap();
