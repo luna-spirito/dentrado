@@ -7,7 +7,6 @@ dist
 *.png
 
 /thinking
-/*.md
 /*.html
 /tools
 /result
