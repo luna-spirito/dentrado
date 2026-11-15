@@ -55,7 +55,6 @@ Engine
 - core/loc_ctx.rs, routing.rs, stats.rs, doorbell.rs — id localization, event routing.
 - core/wire/{format,builder,merger}.rs — network event protocol.
 - core/storage/ — the Storage<R> contract: in_memory.rs (reference), paged/ (on-disk via dentrado-cache), view.rs (GearView overlay).
-- fs/fs.rs — O_DIRECT file I/O on compio.
 - utils/ — state_graph*.rs (dependency graph/incrementality), text.rs (RGA/text CRDTs), sg_ord_map.rs.
 - tests/ — mulsum, paged, shared, wiki, wiki2 (collaboration scenarios).
 - dentrado-cache/ — persistent page cache (port of the Lean model; single-threaded, arena, zero-copy).

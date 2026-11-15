@@ -13,7 +13,6 @@ pub use dentrado_macros::{gear, gears};
 
 pub mod types;
 pub mod core;
-pub(crate) mod fs;
 pub mod utils;
 
 pub use core::wire;
