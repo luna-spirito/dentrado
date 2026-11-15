@@ -362,3 +362,10 @@ Whatever, it needs caching and proper background update smeanics
 - multiple tables for different gear cache kinds.
 
 - Currently gears that perform IO can fail, and that poisons the cache since they're total. Probably need to mark gears as poisoned, idk... And make a new pass to raise alarms.
+
+
+----
+
+6. Unchanged upstream runs still cascade.
+run_loc_gear_task always installs a fresh output, bumps changed, and kicks dependents (core_ctx.rs:720, 763, 805). repo correctly returns the previous RepoMeta when HEAD did not move (repo_gear.rs:56-62), but every article_latest_parsed for that site still reruns, opens its view, reads the cache, and calls secondary_get. With ~2100 pages, every repo interval does ~2100 runs/sessions for nothing.
+Fix: add an “unchanged” marker to GearProduce (or GearCtx::unchanged()); when repo sees the same HEAD, keep the old output and skip the bump/fan-out. This is now the dominant steady-state cost.
