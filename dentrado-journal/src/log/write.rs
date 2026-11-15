@@ -25,6 +25,7 @@ impl Journal {
     /// shape already belongs to another declaration, and [`Error::RegistryFull`]
     /// when the id space is exhausted.
     pub async fn intern(&mut self, decl: Decl<'_>) -> Result<SchemaId, Error> {
+        self.live()?;
         let known = self
             .registry
             .find(decl.shape)
@@ -51,7 +52,8 @@ impl Journal {
         }
         let record = DeclRecord::new(self.registry.next_id()?, decl);
         self.registry.check(&record)?;
-        self.declare(&record).await?;
+        let done = self.declare(&record).await;
+        self.poison(done)?;
         let id = record.id;
         self.registry.insert(record);
         Ok(id)
@@ -68,6 +70,9 @@ impl Journal {
     /// [`Error::Undeclared`] for one this log never declared,
     /// [`Error::TooLarge`] for a payload past [`frame::MAX_PAYLOAD`].
     pub async fn append(&mut self, frames: &[Frame<'_>]) -> Result<Cursor, Error> {
+        self.live()?;
+        // Everything a record can be refused for is decided before a byte is
+        // written, so a bad argument never costs the log its handle.
         let mut batch = Vec::with_capacity(frames.iter().map(Frame::encoded_len).sum());
         for frame in frames {
             frame.check()?;
@@ -82,6 +87,11 @@ impl Journal {
         if batch.is_empty() {
             return Ok(self.head());
         }
+        let done = self.write_batch(batch).await;
+        self.poison(done)
+    }
+
+    async fn write_batch(&mut self, batch: Vec<u8>) -> Result<Cursor, Error> {
         self.ensure_decl().await?;
         self.ensure_active(batch.len() as u64).await?;
         let Some(writer) = self.active.as_mut() else {
@@ -160,6 +170,10 @@ impl Journal {
                 return Ok(());
             }
         }
+        // Closing first is what lets a crash land in the middle: the next
+        // segment may exist while this one has no footer. `open` recognises
+        // that as damage only if this segment was acked, and `poison` stops a
+        // retry from reaching it.
         let last = self.last.unwrap_or(segment::DECL);
         if let Some(mut writer) = self.active.take() {
             writer.close().await?;

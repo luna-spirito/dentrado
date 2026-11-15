@@ -50,15 +50,25 @@
 //!
 //! This is not immunity to the hardware:
 //!
-//! - **Bit rot and media errors** happen, and nothing a log does prevents
-//!   them. Both are *detected*: every frame carries a crc32, and every closed
-//!   segment carries a blake3 digest over all of its frames, verified on every
-//!   full replay and by [`Journal::verify`]. Detection is not repair — repair
-//!   takes redundancy, which is not in this format.
-//! - **A drive that lies about a flush** loses the most recent appends, and
-//!   the log then ends earlier than the writer believed. That is why an
-//!   acknowledgement waits for [`Journal::sync`].
-//! - **An adversary**, or a second writer: see [`Journal`].
+//! - **Bit rot and media errors** happen, and nothing a log does prevents them.
+//!   They are *detected*, never repaired — repair takes redundancy, which is
+//!   not in this format. Every frame carries a crc32 and every closed segment
+//!   carries a blake3 digest over all of its frames, verified on every full
+//!   replay and by [`Journal::verify`]. But a checksum alone cannot tell a
+//!   rotted tail from an append that was interrupted, and getting that wrong is
+//!   exactly how a log loses data it promised: so [`Journal::sync`] also writes
+//!   down *how far* it got (a two-slot, crc'd `acked` file, fsynced after the
+//!   segments). Opening then knows the difference — damage at or below the
+//!   acked head is rot and refuses to open, damage past it is an unfinished
+//!   append and is truncated away.
+//! - **Losing that file** costs only the distinction: the log falls back to
+//!   reading its tail as an interrupted append, exactly as it did before.
+//! - **A drive that lies about a flush** loses the most recent appends, and the
+//!   log then ends earlier than the writer believed. That is why an
+//!   acknowledgement waits for [`Journal::sync`]: the acked file can lag the
+//!   data, never lead it.
+//! - **A second writer** is refused at open by the directory's lock. **An
+//!   adversary** with write access to the files is out of scope.
 //!
 //! When redundancy arrives it is replication, not local doubling: segments are
 //! immutable and self-describing, so a peer holding the same segment can be
@@ -77,16 +87,23 @@
 //! footer (44 B):  "DJNF" | count u64 | digest [u8; 32]
 //! ```
 //!
-//! The frame `crc32` covers `schema_id | payload` and catches a torn tail; the
-//! footer digest (blake3 over every frame byte) catches silent interior damage
-//! in closed segments. Neither defends against an adversary.
+//! The frame `crc32` covers `schema_id | payload` and catches damage inside a
+//! record; the footer digest (blake3 over every frame byte) is what notices a
+//! *missing* record — a crc cannot, because a truncated prefix of a segment
+//! has only valid crcs. Neither defends against an adversary.
+//!
+//! Beside the segments sits `acked`: two 40-byte slots, `seq | decl_end |
+//! segment | offset | crc32`, written in alternation so that a torn write of it
+//! costs a slot rather than the record.
 //!
 //! # Recovery
 //!
 //! Opening is a pure function of the files: segment zero is scanned for
-//! declarations, the last segment's tail is truncated at its first bad frame,
-//! and every other segment is only checked for a header and a footer (frames
-//! are verified as they are replayed). Interior damage is fatal.
+//! declarations, the last segment's tail is truncated at its first bad frame
+//! unless that frame is at or below the acked head, and every other segment is
+//! only checked for a header and a footer (frames are verified as they are
+//! replayed). Interior damage is fatal, and so is a header that does not decode
+//! in a segment the log acked: recreating it would throw away promised records.
 
 #![deny(unsafe_code)]
 #![warn(clippy::pedantic)]
@@ -96,6 +113,7 @@ pub mod cursor;
 pub mod schema;
 pub mod frame;
 pub mod segment;
+pub mod acked;
 pub mod log;
 
 pub use cursor::Cursor;

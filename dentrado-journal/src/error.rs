@@ -86,6 +86,11 @@ pub enum Error {
     },
     /// Every `u16` user schema id is taken.
     RegistryFull,
+    /// A write failed and the journal refuses further work. Drop it and reopen:
+    /// the failed write left a tail that only a reopen can truncate.
+    Poisoned,
+    /// Another writer holds this directory.
+    Locked,
 }
 
 impl Error {
@@ -131,6 +136,8 @@ impl fmt::Display for Error {
                 )
             }
             Self::RegistryFull => f.write_str("every user schema id is taken"),
+            Self::Poisoned => f.write_str("a write failed; reopen the journal"),
+            Self::Locked => f.write_str("another writer holds this journal"),
         }
     }
 }

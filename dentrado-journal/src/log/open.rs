@@ -5,12 +5,19 @@
 //! and truncated at its first bad frame; every segment in between is only
 //! checked for a header and a footer, because its frames are verified as they
 //! are replayed anyway.
+//!
+//! The acked head decides what "its first bad frame" may be forgiven. Past it
+//! the bytes were never acknowledged and any valid prefix is the truth; at or
+//! below it the bytes were promised, so a frame that does not decode is damage
+//! and the log refuses to open.
 
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use compio::fs::OpenOptions;
 
 use super::{Journal, Options};
+use crate::acked;
 use crate::cursor::Cursor;
 use crate::error::Error;
 use crate::frame::Frame;
@@ -20,6 +27,8 @@ use crate::segment::{self, Reader};
 pub(super) async fn open(dir: impl AsRef<Path>, options: Options) -> Result<Journal, Error> {
     let dir = dir.as_ref().to_path_buf();
     std::fs::create_dir_all(&dir)?;
+    let lock = lock(&dir)?;
+    let (recorder, acked) = acked::Recorder::open(&dir).await?;
     let ids = list(&dir)?;
     dense(&ids)?;
 
@@ -34,7 +43,29 @@ pub(super) async fn open(dir: impl AsRef<Path>, options: Options) -> Result<Jour
         last_end: 0,
         head: Cursor::START,
         truncated: 0,
+        acked,
+        recorder,
+        broken: false,
+        _lock: lock,
     };
+    // An acked head names a segment that must still be there: the log promised
+    // bytes this directory no longer holds.
+    if journal.acked.is_some_and(|acked| acked.decl_end > 0) && !ids.contains(&segment::DECL) {
+        return Err(Error::corrupt(
+            segment::DECL,
+            0,
+            "the acked head names a segment that is gone",
+        ));
+    }
+    if let Some(data) = journal.acked.and_then(|acked| acked.data)
+        && journal.last.is_none_or(|last| data.segment > last)
+    {
+        return Err(Error::corrupt(
+            data.segment,
+            0,
+            "the acked head names a segment that is gone",
+        ));
+    }
     if journal.last.is_some() && ids.contains(&segment::DECL) {
         journal.load_decls().await?;
     }
@@ -53,6 +84,17 @@ pub(super) async fn open(dir: impl AsRef<Path>, options: Options) -> Result<Jour
         None => Cursor::START,
     };
     Ok(journal)
+}
+
+/// Takes the directory's lock, so that a second writer is refused instead of
+/// interleaving at the same offsets. Nothing is created for it.
+fn lock(dir: &Path) -> Result<std::fs::File, Error> {
+    let file = std::fs::File::open(dir)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Error::Locked),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 impl Journal {
@@ -78,7 +120,8 @@ impl Journal {
                 ));
             }
             Err(fault) => {
-                if !fault.is_creation() || self.last != Some(segment::DECL) {
+                let acked = self.acked.is_some_and(|acked| acked.decl_end > 0);
+                if !Self::forgivable(acked, fault) || self.last != Some(segment::DECL) {
                     return Err(fault.error(segment::DECL));
                 }
                 self.truncated += len;
@@ -108,11 +151,21 @@ impl Journal {
         )
         .await?;
         if walked.end != len {
-            if self.last != Some(segment::DECL) {
-                return Err(Error::corrupt(segment::DECL, walked.end, "damaged frame"));
+            // A declaration past the acked end was never acknowledged, so the
+            // tail may be cut. Anything at or below it was promised, and its
+            // loss is damage — even when data segments exist, because then the
+            // records that named it are acked too.
+            if self.acked.is_some_and(|acked| acked.decl_end > walked.end) {
+                return Err(Error::corrupt(
+                    segment::DECL,
+                    walked.end,
+                    "damage below the acked head",
+                ));
             }
             self.truncated += len - walked.end;
             file.set_len(walked.end).await?;
+            self.decl_end = Some(walked.end);
+            return Ok(());
         }
         self.decl_end = Some(walked.end);
         Ok(())
@@ -140,7 +193,10 @@ impl Journal {
                 ));
             }
             Err(fault) => {
-                if !fault.is_creation() {
+                // A segment header this build cannot read is a crash during
+                // creation only if nothing in the segment was ever acked.
+                let acked = self.acked.is_some_and(|acked| acked.reaches(segment));
+                if !Self::forgivable(acked, fault) {
                     return Err(fault.error(segment));
                 }
                 self.truncated += len;
@@ -151,23 +207,30 @@ impl Journal {
             }
         }
         let registry = &self.registry;
+        let acked = self.acked.and_then(|acked| acked.offset_in(segment));
         let walked = segment::walk(
             &mut reader,
             segment,
             segment::HEADER_LEN as u64,
             len,
             async |cursor, frame: Frame<'_>| {
-                if frame.schema == SchemaId::DECL {
+                if !frame.schema.is_user() {
                     return Err(Error::corrupt(
                         segment,
                         cursor.offset,
-                        "a declaration outside the declaration segment",
+                        "a record with a schema that does not belong here",
                     ));
                 }
                 if registry.get(frame.schema).is_none() {
+                    // Past the acked head a record may name a declaration that
+                    // was torn away with it: nothing promised is lost by
+                    // stopping here, and the tail is cut below.
+                    if acked.is_some_and(|acked| cursor.offset >= acked) {
+                        return Ok(ControlFlow::Break(()));
+                    }
                     return Err(Error::Undeclared { id: frame.schema.0 });
                 }
-                Ok(std::ops::ControlFlow::Continue(()))
+                Ok(ControlFlow::Continue(()))
             },
         )
         .await?;
@@ -195,12 +258,31 @@ impl Journal {
             }
             return Ok(());
         }
+        // Unsealed: an unfinished append, so everything past the acked head may
+        // go. Damage at or below it was promised to a writer that got a reply.
+        if let Some(acked) = acked
+            && walked.end < acked
+        {
+            return Err(Error::corrupt(
+                segment,
+                walked.end,
+                "damage below the acked head",
+            ));
+        }
         if walked.end < len {
             self.truncated += len - walked.end;
             file.set_len(walked.end).await?;
         }
         self.active = Some(segment::Writer::resume(file, segment, &walked));
         Ok(())
+    }
+
+    /// Whether a segment header this build cannot read is explained by a crash
+    /// while the segment was being created. Only when no byte of it was ever
+    /// acked: otherwise the header is damage, and recreating the file would
+    /// throw away records the log promised to keep.
+    fn forgivable(acked: bool, fault: segment::HeaderFault) -> bool {
+        !acked && fault.is_creation()
     }
 
     /// Checks that an interior segment is structurally sealed: its header names

@@ -49,10 +49,15 @@ pub fn file_name(segment: u64) -> String {
     format!("{segment:020}{SUFFIX}")
 }
 
-/// The segment id a file name stands for, if it is one of ours.
+/// The segment id a file name stands for, if it is one of ours. Digits only,
+/// so that one segment has exactly one name.
 #[must_use]
 pub fn parse_file_name(name: &str) -> Option<u64> {
-    name.strip_suffix(SUFFIX)?.parse().ok()
+    let digits = name.strip_suffix(SUFFIX)?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// The id a segment header announces.
@@ -199,10 +204,17 @@ impl Writer {
     }
 
     /// Appends one whole frame.
+    ///
+    /// The footer state is advanced only once the bytes are in the file, so a
+    /// failed write leaves a writer that still describes what is on disk — and
+    /// a close after it would seal the truth rather than a lie.
     pub(crate) async fn write(&mut self, bytes: Vec<u8>) -> Result<(), Error> {
-        self.digest.update(&bytes);
+        let mut digest = self.digest.clone();
+        digest.update(&bytes);
+        self.put(bytes).await?;
+        self.digest = digest;
         self.count += 1;
-        self.put(bytes).await
+        Ok(())
     }
 
     /// Makes everything written so far durable, unless it already is.
@@ -239,9 +251,9 @@ impl Writer {
     }
 }
 
-/// Makes a directory entry durable. Called once per segment created; a `Log`
-/// without the fsync would forget the segment's very existence after a crash.
-fn sync_dir(dir: &Path) -> io::Result<()> {
+/// Makes a directory entry durable. Called once per file created; a log
+/// without the fsync would forget the file's very existence after a crash.
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
@@ -310,6 +322,10 @@ pub(crate) struct Walked {
 /// The visitor is async and gets a frame borrowing the read window, so it may
 /// await on it (a cache write, say) as long as it does not try to read the same
 /// segment meanwhile. Nothing is copied per record.
+///
+/// [`ControlFlow::Break`] means "stop, and do not count this record": the
+/// returned [`Walked`] describes the prefix *before* it. A caller that
+/// consumed the record anyway has to add its length back.
 pub(crate) async fn walk(
     reader: &mut Reader,
     segment: u64,
@@ -339,13 +355,13 @@ pub(crate) async fn walk(
         let Some((frame, _)) = frame::decode(raw) else {
             break;
         };
-        walked.digest.update(raw);
-        walked.count += 1;
-        walked.end = at + total as u64;
         if visit(Cursor::new(segment, at), frame).await?.is_break() {
             walked.broke = true;
             break;
         }
+        walked.digest.update(raw);
+        walked.count += 1;
+        walked.end = at + total as u64;
     }
     Ok(walked)
 }

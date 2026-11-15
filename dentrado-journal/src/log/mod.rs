@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use compio::fs::File;
 
+use crate::acked::{self, Acked};
 use crate::cursor::Cursor;
 use crate::error::{Error, ReplayError};
 use crate::frame::Frame;
@@ -37,9 +38,14 @@ impl Default for Options {
 /// files and does positional io through `compio`. An append reaches the file
 /// immediately; it is only durable after [`Journal::sync`].
 ///
-/// One writer per directory: the log takes no lock, so a second `open` of the
-/// same directory would append at the same offsets. Readers ([`Journal::replay_from`])
-/// are fine alongside a writer.
+/// One writer per directory: `open` takes the directory's lock, so a second
+/// writer is refused rather than allowed to interleave. Readers
+/// ([`Journal::replay_from`]) are fine alongside a writer.
+///
+/// After an append, a sync or a close returns an error, the journal is
+/// poisoned: the failed write left a tail no writer can reason about, so every
+/// later call fails with [`Error::Poisoned`] until the handle is dropped and
+/// the log reopened.
 #[derive(Debug)]
 pub struct Journal {
     dir: PathBuf,
@@ -52,21 +58,28 @@ pub struct Journal {
     last_end: u64,
     head: Cursor,
     truncated: u64,
+    acked: Option<Acked>,
+    recorder: acked::Recorder,
+    broken: bool,
+    _lock: std::fs::File,
 }
 
 impl Journal {
     /// Opens (or creates) the log in `dir`.
     ///
     /// This is a pure function of the files present: declarations are read from
-    /// segment zero, the last segment's torn tail is truncated, and closed
-    /// segments are only checked for a header and a footer. Nothing is written
-    /// unless there is damage to repair.
+    /// segment zero, the last segment's unfinished tail is truncated, and
+    /// closed segments are only checked for a header and a footer. Nothing is
+    /// written unless there is damage to repair. The directory is locked
+    /// against a second writer for as long as the journal lives, and nothing is
+    /// created for the lock.
     ///
     /// # Errors
     ///
     /// [`Error::Corrupt`] for interior damage, a hole in the segment ids, a
-    /// declaration that contradicts the registry, or a record naming an
-    /// undeclared schema. [`Error::Version`] for a log this build cannot read.
+    /// declaration that contradicts the registry, a record naming an undeclared
+    /// schema, or damage at or below the acked head. [`Error::Version`] for a
+    /// log this build cannot read, [`Error::Locked`] for a second writer.
     pub async fn open(dir: impl AsRef<Path>) -> Result<Self, Error> {
         open::open(dir, Options::default()).await
     }
@@ -99,19 +112,21 @@ impl Journal {
         &self.registry
     }
 
-    /// Makes every append so far durable. One `fdatasync` per segment at most.
+    /// Makes every append so far durable, and says so.
+    ///
+    /// The segments are synced first and the acked head second, so the record
+    /// of the ack can never run ahead of the data it describes: a crash between
+    /// the two leaves the head behind, which only makes the next open more
+    /// forgiving. Nothing is written when there is nothing new to ack.
     ///
     /// # Errors
     ///
-    /// Whatever the filesystem says; the log stays a valid prefix.
+    /// Whatever the filesystem says; the log stays a valid prefix, and the
+    /// journal is poisoned.
     pub async fn sync(&mut self) -> Result<(), Error> {
-        if let Some(writer) = &mut self.decl {
-            writer.sync().await?;
-        }
-        if let Some(writer) = &mut self.active {
-            writer.sync().await?;
-        }
-        Ok(())
+        self.live()?;
+        let done = self.sync_segments().await;
+        self.poison(done)
     }
 
     /// Closes the segment being written, so that the next append rotates.
@@ -121,12 +136,65 @@ impl Journal {
     ///
     /// # Errors
     ///
-    /// Whatever the filesystem says.
+    /// Whatever the filesystem says; the journal is poisoned.
     pub async fn close(&mut self) -> Result<(), Error> {
-        if let Some(mut writer) = self.active.take() {
-            writer.close().await?;
+        self.live()?;
+        let done = async {
+            if let Some(mut writer) = self.active.take() {
+                writer.close().await?;
+            }
+            self.sync_segments().await
         }
-        self.sync().await
+        .await;
+        self.poison(done)
+    }
+
+    async fn sync_segments(&mut self) -> Result<(), Error> {
+        if let Some(writer) = &mut self.decl {
+            writer.sync().await?;
+        }
+        if let Some(writer) = &mut self.active {
+            writer.sync().await?;
+        }
+        self.record_ack().await
+    }
+
+    /// Writes down how far the log is acked, skipping the write when nothing
+    /// moved. Called only after the segments themselves are durable.
+    async fn record_ack(&mut self) -> Result<(), Error> {
+        let acked = Acked {
+            decl_end: self.decl_end.unwrap_or(0),
+            data: match self.last {
+                Some(segment) if segment != segment::DECL => {
+                    Some(Cursor::new(segment, self.last_end))
+                }
+                _ => None,
+            },
+        };
+        if acked.is_empty() || Some(acked) == self.acked {
+            return Ok(());
+        }
+        self.recorder.save(acked).await?;
+        self.acked = Some(acked);
+        Ok(())
+    }
+
+    /// Fails every call once a write has failed: the tail is half-applied, and
+    /// only a reopen — which truncates it — can tell how much landed.
+    fn live(&self) -> Result<(), Error> {
+        if self.broken {
+            Err(Error::Poisoned)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Marks the journal unusable if `done` failed, and hands it back.
+    fn poison<T>(&mut self, done: Result<T, Error>) -> Result<T, Error> {
+        if done.is_err() {
+            self.broken = true;
+        }
+        done
     }
 
     /// Replays every record from `from` onwards.
@@ -169,7 +237,9 @@ impl Journal {
     /// # Errors
     ///
     /// As [`Journal::replay_from`], plus [`ReplayError::Visit`] if the visitor
-    /// stops with an error.
+    /// stops with an error. If the log itself fails after the visitor already
+    /// refused a record, [`ReplayError::Log`] wins: the log's state is the one
+    /// the caller cannot act on.
     pub async fn try_replay_from<E, F>(
         &self,
         from: Cursor,
@@ -240,21 +310,42 @@ impl Journal {
             }
             let mut reader = Reader::new(file);
             let registry = &self.registry;
-            let walked = segment::walk(&mut reader, segment, start, end, async |cursor, frame| {
-                if frame.schema == SchemaId::DECL && segment != segment::DECL {
-                    return Err(Error::corrupt(
-                        segment,
-                        cursor.offset,
-                        "a declaration outside the declaration segment",
-                    ));
-                }
-                if registry.get(frame.schema).is_none() {
-                    return Err(Error::Undeclared { id: frame.schema.0 });
-                }
-                visit(cursor, frame).await
-            })
+            let mut consumed = 0;
+            let walked = segment::walk(
+                &mut reader,
+                segment,
+                start,
+                end,
+                async |cursor, frame: Frame<'_>| {
+                    consumed = frame.encoded_len() as u64;
+                    // Segment zero holds declarations and nothing else; every other
+                    // segment holds consumer records and nothing else. Format-owned
+                    // ids (a stray purge, say) never appear in a data stream.
+                    let belongs = if segment == segment::DECL {
+                        frame.schema == SchemaId::DECL
+                    } else {
+                        frame.schema.is_user()
+                    };
+                    if !belongs {
+                        return Err(Error::corrupt(
+                            segment,
+                            cursor.offset,
+                            "a record with a schema that does not belong here",
+                        ));
+                    }
+                    if registry.get(frame.schema).is_none() {
+                        return Err(Error::Undeclared { id: frame.schema.0 });
+                    }
+                    visit(cursor, frame).await
+                },
+            )
             .await?;
-            at = Cursor::new(segment, walked.end);
+            // The visitor stopped before the record it broke on; it saw that
+            // record, so the resume point is past it.
+            at = Cursor::new(
+                segment,
+                walked.end + if walked.broke { consumed } else { 0 },
+            );
             if walked.broke {
                 return Ok(at);
             }
@@ -305,5 +396,44 @@ impl Journal {
             return Err(Error::corrupt(segment, end, "the footer disagrees"));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+
+    use super::Journal;
+    use crate::error::Error;
+    use crate::frame::Frame;
+    use crate::schema::SchemaId;
+    use crate::segment;
+
+    fn run<F: Future>(f: F) -> F::Output {
+        compio::runtime::Runtime::new().unwrap().block_on(f)
+    }
+
+    #[test]
+    fn a_format_owned_record_in_a_data_segment_is_refused() {
+        run(async {
+            let dir = tempfile::tempdir().unwrap();
+            segment::Writer::create(dir.path(), segment::DECL)
+                .await
+                .unwrap()
+                .close()
+                .await
+                .unwrap();
+            let mut data = segment::Writer::create(dir.path(), 1).await.unwrap();
+            let mut bytes = Vec::new();
+            Frame::new(SchemaId::PURGE, b"not a consumer record").encode(&mut bytes);
+            data.write(bytes).await.unwrap();
+            data.close().await.unwrap();
+
+            let opened = Journal::open(dir.path()).await.map(|_| ());
+            assert!(
+                matches!(opened, Err(Error::Corrupt { .. })),
+                "a purge record is not consumer data: {opened:?}"
+            );
+        });
     }
 }

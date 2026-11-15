@@ -1,11 +1,12 @@
-//! Opening, repairing, and refusing: what the files on disk mean.
-
-use std::ops::ControlFlow;
+//! Opening, declaring, rotating: the log when nothing is wrong.
+//!
+//! Damage has its own file — this one is about the shape of a healthy log and
+//! the states a crash alone can produce.
 
 use dentrado_journal::{Conflict, Cursor, Decl, Error, Frame, Journal, Options, SchemaId};
 
 mod common;
-use common::{COUNTER, COUNTER_SHAPE, copy_dir, counter, flip, records, run, segments, truncate};
+use common::{COUNTER, COUNTER_SHAPE, counter, records, run, segments};
 
 #[test]
 fn an_empty_directory_is_a_log() {
@@ -169,6 +170,29 @@ fn appending_after_a_close_starts_a_new_segment() {
 }
 
 #[test]
+fn a_failed_write_poisons_the_journal() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let options = Options { rotate_bytes: 128 };
+        let mut log = Journal::open_with(&path, options).await.unwrap();
+        let schema = counter(&mut log).await;
+        log.append(&[Frame::new(schema, &[0u8; 64])]).await.unwrap();
+
+        // Rotation needs a new file, and the directory is no longer there.
+        std::fs::remove_dir_all(&path).unwrap();
+        let failed = log.append(&[Frame::new(schema, &[1u8; 64])]).await;
+        assert!(failed.is_err(), "the rotation cannot succeed: {failed:?}");
+
+        // A half-applied write is not retried on the same handle.
+        let refused = log.append(&[Frame::new(schema, &[2u8; 64])]).await;
+        assert!(matches!(refused, Err(Error::Poisoned)), "{refused:?}");
+        assert!(matches!(log.sync().await, Err(Error::Poisoned)));
+        assert!(matches!(log.close().await, Err(Error::Poisoned)));
+    });
+}
+
+#[test]
 fn rotation_keeps_the_stream_and_the_cursors() {
     run(async {
         let dir = tempfile::tempdir().unwrap();
@@ -196,229 +220,14 @@ fn rotation_keeps_the_stream_and_the_cursors() {
 }
 
 #[test]
-fn damage_in_a_closed_segment_is_fatal() {
+fn a_second_writer_is_refused() {
     run(async {
         let dir = tempfile::tempdir().unwrap();
-        let options = Options { rotate_bytes: 128 };
-        let mut log = Journal::open_with(dir.path(), options).await.unwrap();
-        let schema = counter(&mut log).await;
-        for round in 0..20u8 {
-            log.append(&[Frame::new(schema, &[round; 16])])
-                .await
-                .unwrap();
-        }
-        log.close().await.unwrap();
-        drop(log);
-
-        let files = segments(dir.path());
-        assert!(files.len() > 2);
-        flip(&files[1], 32 + 4);
-
-        let log = Journal::open(dir.path()).await.unwrap();
-        let refused = log
-            .replay_from(Cursor::START, async |_, _| ControlFlow::Continue(()))
-            .await;
-        assert!(matches!(refused, Err(Error::Corrupt { .. })), "{refused:?}");
-    });
-}
-
-#[test]
-fn damage_inside_a_sealed_tail_is_fatal_not_a_torn_tail() {
-    run(async {
-        let dir = tempfile::tempdir().unwrap();
-        let mut log = Journal::open(dir.path()).await.unwrap();
-        let schema = counter(&mut log).await;
-        for round in 0..4u8 {
-            log.append(&[Frame::new(schema, &[round; 16])])
-                .await
-                .unwrap();
-        }
-        log.close().await.unwrap();
-        drop(log);
-
-        let files = segments(dir.path());
-        flip(&files[1], 32);
-
-        let opened = Journal::open(dir.path()).await.map(|_| ());
+        let _first = Journal::open(dir.path()).await.unwrap();
+        let second = Journal::open(dir.path()).await.map(|_| ());
         assert!(
-            matches!(opened, Err(Error::Corrupt { .. })),
-            "a sealed segment with a damaged frame must abort, not lose its tail: {opened:?}"
+            matches!(second, Err(Error::Locked)),
+            "one writer per directory: {second:?}"
         );
     });
-}
-
-#[test]
-fn an_interior_segment_without_a_footer_is_refused_at_open() {
-    run(async {
-        let dir = tempfile::tempdir().unwrap();
-        let options = Options { rotate_bytes: 128 };
-        let mut log = Journal::open_with(dir.path(), options).await.unwrap();
-        let schema = counter(&mut log).await;
-        for round in 0..20u8 {
-            log.append(&[Frame::new(schema, &[round; 16])])
-                .await
-                .unwrap();
-        }
-        log.close().await.unwrap();
-        drop(log);
-
-        let files = segments(dir.path());
-        assert!(files.len() > 2);
-        let len = std::fs::metadata(&files[1]).unwrap().len();
-        truncate(&files[1], len - 44);
-
-        let opened = Journal::open(dir.path()).await.map(|_| ());
-        assert!(
-            matches!(opened, Err(Error::Corrupt { .. })),
-            "a sealed interior segment that lost its footer must be refused: {opened:?}"
-        );
-    });
-}
-
-#[test]
-fn a_footer_that_disagrees_is_fatal() {
-    run(async {
-        let dir = tempfile::tempdir().unwrap();
-        let options = Options { rotate_bytes: 128 };
-        let mut log = Journal::open_with(dir.path(), options).await.unwrap();
-        let schema = counter(&mut log).await;
-        for round in 0..20u8 {
-            log.append(&[Frame::new(schema, &[round; 16])])
-                .await
-                .unwrap();
-        }
-        log.close().await.unwrap();
-        drop(log);
-
-        let files = segments(dir.path());
-        let len = std::fs::metadata(&files[1]).unwrap().len();
-        flip(&files[1], len - 40);
-
-        let log = Journal::open(dir.path()).await.unwrap();
-        let refused = log
-            .replay_from(Cursor::START, async |_, _| ControlFlow::Continue(()))
-            .await;
-        assert!(matches!(refused, Err(Error::Corrupt { .. })), "{refused:?}");
-    });
-}
-
-#[test]
-fn a_torn_tail_replays_exactly_its_valid_prefix() {
-    run(async {
-        let source = tempfile::tempdir().unwrap();
-        let mut log = Journal::open(source.path()).await.unwrap();
-        let schema = counter(&mut log).await;
-        for payload in [&b""[..], b"a", &[7u8; 300], b"last"] {
-            log.append(&[Frame::new(schema, payload)]).await.unwrap();
-        }
-        let full = records(&log, Cursor::START).await;
-        drop(log);
-
-        let tail = segments(source.path()).pop().unwrap();
-        let len = std::fs::metadata(&tail).unwrap().len();
-        let tail_name = tail.file_name().unwrap().to_owned();
-
-        for cut in 0..=len {
-            let victim = tempfile::tempdir().unwrap();
-            copy_dir(source.path(), victim.path());
-            truncate(&victim.path().join(&tail_name), cut);
-
-            let mut log = Journal::open(victim.path()).await.unwrap();
-            let segment = log.head().segment;
-            let want: Vec<_> = full
-                .iter()
-                .filter(|(at, _, payload)| {
-                    at.segment < segment || at.offset + 10 + payload.len() as u64 <= cut
-                })
-                .cloned()
-                .collect();
-            assert_eq!(
-                records(&log, Cursor::START).await,
-                want,
-                "cut at {cut} of {len}"
-            );
-
-            // And the log goes on from there.
-            let head = log.head();
-            log.append(&[Frame::new(schema, b"recovered")])
-                .await
-                .unwrap();
-            let seen = records(&log, Cursor::START).await;
-            assert_eq!(seen.len(), want.len() + 1, "cut at {cut} of {len}");
-            assert_eq!(seen.last().unwrap().2, b"recovered");
-            assert!(head < log.head());
-        }
-    });
-}
-
-#[test]
-fn a_cut_tail_is_repaired_but_a_closed_one_is_not() {
-    run(async {
-        let dir = tempfile::tempdir().unwrap();
-        let mut log = Journal::open(dir.path()).await.unwrap();
-        let schema = counter(&mut log).await;
-        log.append(&[Frame::new(schema, b"kept")]).await.unwrap();
-        log.close().await.unwrap();
-        log.append(&[Frame::new(schema, b"new")]).await.unwrap();
-        log.sync().await.unwrap();
-        let head = log.head();
-        drop(log);
-
-        let files = segments(dir.path());
-        let len = std::fs::metadata(&files[2]).unwrap().len();
-        truncate(&files[2], len / 2);
-
-        let log = Journal::open(dir.path()).await.unwrap();
-        assert!(log.truncated() > 0);
-        assert!(log.head() < head);
-        let payloads: Vec<_> = records(&log, Cursor::START)
-            .await
-            .into_iter()
-            .filter(|(_, schema, _)| schema.is_user())
-            .map(|(_, _, payload)| payload)
-            .collect();
-        assert_eq!(payloads, [b"kept".to_vec()]);
-    });
-}
-
-use proptest::prelude::*;
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(24))]
-
-    #[test]
-    fn any_stream_survives_any_torn_tail(
-        payloads in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..40), 1..6),
-        seed in any::<u64>(),
-    ) {
-        run(async {
-            let source = tempfile::tempdir().unwrap();
-            let mut log = Journal::open(source.path()).await.unwrap();
-            let schema = counter(&mut log).await;
-            for payload in &payloads {
-                log.append(&[Frame::new(schema, payload)]).await.unwrap();
-            }
-            let full = records(&log, Cursor::START).await;
-            drop(log);
-
-            let tail = segments(source.path()).pop().unwrap();
-            let len = std::fs::metadata(&tail).unwrap().len();
-            let cut = if len == 0 { 0 } else { seed % (len + 1) };
-            let tail_name = tail.file_name().unwrap().to_owned();
-
-            let victim = tempfile::tempdir().unwrap();
-            copy_dir(source.path(), victim.path());
-            truncate(&victim.path().join(&tail_name), cut);
-
-            let log = Journal::open(victim.path()).await.unwrap();
-            let segment = log.head().segment;
-            let want: Vec<_> = full
-                .into_iter()
-                .filter(|(at, _, payload)| {
-                    at.segment < segment || at.offset + 10 + payload.len() as u64 <= cut
-                })
-                .collect();
-            assert_eq!(records(&log, Cursor::START).await, want);
-        });
-    }
 }

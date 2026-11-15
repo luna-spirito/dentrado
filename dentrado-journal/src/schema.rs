@@ -79,13 +79,19 @@ pub fn hash_of(shape: &str) -> [u8; 32] {
 
 /// Serializes a declaration: `id u16 | hash [u8;32] | name | shape`,
 /// each text being `len u32 | utf-8`.
+///
+/// # Panics
+///
+/// If a text is longer than `u32`, which [`MAX_TEXT`] makes unreachable for
+/// anything `intern` accepted.
 #[must_use]
 pub fn encode_decl(record: &DeclRecord) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(2 + 32 + 8 + record.name.len() + record.shape.len());
     bytes.extend_from_slice(&record.id.0.to_le_bytes());
     bytes.extend_from_slice(&record.hash);
     for text in [&record.name, &record.shape] {
-        bytes.extend_from_slice(&u32::try_from(text.len()).unwrap_or(0).to_le_bytes());
+        let len = u32::try_from(text.len()).expect("a declaration text is capped at MAX_TEXT");
+        bytes.extend_from_slice(&len.to_le_bytes());
         bytes.extend_from_slice(text.as_bytes());
     }
     bytes
@@ -290,9 +296,7 @@ impl Registry {
             self.by_id.resize(at + 1, None);
         }
         self.by_hash.insert(record.hash, record.id.0);
-        if let Some(slot) = self.by_id.get_mut(at) {
-            *slot = Some(record);
-        }
+        self.by_id[at] = Some(record);
     }
 
     /// `blake3` over every `(id, shape_hash)` pair in id order: the identity of
