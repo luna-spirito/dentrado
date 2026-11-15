@@ -1,0 +1,15 @@
+[package]
+name = "dentrado-journal"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Append-only, domain-blind event journal for Dentrado"
+
+[dependencies]
+blake3 = "1"
+compio = { version = "0.19.2", features = ["fs", "io"] }
+crc32fast = "1"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"

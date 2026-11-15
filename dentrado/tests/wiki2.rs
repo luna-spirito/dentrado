@@ -243,6 +243,17 @@ impl RuntimeTypes for Wiki2Runtime {
     type Group = Wiki2Group;
     type Body = Wiki2Body;
     type Data = BranchData;
+
+    fn gear_kind(gear: &Self::GearId) -> &'static str {
+        match gear {
+            Wiki2Gear::Invited { .. } => "Invited",
+            Wiki2Gear::DocContent { .. } => "DocContent",
+        }
+    }
+
+    fn gear_kinds() -> &'static [&'static str] {
+        &["Invited", "DocContent"]
+    }
 }
 
 impl IsRuntime for Wiki2Runtime {

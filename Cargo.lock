@@ -1091,6 +1091,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dentrado-journal"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "compio",
+ "crc32fast",
+ "proptest",
+ "tempfile",
+]
+
+[[package]]
 name = "dentrado-macros"
 version = "0.1.0"
 dependencies = [

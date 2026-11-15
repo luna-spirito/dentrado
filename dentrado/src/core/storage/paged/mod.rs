@@ -36,7 +36,7 @@ use dentrado_cache::{Storage, disk::FsDisk};
 
 use crate::{
     core::{
-        api::RuntimeTypes,
+        api::{GearTable, RuntimeTypes},
         loc_ctx::{StoreResultSuccess, StoredEvent},
         storage::{
             GroupDiff, IsStorage, Watermark,
@@ -232,7 +232,7 @@ where
         Self: 'a;
 
     fn gear_view(&self, gear: &R::GearId) -> impl Future<Output = Self::View<'_>> {
-        let table = R::gear_table(gear);
+        let table = GearTable::of(R::gear_kind(gear));
         let prefix = gear_key::<R>(gear).to_vec();
         async move {
             match &self.file {

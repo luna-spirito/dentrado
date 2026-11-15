@@ -45,7 +45,7 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    FnArg, Ident, Item, ItemMod, LitByteStr, LitStr, Pat, ReturnType, Token, Type, Visibility,
+    FnArg, Ident, Item, ItemMod, LitStr, Pat, ReturnType, Token, Type, Visibility,
     parse::{Parse, ParseStream, Parser},
     punctuated::Punctuated,
 };
@@ -1164,19 +1164,14 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         }
     });
 
-    let table_ids: Vec<LitByteStr> = specs
+    let kind_names: Vec<LitStr> = specs
         .iter()
-        .map(|g| {
-            LitByteStr::new(
-                format!("dentrado/gear-view/0/{}", g.name).as_bytes(),
-                g.name.span(),
-            )
-        })
+        .map(|g| LitStr::new(&g.name.to_string(), g.name.span()))
         .collect();
 
-    let table_arms = specs.iter().zip(&table_ids).map(|(g, id)| {
+    let kind_arms = specs.iter().zip(&kind_names).map(|(g, kind)| {
         let v = &g.name;
-        quote! { GearId::#v { .. } => #id, }
+        quote! { GearId::#v { .. } => #kind, }
     });
 
     let generated = quote! {
@@ -1242,18 +1237,17 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             type Body = ();
             type Data = ();
 
-            // One table per gear kind, named `dentrado/gear-view/0/<Kind>` —
-            // the prefix must match `dentrado::core::api::GEAR_TABLE_PREFIX`,
-            // which the store's startup GC matches against to drop kinds this
-            // layout no longer declares.
-            fn gear_table(gear: &Self::GearId) -> &'static [u8] {
+            // One table per gear kind. Only the *kind* is declared here: the
+            // namespace and the layout version are the store's business
+            // (`dentrado::core::api::gear_table_id`).
+            fn gear_kind(gear: &Self::GearId) -> &'static str {
                 match gear {
-                    #( #table_arms )*
+                    #( #kind_arms )*
                 }
             }
 
-            fn gear_tables() -> &'static [&'static [u8]] {
-                &[ #( #table_ids as &'static [u8] ),* ]
+            fn gear_kinds() -> &'static [&'static str] {
+                &[ #( #kind_names ),* ]
             }
         }
 

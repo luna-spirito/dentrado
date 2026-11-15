@@ -208,6 +208,14 @@ impl RuntimeTypes for EmptyRuntime {
     type Group = ();
     type Body = ();
     type Data = ();
+
+    fn gear_kind(_gear: &Self::GearId) -> &'static str {
+        "empty"
+    }
+
+    fn gear_kinds() -> &'static [&'static str] {
+        &["empty"]
+    }
 }
 
 impl IsRuntime for EmptyRuntime {

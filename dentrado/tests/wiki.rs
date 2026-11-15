@@ -81,6 +81,14 @@ impl RuntimeTypes for WikiCounterRuntime {
     type Group = LocDataId;
     type Body = LocUserId;
     type Data = BranchData;
+
+    fn gear_kind(_gear: &Self::GearId) -> &'static str {
+        "InvitesCount"
+    }
+
+    fn gear_kinds() -> &'static [&'static str] {
+        &["InvitesCount"]
+    }
 }
 
 impl IsRuntime for WikiCounterRuntime {

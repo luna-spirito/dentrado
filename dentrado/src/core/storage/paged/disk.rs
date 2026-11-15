@@ -14,13 +14,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use dentrado_cache::{Storage, StoreError, disk::FsDisk};
+use dentrado_cache::{Storage, StoreError, TableSpec, disk::FsDisk};
 use futures::channel::oneshot;
 
 use super::PagedStorage;
 use crate::core::{
-    api::RuntimeTypes,
-    storage::view::{gear_specs, is_gear_table, legacy_gear_table},
+    api::{GearTable, RuntimeTypes},
+    storage::view::{gear_specs, gear_tables, legacy_gear_table},
 };
 
 /// Page-cache arena slots per core (1024 pages = 4 MiB).
@@ -104,17 +104,21 @@ impl<R: RuntimeTypes> PagedStorage<R> {
         }
     }
 
-    /// Open the store, then the startup table GC: this file holds only
-    /// gear-view tables, so a gear-view identity outside the current set is an
-    /// orphan an older build left — dropped at rest, before the first view
-    /// (and the drop marked dirty, so the next `flush` engraves it into the
-    /// image). Unrelated tables are never touched.
+    /// Open the store, then the startup table GC: a gear-view table that this
+    /// layout does not ask for (an older kind set, or an older layout version)
+    /// is an orphan an older build left — dropped at rest, before the first
+    /// view (and the drop marked dirty, so the next `flush` engraves it into
+    /// the image). Anything outside the namespace is never touched.
     async fn open(&self, file: &Path) -> Result<Storage<FsDisk>, StoreError> {
-        let store = open_quarantining::<R>(file).await?;
-        let keep = R::gear_tables();
+        let tables = gear_tables::<R>();
+        let specs = gear_specs(&tables);
+        let store = open_quarantining(file, &specs).await?;
         for name in store.tables() {
-            let ours = is_gear_table(&name) || name == legacy_gear_table();
-            if ours && !keep.contains(&name.as_slice()) {
+            let orphan = match GearTable::decode(&name) {
+                Some(table) => !tables.contains(&table),
+                None => name == legacy_gear_table(),
+            };
+            if orphan {
                 match store.drop_table(&name).await {
                     Ok(()) => self.dirty.set(true),
                     Err(e) => log::warn!("page store: GC of table {name:?} failed: {e:?}"),
@@ -128,10 +132,12 @@ impl<R: RuntimeTypes> PagedStorage<R> {
 /// Open the store, quarantining a corrupt image: the file is renamed aside
 /// (kept for inspection) and a fresh store opens in its place. A rename
 /// failure falls back to the plain open — its error is fatal.
-async fn open_quarantining<R: RuntimeTypes>(file: &Path) -> Result<Storage<FsDisk>, StoreError> {
+async fn open_quarantining(
+    file: &Path,
+    specs: &[TableSpec],
+) -> Result<Storage<FsDisk>, StoreError> {
     let path = file.display().to_string();
-    let specs = gear_specs::<R>();
-    match Storage::open(&FsDisk, &path, BLOCK_CACHE, &specs).await {
+    match Storage::open(&FsDisk, &path, BLOCK_CACHE, specs).await {
         Err(StoreError::CorruptImage) => {
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -154,7 +160,7 @@ async fn open_quarantining<R: RuntimeTypes>(file: &Path) -> Result<Storage<FsDis
                     );
                 }
             }
-            Storage::open(&FsDisk, &path, BLOCK_CACHE, &specs).await
+            Storage::open(&FsDisk, &path, BLOCK_CACHE, specs).await
         }
         other => other,
     }

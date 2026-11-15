@@ -75,17 +75,16 @@ pub(crate) fn out_hash(out: &wire::GearOut) -> String {
 mod tests {
     use std::collections::HashSet;
 
-    use dentrado::core::{api::GEAR_TABLE_PREFIX, gear::RuntimeTypes};
+    use dentrado::core::gear::RuntimeTypes;
 
     use super::KolorinkoRT;
 
-    /// The generated gear-view tables are all recognized by the store's
-    /// startup GC (shared prefix) and no two gear kinds share one.
+    /// Every gear kind names its own table; the encoding is shared, so the
+    /// only per-runtime risk is two kinds collapsing into one.
     #[test]
-    fn gear_tables_are_prefixed_and_distinct() {
-        let tables = KolorinkoRT::gear_tables();
-        assert!(!tables.is_empty());
-        assert!(tables.iter().all(|id| id.starts_with(GEAR_TABLE_PREFIX)));
-        assert_eq!(tables.iter().collect::<HashSet<_>>().len(), tables.len());
+    fn gear_kinds_are_distinct() {
+        let kinds = KolorinkoRT::gear_kinds();
+        assert!(!kinds.is_empty());
+        assert_eq!(kinds.iter().collect::<HashSet<_>>().len(), kinds.len());
     }
 }

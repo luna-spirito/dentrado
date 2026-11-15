@@ -17,31 +17,66 @@ use crate::types::{GlobalHash, LocGroupId, LocMsgTypeId, Localizable};
 pub use self::shared::Shared;
 pub(crate) use self::shared::{Epoch, RemoteShared, SharedArena, SharedBus, SharedData, SharedKey};
 
-/// Common prefix of every gear-view table id. The store's startup GC uses it
-/// to recognize (and drop) tables left by an older gear layout without
-/// touching unrelated tables in the same store.
-pub const GEAR_TABLE_PREFIX: &[u8] = b"dentrado/gear-view/";
+/// The namespace of every gear-view table. The startup GC decodes each table
+/// id and only touches ids that name this namespace, so a store shared with
+/// another namespace (an event log, say) is left alone.
+pub const GEAR_TABLE_NAMESPACE: &str = "gears";
 
-/// The single table a manual [`RuntimeTypes`] uses when it does not override
-/// [`RuntimeTypes::gear_table`] / [`RuntimeTypes::gear_tables`]. Generated
-/// runtimes emit one table per gear kind instead.
-pub const DEFAULT_GEAR_TABLE: &[u8] = b"dentrado/gear-view/0/default";
+/// The record-layout version of every gear-view table. Bump it when the stored
+/// shape changes: the ids this layout asks for are then `version + 1`, so the
+/// startup GC drops the old ones and every gear cold-starts.
+pub const GEAR_TABLE_VERSION: u32 = 0;
+
+/// A gear-view table: its kind and record-layout version.
+///
+/// The version is a number *beside* the name, never a piece of it — a
+/// migration branches on it without parsing anything. [`encode`](Self::encode)
+/// is the only place the pair becomes the store's opaque id bytes, and
+/// [`decode`](Self::decode) the only place it comes back, so the id's shape is
+/// stated exactly once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GearTable<'a> {
+    pub kind: &'a str,
+    pub version: u32,
+}
+
+impl GearTable<'static> {
+    /// This layout's table of `kind`.
+    #[must_use]
+    pub const fn of(kind: &'static str) -> Self {
+        Self {
+            kind,
+            version: GEAR_TABLE_VERSION,
+        }
+    }
+}
+
+impl<'a> GearTable<'a> {
+    /// The store id: `postcard((namespace, kind, version))`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        postcard::to_stdvec(&(GEAR_TABLE_NAMESPACE, self.kind, self.version))
+            .expect("a tuple of two strs and a u32 serializes")
+    }
+
+    /// The table an id names — `None` for any id outside the gear-view
+    /// namespace (another subsystem's tables, or the pre-namespace layout).
+    #[must_use]
+    pub fn decode(id: &'a [u8]) -> Option<Self> {
+        let (namespace, kind, version) = postcard::from_bytes::<(&str, &str, u32)>(id).ok()?;
+        (namespace == GEAR_TABLE_NAMESPACE).then_some(Self { kind, version })
+    }
+}
 
 pub trait RuntimeTypes: Debug + Send + Sync + Sized + 'static {
     type GearId: Debug + Hash + Eq + Clone + Send + 'static + Localizable;
 
-    /// The gear-view table that stores `gear`'s kind. One table per gear
-    /// kind, so a whole kind can be dropped without touching the others.
-    /// The generated runtimes override this with a stable per-kind id; a
-    /// manual runtime defaults to one shared table.
-    fn gear_table(_gear: &Self::GearId) -> &'static [u8] {
-        DEFAULT_GEAR_TABLE
-    }
+    /// `gear`'s kind — its name within [`GEAR_TABLE_NAMESPACE`]. One table per
+    /// kind, so a kind can be dropped whole without walking the others.
+    fn gear_kind(gear: &Self::GearId) -> &'static str;
 
-    /// Every gear-view table the store opens at startup.
-    fn gear_tables() -> &'static [&'static [u8]] {
-        &[DEFAULT_GEAR_TABLE]
-    }
+    /// Every kind the store opens at startup.
+    fn gear_kinds() -> &'static [&'static str];
 
     type GearOut: Debug + Clone + Send + 'static + Localizable;
 
@@ -224,6 +259,39 @@ impl<R: RuntimeTypes> GearResult<R> {
         match self {
             Self::Ship(o) => o,
             _ => panic!("expected a shippable GearResult"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GEAR_TABLE_NAMESPACE, GearTable};
+
+    #[test]
+    fn gear_table_ids_round_trip() {
+        let table = GearTable::of("Repo");
+        assert_eq!(
+            GearTable::decode(&table.encode()).map(|t| (t.kind, t.version)),
+            Some(("Repo", 0))
+        );
+        // The version is a field, not a piece of the name.
+        let bumped = GearTable {
+            kind: "Repo",
+            version: 7,
+        };
+        assert_eq!(
+            GearTable::decode(&bumped.encode()).map(|t| (t.kind, t.version)),
+            Some(("Repo", 7))
+        );
+    }
+
+    #[test]
+    fn gear_table_decode_rejects_other_ids() {
+        // Another namespace, the pre-namespace layout, and plain garbage.
+        let events = postcard::to_stdvec(&("events", "Tick", 0u32)).unwrap();
+        let legacy = postcard::to_stdvec(&("dentrado/gear-view", 0u64)).unwrap();
+        for id in [events, legacy, b"garbage".to_vec(), Vec::new()] {
+            assert!(GearTable::decode(&id).is_none(), "{id:?}");
         }
     }
 }

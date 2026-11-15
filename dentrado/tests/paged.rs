@@ -10,7 +10,7 @@ use std::{fmt::Debug, panic::AssertUnwindSafe};
 
 use dentrado::{
     core::{
-        api::GEAR_TABLE_PREFIX,
+        api::GearTable,
         core_ctx::GearCtx,
         gear::{GearInput, GearMeta, GearProduce, IsRuntime, RuntimeTypes},
         storage::{GearView, IsStorage, PagedStorage},
@@ -20,8 +20,8 @@ use dentrado::{
 
 /// The two gear kinds this runtime declares, one table each (a manual
 /// stand-in for what `#[gears]` generates).
-const BLOB_TABLE: &[u8] = b"dentrado/gear-view/0/Blob";
-const NOTE_TABLE: &[u8] = b"dentrado/gear-view/0/Note";
+const BLOB_KIND: &str = "Blob";
+const NOTE_KIND: &str = "Note";
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum BlobGear {
@@ -48,15 +48,15 @@ impl RuntimeTypes for BlobRuntime {
     type Body = ();
     type Data = ();
 
-    fn gear_table(gear: &Self::GearId) -> &'static [u8] {
+    fn gear_kind(gear: &Self::GearId) -> &'static str {
         match gear {
-            BlobGear::Blob { .. } => BLOB_TABLE,
-            BlobGear::Note { .. } => NOTE_TABLE,
+            BlobGear::Blob { .. } => BLOB_KIND,
+            BlobGear::Note { .. } => NOTE_KIND,
         }
     }
 
-    fn gear_tables() -> &'static [&'static [u8]] {
-        &[BLOB_TABLE, NOTE_TABLE]
+    fn gear_kinds() -> &'static [&'static str] {
+        &[BLOB_KIND, NOTE_KIND]
     }
 }
 
@@ -227,8 +227,8 @@ fn paged_storage_gcs_old_gear_tables() {
             let file = dir.path().join("core-0.dstore");
             let path = file.display().to_string();
             let legacy = postcard::to_stdvec(&("dentrado/gear-view", 0u64)).unwrap();
-            let orphan = b"dentrado/gear-view/0/Gone".to_vec();
-            let foreign = b"unrelated/table".to_vec();
+            let orphan = GearTable::of("Gone").encode();
+            let foreign = postcard::to_stdvec(&("events", "Tick", 0u32)).unwrap();
             // An older image with one live entry in every odd table.
             {
                 let specs = [legacy.clone(), orphan.clone(), foreign.clone()].map(TableSpec::flat);
@@ -249,14 +249,20 @@ fn paged_storage_gcs_old_gear_tables() {
             st.flush().await.unwrap();
             drop(view);
             drop(st);
-            // …and a raw reopen sees the current kinds (one table each) plus
-            // the unrelated table.
+            // …and a raw reopen sees exactly the current kinds (one table
+            // each); the `events/` namespace is left alone, the pre-namespace
+            // id is gone.
             let raw = Storage::open(&FsDisk, &path, 4, &[]).await.unwrap();
-            let mut names = raw.tables();
-            names.sort();
-            let mut expected = [BLOB_TABLE.to_vec(), NOTE_TABLE.to_vec(), foreign];
-            expected.sort();
-            assert_eq!(names, expected);
+            let names = raw.tables();
+            assert!(names.contains(&foreign), "another namespace is untouched");
+            assert!(!names.contains(&legacy), "the pre-namespace id is dropped");
+            let mut found: Vec<&str> = names
+                .iter()
+                .filter_map(|name| GearTable::decode(name))
+                .map(|table| table.kind)
+                .collect();
+            found.sort_unstable();
+            assert_eq!(found, [BLOB_KIND, NOTE_KIND]);
             drop(raw);
             // GC never touches the live kinds' records.
             let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file);
@@ -266,19 +272,15 @@ fn paged_storage_gcs_old_gear_tables() {
 }
 
 /// One table per gear kind: each kind reads back independently across a
-/// reopen, and the runtime's table ids all carry the GC's shared prefix.
+/// reopen, and every kind names a distinct table.
 #[test]
 fn paged_storage_separates_gear_kinds() {
     compio::runtime::RuntimeBuilder::new()
         .build()
         .unwrap()
         .block_on(async {
-            assert!(
-                BlobRuntime::gear_tables()
-                    .iter()
-                    .all(|id| id.starts_with(GEAR_TABLE_PREFIX)),
-                "the startup GC recognizes tables by this prefix"
-            );
+            assert_eq!(BlobRuntime::gear_kinds(), [BLOB_KIND, NOTE_KIND]);
+            assert_ne!(BLOB_KIND, NOTE_KIND);
 
             let dir = tempfile::tempdir().unwrap();
             let file = dir.path().join("core-0.dstore");

@@ -58,6 +58,17 @@ impl RuntimeTypes for SharedRuntime {
     type Group = i64;
     type Body = ();
     type Data = ();
+
+    fn gear_kind(gear: &Self::GearId) -> &'static str {
+        match gear {
+            SharedGear::Src { .. } => "Src",
+            SharedGear::Len { .. } => "Len",
+        }
+    }
+
+    fn gear_kinds() -> &'static [&'static str] {
+        &["Src", "Len"]
+    }
 }
 
 impl IsRuntime for SharedRuntime {

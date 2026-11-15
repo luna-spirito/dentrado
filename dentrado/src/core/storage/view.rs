@@ -16,9 +16,9 @@
 //! top of the raw session; the store itself does not chunk.
 //!
 //! Each gear **kind** gets its own table (see
-//! [`RuntimeTypes::gear_table`](crate::core::api::RuntimeTypes::gear_table)),
-//! so a kind can be dropped whole without walking the others. Per-gear
-//! isolation *within* a kind is still the key prefix.
+//! [`RuntimeTypes::gear_kind`](crate::core::api::RuntimeTypes::gear_kind) and
+//! [`GearTable`]), so a kind can be dropped whole without walking the others.
+//! Per-gear isolation *within* a kind is still the key prefix.
 
 use std::{
     cell::{Cell, RefCell},
@@ -30,24 +30,26 @@ use std::{
 
 use dentrado_cache::{Session, Storage, disk::FsDisk};
 
-use crate::core::api::{GEAR_TABLE_PREFIX, RuntimeTypes};
+use crate::core::api::{GearTable, RuntimeTypes};
 
-/// The flat table spec per gear-view table. A view value names no pages.
-pub(crate) fn gear_specs<R: RuntimeTypes>() -> Vec<dentrado_cache::TableSpec> {
-    R::gear_tables()
+/// The gear-view tables this runtime declares, at the current layout version.
+pub(crate) fn gear_tables<R: RuntimeTypes>() -> Vec<GearTable<'static>> {
+    R::gear_kinds()
         .iter()
-        .map(|id| dentrado_cache::TableSpec::flat(id.to_vec()))
+        .map(|kind| GearTable::of(kind))
         .collect()
 }
 
-/// Is `name` a gear-view table of the current id scheme? The startup GC
-/// uses this to tell our orphans from unrelated tables in the same store.
-pub(crate) fn is_gear_table(name: &[u8]) -> bool {
-    name.starts_with(GEAR_TABLE_PREFIX)
+/// The flat store spec per table. A view value names no pages.
+pub(crate) fn gear_specs(tables: &[GearTable<'_>]) -> Vec<dentrado_cache::TableSpec> {
+    tables
+        .iter()
+        .map(|table| dentrado_cache::TableSpec::flat(table.encode()))
+        .collect()
 }
 
 /// The pre-per-kind table id (`postcard(("dentrado/gear-view", 0))`). It
-/// predates [`GEAR_TABLE_PREFIX`], so the GC needs an explicit check for it.
+/// predates the `gears` namespace, so the GC needs an explicit check for it.
 pub(crate) fn legacy_gear_table() -> &'static [u8] {
     static TABLE: OnceLock<Vec<u8>> = OnceLock::new();
     TABLE.get_or_init(|| {
@@ -153,8 +155,9 @@ pub struct DiskView<'a> {
     /// `None` between a commit and the next touch: the commit consumes the
     /// session, and a fresh one (seeing the commit) opens on demand.
     session: Option<Session<FsDisk>>,
-    /// The gear kind's table; the key prefix only separates gears within it.
-    table: &'static [u8],
+    /// The gear kind's table, encoded once here ([`GearTable::encode`]); the
+    /// key prefix only separates gears within it.
+    table: Vec<u8>,
     prefix: Vec<u8>,
     dirty: &'a Cell<bool>,
 }
@@ -162,14 +165,14 @@ pub struct DiskView<'a> {
 impl<'a> DiskView<'a> {
     pub(crate) fn new(
         store: Rc<Storage<FsDisk>>,
-        table: &'static [u8],
+        table: GearTable<'static>,
         prefix: Vec<u8>,
         dirty: &'a Cell<bool>,
     ) -> Self {
         Self {
             session: Some(store.session()),
             store,
-            table,
+            table: table.encode(),
             prefix,
             dirty,
         }
@@ -196,7 +199,7 @@ impl GearView for DiskView<'_> {
     async fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         let full = self.full(key);
         session(&mut self.session, &self.store)
-            .get_old(self.table, &full)
+            .get_old(&self.table, &full)
             .await
             .expect("gear view get")
     }
@@ -204,7 +207,7 @@ impl GearView for DiskView<'_> {
     async fn scan(&mut self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         let full = self.full(prefix);
         let rows = session(&mut self.session, &self.store)
-            .scan_old(self.table, &full, &[])
+            .scan_old(&self.table, &full, &[])
             .await
             .expect("gear view scan");
         let strip = self.prefix.len();
@@ -217,14 +220,14 @@ impl GearView for DiskView<'_> {
         let full = self.full(key);
         check_leaf(&full, value);
         session(&mut self.session, &self.store)
-            .put(self.table, &full, value, &[], &[])
+            .put(&self.table, &full, value, &[], &[])
             .expect("gear view put");
     }
 
     fn del(&mut self, key: &[u8]) {
         let full = self.full(key);
         session(&mut self.session, &self.store)
-            .del(self.table, &full, &[])
+            .del(&self.table, &full, &[])
             .expect("gear view del");
     }
 

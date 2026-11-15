@@ -63,6 +63,14 @@ impl RuntimeTypes for MulSumRuntime {
     type Group = i64;
     type Body = MulSumBody;
     type Data = ();
+
+    fn gear_kind(_gear: &Self::GearId) -> &'static str {
+        "MulSum"
+    }
+
+    fn gear_kinds() -> &'static [&'static str] {
+        &["MulSum"]
+    }
 }
 
 impl IsRuntime for MulSumRuntime {
