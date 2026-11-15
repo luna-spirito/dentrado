@@ -6,6 +6,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
+use dentrado_journal::segment;
 use dentrado_journal::{Cursor, Decl, Frame, Journal, SchemaId};
 
 pub fn run<F: Future>(f: F) -> F::Output {
@@ -76,6 +77,21 @@ pub fn flip(path: &Path, offset: u64) {
     byte[0] ^= 0xff;
     file.seek(SeekFrom::Start(offset)).unwrap();
     file.write_all(&byte).unwrap();
+}
+
+/// Overwrites `bytes` at `offset`, leaving the rest of the file alone.
+pub fn write_at(path: &Path, offset: u64, bytes: &[u8]) {
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(bytes).unwrap();
+}
+
+/// The 32-byte header of `from`, re-addressed to `to` — the only way to build
+/// a segment file the writer itself would never produce.
+pub fn header_for(dir: &Path, from: u64, to: u64) -> Vec<u8> {
+    let mut header = std::fs::read(dir.join(segment::file_name(from))).unwrap()[..32].to_vec();
+    header[8..16].copy_from_slice(&to.to_le_bytes());
+    header
 }
 
 pub fn truncate(path: &Path, len: u64) {

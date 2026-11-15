@@ -31,6 +31,9 @@ impl Journal {
             .find(decl.shape)
             .and_then(|id| self.registry.get(id));
         if let Some(declared) = known {
+            if !declared.id.is_user() {
+                return Err(Error::Reserved { id: declared.id.0 });
+            }
             if declared.name == decl.name {
                 return Ok(declared.id);
             }
@@ -170,10 +173,14 @@ impl Journal {
                 return Ok(());
             }
         }
-        // Closing first is what lets a crash land in the middle: the next
-        // segment may exist while this one has no footer. `open` recognises
-        // that as damage only if this segment was acked, and `poison` stops a
-        // retry from reaching it.
+        // Declarations first, for the same reason as `close`: a sealed segment
+        // must never name a declaration that is not durable. Closing before
+        // creating the next segment is what lets a crash leave this one
+        // unsealed beside a live successor; `open` recognises that as damage
+        // only if this segment was acked.
+        if let Some(writer) = &mut self.decl {
+            writer.sync().await?;
+        }
         let last = self.last.unwrap_or(segment::DECL);
         if let Some(mut writer) = self.active.take() {
             writer.close().await?;

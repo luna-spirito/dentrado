@@ -3,10 +3,13 @@
 //! Damage has its own file — this one is about the shape of a healthy log and
 //! the states a crash alone can produce.
 
+use std::ops::ControlFlow;
+
+use dentrado_journal::segment;
 use dentrado_journal::{Conflict, Cursor, Decl, Error, Frame, Journal, Options, SchemaId};
 
 mod common;
-use common::{COUNTER, COUNTER_SHAPE, counter, records, run, segments};
+use common::{COUNTER, COUNTER_SHAPE, counter, header_for, payloads, records, run, segments};
 
 #[test]
 fn an_empty_directory_is_a_log() {
@@ -166,6 +169,76 @@ fn appending_after_a_close_starts_a_new_segment() {
             .map(|(_, _, payload)| payload)
             .collect();
         assert_eq!(payloads, [b"before".to_vec(), b"after".to_vec()]);
+    });
+}
+
+#[test]
+fn a_reopened_log_syncs_again() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Journal::open(dir.path()).await.unwrap();
+        let schema = counter(&mut log).await;
+        log.append(&[Frame::new(schema, b"one")]).await.unwrap();
+        log.sync().await.unwrap();
+        assert_eq!(log.acked(), Some(log.head()));
+        drop(log);
+
+        // A second process writes through a handle it did not create.
+        let mut log = Journal::open(dir.path()).await.unwrap();
+        assert_eq!(log.acked(), Some(log.head()), "the ack survived the reopen");
+        log.append(&[Frame::new(schema, b"two")]).await.unwrap();
+        log.sync().await.unwrap();
+        assert_eq!(log.acked(), Some(log.head()));
+        drop(log);
+
+        let log = Journal::open(dir.path()).await.unwrap();
+        assert_eq!(payloads(&log).await, [b"one".to_vec(), b"two".to_vec()]);
+        assert_eq!(log.truncated(), 0);
+    });
+}
+
+#[test]
+fn intern_refuses_the_format_schemas() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Journal::open(dir.path()).await.unwrap();
+        for name in ["journal/schema", "journal/purge"] {
+            let refused = log
+                .intern(Decl {
+                    name: "mine",
+                    shape: name,
+                })
+                .await;
+            assert!(
+                matches!(refused, Err(Error::Reserved { .. })),
+                "the format's own shape is not the consumer's: {refused:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn an_empty_tail_replays_to_the_head() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Journal::open(dir.path()).await.unwrap();
+        let schema = counter(&mut log).await;
+        log.append(&[Frame::new(schema, b"one")]).await.unwrap();
+        log.close().await.unwrap();
+        drop(log);
+
+        // A crash after a rotation created the next segment, before its first
+        // record: a valid header and nothing else.
+        let next = dir.path().join(segment::file_name(2));
+        std::fs::write(&next, header_for(dir.path(), 1, 2)).unwrap();
+
+        let log = Journal::open(dir.path()).await.unwrap();
+        assert_eq!(log.head(), Cursor::new(2, segment::HEADER_LEN as u64));
+        let end = log
+            .replay_from(Cursor::START, async |_, _| ControlFlow::Continue(()))
+            .await
+            .unwrap();
+        assert_eq!(end, log.head(), "a full replay lands on the head");
     });
 }
 

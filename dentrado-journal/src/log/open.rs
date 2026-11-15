@@ -110,26 +110,20 @@ impl Journal {
         let len = file.metadata().await?.len();
         let mut reader = Reader::new(file.clone());
         let bytes = reader.at(0, segment::HEADER_LEN).await?;
-        match segment::decode_header(bytes) {
-            Ok(header) if header.segment == segment::DECL => {}
-            Ok(_) => {
-                return Err(Error::corrupt(
-                    segment::DECL,
-                    0,
-                    "segment header names another segment",
-                ));
+        if let Some(fault) = segment::header_fault(bytes, segment::DECL) {
+            let acked = self.acked.is_some_and(|acked| acked.decl_end > 0);
+            // A declaration segment that data segments point at cannot be
+            // recreated: `create` makes the header durable before the segment
+            // exists, so its absence here is damage, not a torn create.
+            let alone = self.last == Some(segment::DECL);
+            if !alone || !Self::forgivable(acked, fault) {
+                return Err(fault.error(segment::DECL));
             }
-            Err(fault) => {
-                let acked = self.acked.is_some_and(|acked| acked.decl_end > 0);
-                if !Self::forgivable(acked, fault) || self.last != Some(segment::DECL) {
-                    return Err(fault.error(segment::DECL));
-                }
-                self.truncated += len;
-                let writer = segment::Writer::create(&self.dir, segment::DECL).await?;
-                self.decl_end = Some(writer.end());
-                self.decl = Some(writer);
-                return Ok(());
-            }
+            self.truncated += len;
+            let writer = segment::Writer::create(&self.dir, segment::DECL).await?;
+            self.decl_end = Some(writer.end());
+            self.decl = Some(writer);
+            return Ok(());
         }
         let registry = &mut self.registry;
         let walked = segment::walk(
@@ -145,7 +139,17 @@ impl Journal {
                         "segment zero holds declarations only",
                     ));
                 }
-                registry.declare(schema::decode_decl(frame.payload)?)?;
+                let decl = schema::decode_decl(frame.payload)?;
+                // Ids are assigned densely by construction; a gap means the
+                // file was edited or written by something else.
+                if decl.id != registry.next_id()? {
+                    return Err(Error::corrupt(
+                        segment::DECL,
+                        cursor.offset,
+                        "declaration ids are not dense",
+                    ));
+                }
+                registry.declare(decl)?;
                 Ok(std::ops::ControlFlow::Continue(()))
             },
         )
@@ -164,10 +168,11 @@ impl Journal {
             }
             self.truncated += len - walked.end;
             file.set_len(walked.end).await?;
-            self.decl_end = Some(walked.end);
-            return Ok(());
         }
         self.decl_end = Some(walked.end);
+        // Kept open, and dirty: a sync must flush the declarations a later
+        // record may rely on before it acks anything that relies on them.
+        self.decl = Some(segment::Writer::resume(file, segment::DECL, &walked));
         Ok(())
     }
 
@@ -183,31 +188,21 @@ impl Journal {
         let len = file.metadata().await?.len();
         let mut reader = Reader::new(file.clone());
         let bytes = reader.at(0, segment::HEADER_LEN).await?;
-        match segment::decode_header(bytes) {
-            Ok(header) if header.segment == segment => {}
-            Ok(_) => {
-                return Err(Error::corrupt(
-                    segment,
-                    0,
-                    "segment header names another segment",
-                ));
+        if let Some(fault) = segment::header_fault(bytes, segment) {
+            // A header this build cannot read is a crash during creation only
+            // if nothing in the segment was ever acked.
+            let acked = self.acked.is_some_and(|acked| acked.reaches(segment));
+            if !Self::forgivable(acked, fault) {
+                return Err(fault.error(segment));
             }
-            Err(fault) => {
-                // A segment header this build cannot read is a crash during
-                // creation only if nothing in the segment was ever acked.
-                let acked = self.acked.is_some_and(|acked| acked.reaches(segment));
-                if !Self::forgivable(acked, fault) {
-                    return Err(fault.error(segment));
-                }
-                self.truncated += len;
-                let writer = segment::Writer::create(&self.dir, segment).await?;
-                self.last_end = writer.end();
-                self.active = Some(writer);
-                return Ok(());
-            }
+            self.truncated += len;
+            let writer = segment::Writer::create(&self.dir, segment).await?;
+            self.last_end = writer.end();
+            self.active = Some(writer);
+            return Ok(());
         }
         let registry = &self.registry;
-        let acked = self.acked.and_then(|acked| acked.offset_in(segment));
+        let acked = self.acked;
         let walked = segment::walk(
             &mut reader,
             segment,
@@ -225,7 +220,7 @@ impl Journal {
                     // Past the acked head a record may name a declaration that
                     // was torn away with it: nothing promised is lost by
                     // stopping here, and the tail is cut below.
-                    if acked.is_some_and(|acked| cursor.offset >= acked) {
+                    if acked.is_some_and(|acked| acked.unacked_from(cursor)) {
                         return Ok(ControlFlow::Break(()));
                     }
                     return Err(Error::Undeclared { id: frame.schema.0 });
@@ -235,34 +230,30 @@ impl Journal {
         )
         .await?;
         self.last_end = walked.end;
-        // A footer at the end of the file is the seal: this segment is closed,
-        // so nothing past the last good frame may be forgiven — a walk that
-        // stopped early, or a footer that disagrees, is damage, not a tail
-        // still being written. Only an unsealed file is a torn tail.
-        let sealed = match len.checked_sub(segment::FOOTER_LEN as u64) {
-            Some(at) => segment::decode_footer(reader.at(at, segment::FOOTER_LEN).await?)
-                .map(|footer| (at, footer)),
-            None => None,
+        // A footer is only a footer where the frames stop. Bytes that merely
+        // look like one — inside a record, or past damage — are data, and a
+        // log whose payload happens to spell them must still open.
+        //
+        // A candidate that is in the right place but disagrees is a torn or
+        // rotted seal, not missing data: every frame before it decoded, so the
+        // footer is dropped and the segment continues. Whether those frames may
+        // be *kept* is the acked head's question, asked below.
+        let candidate = match len.checked_sub(segment::FOOTER_LEN as u64) {
+            Some(at) if at == walked.end => {
+                segment::decode_footer(reader.at(at, segment::FOOTER_LEN).await?)
+            }
+            _ => None,
         };
-        if let Some((at, footer)) = sealed {
-            if walked.end != at {
-                return Err(Error::corrupt(
-                    segment,
-                    walked.end,
-                    "damage inside a sealed segment",
-                ));
-            }
-            if footer.count != walked.count || footer.digest != *walked.digest.finalize().as_bytes()
-            {
-                return Err(Error::corrupt(segment, at, "the footer disagrees"));
-            }
+        let sealed = candidate.is_some_and(|footer| {
+            footer.count == walked.count && footer.digest == *walked.digest.finalize().as_bytes()
+        });
+        if sealed {
             return Ok(());
         }
         // Unsealed: an unfinished append, so everything past the acked head may
         // go. Damage at or below it was promised to a writer that got a reply.
-        if let Some(acked) = acked
-            && walked.end < acked
-        {
+        let promised = acked.and_then(|acked| acked.offset_in(segment));
+        if promised.is_some_and(|at| walked.end < at) {
             return Err(Error::corrupt(
                 segment,
                 walked.end,
@@ -293,16 +284,10 @@ impl Journal {
         let file = OpenOptions::new().read(true).open(&path).await?;
         let len = file.metadata().await?.len();
         let mut reader = Reader::new(file);
-        match segment::decode_header(reader.at(0, segment::HEADER_LEN).await?) {
-            Ok(header) if header.segment == segment => {}
-            Ok(_) => {
-                return Err(Error::corrupt(
-                    segment,
-                    0,
-                    "segment header names another segment",
-                ));
-            }
-            Err(fault) => return Err(fault.error(segment)),
+        if let Some(fault) =
+            segment::header_fault(reader.at(0, segment::HEADER_LEN).await?, segment)
+        {
+            return Err(fault.error(segment));
         }
         let Some(at) = len.checked_sub(segment::FOOTER_LEN as u64) else {
             return Err(Error::corrupt(

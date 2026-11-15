@@ -70,6 +70,11 @@
 //! - **A second writer** is refused at open by the directory's lock. **An
 //!   adversary** with write access to the files is out of scope.
 //!
+//! There is no read-only mode: `open` needs write access and takes the lock,
+//! because one handle serves both replay and append, and a replay is what may
+//! have to truncate a torn tail. A read-only replica would need a second entry
+//! point, and there is no consumer for one yet.
+//!
 //! When redundancy arrives it is replication, not local doubling: segments are
 //! immutable and self-describing, so a peer holding the same segment can be
 //! asked for the frames a crc or a digest disagrees on. Duplicating writes
@@ -113,7 +118,7 @@ pub mod cursor;
 pub mod schema;
 pub mod frame;
 pub mod segment;
-pub mod acked;
+mod acked;
 pub mod log;
 
 pub use cursor::Cursor;

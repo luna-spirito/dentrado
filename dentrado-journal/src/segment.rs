@@ -43,18 +43,22 @@ const CHUNK: usize = 256 << 10;
 const MAGIC: [u8; 4] = *b"DJNL";
 const DONE: [u8; 4] = *b"DJNF";
 
+/// How many digits a segment file name carries. `u64::MAX` needs twenty, so
+/// twenty is enough and exactly matches [`file_name`].
+const DIGITS: usize = 20;
+
 /// The file name of a segment.
 #[must_use]
 pub fn file_name(segment: u64) -> String {
-    format!("{segment:020}{SUFFIX}")
+    format!("{segment:0DIGITS$}{SUFFIX}")
 }
 
-/// The segment id a file name stands for, if it is one of ours. Digits only,
-/// so that one segment has exactly one name.
+/// The segment id a file name stands for, if it is one of ours. Exactly the
+/// canonical spelling, so that one segment cannot have two names.
 #[must_use]
 pub fn parse_file_name(name: &str) -> Option<u64> {
     let digits = name.strip_suffix(SUFFIX)?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+    if digits.len() != DIGITS || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
     digits.parse().ok()
@@ -70,22 +74,38 @@ pub struct Header {
 /// Why a segment does not start with a header this build wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeaderFault {
+    /// No room even for a header.
     Short,
+    /// The magic is not ours, so this is not the file we think it is.
     Magic,
+    /// The header is ours but names another segment — a tear mid-header.
+    Id,
+    /// The header is ours but announces a width this build does not know.
+    Length,
+    /// Another build wrote this file.
     Version(u16),
 }
 
 impl HeaderFault {
     /// Whether a crash during segment creation could have produced this, i.e.
     /// whether the file may be started over instead of being declared damaged.
+    ///
+    /// Version zero is never written by any build, so it is a tear, not a
+    /// newer log. A version we do not know is the opposite: someone else's
+    /// file, which must never be recreated.
     pub(crate) fn is_creation(self) -> bool {
-        matches!(self, Self::Short | Self::Magic)
+        match self {
+            Self::Version(version) => version == 0,
+            Self::Short | Self::Magic | Self::Id | Self::Length => true,
+        }
     }
 
     pub(crate) fn error(self, segment: u64) -> Error {
         match self {
             Self::Short => Error::corrupt(segment, 0, "truncated segment header"),
             Self::Magic => Error::corrupt(segment, 0, "not a journal segment"),
+            Self::Id => Error::corrupt(segment, 0, "segment header names another segment"),
+            Self::Length => Error::corrupt(segment, 0, "unsupported segment header length"),
             Self::Version(found) => Error::Version { segment, found },
         }
     }
@@ -106,12 +126,27 @@ pub(crate) fn decode_header(bytes: &[u8]) -> Result<Header, HeaderFault> {
     if raw[0..4] != MAGIC {
         return Err(HeaderFault::Magic);
     }
+    // The version comes before the width: a newer build may legitimately use a
+    // wider header, and that must read as "another build", never as damage.
     let version = u16::from_le_bytes(raw[4..6].try_into().expect("two bytes"));
     if version != LOG_VERSION {
         return Err(HeaderFault::Version(version));
     }
+    let len = u16::from_le_bytes(raw[6..8].try_into().expect("two bytes"));
+    if usize::from(len) != HEADER_LEN {
+        return Err(HeaderFault::Length);
+    }
     let segment = u64::from_le_bytes(raw[8..16].try_into().expect("eight bytes"));
     Ok(Header { segment })
+}
+
+/// The fault in the header of `segment`, if the bytes are not that header.
+pub(crate) fn header_fault(bytes: &[u8], segment: u64) -> Option<HeaderFault> {
+    match decode_header(bytes) {
+        Ok(header) if header.segment == segment => None,
+        Ok(_) => Some(HeaderFault::Id),
+        Err(fault) => Some(fault),
+    }
 }
 
 /// What a closed segment vouches for.
@@ -174,12 +209,20 @@ impl Writer {
             dirty: true,
         };
         writer.put(encode_header(segment).to_vec()).await?;
+        // The header before the entry that names it: a segment that is visible
+        // after a crash must be readable, or every open would have to guess
+        // whether a garbage header is a torn create or rot.
+        writer.file.sync_data().await?;
+        writer.dirty = false;
         sync_dir(dir)?;
         Ok(writer)
     }
 
     /// Continues a segment whose frames were already scanned and whose tail was
     /// truncated to `end`.
+    /// Adopts a file a previous process left. Nothing it holds is known to be
+    /// durable — that is exactly what the acked head says — so the writer
+    /// starts dirty and the first sync flushes it.
     pub(crate) fn resume(file: File, segment: u64, walked: &Walked) -> Self {
         Self {
             file,
@@ -187,7 +230,7 @@ impl Writer {
             end: walked.end,
             count: walked.count,
             digest: walked.digest.clone(),
-            dirty: false,
+            dirty: true,
         }
     }
 
@@ -206,8 +249,9 @@ impl Writer {
     /// Appends one whole frame.
     ///
     /// The footer state is advanced only once the bytes are in the file, so a
-    /// failed write leaves a writer that still describes what is on disk — and
-    /// a close after it would seal the truth rather than a lie.
+    /// failed write leaves a writer that still describes what is on disk. The
+    /// journal poisons itself on top of that, but a writer that describes the
+    /// file is the invariant that makes the poison safe rather than load-bearing.
     pub(crate) async fn write(&mut self, bytes: Vec<u8>) -> Result<(), Error> {
         let mut digest = self.digest.clone();
         digest.update(&bytes);

@@ -19,8 +19,10 @@ use crate::segment::{self, Reader};
 /// How a log is laid out beyond the format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
-    /// How large a data segment may grow before the next record starts a new
-    /// one. One record may exceed it; such a record gets a segment of its own.
+    /// How large a data segment may grow before the next append starts a new
+    /// one. The unit is the batch: an append that would cross the boundary
+    /// rotates as a whole, and a batch larger than the limit gets a segment of
+    /// its own.
     pub rotate_bytes: u64,
 }
 
@@ -38,9 +40,10 @@ impl Default for Options {
 /// files and does positional io through `compio`. An append reaches the file
 /// immediately; it is only durable after [`Journal::sync`].
 ///
-/// One writer per directory: `open` takes the directory's lock, so a second
-/// writer is refused rather than allowed to interleave. Readers
-/// ([`Journal::replay_from`]) are fine alongside a writer.
+/// One handle per directory: `open` takes the directory's lock, so a second
+/// handle is refused rather than allowed to interleave. Reads and writes share
+/// one handle — [`Journal::replay_from`] takes `&self`, so nesting a replay
+/// inside a writer's loop is fine, but opening the same directory twice is not.
 ///
 /// After an append, a sync or a close returns an error, the journal is
 /// poisoned: the failed write left a tail no writer can reason about, so every
@@ -69,10 +72,10 @@ impl Journal {
     ///
     /// This is a pure function of the files present: declarations are read from
     /// segment zero, the last segment's unfinished tail is truncated, and
-    /// closed segments are only checked for a header and a footer. Nothing is
-    /// written unless there is damage to repair. The directory is locked
-    /// against a second writer for as long as the journal lives, and nothing is
-    /// created for the lock.
+    /// closed segments are only checked for a header and a footer. Repair is
+    /// the only thing it writes apart from creating the directory and the
+    /// `acked` file. The directory is locked for as long as the journal lives,
+    /// and nothing is created for the lock.
     ///
     /// # Errors
     ///
@@ -93,11 +96,19 @@ impl Journal {
         open::open(dir, options).await
     }
 
-    /// Just past the last record: the durability boundary, and the cursor a
-    /// consumer resumes from once it has applied everything.
+    /// Just past the last record — the append cursor, and the cursor a consumer
+    /// resumes from. Not the durability boundary: everything at or below
+    /// [`Journal::acked`] is durable, everything above it is only written.
     #[must_use]
     pub fn head(&self) -> Cursor {
         self.head
+    }
+
+    /// The durable boundary: everything before it survived a [`Journal::sync`],
+    /// which is what a consumer may treat as promised.
+    #[must_use]
+    pub fn acked(&self) -> Option<Cursor> {
+        self.acked.and_then(|acked| acked.data)
     }
 
     /// How many bytes of torn tail this open repaired.
@@ -140,6 +151,12 @@ impl Journal {
     pub async fn close(&mut self) -> Result<(), Error> {
         self.live()?;
         let done = async {
+            // Declarations first: sealing the data segment must never make a
+            // record durable before the declaration it names, or a crash leaves
+            // a closed segment that can never be interpreted.
+            if let Some(writer) = &mut self.decl {
+                writer.sync().await?;
+            }
             if let Some(mut writer) = self.active.take() {
                 writer.close().await?;
             }
@@ -237,9 +254,9 @@ impl Journal {
     /// # Errors
     ///
     /// As [`Journal::replay_from`], plus [`ReplayError::Visit`] if the visitor
-    /// stops with an error. If the log itself fails after the visitor already
-    /// refused a record, [`ReplayError::Log`] wins: the log's state is the one
-    /// the caller cannot act on.
+    /// stops with an error. A visitor that breaks is never followed by a log
+    /// error — the replay stops there — so the visitor's own error is the one
+    /// that always comes back.
     pub async fn try_replay_from<E, F>(
         &self,
         from: Cursor,
@@ -305,7 +322,10 @@ impl Journal {
             } else {
                 segment::HEADER_LEN as u64
             };
-            if start >= end {
+            // An empty segment still counts as visited: the cursor must land on
+            // `head()` after a full replay, including a rotation a crash left
+            // with no records yet.
+            if start > end {
                 continue;
             }
             let mut reader = Reader::new(file);
@@ -350,11 +370,9 @@ impl Journal {
                 return Ok(at);
             }
             if walked.end != end {
-                // Only the segment being written may end early; `open` has
-                // already truncated it, so this is a concurrent writer.
-                if Some(segment) == self.last && self.active.is_some() {
-                    return Ok(at);
-                }
+                // The log holds the directory's lock, so nobody else can be
+                // writing here: a walk that stops short of the head is damage,
+                // including in the segment we are appending to.
                 return Err(Error::corrupt(segment, walked.end, "damaged frame"));
             }
             self.footer_checked(&mut reader, segment, start, end, len, &walked)

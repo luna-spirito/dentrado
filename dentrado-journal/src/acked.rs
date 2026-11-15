@@ -50,18 +50,28 @@ pub(crate) struct Acked {
 }
 
 impl Acked {
-    /// Whether `segment` may hold acked records.
+    /// Whether the acked head stops at or before `cursor`, i.e. a record
+    /// starting there — and anything after it — was never acknowledged.
+    ///
+    /// The head is exclusive: it sits just past the last acked record, so a
+    /// record beginning exactly at it is not covered.
     #[must_use]
-    pub fn reaches(self, segment: u64) -> bool {
-        self.data.is_some_and(|data| data.segment >= segment)
+    pub fn unacked_from(self, cursor: Cursor) -> bool {
+        self.data.is_some_and(|data| data <= cursor)
     }
 
-    /// The acked offset in `segment`, if the acked head is in it.
+    /// The acked offset in `segment`, if the head is in it.
     #[must_use]
     pub fn offset_in(self, segment: u64) -> Option<u64> {
         self.data
             .filter(|data| data.segment == segment)
             .map(|data| data.offset)
+    }
+
+    /// Whether `segment` may hold acked records.
+    #[must_use]
+    pub fn reaches(self, segment: u64) -> bool {
+        self.data.is_some_and(|data| data.segment >= segment)
     }
 
     /// Whether anything at all has been acked.
@@ -88,7 +98,12 @@ impl Recorder {
             file: None,
             seq: 0,
         };
-        let file = match File::open(&recorder.path).await {
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&recorder.path)
+            .await
+        {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((recorder, None)),
             Err(e) => return Err(e.into()),
@@ -99,6 +114,9 @@ impl Recorder {
             .0
             .iter()
             .filter_map(|slot| decode(slot))
+            // 2^64 syncs away is crafted, not a sequence: ignoring it keeps the
+            // other slot authoritative and the next save from overflowing.
+            .filter(|(seq, _)| *seq != u64::MAX)
             .fold(None, |newest: Option<(u64, Acked)>, slot| match newest {
                 Some((seq, _)) if seq >= slot.0 => newest,
                 _ => Some(slot),
@@ -131,10 +149,20 @@ impl Recorder {
     }
 }
 
-/// Both slots, zero-filled past the end of the file.
+/// Both slots, zero-filled past the end of the file. A short read is legal, so
+/// read until the file says it is done instead of trusting one call.
 async fn read(file: &File) -> Result<[u8; SLOT * 2], Error> {
-    let BufResult(result, bytes) = file.read_at([0u8; SLOT * 2], 0).await;
-    result?;
+    let mut bytes = [0u8; SLOT * 2];
+    let mut at = 0;
+    while at < bytes.len() {
+        let BufResult(result, buf) = file.read_at(bytes, at as u64).await;
+        let read = result?;
+        bytes = buf;
+        if read == 0 {
+            break;
+        }
+        at += read;
+    }
     Ok(bytes)
 }
 
@@ -215,6 +243,54 @@ mod tests {
         let mut padded = bytes;
         padded[SLOT - 1] ^= 0xff;
         assert_eq!(decode(&padded), Some((3, acked())), "padding is ignored");
+    }
+
+    fn run<F: std::future::Future>(f: F) -> F::Output {
+        compio::runtime::Runtime::new().unwrap().block_on(f)
+    }
+
+    #[test]
+    fn a_crafted_sequence_is_ignored() {
+        run(async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&encode(
+                7,
+                Acked {
+                    decl_end: 96,
+                    data: None,
+                },
+            ));
+            bytes.extend_from_slice(&encode(
+                u64::MAX,
+                Acked {
+                    decl_end: 4096,
+                    data: None,
+                },
+            ));
+            std::fs::write(dir.path().join(super::FILE), bytes).unwrap();
+
+            let (_, found) = super::Recorder::open(dir.path()).await.unwrap();
+            assert_eq!(
+                found,
+                Some(Acked {
+                    decl_end: 96,
+                    data: None
+                }),
+                "2^64 syncs away is crafted, not a sequence"
+            );
+        });
+    }
+
+    #[test]
+    fn a_short_file_still_yields_its_slot() {
+        run(async {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(super::FILE), encode(5, acked())).unwrap();
+
+            let (_, found) = super::Recorder::open(dir.path()).await.unwrap();
+            assert_eq!(found, Some(acked()));
+        });
     }
 
     #[test]

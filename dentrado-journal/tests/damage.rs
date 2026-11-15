@@ -1,16 +1,17 @@
-//! Damage: which loss is repaired, which is refused, and on what evidence.
+//! Damage: what a segment may lose, and what must never be forgiven.
 //!
-//! The dividing line is the acked head: bytes the log promised must be there,
-//! bytes it was still writing may be gone. Everything here is a probe of that
-//! line from one side or the other.
+//! Torn appends and rotted bytes look the same from inside a segment, so the
+//! rules here are about position — sealed or not, the segment's own frames —
+//! and the acked head has its own file.
 
 use std::ops::ControlFlow;
 
-use dentrado_journal::{Cursor, Decl, Error, Frame, Journal, Options};
+use dentrado_journal::segment;
+use dentrado_journal::{Cursor, Error, Frame, Journal, Options};
 use proptest::prelude::*;
 
 mod common;
-use common::{copy_dir, counter, flip, records, run, segments, truncate};
+use common::{copy_dir, counter, flip, payloads, records, run, segments, truncate, write_at};
 
 #[test]
 fn damage_in_a_closed_segment_is_fatal() {
@@ -198,175 +199,73 @@ fn a_cut_unacked_tail_is_repaired() {
 }
 
 #[test]
-fn a_cut_acked_tail_is_damage() {
+fn a_payload_that_looks_like_a_footer_is_not_a_footer() {
     run(async {
         let dir = tempfile::tempdir().unwrap();
         let mut log = Journal::open(dir.path()).await.unwrap();
         let schema = counter(&mut log).await;
-        log.append(&[Frame::new(schema, b"acked")]).await.unwrap();
+        // Exactly the last 44 bytes of the file, starting with the magic.
+        let mut payload = [0u8; 44];
+        payload[..4].copy_from_slice(b"DJNF");
+        log.append(&[Frame::new(schema, &payload)]).await.unwrap();
         log.sync().await.unwrap();
         drop(log);
 
-        let files = segments(dir.path());
-        let len = std::fs::metadata(&files[1]).unwrap().len();
-        truncate(&files[1], len / 2);
-
-        let opened = Journal::open(dir.path()).await.map(|_| ());
-        assert!(
-            matches!(opened, Err(Error::Corrupt { .. })),
-            "bytes that were synced are promised, not optional: {opened:?}"
-        );
+        let log = Journal::open(dir.path()).await.unwrap();
+        assert_eq!(payloads(&log).await, [payload.to_vec()]);
+        assert_eq!(log.truncated(), 0, "nothing was cut from a healthy log");
     });
 }
 
 #[test]
-fn damage_in_an_acked_tail_is_damage() {
+fn a_torn_footer_is_not_damage() {
     run(async {
         let dir = tempfile::tempdir().unwrap();
         let mut log = Journal::open(dir.path()).await.unwrap();
         let schema = counter(&mut log).await;
-        for payload in [&b"a"[..], b"b", b"c", b"d"] {
+        for payload in [&b"a"[..], b"b"] {
             log.append(&[Frame::new(schema, payload)]).await.unwrap();
         }
-        log.sync().await.unwrap();
-        drop(log);
-
-        let files = segments(dir.path());
-        flip(&files[1], 32 + 4 + 2 + 1);
-
-        let opened = Journal::open(dir.path()).await.map(|_| ());
-        assert!(
-            matches!(opened, Err(Error::Corrupt { .. })),
-            "rot between acked records is rot, not a short segment: {opened:?}"
-        );
-    });
-}
-
-#[test]
-fn a_rotted_header_of_an_acked_segment_is_damage() {
-    run(async {
-        let dir = tempfile::tempdir().unwrap();
-        let mut log = Journal::open(dir.path()).await.unwrap();
-        let schema = counter(&mut log).await;
-        log.append(&[Frame::new(schema, b"acked")]).await.unwrap();
-        log.sync().await.unwrap();
-        drop(log);
-
-        let files = segments(dir.path());
-        flip(&files[1], 0);
-
-        let opened = Journal::open(dir.path()).await.map(|_| ());
-        assert!(
-            matches!(opened, Err(Error::Corrupt { .. })),
-            "a header that was acked is not a crashed create: {opened:?}"
-        );
-    });
-}
-
-#[test]
-fn a_crashed_create_past_the_acked_head_is_forgiven() {
-    run(async {
-        let dir = tempfile::tempdir().unwrap();
-        let mut log = Journal::open(dir.path()).await.unwrap();
-        let schema = counter(&mut log).await;
-        log.append(&[Frame::new(schema, b"acked")]).await.unwrap();
         log.close().await.unwrap();
         drop(log);
 
-        // A crash between creating the next segment and writing its header.
-        let next = dir.path().join(dentrado_journal::segment::file_name(2));
-        std::fs::write(&next, [0u8; 32]).unwrap();
+        // A crash while the footer was written: the magic landed, nothing else.
+        let file = segments(dir.path()).pop().unwrap();
+        let len = std::fs::metadata(&file).unwrap().len();
+        let mut torn = [0u8; segment::FOOTER_LEN];
+        torn[..4].copy_from_slice(b"DJNF");
+        write_at(&file, len - torn.len() as u64, &torn);
 
+        let mut log = Journal::open(dir.path()).await.unwrap();
+        assert_eq!(payloads(&log).await, [b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(log.truncated(), segment::FOOTER_LEN as u64);
+
+        // The seal is gone, the records are not: it may be sealed again.
+        log.close().await.unwrap();
+        drop(log);
         let log = Journal::open(dir.path()).await.unwrap();
-        assert_eq!(log.head().segment, 2, "the empty segment is reused");
-        assert_eq!(
-            records(&log, Cursor::START)
-                .await
-                .into_iter()
-                .filter(|(_, schema, _)| schema.is_user())
-                .count(),
-            1
-        );
+        assert_eq!(payloads(&log).await, [b"a".to_vec(), b"b".to_vec()]);
     });
 }
 
 #[test]
-fn a_deleted_declaration_segment_is_damage() {
+fn a_flip_in_the_segment_being_written_is_damage() {
     run(async {
         let dir = tempfile::tempdir().unwrap();
         let mut log = Journal::open(dir.path()).await.unwrap();
         let schema = counter(&mut log).await;
         log.append(&[Frame::new(schema, b"acked")]).await.unwrap();
         log.sync().await.unwrap();
-        drop(log);
 
-        std::fs::remove_file(&segments(dir.path())[0]).unwrap();
-
-        let opened = Journal::open(dir.path()).await.map(|_| ());
-        assert!(
-            matches!(opened, Err(Error::Corrupt { .. })),
-            "the declarations were acked, so their segment cannot vanish: {opened:?}"
-        );
-    });
-}
-
-#[test]
-fn an_acked_head_that_names_a_missing_segment_is_damage() {
-    run(async {
-        let dir = tempfile::tempdir().unwrap();
-        let mut log = Journal::open(dir.path()).await.unwrap();
-        let schema = counter(&mut log).await;
-        log.append(&[Frame::new(schema, b"acked")]).await.unwrap();
-        log.sync().await.unwrap();
-        drop(log);
-
+        // The handle holds the directory's lock: nobody else is writing, so a
+        // byte that changes under us is rot, not a concurrent append.
         let files = segments(dir.path());
-        std::fs::remove_file(&files[1]).unwrap();
+        flip(&files[1], 32 + 4 + 2);
 
-        let opened = Journal::open(dir.path()).await.map(|_| ());
         assert!(
-            matches!(opened, Err(Error::Corrupt { .. })),
-            "the log promised a segment that is gone: {opened:?}"
+            matches!(log.verify().await, Err(Error::Corrupt { .. })),
+            "verify must not forgive damage in the segment it is writing"
         );
-    });
-}
-
-#[test]
-fn a_record_that_names_an_unacked_declaration_is_dropped() {
-    run(async {
-        let dir = tempfile::tempdir().unwrap();
-        let mut log = Journal::open(dir.path()).await.unwrap();
-        let kept = counter(&mut log).await;
-        log.append(&[Frame::new(kept, b"kept")]).await.unwrap();
-        log.sync().await.unwrap();
-
-        // The declaration segment holds exactly the acked declarations now.
-        let files = segments(dir.path());
-        let decls = std::fs::metadata(&files[0]).unwrap().len();
-
-        // A declaration and a record that names it, neither of them synced.
-        let lost = log
-            .intern(Decl {
-                name: "example/lost",
-                shape: "u8",
-            })
-            .await
-            .unwrap();
-        log.append(&[Frame::new(lost, b"lost")]).await.unwrap();
-        drop(log);
-
-        // The crash kept the record but lost the declaration it names.
-        truncate(&files[0], decls);
-
-        let log = Journal::open(dir.path()).await.unwrap();
-        assert!(log.truncated() > 0, "the unacked record is cut");
-        let payloads: Vec<_> = records(&log, Cursor::START)
-            .await
-            .into_iter()
-            .filter(|(_, schema, _)| schema.is_user())
-            .map(|(_, _, payload)| payload)
-            .collect();
-        assert_eq!(payloads, [b"kept".to_vec()]);
     });
 }
 
