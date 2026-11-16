@@ -1062,6 +1062,7 @@ dependencies = [
  "compio",
  "crc32fast",
  "dentrado-cache",
+ "dentrado-journal",
  "dentrado-macros",
  "dentrado-types",
  "flume 0.11.1",
@@ -1116,6 +1117,7 @@ version = "0.1.0"
 dependencies = [
  "dentrado-macros",
  "rkyv",
+ "serde",
 ]
 
 [[package]]

@@ -18,7 +18,7 @@ libc = "0.2"
 rkyv = { version = "0.8", features = ["bytecheck"] }
 imbl = "7.0"
 slotmap = "1.1"
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 base64 = "0.22"
@@ -26,9 +26,9 @@ similar = { version = "3", default-features = false, features = ["std"] }
 dentrado-macros = { path = "../dentrado-macros" }
 dentrado-types = { path = "../dentrado-types" }
 dentrado-cache = { path = "../dentrado-cache" }
+dentrado-journal = { path = "../dentrado-journal" }
 
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
-serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["use-std"] }

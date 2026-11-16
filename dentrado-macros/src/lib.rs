@@ -10,6 +10,7 @@ use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Fields, Ident, parse_macro_input, parse_quote};
 
 mod gears;
+mod shape;
 
 /// Derive [`dentrado::types::Localizable`].
 ///
@@ -23,6 +24,22 @@ mod gears;
 pub fn derive_localizable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand(&input)
+        .unwrap_or_else(|e| e.to_compile_error())
+        .into()
+}
+
+/// Derive `dentrado_types::Shape` — the textual identity of a serialized
+/// layout.
+///
+/// Follows the encoding, not the source syntax: `#[serde(skip)]` omits,
+/// `#[serde(transparent)]` collapses, names are ignored (postcard encodes
+/// none). Attributes it cannot follow (`flatten`, `with`, `tag`,
+/// `serialize_with`, ...) are compile errors: a custom encoding pairs a
+/// hand-written `Serialize` with a hand-written `Shape`.
+#[proc_macro_derive(Shape, attributes(serde))]
+pub fn derive_shape(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    shape::expand(&input)
         .unwrap_or_else(|e| e.to_compile_error())
         .into()
 }

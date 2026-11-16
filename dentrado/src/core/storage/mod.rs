@@ -67,6 +67,7 @@
 
 pub mod view;
 pub mod in_memory;
+pub mod journal;
 pub mod paged;
 
 pub use in_memory::InMemoryStorage;

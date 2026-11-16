@@ -12,7 +12,7 @@ mod shared;
 
 use std::{fmt::Debug, hash::Hash, num::NonZero};
 
-use crate::types::{GlobalHash, LocGroupId, LocMsgTypeId, Localizable};
+use crate::types::{GlobalHash, LocGroupId, LocMsgTypeId, Localizable, Shape};
 
 pub use self::shared::Shared;
 pub(crate) use self::shared::{Epoch, RemoteShared, SharedArena, SharedBus, SharedData, SharedKey};
@@ -101,11 +101,41 @@ pub trait RuntimeTypes: Debug + Send + Sync + Sized + 'static {
 
     type Module: Debug + Send + Sync + 'static;
 
-    type Group: Debug + Clone + Hash + Eq + Send + Sync + 'static + GlobalHash;
+    /// A group's local key. `Shape + serde` because it is journaled: the
+    /// group record carries its bytes and its declared layout.
+    type Group: Debug
+        + Clone
+        + Hash
+        + Eq
+        + Send
+        + Sync
+        + 'static
+        + GlobalHash
+        + Shape
+        + serde::Serialize
+        + serde::de::DeserializeOwned;
 
-    type Body: Debug + Clone + Send + Sync + 'static + Localizable;
+    type Body: Debug
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + Localizable
+        + Shape
+        + serde::Serialize
+        + serde::de::DeserializeOwned;
 
-    type Data: Debug + Clone + Hash + Eq + Send + Sync + 'static + GlobalHash;
+    type Data: Debug
+        + Clone
+        + Hash
+        + Eq
+        + Send
+        + Sync
+        + 'static
+        + GlobalHash
+        + Shape
+        + serde::Serialize
+        + serde::de::DeserializeOwned;
 }
 
 /// How a gear is driven and where it lives, returned by

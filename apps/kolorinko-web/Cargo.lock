@@ -330,6 +330,7 @@ version = "0.1.0"
 dependencies = [
  "dentrado-macros",
  "rkyv",
+ "serde",
 ]
 
 [[package]]

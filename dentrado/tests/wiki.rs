@@ -43,7 +43,7 @@ fn encode(state: &CacheState) -> Vec<u8> {
     postcard::to_stdvec(state).expect("a flat tuple serializes")
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize, Shape)]
 pub struct BranchData {
     pub creator: LocUserId,
     pub created_at: i64,

@@ -26,7 +26,16 @@ impl Localizable for MulSumGear {
     }
 }
 
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug)]
+#[derive(
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    Shape,
+)]
 pub struct MulSumBody {
     pub a: i64,
     pub b: i64,

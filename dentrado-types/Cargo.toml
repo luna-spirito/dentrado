@@ -8,3 +8,4 @@ description = "Wire-localization contract (Localizable / Remapper / local-id typ
 [dependencies]
 rkyv = { version = "0.8", features = ["bytecheck"] }
 dentrado-macros = { path = "../dentrado-macros" }
+serde = { version = "1", features = ["derive"] }

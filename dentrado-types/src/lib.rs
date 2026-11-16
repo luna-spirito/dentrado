@@ -8,6 +8,14 @@
 
 #![feature(box_take)]
 
+// The derives this crate uses on its own types expand to absolute
+// `dentrado_types::...` paths; the alias makes that name resolve inside.
+extern crate self as dentrado_types;
+
+mod shape;
+
+pub use shape::Shape;
+
 #[repr(transparent)]
 #[derive(
     Clone,
@@ -21,6 +29,9 @@
     rkyv::Archive,
     rkyv::Serialize,
     rkyv::Deserialize,
+    serde::Serialize,
+    serde::Deserialize,
+    Shape,
 )]
 pub struct LocUserId(pub u64);
 
@@ -32,7 +43,19 @@ impl LocUserId {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    Shape,
+)]
 pub struct LocSenderId(pub u64);
 
 impl LocSenderId {
@@ -55,6 +78,9 @@ impl LocSenderId {
     rkyv::Archive,
     rkyv::Serialize,
     rkyv::Deserialize,
+    serde::Serialize,
+    serde::Deserialize,
+    Shape,
 )]
 pub struct LocDataId(pub u64);
 
@@ -65,7 +91,19 @@ impl LocDataId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    Shape,
+)]
 pub struct LocSenderEventId(pub LocSenderId, pub u32);
 
 impl Localizable for LocSenderEventId {
@@ -164,3 +202,7 @@ impl<T: Localizable> Localizable for Box<T> {
 /// (`dentrado_types::Localizable` is both the trait and the derive, in their
 /// respective namespaces — same convention as `serde::Serialize`).
 pub use dentrado_macros::Localizable;
+
+/// Re-export the [`Shape`] derive next to the trait, the same way
+/// [`Localizable`] is exposed.
+pub use dentrado_macros::Shape;

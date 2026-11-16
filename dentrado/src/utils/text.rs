@@ -9,16 +9,40 @@ use crate::{
         gear::IsRuntime,
         storage::{GroupStore, IsStorage},
     },
-    types::{LocSenderEventId, LocSenderId, Localizable, Remapper},
+    types::{LocSenderEventId, LocSenderId, Localizable, Remapper, Shape},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    Shape,
+)]
 pub struct AnchorId(pub LocSenderEventId, pub u32);
 
 pub const ROOT_ANCHOR: AnchorId =
     AnchorId(LocSenderEventId(LocSenderId(u64::MAX), u32::MAX), u32::MAX);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    Shape,
+)]
 pub struct AnchorPos {
     pub(crate) parent: AnchorId,
     pub(crate) offset: u32,
@@ -44,7 +68,7 @@ impl Anchor {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, Shape)]
 pub struct TextUpd {
     pub(crate) new_anchors: Vec<AnchorPos>,
     pub(crate) new_strings: Vec<String>,

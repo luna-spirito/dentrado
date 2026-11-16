@@ -4,7 +4,7 @@ use std::{mem::size_of, num::NonZero};
 // (compio-free, client-reachable); re-exported so `dentrado::types::*` keeps
 // resolving.
 pub use dentrado_types::{
-    LocDataId, LocSenderEventId, LocSenderId, LocUserId, Localizable, Remapper,
+    LocDataId, LocSenderEventId, LocSenderId, LocUserId, Localizable, Remapper, Shape,
 };
 
 #[repr(transparent)]
@@ -155,6 +155,9 @@ impl std::error::Error for DataVerifyError {
     rkyv::Archive,
     rkyv::Serialize,
     rkyv::Deserialize,
+    serde::Serialize,
+    serde::Deserialize,
+    Shape,
 )]
 pub struct Id(pub u64);
 

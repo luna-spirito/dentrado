@@ -1208,7 +1208,17 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             #( #out_local_variants, )*
         }
 
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, dentrado_types::Localizable)]
+        #[derive(
+            Debug,
+            Clone,
+            PartialEq,
+            Eq,
+            Hash,
+            dentrado_types::Localizable,
+            serde::Serialize,
+            serde::Deserialize,
+            dentrado_types::Shape,
+        )]
         pub(crate) enum Group {
             Phantom(u32),
         }

@@ -58,19 +58,19 @@ impl Localizable for Wiki2GearOut {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Shape)]
 pub enum Wiki2Body {
     Invite(LocUserId),
     Attach(AttachBody),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Shape)]
 pub struct AttachBody {
     pub branch: LocDataId,
     pub payload: UpdatePayload,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Shape)]
 pub enum UpdatePayload {
     Edit { edit: TextUpd },
     Merge { from: LocDataId },
@@ -123,7 +123,7 @@ impl Wiki2Body {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize, Shape)]
 pub struct BranchData {
     pub creator: LocUserId,
     pub created_at: i64,
@@ -199,7 +199,7 @@ fn put_cache(gear: Wiki2Gear, cache: Wiki2Cache) {
     });
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize, Shape)]
 pub enum Wiki2Group {
     Branch(LocDataId),
     Doc(Id),
