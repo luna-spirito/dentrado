@@ -11,6 +11,33 @@ mod common;
 use common::{counter, flip, payloads, records, run, segments, truncate, write_at};
 
 #[test]
+fn the_segment_count_tracks_the_files_on_disk() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Journal::open_with(dir.path(), Options { rotate_bytes: 128 })
+            .await
+            .unwrap();
+        let schema = counter(&mut log).await;
+        for round in 0..20u8 {
+            log.append(&[Frame::new(schema, &[round; 16])])
+                .await
+                .unwrap();
+        }
+        assert!(log.segments() > 1, "the writes crossed a rotation");
+        assert_eq!(log.segments() as usize, segments(dir.path()).len());
+        log.close().await.unwrap();
+        drop(log);
+
+        let log = Journal::open(dir.path()).await.unwrap();
+        assert_eq!(
+            log.segments() as usize,
+            segments(dir.path()).len(),
+            "a reopen counts the same files"
+        );
+    });
+}
+
+#[test]
 fn a_cut_acked_tail_is_damage() {
     run(async {
         let dir = tempfile::tempdir().unwrap();

@@ -2,7 +2,7 @@ use super::format::{MergeError, WireEventBody, WireLocCtx};
 use crate::{
     core::{
         api::RuntimeTypes,
-        loc_ctx::{StoreResultSuccess, StoredEvent},
+        loc_ctx::{GroupDelta, StoredEvent},
         storage::IsStorage,
     },
     types::{LocDataId, LocGroupId, LocSenderId, LocUserId, Localizable, NodeId, Remapper},
@@ -45,7 +45,7 @@ impl<'a, R: RuntimeTypes, S: IsStorage<R>> WireLocCtxMerger<'a, R, S> {
         event: WireEventBody<R::Group, R::Body>,
         timestamp: u32,
         source_node: NodeId,
-    ) -> Result<(LocGroupId, Option<StoreResultSuccess>), MergeError> {
+    ) -> Result<(LocGroupId, Option<GroupDelta>), MergeError> {
         let sender = self.remap(event.sender).await?;
         let group = self.remap(event.group).await?;
         let body = self.remap(event.body).await?;

@@ -334,13 +334,21 @@ async fn render_owned(
     // core busy instead of idling. A future dropped mid-await cancels
     // cleanly (subscription `Drop` releases interest), so erroring out of
     // the drain loop tears the window down safely.
-    let owned = listed.pages.into_iter().filter_map(|page| {
-        // The listed page id is the canonical local id — no slug round-trip
-        // needed.
-        let local = kolorinko_rt::LocalId::from_page_id(&page.page_id)?;
-        let page_q = crate::runtime::article_latest(shared.space, local);
-        core.owns(page_q.id()).then_some((page, page_q))
-    });
+    let owned = {
+        let mut owned = Vec::new();
+        for page in listed.pages {
+            // The listed page id is the canonical local id — no slug
+            // round-trip needed.
+            let Some(local) = kolorinko_rt::LocalId::from_page_id(&page.page_id) else {
+                continue;
+            };
+            let page_q = crate::runtime::article_latest(shared.space, local);
+            if core.owns(page_q.id()).await {
+                owned.push((page, page_q));
+            }
+        }
+        owned
+    };
     let mut rendering = stream::iter(owned)
         .map(|(page, page_q)| {
             // Borrow the shell instead of moving it — the closure must stay

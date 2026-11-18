@@ -9,6 +9,7 @@ description = "Append-only, domain-blind event journal for Dentrado"
 blake3 = "1"
 compio = { version = "0.19.2", features = ["fs", "io"] }
 crc32fast = "1"
+getrandom = { version = "0.3", features = ["std"] }
 
 [dev-dependencies]
 proptest = "1"

@@ -1,63 +1,51 @@
-//! The disk-backed [`IsStorage`]: localization and the event log stay in
-//! RAM; the gear views spill into [`dentrado_cache`], one table per gear
-//! kind.
+//! The storage facade: RAM or journaled.
 //!
-//! A view is a flat key-value overlay scoped to one gear (see
-//! [`GearView`]). The disk view is one `Session` over the store: reads use
-//! the session's old snapshot, writes are staged by the session, and the
-//! runtime commits the whole batch after the gear run. There is no image
-//! envelope and no chunking here — a gear that needs bigger values stores
-//! several records itself.
+//! Disk mode is entirely [`JournalStorage`]: layers 1–2 live in the journal,
+//! the fold, and the body cache; gear views live in the same page store. RAM
+//! mode is [`InMemoryStorage`], the non-durable reference backend.
+//!
+//! A view is a flat key-value overlay scoped to one gear (see [`GearView`]).
+//! The disk view is one `Session` over the store: reads use the session's old
+//! snapshot, writes are staged by the session, and the runtime commits the
+//! whole batch after the gear run.
 //!
 //! ## The poison boundary
 //!
-//! A store error is fatal: the view panics rather than silently degrading
-//! to RAM. The process is expected to restart against a fresh store (the
-//! cache is recomputable). A corrupt image is quarantined (renamed aside,
-//! kept for inspection) and a fresh store opens in its place; a failed
-//! open is a panic, never a silent RAM fallback.
-//!
-//! The store opens lazily on the first view: `make_storage` runs before the
-//! core's runtime exists, and opening spawns the store's driver task — both
-//! need runtime context. Concurrent first-touchers park on a oneshot while
-//! one of them opens.
+//! A store or journal error is fatal: the backend panics rather than silently
+//! degrading to RAM. The process is expected to restart against a fresh cache
+//! (the cache is recomputable; the journal is not). A corrupt cache image is
+//! quarantined (renamed aside, kept for inspection) and a fresh store opens in
+//! its place; a failed open is a panic, never a silent RAM fallback.
 
-mod disk;
-
-use std::{
-    cell::{Cell, RefCell},
-    future::Future,
-    io,
-    path::PathBuf,
-    rc::Rc,
-};
-
-use dentrado_cache::{Storage, disk::FsDisk};
+use std::{io, path::PathBuf};
 
 use crate::{
     core::{
-        api::{GearTable, RuntimeTypes},
-        loc_ctx::{StoreResultSuccess, StoredEvent},
+        api::RuntimeTypes,
+        loc_ctx::{GroupDelta, StoredEvent},
         storage::{
             GroupDiff, IsStorage, Watermark,
             in_memory::InMemoryStorage,
-            view::{DiskView, GearView, RamView, gear_key},
+            journal::JournalStorage,
+            view::{DiskView, GearView, RamView},
         },
     },
     types::{
-        DataId, DataVerifyError, GlobalResolver, GroupEventId, GroupRouteError, LocDataId,
-        LocGroupId, LocMsgTypeId, LocSenderId, LocUserId, SenderPk, UserId,
+        DataId, DataVerifyError, GlobalHash, GroupEventId, GroupRouteError, LocDataId, LocGroupId,
+        LocMsgTypeId, LocSenderId, LocUserId, SenderPk, UserId,
     },
 };
-use disk::Disk;
 
-/// [`IsStorage`] whose gear views live in a [`dentrado_cache`] file.
-/// `ram()` is the runtime toggle: no file, views in a `BTreeMap`.
+/// [`IsStorage`] whose durability is chosen at construction.
 pub struct PagedStorage<R: RuntimeTypes> {
-    ram: InMemoryStorage<R>,
-    file: Option<PathBuf>,
-    disk: RefCell<Disk>,
-    dirty: Cell<bool>,
+    backend: Backend<R>,
+}
+
+enum Backend<R: RuntimeTypes> {
+    /// Boxed: a storage is constructed once per core, never per call, and the
+    /// two backends differ in size enough to make an inline enum wasteful.
+    Ram(Box<InMemoryStorage<R>>),
+    Journal(Box<JournalStorage<R>>),
 }
 
 impl<R: RuntimeTypes> Default for PagedStorage<R> {
@@ -67,41 +55,23 @@ impl<R: RuntimeTypes> Default for PagedStorage<R> {
 }
 
 impl<R: RuntimeTypes> PagedStorage<R> {
+    /// Non-durable mode: every layer in RAM.
     #[must_use]
     pub fn ram() -> Self {
         Self {
-            ram: InMemoryStorage::default(),
-            file: None,
-            disk: RefCell::new(Disk::Closed),
-            dirty: Cell::new(false),
+            backend: Backend::Ram(Box::default()),
         }
     }
 
-    /// Disk mode: gear views live (after [`IsStorage::flush`]) in one
-    /// page-store file. The parent directory must already exist; the store
-    /// opens lazily inside the core's runtime on the first view.
+    /// Disk mode: `<file>.journal/` is the source of truth and `<file>` is the
+    /// recomputable cache for event bodies and gear views. The parent
+    /// directory must already exist; both open lazily inside the core's
+    /// runtime on the first storage call.
     #[must_use]
     pub fn on_disk(file: PathBuf) -> Self {
         Self {
-            file: Some(file),
-            ..Self::ram()
+            backend: Backend::Journal(Box::new(JournalStorage::new(file))),
         }
-    }
-
-    /// The opened store, or a panic. A missing file means [`Self::ram`];
-    /// disk mode always has one.
-    pub(super) async fn ensure(&self) -> Rc<Storage<FsDisk>> {
-        self.disk_open().await.expect("open the gear view store")
-    }
-}
-
-impl<R: RuntimeTypes> GlobalResolver for PagedStorage<R> {
-    fn resolve_user(&self, lid: LocUserId) -> Result<UserId, GroupRouteError> {
-        self.ram.resolve_user(lid)
-    }
-
-    fn resolve_data(&self, did: LocDataId) -> Result<DataId, GroupRouteError> {
-        self.ram.resolve_data(did)
     }
 }
 
@@ -109,7 +79,7 @@ impl<R: RuntimeTypes> GlobalResolver for PagedStorage<R> {
 /// branch is a `Session` + gear prefix; the RAM branch is the same
 /// contract over a `BTreeMap` (the `ram()` toggle).
 pub enum PagedView<'a> {
-    Disk(DiskView<'a>),
+    Disk(DiskView),
     Ram(RamView<'a>),
 }
 
@@ -150,114 +120,137 @@ impl GearView for PagedView<'_> {
     }
 }
 
-impl<R> IsStorage<R> for PagedStorage<R>
-where
-    R: RuntimeTypes,
-{
-    // ── Layers 1–2: delegated to RAM ───────────────────────────────────────
+impl<R: RuntimeTypes> IsStorage<R> for PagedStorage<R> {
+    // ── localization ──────────────────────────────────────────────────────
 
-    fn mk_loc_user(&self, uid: UserId) -> impl Future<Output = LocUserId> {
-        self.ram.mk_loc_user(uid)
+    async fn mk_loc_user(&self, uid: UserId) -> LocUserId {
+        match &self.backend {
+            Backend::Ram(storage) => storage.mk_loc_user(uid).await,
+            Backend::Journal(storage) => storage.mk_loc_user(uid).await,
+        }
     }
 
-    fn mk_loc_sender(
-        &self,
-        pk: SenderPk,
-        uid: Option<UserId>,
-    ) -> impl Future<Output = LocSenderId> {
-        self.ram.mk_loc_sender(pk, uid)
+    async fn mk_loc_sender(&self, pk: SenderPk, uid: Option<UserId>) -> LocSenderId {
+        match &self.backend {
+            Backend::Ram(storage) => storage.mk_loc_sender(pk, uid).await,
+            Backend::Journal(storage) => storage.mk_loc_sender(pk, uid).await,
+        }
     }
 
-    fn mk_loc_group(
-        &self,
-        msg_type: LocMsgTypeId,
-        group: R::Group,
-    ) -> impl Future<Output = LocGroupId> {
-        self.ram.mk_loc_group(msg_type, group)
+    async fn mk_loc_group(&self, msg_type: LocMsgTypeId, group: R::Group) -> LocGroupId {
+        match &self.backend {
+            Backend::Ram(storage) => storage.mk_loc_group(msg_type, group).await,
+            Backend::Journal(storage) => storage.mk_loc_group(msg_type, group).await,
+        }
     }
 
-    fn mk_data(
+    async fn mk_data(
         &self,
         data_id: DataId,
         content: R::Data,
-    ) -> impl Future<Output = Result<LocDataId, DataVerifyError>> {
-        self.ram.mk_data(data_id, content)
+    ) -> Result<LocDataId, DataVerifyError> {
+        match &self.backend {
+            Backend::Ram(storage) => storage.mk_data(data_id, content).await,
+            Backend::Journal(storage) => storage.mk_data(data_id, content).await,
+        }
     }
 
-    fn user_by_local(&self, lid: LocUserId) -> impl Future<Output = Option<UserId>> {
-        self.ram.user_by_local(lid)
+    async fn user_by_local(&self, lid: LocUserId) -> Option<UserId> {
+        match &self.backend {
+            Backend::Ram(storage) => storage.user_by_local(lid).await,
+            Backend::Journal(storage) => storage.user_by_local(lid).await,
+        }
     }
 
-    fn sender_user(&self, sid: LocSenderId) -> impl Future<Output = Option<LocUserId>> {
-        self.ram.sender_user(sid)
+    async fn sender_user(&self, sid: LocSenderId) -> Option<LocUserId> {
+        match &self.backend {
+            Backend::Ram(storage) => storage.sender_user(sid).await,
+            Backend::Journal(storage) => storage.sender_user(sid).await,
+        }
     }
 
-    fn sender_pk(&self, sid: LocSenderId) -> impl Future<Output = Option<SenderPk>> {
-        self.ram.sender_pk(sid)
+    async fn sender_pk(&self, sid: LocSenderId) -> Option<SenderPk> {
+        match &self.backend {
+            Backend::Ram(storage) => storage.sender_pk(sid).await,
+            Backend::Journal(storage) => storage.sender_pk(sid).await,
+        }
     }
 
-    fn find_data(&self, data_id: &DataId) -> impl Future<Output = Option<LocDataId>> {
-        self.ram.find_data(data_id)
+    async fn find_data(&self, data_id: &DataId) -> Option<LocDataId> {
+        match &self.backend {
+            Backend::Ram(storage) => storage.find_data(data_id).await,
+            Backend::Journal(storage) => storage.find_data(data_id).await,
+        }
     }
 
-    fn fetch_data(&self, did: LocDataId) -> impl Future<Output = Option<(DataId, R::Data)>> {
-        self.ram.fetch_data(did)
+    async fn fetch_data(&self, did: LocDataId) -> Option<(DataId, R::Data)> {
+        match &self.backend {
+            Backend::Ram(storage) => storage.fetch_data(did).await,
+            Backend::Journal(storage) => storage.fetch_data(did).await,
+        }
     }
 
-    fn store_event(
-        &self,
-        group: LocGroupId,
-        ev: StoredEvent<R::Body>,
-    ) -> impl Future<Output = Option<StoreResultSuccess>> {
-        self.ram.store_event(group, ev)
+    async fn global_hash<V: GlobalHash>(&self, value: &V) -> Result<[u8; 32], GroupRouteError> {
+        match &self.backend {
+            Backend::Ram(storage) => storage.global_hash(value).await,
+            Backend::Journal(storage) => storage.global_hash(value).await,
+        }
     }
 
-    fn fetch_event(
+    // ── event log ─────────────────────────────────────────────────────────
+
+    async fn store_event(&self, group: LocGroupId, ev: StoredEvent<R::Body>) -> Option<GroupDelta> {
+        match &self.backend {
+            Backend::Ram(storage) => storage.store_event(group, ev).await,
+            Backend::Journal(storage) => storage.store_event(group, ev).await,
+        }
+    }
+
+    async fn fetch_event(
         &self,
         group: LocGroupId,
         slot: GroupEventId,
-    ) -> impl Future<Output = Option<StoredEvent<R::Body>>> {
-        self.ram.fetch_event(group, slot)
+    ) -> Option<StoredEvent<R::Body>> {
+        match &self.backend {
+            Backend::Ram(storage) => storage.fetch_event(group, slot).await,
+            Backend::Journal(storage) => storage.fetch_event(group, slot).await,
+        }
     }
 
-    fn diff_group(&self, group: LocGroupId, since: Watermark) -> impl Future<Output = GroupDiff> {
-        self.ram.diff_group(group, since)
+    async fn diff_group(&self, group: LocGroupId, since: Watermark) -> GroupDiff {
+        match &self.backend {
+            Backend::Ram(storage) => storage.diff_group(group, since).await,
+            Backend::Journal(storage) => storage.diff_group(group, since).await,
+        }
     }
 
-    // ── Layer 3: the gear's private view ──────────────────────────────────
+    // ── layer 3: the gear's private view ──────────────────────────────────
 
     type View<'a>
         = PagedView<'a>
     where
         Self: 'a;
 
-    fn gear_view(&self, gear: &R::GearId) -> impl Future<Output = Self::View<'_>> {
-        let table = GearTable::of(R::gear_kind(gear));
-        let prefix = gear_key::<R>(gear).to_vec();
-        async move {
-            match &self.file {
-                Some(_) => {
-                    let store = self.ensure().await;
-                    PagedView::Disk(DiskView::new(store, table, prefix, &self.dirty))
-                }
-                None => PagedView::Ram(RamView::new(self.ram.gear_data(), prefix)),
-            }
+    async fn gear_view(&self, gear: &R::GearId) -> Self::View<'_> {
+        match &self.backend {
+            Backend::Ram(storage) => PagedView::Ram(storage.gear_view(gear).await),
+            Backend::Journal(storage) => PagedView::Disk(storage.gear_view(gear).await),
         }
     }
 
-    // ── Durability ─────────────────────────────────────────────────────────
+    // ── durability ────────────────────────────────────────────────────────
 
-    fn flush(&self) -> impl Future<Output = io::Result<()>> {
-        async move {
-            self.ram.flush().await?;
-            // Take the flag *before* the await: a commit that lands while the
-            // store flush is in flight sets it again and gets its own round,
-            // instead of being erased by this one's clear.
-            if self.dirty.replace(false) {
-                let store = self.ensure().await;
-                store.flush().await.expect("flush the gear view store");
-            }
-            Ok(())
+    async fn sync_log(&self) -> io::Result<()> {
+        match &self.backend {
+            Backend::Ram(_) => Ok(()),
+            Backend::Journal(storage) => storage.sync_log().await,
+        }
+    }
+
+    async fn flush(&self) -> io::Result<()> {
+        match &self.backend {
+            Backend::Ram(storage) => storage.flush().await,
+            Backend::Journal(storage) => storage.flush().await,
         }
     }
 }

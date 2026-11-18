@@ -36,6 +36,7 @@ pub(super) async fn open(dir: impl AsRef<Path>, options: Options) -> Result<Jour
         dir,
         options,
         registry: Registry::new(),
+        identity: None,
         decl: None,
         active: None,
         last: ids.last().copied(),
@@ -126,34 +127,56 @@ impl Journal {
             return Ok(());
         }
         let registry = &mut self.registry;
+        let mut identity = None;
         let walked = segment::walk(
             &mut reader,
             segment::DECL,
             segment::HEADER_LEN as u64,
             len,
             async |cursor, frame: Frame<'_>| {
-                if frame.schema != SchemaId::DECL {
-                    return Err(Error::corrupt(
-                        segment::DECL,
-                        cursor.offset,
-                        "segment zero holds declarations only",
-                    ));
+                match frame.schema {
+                    SchemaId::DECL => {
+                        let decl = schema::decode_decl(frame.payload)?;
+                        // Ids are assigned densely by construction; a gap means
+                        // the file was edited or written by something else.
+                        if decl.id != registry.next_id()? {
+                            return Err(Error::corrupt(
+                                segment::DECL,
+                                cursor.offset,
+                                "declaration ids are not dense",
+                            ));
+                        }
+                        registry.declare(decl)?;
+                    }
+                    SchemaId::IDENTITY => {
+                        let bytes: [u8; 16] = frame.payload.try_into().map_err(|_| {
+                            Error::corrupt(
+                                segment::DECL,
+                                cursor.offset,
+                                "a malformed identity record",
+                            )
+                        })?;
+                        if identity.replace(bytes).is_some() {
+                            return Err(Error::corrupt(
+                                segment::DECL,
+                                cursor.offset,
+                                "a second identity record",
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(Error::corrupt(
+                            segment::DECL,
+                            cursor.offset,
+                            "segment zero holds declarations and the identity only",
+                        ));
+                    }
                 }
-                let decl = schema::decode_decl(frame.payload)?;
-                // Ids are assigned densely by construction; a gap means the
-                // file was edited or written by something else.
-                if decl.id != registry.next_id()? {
-                    return Err(Error::corrupt(
-                        segment::DECL,
-                        cursor.offset,
-                        "declaration ids are not dense",
-                    ));
-                }
-                registry.declare(decl)?;
                 Ok(std::ops::ControlFlow::Continue(()))
             },
         )
         .await?;
+        self.identity = identity;
         if walked.end != len {
             // A declaration past the acked end was never acknowledged, so the
             // tail may be cut. Anything at or below it was promised, and its

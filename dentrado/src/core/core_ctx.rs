@@ -31,7 +31,7 @@ use crate::{
             WireLocCtxMerger,
         },
     },
-    types::{GlobalCoreId, GlobalHash, LocGroupId, NodeId},
+    types::{GlobalCoreId, LocGroupId, NodeId},
 };
 
 /// The behaviour half of a runtime: how a gear is routed and how it runs.
@@ -472,11 +472,11 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
     /// Does this core own `gear`? Placement is deterministic — the gear's group
     /// hash through the jump-consistent hash, the same computation on every
     /// core — so workers can shard work by ownership without a round trip.
-    #[must_use]
-    pub fn owns(&self, gear: &R::GearId) -> bool {
-        R::meta(gear)
-            .group()
-            .global_hash(&self.storage)
+    pub async fn owns(&self, gear: &R::GearId) -> bool {
+        let group = R::meta(gear).group().clone();
+        self.storage
+            .global_hash(&group)
+            .await
             .is_ok_and(|h| GlobalCoreId::from_hash(h).route(self.num_cores) == self.core_id)
     }
 
@@ -849,8 +849,10 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
         // no borrow spans the `.await`.
         let meta = R::meta(gear);
         let group_key = meta.group().clone();
-        let target_core = group_key
-            .global_hash(&self.storage)
+        let target_core = self
+            .storage
+            .global_hash(&group_key)
+            .await
             .map(GlobalCoreId::from_hash)
             .expect("force_active: global_hash")
             .route(self.num_cores);
@@ -1296,6 +1298,9 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
                 }
             }
         }
+        // Every event in this batch is appended; one sync makes the whole
+        // batch durable before any reply. This is the group-commit point.
+        self.storage.sync_log().await.map_err(MergeError::Storage)?;
         {
             let mut inner = self.inner.borrow_mut();
             let CoreLocCtx {

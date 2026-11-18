@@ -178,9 +178,7 @@ where
     pub(crate) fn add_data(&mut self, content: R::Data) -> LocDataId {
         let ts = self.next_data_ts;
         self.next_data_ts += 1;
-        let hash = content
-            .global_hash(&self.client)
-            .expect("global_hash failed");
+        let hash = block_on(self.client.global_hash(&content)).expect("global_hash failed");
         let data_id = DataId {
             timestamp: ts,
             hash,

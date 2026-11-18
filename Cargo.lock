@@ -1098,6 +1098,7 @@ dependencies = [
  "blake3",
  "compio",
  "crc32fast",
+ "getrandom 0.3.4",
  "proptest",
  "tempfile",
 ]
@@ -1964,6 +1965,7 @@ dependencies = [
  "dentrado-types",
  "imbl",
  "kolorinko-wikitext",
+ "postcard",
  "serde",
  "serde_json",
 ]

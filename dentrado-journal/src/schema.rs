@@ -18,7 +18,10 @@ impl SchemaId {
     pub const DECL: Self = Self(0);
     /// Reserved for a future purge record.
     pub const PURGE: Self = Self(1);
-    /// First id available to the consumer; `2..16` are reserved.
+    /// The log's identity (`journal/identity`): 16 random bytes, created on
+    /// first use and never changed.
+    pub const IDENTITY: Self = Self(2);
+    /// First id available to the consumer; `3..16` are reserved.
     pub const USER_MIN: u16 = 16;
 
     /// Whether this id belongs to the consumer (as opposed to the format).

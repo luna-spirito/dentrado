@@ -1,74 +1,37 @@
-//! Reference typed in-memory [`Storage`] implementation.
+//! The RAM backend: a [`Fold`] plus a `BTreeMap` of gear views.
 //!
-//! Behaviorally identical to the structures it replaces in `loc_ctx.rs` /
-//! `core_ctx.rs`: the localization `HashMap`s, the per-group event shards
-//! ([`EventGroup`]: bodies + `(sender, tx_id)` dedup + changelog), and the
-//! per-gear view — just lifted behind the trait. Used as the test backend and
-//! the baseline a disk backend is validated against.
+//! Used as the test backend, as the `PagedStorage::ram()` dev mode, and as the
+//! reference a disk backend is validated against. It holds no journal and does
+//! no IO: every method does its work eagerly and returns an already-ready
+//! future, so no `RefCell` borrow is ever held across an `.await`.
 //!
-//! Like any RAM-only backend, NOTHING here survives process death — not just
-//! the gear views, but events and localization too. That is a property of
-//! the backend, not of any one layer; the `Storage` contract treats all of it
-//! as restart-surviving state, satisfied here in the (only) trivial sense RAM
-//! allows: live for the lifetime of this object.
-//!
-//! All methods do their work eagerly (synchronously) and return a `ready`
-//! future — there is no IO to await — so no `RefCell` borrow is ever held
-//! across an `.await`. Typed end-to-end: zero serialization.
+//! Nothing here survives process death — not just the gear views, but events
+//! and localization too. That is a property of the backend, not of any one
+//! layer; the `Storage` contract treats all of it as restart-surviving state,
+//! satisfied here in the (only) trivial sense RAM allows: live for the lifetime
+//! of this object. The durable backend pairs the same [`Fold`] with a journal.
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap},
-    future::ready,
+    collections::BTreeMap,
+    future::{Future, ready},
 };
 
 use crate::{
     core::{
         api::RuntimeTypes,
-        loc_ctx::{EventGroup, StoreResultSuccess, StoredEvent},
-        storage::{GroupDiff, IsStorage, RamView, Watermark, view::gear_key},
+        loc_ctx::{GroupDelta, StoredEvent},
+        storage::{GroupDiff, IsStorage, RamView, Watermark, fold::Fold, view::gear_key},
     },
     types::{
-        DataId, DataVerifyError, GlobalHash, GlobalResolver, GroupEventId, GroupRouteError,
-        LocDataId, LocGroupId, LocMsgTypeId, LocSenderId, LocUserId, SenderPk, UserId,
+        DataId, DataVerifyError, GlobalHash, GroupEventId, GroupRouteError, LocDataId, LocGroupId,
+        LocMsgTypeId, LocSenderId, LocUserId, SenderPk, UserId,
     },
 };
 
-struct Inner<R: RuntimeTypes> {
-    // localization
-    pk_to_sender: HashMap<SenderPk, LocSenderId>,
-    sender_to_pk: HashMap<LocSenderId, SenderPk>,
-    sender_to_user: HashMap<LocSenderId, LocUserId>,
-    user_id_to_local: HashMap<UserId, LocUserId>,
-    local_to_user_id: HashMap<LocUserId, UserId>,
-    // event log: one append-only shard per group (bodies + dedup + changelog).
-    events_by_group: HashMap<LocGroupId, EventGroup<R::Body>>,
-    // content-addressed data
-    data_by_id: Vec<(DataId, R::Data)>,
-    data_id_to_local: HashMap<DataId, LocDataId>,
-    // group localization
-    group_by_key: HashMap<(LocMsgTypeId, R::Group), LocGroupId>,
-}
-
-impl<R: RuntimeTypes> Inner<R> {
-    fn new() -> Self {
-        Self {
-            pk_to_sender: HashMap::new(),
-            sender_to_pk: HashMap::new(),
-            sender_to_user: HashMap::new(),
-            user_id_to_local: HashMap::new(),
-            local_to_user_id: HashMap::new(),
-            events_by_group: HashMap::new(),
-            data_by_id: Vec::new(),
-            data_id_to_local: HashMap::new(),
-            group_by_key: HashMap::new(),
-        }
-    }
-}
-
 /// In-memory typed `Storage`.
 pub struct InMemoryStorage<R: RuntimeTypes> {
-    inner: RefCell<Inner<R>>,
+    fold: RefCell<Fold<R, R::Body>>,
     /// The gear views: full (prefixed) key → flat value.
     gear_data: RefCell<BTreeMap<Vec<u8>, Vec<u8>>>,
 }
@@ -76,7 +39,7 @@ pub struct InMemoryStorage<R: RuntimeTypes> {
 impl<R: RuntimeTypes> Default for InMemoryStorage<R> {
     fn default() -> Self {
         Self {
-            inner: RefCell::new(Inner::new()),
+            fold: RefCell::new(Fold::default()),
             gear_data: RefCell::new(BTreeMap::new()),
         }
     }
@@ -97,46 +60,11 @@ impl<R: RuntimeTypes> InMemoryStorage<R> {
     }
 }
 
-// mk_data verifies content hashes by resolving embedded LocDataId refs against
-// the store, so the backend must be a GlobalResolver over its own state.
-impl<R: RuntimeTypes> GlobalResolver for InMemoryStorage<R> {
-    fn resolve_user(&self, lid: LocUserId) -> Result<UserId, GroupRouteError> {
-        let inner = self.inner.borrow();
-        inner.local_to_user_id.get(&lid).copied().ok_or({
-            GroupRouteError::UserIdOutOfBounds {
-                idx: lid.0,
-                users_len: inner.user_id_to_local.len(),
-            }
-        })
-    }
-
-    fn resolve_data(&self, did: LocDataId) -> Result<DataId, GroupRouteError> {
-        let inner = self.inner.borrow();
-        inner
-            .data_by_id
-            .get(did.0 as usize)
-            .map(|(id, _)| *id)
-            .ok_or({
-                GroupRouteError::DataIdOutOfBounds {
-                    idx: did.0,
-                    objects_len: inner.data_by_id.len(),
-                }
-            })
-    }
-}
-
 impl<R: RuntimeTypes> IsStorage<R> for InMemoryStorage<R> {
     // ── localization: idempotent allocators ───────────────────────────────
 
     fn mk_loc_user(&self, uid: UserId) -> impl Future<Output = LocUserId> {
-        let mut inner = self.inner.borrow_mut();
-        if let Some(&luid) = inner.user_id_to_local.get(&uid) {
-            return ready(luid);
-        }
-        let luid = LocUserId(inner.user_id_to_local.len() as u64);
-        inner.user_id_to_local.insert(uid, luid);
-        inner.local_to_user_id.insert(luid, uid);
-        ready(luid)
+        ready(self.fold.borrow_mut().mk_loc_user(uid))
     }
 
     fn mk_loc_sender(
@@ -144,26 +72,7 @@ impl<R: RuntimeTypes> IsStorage<R> for InMemoryStorage<R> {
         pk: SenderPk,
         uid: Option<UserId>,
     ) -> impl Future<Output = LocSenderId> {
-        let mut inner = self.inner.borrow_mut();
-        if let Some(uid_val) = uid {
-            // inline mk_loc_user to keep this method a single borrow scope
-            if !inner.user_id_to_local.contains_key(&uid_val) {
-                let luid = LocUserId(inner.user_id_to_local.len() as u64);
-                inner.user_id_to_local.insert(uid_val, luid);
-                inner.local_to_user_id.insert(luid, uid_val);
-            }
-        }
-        if let Some(&existing) = inner.pk_to_sender.get(&pk) {
-            return ready(existing);
-        }
-        let sid = LocSenderId(inner.pk_to_sender.len() as u64);
-        inner.pk_to_sender.insert(pk, sid);
-        inner.sender_to_pk.insert(sid, pk);
-        if let Some(uid_val) = uid {
-            let lid = inner.user_id_to_local[&uid_val];
-            inner.sender_to_user.insert(sid, lid);
-        }
-        ready(sid)
+        ready(self.fold.borrow_mut().mk_loc_sender(pk, uid))
     }
 
     fn mk_loc_group(
@@ -171,14 +80,7 @@ impl<R: RuntimeTypes> IsStorage<R> for InMemoryStorage<R> {
         msg_type: LocMsgTypeId,
         group: R::Group,
     ) -> impl Future<Output = LocGroupId> {
-        let mut inner = self.inner.borrow_mut();
-        let key = (msg_type, group);
-        if let Some(&gid) = inner.group_by_key.get(&key) {
-            return ready(gid);
-        }
-        let gid = LocGroupId(inner.group_by_key.len() as u64);
-        inner.group_by_key.insert(key, gid);
-        ready(gid)
+        ready(self.fold.borrow_mut().mk_loc_group(msg_type, group))
     }
 
     fn mk_data(
@@ -186,58 +88,36 @@ impl<R: RuntimeTypes> IsStorage<R> for InMemoryStorage<R> {
         data_id: DataId,
         content: R::Data,
     ) -> impl Future<Output = Result<LocDataId, DataVerifyError>> {
-        // 1. Idempotent fast path (shared borrow, then dropped).
-        if let Some(&existing) = self.inner.borrow().data_id_to_local.get(&data_id) {
-            return ready(Ok(existing));
-        }
-        // 2. Verify content hash. `global_hash` resolves embedded LocDataId refs
-        //    via `GlobalResolver`, which takes its own shared borrow — so no
-        //    borrow may be held across this call.
-        match content.global_hash(self) {
-            Ok(hash) if hash == data_id.hash => {}
-            Ok(computed_hash) => {
-                return ready(Err(DataVerifyError::HashMismatch {
-                    claimed: data_id,
-                    computed_hash,
-                }));
-            }
-            Err(e) => return ready(Err(DataVerifyError::UnresolvableId(e))),
-        }
-        // 3. Record (mutable borrow). Single-threaded + eager ⇒ nothing
-        //    mutated `data_id_to_local` between steps 1 and 3.
-        let mut inner = self.inner.borrow_mut();
-        let did = LocDataId(inner.data_by_id.len() as u64);
-        inner.data_id_to_local.insert(data_id, did);
-        inner.data_by_id.push((data_id, content));
-        ready(Ok(did))
+        ready(self.fold.borrow_mut().mk_data(data_id, content))
     }
 
     // ── localization: reverse lookups ─────────────────────────────────────
 
     fn user_by_local(&self, lid: LocUserId) -> impl Future<Output = Option<UserId>> {
-        ready(self.inner.borrow().local_to_user_id.get(&lid).copied())
+        ready(self.fold.borrow().user_by_local(lid))
     }
 
     fn sender_user(&self, sid: LocSenderId) -> impl Future<Output = Option<LocUserId>> {
-        ready(self.inner.borrow().sender_to_user.get(&sid).copied())
+        ready(self.fold.borrow().sender_user(sid))
     }
 
     fn sender_pk(&self, sid: LocSenderId) -> impl Future<Output = Option<SenderPk>> {
-        ready(self.inner.borrow().sender_to_pk.get(&sid).copied())
+        ready(self.fold.borrow().sender_pk(sid))
     }
 
     fn find_data(&self, data_id: &DataId) -> impl Future<Output = Option<LocDataId>> {
-        ready(self.inner.borrow().data_id_to_local.get(data_id).copied())
+        ready(self.fold.borrow().find_data(data_id))
     }
 
     fn fetch_data(&self, did: LocDataId) -> impl Future<Output = Option<(DataId, R::Data)>> {
-        ready(
-            self.inner
-                .borrow()
-                .data_by_id
-                .get(did.0 as usize)
-                .map(|(id, c)| (*id, c.clone())),
-        )
+        ready(self.fold.borrow().fetch_data(did))
+    }
+
+    fn global_hash<V: GlobalHash>(
+        &self,
+        value: &V,
+    ) -> impl Future<Output = Result<[u8; 32], GroupRouteError>> {
+        ready(value.global_hash(&*self.fold.borrow()))
     }
 
     // ── event log: one append-only shard per group ───────────────────────
@@ -246,37 +126,8 @@ impl<R: RuntimeTypes> IsStorage<R> for InMemoryStorage<R> {
         &self,
         group: LocGroupId,
         ev: StoredEvent<R::Body>,
-    ) -> impl Future<Output = Option<StoreResultSuccess>> {
-        let mut inner = self.inner.borrow_mut();
-        let g = inner.events_by_group.entry(group).or_default();
-        let key = (ev.sender, ev.tx_id);
-        let new_key = (ev.timestamp, ev.source_node);
-        if let Some(&old_slot) = g.dedup.get(&key) {
-            let old_ev = &g.bodies[old_slot as usize];
-            // Same freshness tiebreak as `LocCtx::store_event`: earliest
-            // `(timestamp, source_node)` wins; an at-least-as-early stored
-            // observation makes the incoming one stale.
-            if (old_ev.timestamp, old_ev.source_node) <= new_key {
-                return ready(None);
-            }
-            let new_slot = g.bodies.len() as u64;
-            g.bodies.push(ev);
-            g.dedup.insert(key, new_slot);
-            g.added.push(GroupEventId(new_slot));
-            g.removed.push(GroupEventId(old_slot));
-            return ready(Some(StoreResultSuccess {
-                old: Some(GroupEventId(old_slot)),
-                new: GroupEventId(new_slot),
-            }));
-        }
-        let new_slot = g.bodies.len() as u64;
-        g.bodies.push(ev);
-        g.dedup.insert(key, new_slot);
-        g.added.push(GroupEventId(new_slot));
-        ready(Some(StoreResultSuccess {
-            old: None,
-            new: GroupEventId(new_slot),
-        }))
+    ) -> impl Future<Output = Option<GroupDelta>> {
+        ready(self.fold.borrow_mut().store_event(group, ev))
     }
 
     fn fetch_event(
@@ -284,32 +135,11 @@ impl<R: RuntimeTypes> IsStorage<R> for InMemoryStorage<R> {
         group: LocGroupId,
         slot: GroupEventId,
     ) -> impl Future<Output = Option<StoredEvent<R::Body>>> {
-        ready(
-            self.inner
-                .borrow()
-                .events_by_group
-                .get(&group)
-                .and_then(|g| g.bodies.get(slot.0 as usize))
-                .cloned(),
-        )
+        ready(self.fold.borrow().fetch_event(group, slot))
     }
 
     fn diff_group(&self, group: LocGroupId, since: Watermark) -> impl Future<Output = GroupDiff> {
-        let inner = self.inner.borrow();
-        let Some(g) = inner.events_by_group.get(&group) else {
-            return ready(GroupDiff {
-                added: Vec::new(),
-                removed: Vec::new(),
-                watermark: since,
-            });
-        };
-        let a = (since.0 as usize).min(g.added.len());
-        let r = (since.1 as usize).min(g.removed.len());
-        ready(GroupDiff {
-            added: g.added[a..].to_vec(),
-            removed: g.removed[r..].to_vec(),
-            watermark: Watermark(g.added.len() as u64, g.removed.len() as u64),
-        })
+        ready(self.fold.borrow().diff_group(group, since))
     }
 
     // ── the gear's private view ───────────────────────────────────────────

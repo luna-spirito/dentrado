@@ -54,6 +54,7 @@ pub struct Journal {
     dir: PathBuf,
     options: Options,
     registry: Registry,
+    identity: Option<[u8; 16]>,
     decl: Option<segment::Writer>,
     active: Option<segment::Writer>,
     last: Option<u64>,
@@ -115,6 +116,13 @@ impl Journal {
     #[must_use]
     pub fn truncated(&self) -> u64 {
         self.truncated
+    }
+
+    /// How many segment files this log occupies: the declaration segment
+    /// (once it exists) plus every data segment.
+    #[must_use]
+    pub fn segments(&self) -> u64 {
+        self.last.map_or(0, |last| last + 1)
     }
 
     /// The schemas interned so far.
@@ -338,11 +346,12 @@ impl Journal {
                 end,
                 async |cursor, frame: Frame<'_>| {
                     consumed = frame.encoded_len() as u64;
-                    // Segment zero holds declarations and nothing else; every other
-                    // segment holds consumer records and nothing else. Format-owned
-                    // ids (a stray purge, say) never appear in a data stream.
+                    // Segment zero holds declarations and the reserved
+                    // identity record; every other segment holds consumer
+                    // records and nothing else. Format-owned ids (a stray
+                    // purge, say) never appear in a data stream.
                     let belongs = if segment == segment::DECL {
-                        frame.schema == SchemaId::DECL
+                        matches!(frame.schema, SchemaId::DECL | SchemaId::IDENTITY)
                     } else {
                         frame.schema.is_user()
                     };
@@ -353,7 +362,9 @@ impl Journal {
                             "a record with a schema that does not belong here",
                         ));
                     }
-                    if registry.get(frame.schema).is_none() {
+                    if !matches!(frame.schema, SchemaId::DECL | SchemaId::IDENTITY)
+                        && registry.get(frame.schema).is_none()
+                    {
                         return Err(Error::Undeclared { id: frame.schema.0 });
                     }
                     visit(cursor, frame).await
@@ -451,6 +462,48 @@ mod tests {
             assert!(
                 matches!(opened, Err(Error::Corrupt { .. })),
                 "a purge record is not consumer data: {opened:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_malformed_identity_is_refused() {
+        run(async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut decl = segment::Writer::create(dir.path(), segment::DECL)
+                .await
+                .unwrap();
+            let mut bytes = Vec::new();
+            Frame::new(SchemaId::IDENTITY, b"short").encode(&mut bytes);
+            decl.write(bytes).await.unwrap();
+            decl.close().await.unwrap();
+
+            let opened = Journal::open(dir.path()).await.map(|_| ());
+            assert!(
+                matches!(opened, Err(Error::Corrupt { .. })),
+                "an identity is exactly 16 bytes: {opened:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_second_identity_is_refused() {
+        run(async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut decl = segment::Writer::create(dir.path(), segment::DECL)
+                .await
+                .unwrap();
+            for id in [[1u8; 16], [2u8; 16]] {
+                let mut bytes = Vec::new();
+                Frame::new(SchemaId::IDENTITY, &id).encode(&mut bytes);
+                decl.write(bytes).await.unwrap();
+            }
+            decl.close().await.unwrap();
+
+            let opened = Journal::open(dir.path()).await.map(|_| ());
+            assert!(
+                matches!(opened, Err(Error::Corrupt { .. })),
+                "a log has exactly one identity: {opened:?}"
             );
         });
     }

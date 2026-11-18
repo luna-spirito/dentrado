@@ -21,7 +21,7 @@
 //! Per-gear isolation *within* a kind is still the key prefix.
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::BTreeMap,
     hash::{Hash, Hasher},
     rc::Rc,
@@ -150,7 +150,7 @@ pub trait GearView {
 }
 
 /// A view over one [`Session`] of the disk store.
-pub struct DiskView<'a> {
+pub struct DiskView {
     store: Rc<Storage<FsDisk>>,
     /// `None` between a commit and the next touch: the commit consumes the
     /// session, and a fresh one (seeing the commit) opens on demand.
@@ -159,22 +159,19 @@ pub struct DiskView<'a> {
     /// key prefix only separates gears within it.
     table: Vec<u8>,
     prefix: Vec<u8>,
-    dirty: &'a Cell<bool>,
 }
 
-impl<'a> DiskView<'a> {
+impl DiskView {
     pub(crate) fn new(
         store: Rc<Storage<FsDisk>>,
         table: GearTable<'static>,
         prefix: Vec<u8>,
-        dirty: &'a Cell<bool>,
     ) -> Self {
         Self {
             session: Some(store.session()),
             store,
             table: table.encode(),
             prefix,
-            dirty,
         }
     }
 
@@ -195,7 +192,7 @@ fn session<'s>(
     slot.get_or_insert_with(|| store.session())
 }
 
-impl GearView for DiskView<'_> {
+impl GearView for DiskView {
     async fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         let full = self.full(key);
         session(&mut self.session, &self.store)
@@ -234,7 +231,6 @@ impl GearView for DiskView<'_> {
     fn commit(&mut self) {
         if let Some(session) = self.session.take() {
             session.commit().expect("gear view commit");
-            self.dirty.set(true);
         }
     }
 }

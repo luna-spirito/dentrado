@@ -44,27 +44,16 @@
 //! an `.await` on the caller side. `!Send` by construction; used via generics
 //! (monomorphized, unboxed futures), not `dyn`.
 //!
-//! ## Integration status (unblocked)
+//! ## Where it is used
 //!
-//! `Core` is ready to be wired through this trait. The two `Drop`-driven
-//! obstacles that previously forced localization to stay synchronous are now
-//! resolved:
-//!
-//! 1. **Gear views** are keyed by `R::GearId` and never touched by
-//!    `evict_gear`, so the sync `Drop for Subscription` path never reaches
-//!    storage on their behalf.
-//! 2. **Subscription stop** carries only an opaque session token
-//!    (`InterCoreMsg::StopSubscription { session, from_core }`), so
-//!    `evict_gear` → `send_stop` no longer reads localization to build a wire
-//!    message. The entire `Drop` path is now pure RAM + a sync `mpsc::send`.
-//!
-//! What remains for integration is mechanical, all of it already inside async
-//! tasks (`run_loc_gear_task`, `handle_intercore_msg` spawns, `run_gear`):
-//! make `WireLocCtxMerger`, `EventContext`, and the `EventStore` read paths
-//! `async`; lift `LocCtx`'s fields behind `Storage<R>` (with `InMemoryStorage<R>`
-//! as the 1:1 RAM backend); then drop the now-redundant `EventContext` trait.
-//! No new sync↔async boundary is introduced.
+//! `Core` is generic over the backend (`Core<R, S: IsStorage<R>>`), so the same
+//! gear code runs against [`InMemoryStorage`] and the journaled
+//! [`PagedStorage`]. The `Drop`-driven paths stay synchronous by design: gear
+//! views are never touched by `evict_gear`, and a stopped subscription carries
+//! an opaque session token instead of reading localization.
 
+pub mod store;
+pub(crate) mod fold;
 pub mod view;
 pub mod in_memory;
 pub mod journal;
@@ -79,11 +68,11 @@ use std::{fmt::Debug, future::Future, io, marker::PhantomData};
 use crate::{
     core::{
         api::RuntimeTypes,
-        loc_ctx::{StoreResultSuccess, StoredEvent},
+        loc_ctx::{GroupDelta, StoredEvent},
     },
     types::{
-        DataId, DataVerifyError, GlobalResolver, GroupEventId, LocDataId, LocGroupId, LocMsgTypeId,
-        LocSenderId, LocUserId, SenderPk, UserId,
+        DataId, DataVerifyError, GlobalHash, GroupEventId, GroupRouteError, LocDataId, LocGroupId,
+        LocMsgTypeId, LocSenderId, LocUserId, SenderPk, UserId,
     },
 };
 
@@ -100,10 +89,13 @@ pub struct GroupDiff {
 }
 
 /// Event-log watermark: how far a consumer has walked a group's changelog —
-/// the counts of `added`/`removed` entries seen. `Watermark::default()` means
-/// "from the beginning".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Watermark(pub u64, pub u64);
+/// the number of accepted slots and of `removed` entries it has seen.
+/// `Watermark::default()` means "from the beginning".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct Watermark {
+    pub added: u64,
+    pub removed: u64,
+}
 
 /// Typed physical storage for one core. `Watermark::default()` means
 /// "from the beginning".
@@ -113,22 +105,21 @@ pub struct Watermark(pub u64, pub u64);
 /// reverse lookup its sibling getter reads. Allocation of a fresh id uses an
 /// internal monotonic counter (NOT a row count) so that future sender eviction
 /// cannot alias a live id.
-pub trait IsStorage<R: RuntimeTypes>: GlobalResolver /* TODO: Remove this, unviable. */ + 'static {
-
-    // ── Layer 1: localization, идемпотентные аллокаторы ──────────────────
+pub trait IsStorage<R: RuntimeTypes>: 'static {
+    // ── Layer 1: localization, idempotent allocators ──────────────────────
 
     fn mk_loc_user(&self, uid: UserId) -> impl Future<Output = LocUserId>;
-    /// То же для сендеров; при наличии `uid` пользователь тоже регистрируется.
+    /// The same for senders; with a `uid` the user is interned too.
     fn mk_loc_sender(&self, pk: SenderPk, uid: Option<UserId>)
     -> impl Future<Output = LocSenderId>;
-    /// То же для `R::Group`.
+    /// The same for `R::Group`.
     fn mk_loc_group(
         &self,
         msg_type: LocMsgTypeId,
         group: R::Group,
     ) -> impl Future<Output = LocGroupId>;
-    /// То же для content-addressed `R::Data`; `data_id.hash` проверяется
-    /// против `R::Data::global_hash`.
+    /// The same for content-addressed `R::Data`; `data_id.hash` is verified
+    /// against `R::Data::global_hash`.
     fn mk_data(
         &self,
         data_id: DataId,
@@ -141,35 +132,43 @@ pub trait IsStorage<R: RuntimeTypes>: GlobalResolver /* TODO: Remove this, unvia
     fn sender_user(&self, sid: LocSenderId) -> impl Future<Output = Option<LocUserId>>;
     fn sender_pk(&self, sid: LocSenderId) -> impl Future<Output = Option<SenderPk>>;
     fn find_data(&self, data_id: &DataId) -> impl Future<Output = Option<LocDataId>>;
-    /// Прочитать ранее сохранённый payload по локальному id (вместе с его
-    /// content-addressed `DataId` — запись целиком: gear-read API и билдер
-    /// wire-контекста получают `DataId` и контент одним чтением).
+    /// Read a stored payload by its local id, together with its
+    /// content-addressed `DataId`: the gear-read API and the wire-context
+    /// builder get both in one read.
     fn fetch_data(&self, did: LocDataId) -> impl Future<Output = Option<(DataId, R::Data)>>;
+
+    /// The global content hash of a value, resolving embedded loc ids through
+    /// this backend's localization maps. Routing is a pure function of this
+    /// hash, so every core that asks computes the same placement.
+    fn global_hash<V: GlobalHash>(
+        &self,
+        value: &V,
+    ) -> impl Future<Output = Result<[u8; 32], GroupRouteError>>;
 
     // ── Layer 2: события, могут ссылаться на объекты layer 1 ─────────────
 
-    /// Добавить событие в шард группы с dedup по `(sender, tx_id)`.
-    /// `None` ⇒ изменение не применено; иначе `old` — вытесненный слот.
-    /// NOTE: побеждает СТАРШЕЕ (по `(timestamp, source_node)`) наблюдение.
+    /// Add an observation to `group`'s shard, dedup'd by `(sender, tx_id)`.
+    /// `None` ⇒ nothing changed (a stale copy); otherwise the shard delta.
+    ///
+    /// # Panics
+    ///
+    /// If the group already observed `(sender, tx_id)`: supersede is a
+    /// `todo!()` until observations can be ranked by authority.
     fn store_event(
         &self,
         group: LocGroupId,
         ev: StoredEvent<R::Body>,
-    ) -> impl Future<Output = Option<StoreResultSuccess>>;
+    ) -> impl Future<Output = Option<GroupDelta>>;
 
-    /// Произвольный доступ по слоту внутри шарда группы.
+    /// Arbitrary access by slot within a group's shard.
     fn fetch_event(
         &self,
         group: LocGroupId,
         slot: crate::types::GroupEventId,
     ) -> impl Future<Output = Option<StoredEvent<R::Body>>>;
 
-    /// Ids, добавленные/вытесненные в `group` с момента `since`, плюс новый tip.
-    fn diff_group(
-        &self,
-        group: LocGroupId,
-        since: Watermark,
-    ) -> impl Future<Output = GroupDiff>;
+    /// Ids added/removed in `group` since `since`, plus the new tip.
+    fn diff_group(&self, group: LocGroupId, since: Watermark) -> impl Future<Output = GroupDiff>;
 
     // ── Layer 3: the gear's private view ──────────────────────────────────
 
@@ -185,10 +184,21 @@ pub trait IsStorage<R: RuntimeTypes>: GlobalResolver /* TODO: Remove this, unvia
 
     // ── Durability ────────────────────────────────────────────────────────
 
+    // REVIEW: 1) Inconsistent naming `flush` vs `log`
+    // REVIEW: Relationship between `flush` and `sync_log` isn't clear. I assume `flush` must imply `sync_log`.
+    // REVIEW: English comments.
     /// Commit point: после успешного `flush` всё, записанное до него,
     /// переживает крах процесса. Порядок внутри: layer 1 → layer 2 →
     /// gear view.
     fn flush(&self) -> impl Future<Output = io::Result<()>>;
+
+    /// The log's durability point, without the gear-view flush. Called once
+    /// per `post_events` batch before the replies: everything acknowledged
+    /// after `sync_log` survives a crash. The default is a no-op for a backend
+    /// with no log.
+    fn sync_log(&self) -> impl Future<Output = io::Result<()>> {
+        async { Ok(()) }
+    }
 }
 
 /// Группа-bound асинхронный read-view над бекендом [`Storage`]. Связывает группу

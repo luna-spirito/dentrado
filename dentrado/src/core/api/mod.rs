@@ -295,7 +295,7 @@ impl<R: RuntimeTypes> GearResult<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GEAR_TABLE_NAMESPACE, GearTable};
+    use super::GearTable;
 
     #[test]
     fn gear_table_ids_round_trip() {

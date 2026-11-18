@@ -118,6 +118,8 @@ pub enum MergeError {
     },
     DataVerify(crate::types::DataVerifyError),
     Route(crate::types::GroupRouteError),
+    /// The log could not be made durable before the reply.
+    Storage(std::io::Error),
     /// A core the operation was routed to died (thread panic/exit or a
     /// panicked task on it) before replying — see `InterCoreMsg::CoreDied`.
     CoreDied,
@@ -153,6 +155,7 @@ impl std::fmt::Display for MergeError {
             ),
             Self::DataVerify(e) => write!(f, "data verification failed: {e}"),
             Self::Route(e) => write!(f, "routing failed: {e}"),
+            Self::Storage(e) => write!(f, "storage: {e}"),
             Self::CoreDied => write!(f, "a core died before replying (panic or shutdown)"),
         }
     }
@@ -162,6 +165,7 @@ impl std::error::Error for MergeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Route(e) => Some(e),
+            Self::Storage(e) => Some(e),
             _ => None,
         }
     }

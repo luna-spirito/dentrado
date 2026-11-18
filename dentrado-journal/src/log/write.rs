@@ -1,5 +1,5 @@
-//! Writing: interning a layout, appending a batch, and the one place a segment
-//! is ever closed.
+//! Writing: interning a layout, appending a batch, creating the log's identity,
+//! and the one place a segment is ever closed.
 //!
 //! The order of operations is the property that matters: a declaration reaches
 //! the log before any record that names it, and a segment's footer is durable
@@ -105,6 +105,49 @@ impl Journal {
         self.last_end = end;
         self.head = Cursor::new(segment, end);
         Ok(self.head)
+    }
+
+    /// The log's identity: 16 random bytes, created on first use.
+    ///
+    /// Stable for the log's lifetime and durable before it is returned: the
+    /// declaration segment is synced, so a materialization that names this
+    /// identity can never outlive it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the identity cannot be generated or written; a write
+    /// failure poisons the journal.
+    pub async fn identity(&mut self) -> Result<[u8; 16], Error> {
+        self.live()?;
+        if let Some(identity) = self.identity {
+            return Ok(identity);
+        }
+        let mut identity = [0u8; 16];
+        getrandom::fill(&mut identity).map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        let done = self.write_identity(identity).await;
+        self.poison(done)?;
+        self.identity = Some(identity);
+        Ok(identity)
+    }
+
+    async fn write_identity(&mut self, identity: [u8; 16]) -> Result<(), Error> {
+        self.ensure_decl().await?;
+        let mut bytes = Vec::with_capacity(frame::HEADER_LEN + identity.len());
+        Frame::new(SchemaId::IDENTITY, &identity).encode(&mut bytes);
+        let Some(mut writer) = self.decl.take() else {
+            return Err(Error::corrupt(segment::DECL, 0, "no declaration segment"));
+        };
+        writer.write(bytes).await?;
+        self.decl_end = Some(writer.end());
+        if self.last == Some(segment::DECL) {
+            self.last_end = writer.end();
+            self.head = Cursor::new(segment::DECL, self.last_end);
+        }
+        // The identity is only useful once it is durable: a cache may record
+        // it immediately after this returns.
+        writer.sync().await?;
+        self.decl = Some(writer);
+        Ok(())
     }
 
     /// Writes a declaration record to segment zero, ahead of any registry

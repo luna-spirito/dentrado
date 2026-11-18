@@ -12,7 +12,11 @@ pub struct StoredEvent<B> {
 }
 
 /// Per-group event shard. Owns, for one group: its event bodies (a flat,
-/// append-only `Vec`), its dedup index, and its `added`/`removed` changelog.
+/// append-only `Vec`), its dedup index, and its `removed` changelog.
+///
+/// `added` is implicit: only an accepted observation gets a body, so the
+/// added slots are exactly `0..bodies.len()`. `removed` is stored because a
+/// superseded slot is not derivable from the bodies alone.
 ///
 /// The dedup key is group-scoped — `(sender, tx_id)` — rather than the former
 /// `(sender, global_core_id, tx_id)`: `global_core_id` is implied by the group
@@ -21,16 +25,13 @@ pub struct StoredEvent<B> {
 /// intra-group by construction** — a cross-group "supersede" cannot arise, so a
 /// `removed` entry never references a foreign shard.
 ///
-/// `added`/`removed` mirror the previous per-group changelog; each references a
-/// body by its `LocEventId` (a slot within this shard). Superseded bodies stay in
-/// `bodies` (still fetchable); "removal" is purely a `removed` entry, never a
-/// deletion.
+/// Bodies stay in `bodies` when superseded (still fetchable); "removal" is
+/// purely a `removed` entry, never a deletion.
 #[derive(Debug)]
 pub(crate) struct EventGroup<B> {
     pub(crate) bodies: Vec<StoredEvent<B>>,
     /// `(sender, tx_id)` -> slot of the currently-live version.
     pub(crate) dedup: HashMap<(LocSenderId, u32), u64>,
-    pub(crate) added: Vec<GroupEventId>,
     pub(crate) removed: Vec<GroupEventId>,
 }
 
@@ -42,13 +43,20 @@ impl<B> Default for EventGroup<B> {
         Self {
             bodies: Vec::new(),
             dedup: HashMap::new(),
-            added: Vec::new(),
             removed: Vec::new(),
         }
     }
 }
 
-pub struct StoreResultSuccess {
-    pub old: Option<GroupEventId>,
-    pub new: GroupEventId,
+/// What one observation changed in its group's shard: the slot it landed in
+/// and the slot it superseded, if any.
+///
+/// An observation that changes nothing (a stale copy) stores no body and has
+/// no delta, so [`store_event`] returns `None` rather than an empty one.
+///
+/// [`store_event`]: crate::core::storage::IsStorage::store_event
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupDelta {
+    pub added: Option<GroupEventId>,
+    pub removed: Option<GroupEventId>,
 }

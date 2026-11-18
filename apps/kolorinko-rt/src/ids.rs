@@ -164,7 +164,18 @@ fn b64u_decode(s: &str) -> Option<Vec<u8>> {
 ///   collapses into the same id. The private key never participates in
 ///   derivation and never leaves the owner; only the 32-byte public key is
 ///   published.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, dentrado_types::Localizable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    dentrado_types::Localizable,
+    dentrado_types::Shape,
+)]
 #[localizable(skip)]
 pub struct SpaceId([u8; 16]);
 
@@ -213,20 +224,30 @@ impl fmt::Display for SpaceId {
     }
 }
 
-// Serialize as the canonical string form (wire-friendly: the client sees ids
-// the way URLs spell them); deserialize through `parse` so a client-supplied
-// frame can never smuggle a non-canonical spelling past validation.
+// The canonical string form is a *presentation*: JSON and other
+// human-readable wires spell ids the way URLs do, and deserialization goes
+// through `parse` so a client-supplied frame cannot smuggle a non-canonical
+// spelling past validation. The binary wire is the payload itself — a journal
+// records bytes, never a spelling that may change.
 impl serde::Serialize for SpaceId {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.as_str())
+        if s.is_human_readable() {
+            s.serialize_str(&self.as_str())
+        } else {
+            self.0.serialize(s)
+        }
     }
 }
 
 impl<'de> serde::Deserialize<'de> for SpaceId {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Self::parse(&String::deserialize(d)?).ok_or_else(|| {
-            serde::de::Error::custom("invalid space id (want S + 22-char base64url)")
-        })
+        if d.is_human_readable() {
+            Self::parse(&String::deserialize(d)?).ok_or_else(|| {
+                serde::de::Error::custom("invalid space id (want S + 22-char base64url)")
+            })
+        } else {
+            <[u8; 16]>::deserialize(d).map(Self)
+        }
     }
 }
 
@@ -240,7 +261,18 @@ impl<'de> serde::Deserialize<'de> for SpaceId {
 /// mint CSPRNG-64. Uniqueness is per-space and birthday-safe only: each
 /// space's authority rejects duplicates at insert, so targeted collisions
 /// are out of scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, dentrado_types::Localizable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    dentrado_types::Localizable,
+    dentrado_types::Shape,
+)]
 #[localizable(skip)]
 pub struct LocalId(u64);
 
@@ -291,15 +323,23 @@ impl fmt::Display for LocalId {
 
 impl serde::Serialize for LocalId {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.to_string())
+        if s.is_human_readable() {
+            s.serialize_str(&self.to_string())
+        } else {
+            self.0.serialize(s)
+        }
     }
 }
 
 impl<'de> serde::Deserialize<'de> for LocalId {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Self::parse(&String::deserialize(d)?).ok_or_else(|| {
-            serde::de::Error::custom("invalid local id (want L + 11-char base64url)")
-        })
+        if d.is_human_readable() {
+            Self::parse(&String::deserialize(d)?).ok_or_else(|| {
+                serde::de::Error::custom("invalid local id (want L + 11-char base64url)")
+            })
+        } else {
+            u64::deserialize(d).map(Self)
+        }
     }
 }
 
@@ -508,6 +548,32 @@ mod tests {
         assert!(LocalId::parse("wonderments").is_none());
         assert!(LocalId::parse("adventurous").is_none());
         assert!(LocalId::from_page_id("not-a-number").is_none());
+    }
+
+    #[test]
+    fn ids_are_raw_on_the_binary_wire_and_spelled_on_the_textual_one() {
+        let s = space();
+        let bin = postcard::to_stdvec(&s).unwrap();
+        assert_eq!(bin, s.as_bytes(), "the journal records the payload");
+        assert_eq!(postcard::from_bytes::<SpaceId>(&bin).unwrap(), s);
+        assert_eq!(serde_json::to_string(&s).unwrap(), format!("\"{s}\""));
+
+        let l = LocalId::parse("LAAAAADXVfyo").unwrap();
+        let bin = postcard::to_stdvec(&l).unwrap();
+        assert_eq!(bin, postcard::to_stdvec(&l.page_id()).unwrap());
+        assert_eq!(postcard::from_bytes::<LocalId>(&bin).unwrap(), l);
+        assert_eq!(serde_json::to_string(&l).unwrap(), format!("\"{l}\""));
+        assert_eq!(
+            serde_json::from_str::<LocalId>(&format!("\"{l}\"")).unwrap(),
+            l
+        );
+    }
+
+    #[test]
+    fn id_shapes_describe_the_binary_layout() {
+        use dentrado_types::Shape;
+        assert_eq!(SpaceId::shape(), "SpaceId([u8;16])");
+        assert_eq!(LocalId::shape(), "LocalId(u64)");
     }
 
     #[test]

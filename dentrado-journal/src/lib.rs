@@ -83,7 +83,9 @@
 //! # Format
 //!
 //! A directory of `<segment:020>.jrnl` files with dense ids from zero. Segment
-//! zero is the declaration segment: it never rotates and never closes. Data
+//! zero is the declaration segment: it never rotates and never closes. It also
+//! holds the reserved `journal/identity` record (schema id 2): 16 random bytes,
+//! created on first use and durable before [`Journal::identity`] returns. Data
 //! segments rotate at [`Options::rotate_bytes`].
 //!
 //! ```text

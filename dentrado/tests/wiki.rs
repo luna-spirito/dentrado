@@ -33,7 +33,7 @@ impl Localizable for WikiGear {
 /// The gear's private state, flattened into the view: `(watermark, out)`.
 const CACHE_KEY: &[u8] = b"state";
 
-type CacheState = ((u64, u64), i64);
+type CacheState = (Watermark, i64);
 
 fn decode(bytes: &[u8]) -> CacheState {
     postcard::from_bytes(bytes).expect("a valid counter cache record")
@@ -106,11 +106,10 @@ impl IsRuntime for WikiCounterRuntime {
         input: GearInput<Self>,
         view: &mut S::View<'_>,
     ) -> GearProduce<Self> {
-        let ((a, r), mut out) = view
+        let (watermark, mut out) = view
             .get(CACHE_KEY)
             .await
-            .map_or(((0, 0), 0), |b| decode(&b));
-        let watermark = Watermark(a, r);
+            .map_or((Watermark::default(), 0), |b| decode(&b));
         let GearInput::Events(group) = input else {
             return GearProduce::Ship(out);
         };
@@ -118,7 +117,7 @@ impl IsRuntime for WikiCounterRuntime {
         out += diff.added.len() as i64;
         out -= diff.removed.len() as i64;
         let wm = diff.watermark;
-        view.put(CACHE_KEY, &encode(&((wm.0, wm.1), out)));
+        view.put(CACHE_KEY, &encode(&(wm, out)));
         GearProduce::Ship(out)
     }
 }

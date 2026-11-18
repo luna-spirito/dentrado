@@ -50,7 +50,7 @@ impl Localizable for MulSumBody {
 /// The gear's private state, flattened into the view: `(watermark, agg)`.
 const CACHE_KEY: &[u8] = b"state";
 
-type CacheState = ((u64, u64), i64);
+type CacheState = (Watermark, i64);
 
 fn decode(bytes: &[u8]) -> CacheState {
     postcard::from_bytes(bytes).expect("a valid mulsum cache record")
@@ -97,11 +97,10 @@ impl IsRuntime for MulSumRuntime {
         input: GearInput<Self>,
         view: &mut S::View<'_>,
     ) -> GearProduce<Self> {
-        let ((a, r), mut agg) = view
+        let (watermark, mut agg) = view
             .get(CACHE_KEY)
             .await
-            .map_or(((0, 0), 0), |b| decode(&b));
-        let watermark = Watermark(a, r);
+            .map_or((Watermark::default(), 0), |b| decode(&b));
         let GearInput::Events(group) = input else {
             return GearProduce::Ship(agg);
         };
@@ -118,7 +117,7 @@ impl IsRuntime for MulSumRuntime {
             agg -= body.a * body.b;
         }
         let wm = diff.watermark;
-        view.put(CACHE_KEY, &encode(&((wm.0, wm.1), agg)));
+        view.put(CACHE_KEY, &encode(&(wm, agg)));
         GearProduce::Ship(agg)
     }
 }

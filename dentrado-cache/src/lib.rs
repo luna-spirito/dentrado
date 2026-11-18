@@ -1,6 +1,5 @@
 #![feature(impl_trait_in_assoc_type, never_type)]
-//! Atomic cache store — a direct port of the frozen Lean model
-//! `lean/storage-model` (spec `thinking/sep22-atomic-no-rc.md`).
+//! Atomic cache store
 //!
 //! The model's effect layer (the `Sched` runner, the world's one-shot
 //! channels) is dissolved into infrastructure: an atomic `Op.state`
