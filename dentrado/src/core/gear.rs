@@ -15,7 +15,7 @@ use crate::{
     core::{
         api::Shared,
         core_ctx::{Core, GearCtx, Subscription},
-        storage::IsStorage,
+        storage::GearView,
     },
     types::LocMsgTypeId,
 };
@@ -82,7 +82,7 @@ impl<R: IsRuntime, Out> GearQuery<R, Out> {
     /// reaches here: it is a routing bug (a `Local` output should be read
     /// through a `follow` gear on its own core), so the getter's defensive arm
     /// panics.
-    pub async fn secondary_get<S: IsStorage<R>>(&self, ctx: &GearCtx<R, S>) -> Out {
+    pub async fn secondary_get(&self, ctx: &GearCtx<R>) -> Out {
         let out = ctx.secondary_get(self.id.clone()).await;
         (self.getter)(out)
     }
@@ -93,10 +93,7 @@ impl<R: IsRuntime, Out> GearQuery<R, Out> {
     /// the raw stream: `current`/`next` yield the extracted `Out`, so callers
     /// never match [`GearResult`] variants by hand (the raw form is reachable
     /// through `Deref` if a wire layer needs it).
-    pub async fn subscribe<S: IsStorage<R>>(
-        &self,
-        core: &Rc<Core<R, S>>,
-    ) -> GearSubscription<R, S, Out> {
+    pub async fn subscribe(&self, core: &Rc<Core<R>>) -> GearSubscription<R, Out> {
         GearSubscription {
             sub: core.subscribe_gear(self.id.clone()).await,
             getter: self.getter,
@@ -107,10 +104,7 @@ impl<R: IsRuntime, Out> GearQuery<R, Out> {
     /// getter projection, for wire bridges that re-encode pushes in the
     /// unprojected [`GearResult`] form (everything else should prefer
     /// [`GearQuery::subscribe`]).
-    pub async fn subscribe_raw<S: IsStorage<R>>(
-        &self,
-        core: &Rc<Core<R, S>>,
-    ) -> Subscription<R, S> {
+    pub async fn subscribe_raw(&self, core: &Rc<Core<R>>) -> Subscription<R> {
         core.subscribe_gear(self.id.clone()).await
     }
 
@@ -132,12 +126,12 @@ impl<R: IsRuntime, Out> GearQuery<R, Out> {
 /// [`Subscription`] for the rare consumer that needs the unprojected form
 /// (e.g. a wire bridge re-encoding pushes).
 #[must_use]
-pub struct GearSubscription<R: IsRuntime, S: IsStorage<R>, Out> {
-    sub: Subscription<R, S>,
+pub struct GearSubscription<R: IsRuntime, Out> {
+    sub: Subscription<R>,
     getter: fn(GearResult<R>) -> Out,
 }
 
-impl<R: IsRuntime, S: IsStorage<R>, Out> GearSubscription<R, S, Out> {
+impl<R: IsRuntime, Out> GearSubscription<R, Out> {
     /// The gear's currently-cached output, extracted.
     #[must_use]
     pub fn current(&self) -> Out {
@@ -150,9 +144,9 @@ impl<R: IsRuntime, S: IsStorage<R>, Out> GearSubscription<R, S, Out> {
     }
 }
 
-impl<R: IsRuntime, S: IsStorage<R>, Out> Deref for GearSubscription<R, S, Out> {
-    type Target = Subscription<R, S>;
-    fn deref(&self) -> &Subscription<R, S> {
+impl<R: IsRuntime, Out> Deref for GearSubscription<R, Out> {
+    type Target = Subscription<R>;
+    fn deref(&self) -> &Subscription<R> {
         &self.sub
     }
 }
@@ -226,10 +220,10 @@ impl IsRuntime for EmptyRuntime {
         }
     }
 
-    async fn run_step<S: IsStorage<Self>>(
-        _ctx: &mut GearCtx<Self, S>,
+    async fn run_step(
+        _ctx: &mut GearCtx<Self>,
         _input: GearInput<Self>,
-        _view: &mut S::View<'_>,
+        _view: &mut GearView,
     ) -> GearProduce<Self> {
         GearProduce::Ship(())
     }

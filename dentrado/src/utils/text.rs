@@ -5,10 +5,7 @@ use similar::{Algorithm, DiffOp, capture_diff_slices};
 use std::collections::BTreeSet;
 
 use crate::{
-    core::{
-        gear::IsRuntime,
-        storage::{GroupStore, IsStorage},
-    },
+    core::{gear::IsRuntime, storage::GroupStore},
     types::{LocSenderEventId, LocSenderId, Localizable, Remapper, Shape},
 };
 
@@ -131,10 +128,10 @@ impl ChildEntry {
         Self { child_id, offset }
     }
 
-    async fn cmp_rga<R: IsRuntime, S: IsStorage<R>>(
+    async fn cmp_rga<R: IsRuntime>(
         &self,
         other: &Self,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) -> std::cmp::Ordering {
         let LocSenderEventId(s_sender, s_tx) = self.child_id.0;
         let LocSenderEventId(o_sender, o_tx) = other.child_id.0;
@@ -189,11 +186,11 @@ impl AnchorAgg {
     }
 
     #[must_use]
-    pub async fn apply<R: IsRuntime, S: IsStorage<R>>(
+    pub async fn apply<R: IsRuntime>(
         mut self,
         event_id: LocSenderEventId,
         upd: &TextUpd,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) -> Self {
         for (i, pos) in upd.new_anchors.iter().enumerate() {
             let id = AnchorId(event_id, i as u32);
@@ -608,7 +605,7 @@ fn char_slice(s: &str, start: usize, end: usize) -> &str {
 mod tests {
     use super::*;
     use crate::core::gear::EmptyRuntime;
-    use crate::core::storage::{GroupStore, InMemoryStorage};
+    use crate::core::storage::{CacheStorage, GroupStore};
     use crate::test_support::block_on;
     use crate::types::LocGroupId;
 
@@ -617,7 +614,7 @@ mod tests {
     /// never actually called by these tests.
     macro_rules! store {
         () => {
-            &GroupStore::new(&InMemoryStorage::<EmptyRuntime>::new(), LocGroupId(0))
+            &GroupStore::new(&CacheStorage::<EmptyRuntime>::ram(), LocGroupId(0))
         };
     }
 

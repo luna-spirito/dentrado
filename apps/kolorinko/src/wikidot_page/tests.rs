@@ -256,7 +256,7 @@ fn repo_metadata_needs_no_archives() {
 #[test]
 fn repo_cache_round_trips_the_generation() {
     use compio::runtime::Runtime;
-    use dentrado::core::storage::InMemoryStorage;
+    use dentrado::core::storage::CacheStorage;
     let dir = std::env::temp_dir().join(format!("kolorinko_repocache_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     let mut pub_builder = Pub::new(&dir, "scp");
@@ -265,7 +265,7 @@ fn repo_cache_round_trips_the_generation() {
     let meta = block_on(read_repo_meta(&site("scp"), &site_dir)).unwrap();
 
     let rt = Runtime::new().unwrap();
-    let storage: InMemoryStorage<KolorinkoRT> = InMemoryStorage::new();
+    let storage: CacheStorage<KolorinkoRT> = CacheStorage::ram();
     let mut view = rt.block_on(storage.gear_view(&crate::runtime::GearId::Repo(site("scp"))));
     rt.block_on(store_meta(&mut view, &meta));
     view.commit();
@@ -288,9 +288,9 @@ fn repo_cache_round_trips_the_generation() {
 #[test]
 fn chunked_round_trips_and_drops_stale_blocks() {
     use compio::runtime::Runtime;
-    use dentrado::core::storage::InMemoryStorage;
+    use dentrado::core::storage::CacheStorage;
     let rt = Runtime::new().unwrap();
-    let storage: InMemoryStorage<KolorinkoRT> = InMemoryStorage::new();
+    let storage: CacheStorage<KolorinkoRT> = CacheStorage::ram();
     let mut view = rt.block_on(storage.gear_view(&crate::runtime::GearId::Repo(site("scp"))));
     let big: Vec<u8> = (0..20_000).map(|i| (i % 251) as u8).collect();
     rt.block_on(chunked::store(&mut view, b"k", &big));

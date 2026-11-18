@@ -2,7 +2,7 @@ use imbl::OrdMap;
 use std::{collections::BTreeSet, hash::Hash};
 
 use crate::core::gear::IsRuntime;
-use crate::core::storage::{GroupStore, IsStorage};
+use crate::core::storage::GroupStore;
 use crate::types::{GroupEventId, Localizable, Remapper};
 use crate::utils::sg_ord_map::{SgOrdMap, SgOrdSet};
 
@@ -30,11 +30,11 @@ where
         }
     }
 
-    pub(crate) async fn query_at<R: IsRuntime, S: IsStorage<R>>(
+    pub(crate) async fn query_at<R: IsRuntime>(
         &self,
         key: &DepK,
         at: SGEventId,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) -> Option<DepV> {
         let Some(timeline) = self.writes.get(key) else {
             return None;
@@ -131,7 +131,6 @@ pub struct HandlerCtx<
     DepK: Ord + Clone + Hash,
     DepV: Clone + PartialEq + Hash + Ord,
     R: IsRuntime,
-    S: IsStorage<R>,
     K: Ord + Clone + Hash,
     V: Clone + Hash,
     D: ?Sized,
@@ -142,11 +141,10 @@ pub struct HandlerCtx<
     pub(crate) self_writes: &'a OrdMap<K, SgOrdMap<V>>,
     ext: &'a mut OrdMap<Dep, ExtDep<DepK, DepV>>,
     dep_resolver: &'a mut D,
-    store: &'a GroupStore<'a, R, S>,
+    store: &'a GroupStore<'a, R>,
 }
 
-impl<Dep, DepK, DepV, R: IsRuntime, S: IsStorage<R>, K, V, D>
-    HandlerCtx<'_, Dep, DepK, DepV, R, S, K, V, D>
+impl<Dep, DepK, DepV, R: IsRuntime, K, V, D> HandlerCtx<'_, Dep, DepK, DepV, R, K, V, D>
 where
     Dep: Ord + Clone + Hash,
     DepK: Ord + Clone + Hash,
@@ -172,7 +170,7 @@ where
 
     /// The group-bound store this handler runs against.
     #[must_use]
-    pub fn store(&self) -> &GroupStore<'_, R, S> {
+    pub fn store(&self) -> &GroupStore<'_, R> {
         self.store
     }
 
@@ -244,16 +242,16 @@ where
         }
     }
 
-    pub async fn apply<R: IsRuntime, S: IsStorage<R>, E, H, D>(
+    pub async fn apply<R: IsRuntime, E, H, D>(
         &mut self,
         handler: &mut H,
         event_resolver: &impl async Fn(GroupEventId) -> (SGEventId, E),
         dep_resolver: &mut D,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
         delta: &DeltaList<GroupEventId>,
     ) where
         E: Clone,
-        H: async FnMut(&E, &mut HandlerCtx<'_, Dep, DepK, DepV, R, S, K, V, D>),
+        H: async FnMut(&E, &mut HandlerCtx<'_, Dep, DepK, DepV, R, K, V, D>),
         D: async FnMut(&Dep) -> Timeline<DepK, DepV>,
     {
         let mut queue: BTreeSet<SGEventId> = BTreeSet::new();
@@ -305,11 +303,11 @@ where
             .map(|(_, v)| v)
     }
 
-    pub(crate) async fn query_at<'a, R: IsRuntime, S: IsStorage<R>>(
+    pub(crate) async fn query_at<'a, R: IsRuntime>(
         &'a self,
         k: &K,
         event_id: SGEventId,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) -> Option<&'a V> {
         let Some(timeline) = self.writes.get(k) else {
             return None;
@@ -328,10 +326,10 @@ where
         self.writes.get(k).into_iter().flat_map(SgOrdMap::iter)
     }
 
-    async fn detect_dep_changes<R: IsRuntime, S: IsStorage<R>, D>(
+    async fn detect_dep_changes<R: IsRuntime, D>(
         &mut self,
         dep_resolver: &mut D,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) -> BTreeSet<SGEventId>
     where
         D: async FnMut(&Dep) -> Timeline<DepK, DepV>,
@@ -401,12 +399,12 @@ where
         affected
     }
 
-    async fn add_affected_readers<R: IsRuntime, S: IsStorage<R>>(
+    async fn add_affected_readers<R: IsRuntime>(
         new_timeline: &SgOrdMap<DepV>,
         changed_at: SGEventId,
         readers: &SgOrdSet,
         affected: &mut BTreeSet<SGEventId>,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) {
         match new_timeline.next_after(&changed_at, store).await {
             Some(next_write) => {
@@ -434,11 +432,11 @@ where
         }
     }
 
-    async fn add_to_reads<R: IsRuntime, S: IsStorage<R>>(
+    async fn add_to_reads<R: IsRuntime>(
         reads: &mut OrdMap<K, SgOrdSet>,
         k: K,
         event_id: SGEventId,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) {
         match reads.entry(k) {
             imbl::ordmap::Entry::Occupied(mut entry) => {
@@ -481,13 +479,13 @@ where
         }
     }
 
-    async fn propagate_key_change<R: IsRuntime, S: IsStorage<R>>(
+    async fn propagate_key_change<R: IsRuntime>(
         reads: &OrdMap<K, SgOrdSet>,
         writes: &OrdMap<K, SgOrdMap<V>>,
         k: &K,
         event_id: SGEventId,
         queue: &mut BTreeSet<SGEventId>,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) {
         let Some(read_set) = reads.get(k) else {
             return;
@@ -513,16 +511,16 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn process_queue<R: IsRuntime, S: IsStorage<R>, E, H, D>(
+    async fn process_queue<R: IsRuntime, E, H, D>(
         &mut self,
         handler: &mut H,
         event_resolver: &impl async Fn(GroupEventId) -> (SGEventId, E),
         dep_resolver: &mut D,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
         queue: &mut BTreeSet<SGEventId>,
     ) where
         E: Clone,
-        H: async FnMut(&E, &mut HandlerCtx<'_, Dep, DepK, DepV, R, S, K, V, D>),
+        H: async FnMut(&E, &mut HandlerCtx<'_, Dep, DepK, DepV, R, K, V, D>),
         D: async FnMut(&Dep) -> Timeline<DepK, DepV>,
     {
         while let Some(&event_id) = queue.first() {

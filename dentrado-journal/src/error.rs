@@ -86,6 +86,17 @@ pub enum Error {
     },
     /// Every `u16` user schema id is taken.
     RegistryFull,
+    /// The log declares a nested value layout that belongs to another runtime.
+    /// Its event records carry no body schema of their own, so the bytes would
+    /// be decoded under the wrong shape.
+    ForeignValue {
+        /// The schema id that declared it.
+        id: u16,
+        /// The declaration's name.
+        name: String,
+        /// Its foreign shape.
+        shape: String,
+    },
     /// A write failed and the journal refuses further work. Drop it and reopen:
     /// the failed write left a tail that only a reopen can truncate.
     Poisoned,
@@ -136,6 +147,10 @@ impl fmt::Display for Error {
                 )
             }
             Self::RegistryFull => f.write_str("every user schema id is taken"),
+            Self::ForeignValue { id, name, shape } => write!(
+                f,
+                "schema {id} declares `{name}` with the foreign shape `{shape}`"
+            ),
             Self::Poisoned => f.write_str("a write failed; reopen the journal"),
             Self::Locked => f.write_str("another writer holds this journal"),
         }

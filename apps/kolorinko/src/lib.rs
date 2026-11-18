@@ -8,7 +8,7 @@ use dentrado::{
     core::{
         core_ctx::Core,
         db::{Db, DbConfig, Doorbell},
-        storage::PagedStorage,
+        storage::CacheStorage,
     },
     types::NodeId,
 };
@@ -209,7 +209,7 @@ fn run_server(config: Config) -> anyhow::Result<()> {
         wt_hash,
     ));
 
-    let worker = move |core: Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>| {
+    let worker = move |core: Rc<Core<KolorinkoRT>>| {
         let bind = bind.clone();
         let assets = assets.clone();
         async move {
@@ -269,8 +269,8 @@ pub(crate) fn core_count() -> NonZero<u32> {
 fn db_config(
     cores: NonZero<u32>,
     storage_dir: Option<PathBuf>,
-) -> anyhow::Result<DbConfig<KolorinkoRT, PagedStorage<KolorinkoRT>>> {
-    let make_storage: Arc<dyn Fn(u32) -> PagedStorage<KolorinkoRT> + Send + Sync> =
+) -> anyhow::Result<DbConfig<KolorinkoRT>> {
+    let make_storage: Arc<dyn Fn(u32) -> CacheStorage<KolorinkoRT> + Send + Sync> =
         match storage_dir {
             Some(dir) => {
                 std::fs::create_dir_all(&dir)
@@ -278,9 +278,9 @@ fn db_config(
                 // One page-store file per core, named by the core's id — routing
                 // is deterministic, so run N's core k reads exactly what run N-1's
                 // core k wrote.
-                Arc::new(move |core| PagedStorage::on_disk(dir.join(format!("core-{core}.dstore"))))
+                Arc::new(move |core| CacheStorage::on_disk(dir.join(format!("core-{core}.dstore"))))
             }
-            None => Arc::new(|_| PagedStorage::<KolorinkoRT>::ram()),
+            None => Arc::new(|_| CacheStorage::<KolorinkoRT>::ram()),
         };
     Ok(DbConfig {
         num_cores: cores,

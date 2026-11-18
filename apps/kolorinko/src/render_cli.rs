@@ -36,7 +36,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use dentrado::core::{core_ctx::Core, storage::PagedStorage};
+use dentrado::core::core_ctx::Core;
 use futures::{FutureExt, StreamExt, stream};
 use kolorinko_render::render_page_document;
 use kolorinko_rt::{
@@ -86,7 +86,7 @@ fn run(config: Config, page: &str, inject: bool) -> anyhow::Result<()> {
     let cores = std::num::NonZero::new(1).unwrap();
 
     let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<(ArticleView, SiteShell)>>();
-    let worker = move |core: Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>| {
+    let worker = move |core: Rc<Core<KolorinkoRT>>| {
         let tx = tx.clone();
         // Clone the captures into fresh locals here (not inside the async
         // block) so the worker closure itself stays `Fn`.
@@ -209,7 +209,7 @@ fn run_mass(
         base_css,
         tx,
     };
-    let worker = move |core: Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>| {
+    let worker = move |core: Rc<Core<KolorinkoRT>>| {
         let shared = shared.clone();
         async move {
             // A panicking render (bad page data) must not hang the CLI waiting
@@ -310,10 +310,7 @@ fn coordinate(
 /// through [`render_page_document`], and streamed to the coordinator; a
 /// page's subscription is dropped after reading, so per-page state never
 /// outlives the current page over a long run.
-async fn render_owned(
-    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
-    shared: &Shared,
-) -> anyhow::Result<()> {
+async fn render_owned(core: &Rc<Core<KolorinkoRT>>, shared: &Shared) -> anyhow::Result<()> {
     let shell_q = crate::runtime::shell(shared.space);
     let shell: SiteShell = (*shell_q.subscribe(core).await.current()).clone();
 

@@ -1,15 +1,15 @@
-//! Replaying journal records into any layer 1–2 sink.
+//! Replaying journal records into the cache.
 //!
 //! The journal is domain-blind, so this adapter is where a record regains
 //! meaning: a `LocUser` becomes a localized user, a `LocGroup` carries its
 //! group value under a declared schema, and an `Event` becomes an observation
-//! of its group. Nested payloads (`group`, `content`, a body) are decoded with
-//! the schema id the record names, after checking that the declaration is this
-//! runtime's layout.
+//! of its group (its body is already raw bytes, whose layout the log declares
+//! once). Nested payloads (`group`, `content`) are decoded with the schema id
+//! the record names, after checking that the declaration is this runtime's
+//! layout.
 //!
-//! The sink is a trait rather than a concrete fold so the only implementation
-//! — the page-cache materialization — lives with the storage backend, while
-//! replay itself stays a pure journal concern.
+//! Replay drives the very same [`Ops`] transitions the live path uses, so the
+//! two cannot disagree about dedup, slots, or counters.
 //!
 //! Declarations and the log's identity are format metadata: the adapter skips
 //! them. Any other schema id must name a dentrado record; an unknown one is a
@@ -17,46 +17,27 @@
 
 use std::{fmt, ops::ControlFlow};
 
+use dentrado_cache::disk::IsFilesystem;
 use dentrado_journal::{Cursor, Frame, Journal, ReplayError, SchemaId};
 use serde::de::DeserializeOwned;
 
 use super::{
-    record::{Event, LocData, LocGroup, LocSender, LocUser},
-    schema,
+    codec,
+    ops::{EventOutcome, Ops},
 };
 use crate::{
-    core::api::RuntimeTypes,
+    core::{
+        api::RuntimeTypes,
+        storage::journal::{
+            record::{Event, LocData, LocGroup, LocSender, LocUser},
+            schema,
+        },
+    },
     types::{
         DataId, IdentityServerPk, LocDataId, LocGroupId, LocMsgTypeId, LocSenderId, LocUserId,
         SenderPk, Shape, UserId,
     },
 };
-
-/// Where replay's records go. Every method is idempotent: replay may restart
-/// after a crash and apply the same record again.
-// REVIEW: What's the point of this abstraction, again?
-pub(crate) trait Sink<R: RuntimeTypes> {
-    async fn user(&mut self, loc: LocUserId, uid: UserId) -> Result<(), String>;
-    async fn sender(
-        &mut self,
-        loc: LocSenderId,
-        pk: SenderPk,
-        user: Option<LocUserId>,
-    ) -> Result<(), String>;
-    async fn group(
-        &mut self,
-        loc: LocGroupId,
-        msg_type: LocMsgTypeId,
-        group: R::Group,
-    ) -> Result<(), String>;
-    async fn data(
-        &mut self,
-        loc: LocDataId,
-        data_id: DataId,
-        content: R::Data,
-    ) -> Result<(), String>;
-    async fn event(&mut self, group: LocGroupId, ev: &Event<'_>) -> Result<(), String>;
-}
 
 /// What a declaration is, once its shape matches one of dentrado's records.
 #[derive(Clone, Copy)]
@@ -75,7 +56,6 @@ struct Replay {
     records: Vec<(SchemaId, Kind)>,
     group: String,
     data: String,
-    body: String,
 }
 
 impl Replay {
@@ -91,20 +71,19 @@ impl Replay {
             records,
             group: R::Group::shape(),
             data: R::Data::shape(),
-            body: R::Body::shape(),
         }
     }
 
-    async fn apply<R: RuntimeTypes, S: Sink<R> + ?Sized>(
+    async fn apply<R: RuntimeTypes, D: IsFilesystem>(
         &self,
         journal: &Journal,
         at: Cursor,
         frame: Frame<'_>,
-        sink: &mut S,
-    ) -> Result<(), Error> {
+        ops: &Ops<'_, R, D>,
+    ) -> Result<bool, Error> {
         // Segment zero carries the log's own metadata, not state to apply.
         if matches!(frame.schema, SchemaId::DECL | SchemaId::IDENTITY) {
-            return Ok(());
+            return Ok(false);
         }
         let Some(kind) = self
             .records
@@ -119,7 +98,7 @@ impl Replay {
         let applied = match kind {
             Kind::User => {
                 let rec: LocUser = decode(at, "loc-user", frame.payload)?;
-                sink.user(
+                ops.apply_user(
                     LocUserId(rec.loc),
                     UserId {
                         id: rec.id,
@@ -130,7 +109,7 @@ impl Replay {
             }
             Kind::Sender => {
                 let rec: LocSender = decode(at, "loc-sender", frame.payload)?;
-                sink.sender(
+                ops.apply_sender(
                     LocSenderId(rec.loc),
                     SenderPk(rec.pk),
                     rec.user.map(LocUserId),
@@ -147,7 +126,7 @@ impl Replay {
                     rec.group_schema,
                     &rec.group,
                 )?;
-                sink.group(LocGroupId(rec.loc), LocMsgTypeId(rec.msg_type), group)
+                ops.apply_group(LocGroupId(rec.loc), LocMsgTypeId(rec.msg_type), &group)
                     .await
             }
             Kind::Data => {
@@ -160,23 +139,39 @@ impl Replay {
                     rec.content_schema,
                     &rec.content,
                 )?;
-                sink.data(
+                ops.apply_data(
                     LocDataId(rec.loc),
                     DataId {
                         timestamp: rec.timestamp,
                         hash: rec.hash,
                     },
-                    content,
+                    &content,
                 )
                 .await
             }
             Kind::Event => {
                 let ev = Event::decode(frame.payload).ok_or(Error::ShortEvent { at })?;
-                check_nested(journal, at, "event body", &self.body, ev.body_schema)?;
-                sink.event(LocGroupId(ev.group), &ev).await
+                let value =
+                    codec::event_bytes(ev.sender, ev.tx_id, ev.timestamp, ev.source_node, ev.body);
+                let group = LocGroupId(ev.group);
+                match ops
+                    .event_outcome(group, LocSenderId(ev.sender), ev.tx_id, &value)
+                    .await
+                {
+                    EventOutcome::New(slot) => {
+                        ops.put_event(group, slot, &value).await;
+                        Ok(())
+                    }
+                    EventOutcome::Same => Ok(()),
+                    EventOutcome::Conflict => {
+                        todo!("supersede: rank by (authoritative, timestamp, source_node)")
+                    }
+                }
             }
         };
-        applied.map_err(|message| Error::Apply { at, message })
+        applied
+            .map(|()| true)
+            .map_err(|message| Error::Apply { at, message })
     }
 }
 
@@ -223,33 +218,35 @@ fn decode<T: DeserializeOwned>(at: Cursor, what: &'static str, bytes: &[u8]) -> 
     postcard::from_bytes(bytes).map_err(|source| Error::Decode { at, what, source })
 }
 
-/// Replays `[from, head)` into `sink`, returning the resume cursor.
+/// Replays `[from, head)` into `ops`, returning how many records were applied.
 ///
 /// # Errors
 ///
 /// [`ReplayError::Log`] if the journal is damaged, [`ReplayError::Visit`] if a
 /// record cannot be applied to this runtime (a layout mismatch, a loc id out of
 /// order, a malformed payload).
-pub(crate) async fn replay<R: RuntimeTypes, S: Sink<R> + ?Sized>(
+pub(super) async fn replay<R: RuntimeTypes, D: IsFilesystem>(
     journal: &Journal,
     schemas: &schema::Schemas,
     from: Cursor,
-    sink: &mut S,
-) -> Result<Cursor, ReplayError<Error>> {
+    ops: &Ops<'_, R, D>,
+) -> Result<usize, ReplayError<Error>> {
     let replay = Replay::new::<R>(schemas);
+    let mut applied = 0usize;
     journal
         .try_replay_from(from, async |at, frame| {
-            replay
-                .apply(journal, at, frame, sink)
-                .await
-                .map(|()| ControlFlow::Continue(()))
+            if replay.apply(journal, at, frame, ops).await? {
+                applied += 1;
+            }
+            Ok(ControlFlow::Continue(()))
         })
-        .await
+        .await?;
+    Ok(applied)
 }
 
 /// Why replay refused a record.
 #[derive(Debug)]
-pub(crate) enum Error {
+pub(super) enum Error {
     /// A declared record that is neither dentrado's nor format metadata.
     UnexpectedRecord { at: Cursor, id: u16 },
     /// A nested payload names a schema the log never declared.
@@ -269,7 +266,7 @@ pub(crate) enum Error {
     },
     /// An event record is shorter than its fixed envelope.
     ShortEvent { at: Cursor },
-    /// The sink refused a record.
+    /// The cache refused a record.
     Apply { at: Cursor, message: String },
 }
 

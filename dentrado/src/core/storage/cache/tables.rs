@@ -36,65 +36,49 @@ const MAGIC: u8 = 0xD5;
 
 /// The cache layout version. Bump whenever a record encoding below changes in
 /// a way replay could not reconstruct.
-pub(crate) const CACHE_VERSION: u32 = 1;
+pub(crate) const CACHE_VERSION: u32 = 2;
 
 /// One table this backend owns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Table {
     Meta,
-    Counters,
-    Users,
-    Senders,
-    Groups,
-    Data,
+    /// Every localization record: users, senders, groups, data, counters.
+    Loc,
+    /// Event slots and removed-slot rows.
     Events,
+    /// The `(group, sender, tx_id)` dedup index.
     EventKeys,
+    /// Per-group shard counters.
     Shards,
-    Removed,
 }
 
 impl Table {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::Meta,
-        Self::Counters,
-        Self::Users,
-        Self::Senders,
-        Self::Groups,
-        Self::Data,
+        Self::Loc,
         Self::Events,
         Self::EventKeys,
         Self::Shards,
-        Self::Removed,
     ];
 
     const fn tag(self) -> u8 {
         match self {
             Self::Meta => 0,
-            Self::Counters => 1,
-            Self::Users => 2,
-            Self::Senders => 3,
-            Self::Groups => 4,
-            Self::Data => 5,
-            Self::Events => 6,
-            Self::EventKeys => 7,
-            Self::Shards => 8,
-            Self::Removed => 9,
+            Self::Loc => 1,
+            Self::Events => 2,
+            Self::EventKeys => 3,
+            Self::Shards => 4,
         }
     }
 
     const fn from_tag(tag: u8) -> Option<Self> {
         Some(match tag {
             0 => Self::Meta,
-            1 => Self::Counters,
-            2 => Self::Users,
-            3 => Self::Senders,
-            4 => Self::Groups,
-            5 => Self::Data,
-            6 => Self::Events,
-            7 => Self::EventKeys,
-            8 => Self::Shards,
-            9 => Self::Removed,
+            1 => Self::Loc,
+            2 => Self::Events,
+            3 => Self::EventKeys,
+            4 => Self::Shards,
             _ => return None,
         })
     }
@@ -122,45 +106,30 @@ fn is_legacy_backend(id: &[u8]) -> bool {
 #[derive(Debug, Clone)]
 pub(crate) struct Tables {
     pub meta: Vec<u8>,
-    pub counters: Vec<u8>,
-    pub users: Vec<u8>,
-    pub senders: Vec<u8>,
-    pub groups: Vec<u8>,
-    pub data: Vec<u8>,
+    pub loc: Vec<u8>,
     pub events: Vec<u8>,
     pub event_keys: Vec<u8>,
     pub shards: Vec<u8>,
-    pub removed: Vec<u8>,
 }
 
 impl Tables {
     pub(crate) fn new() -> Self {
         Self {
             meta: Table::Meta.id(),
-            counters: Table::Counters.id(),
-            users: Table::Users.id(),
-            senders: Table::Senders.id(),
-            groups: Table::Groups.id(),
-            data: Table::Data.id(),
+            loc: Table::Loc.id(),
             events: Table::Events.id(),
             event_keys: Table::EventKeys.id(),
             shards: Table::Shards.id(),
-            removed: Table::Removed.id(),
         }
     }
 
     fn specs(&self) -> Vec<TableSpec> {
         [
             &self.meta,
-            &self.counters,
-            &self.users,
-            &self.senders,
-            &self.groups,
-            &self.data,
+            &self.loc,
             &self.events,
             &self.event_keys,
             &self.shards,
-            &self.removed,
         ]
         .map(|id| TableSpec::flat(id.clone()))
         .to_vec()

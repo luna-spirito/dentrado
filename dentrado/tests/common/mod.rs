@@ -5,7 +5,7 @@ use dentrado::{
         core_ctx::Core,
         db::{Db, DbConfig, Doorbell, DoorbellHandle, PeerChannels, create_peer_channel_pair},
         gear::IsRuntime,
-        storage::IsStorage,
+        storage::CacheStorage,
     },
     types::*,
     wire::{WireEventBody, WireLocCtx, WireLocCtxBuilder},
@@ -36,13 +36,13 @@ struct Node<R: IsRuntime> {
     db: Db<R>,
 }
 
-pub(crate) struct TestCluster<R: IsRuntime, S: IsStorage<R>> {
+pub(crate) struct TestCluster<R: IsRuntime> {
     module: Arc<R::Module>,
     nodes: Vec<Node<R>>,
     /// Client-side context for building wire events: allocates local ids and
     /// resolves them into a `WireLocCtx`. Separate from each core's own storage
     /// (the merger re-localizes into those on the receiving core).
-    pub(crate) client: S,
+    pub(crate) client: CacheStorage<R>,
     next_data_ts: u32,
     drain_duration: Duration,
     rng: XorShift64,
@@ -61,10 +61,7 @@ pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     RUNTIME.with(|rt| rt.block_on(fut))
 }
 
-impl<R: IsRuntime, S: IsStorage<R>> TestCluster<R, S>
-where
-    S: Default,
-{
+impl<R: IsRuntime> TestCluster<R> {
     pub(crate) fn start(core_counts: &[u32], module: R::Module) -> Self {
         Self::start_with_worker(core_counts, module, |_| std::future::pending::<()>())
     }
@@ -78,7 +75,7 @@ where
         worker_fn: W,
     ) -> Self
     where
-        W: Fn(std::rc::Rc<Core<R, S>>) -> F + Clone + Send + 'static,
+        W: Fn(std::rc::Rc<Core<R>>) -> F + Clone + Send + 'static,
         F: std::future::Future<Output = ()> + 'static,
     {
         let num_nodes = core_counts.len();
@@ -132,7 +129,7 @@ where
                 module: module.clone(),
                 peers: std::mem::take(&mut all_peers[i]),
                 doorbells,
-                make_storage: Arc::new(|_| S::default()),
+                make_storage: Arc::new(|_| CacheStorage::ram()),
             };
             let db = Db::start_with_worker(config, worker_fn.clone()).expect("Db::start failed");
             nodes.push(Node { db });
@@ -147,7 +144,7 @@ where
         Self {
             module,
             nodes,
-            client: S::default(),
+            client: CacheStorage::ram(),
             next_data_ts: 1,
             drain_duration,
             rng: XorShift64::new(),

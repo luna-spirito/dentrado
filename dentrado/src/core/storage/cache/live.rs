@@ -85,7 +85,6 @@ impl<R: RuntimeTypes, D: IsFilesystem> Ready<R, D> {
             tx_id: ev.tx_id,
             timestamp: ev.timestamp,
             source_node: ev.source_node.0,
-            body_schema: journal.schemas.body_value.0,
             body,
         };
         journal
@@ -218,10 +217,10 @@ impl<R: RuntimeTypes, D: IsFilesystem> Ready<R, D> {
             .event_outcome(group, ev.sender, ev.tx_id, &value)
             .await;
         match outcome {
-            EventOutcome::Conflict(_) => {
+            EventOutcome::Conflict => {
                 todo!("supersede: rank by (authoritative, timestamp, source_node)")
             }
-            EventOutcome::Same(_) => {
+            EventOutcome::Same => {
                 // The cache may hold an observation whose journal append was
                 // lost; a retry must make it durable. Replay treats the
                 // duplicate as a no-op.

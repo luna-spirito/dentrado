@@ -22,10 +22,10 @@ use super::*;
 /// (the HTTP layer serves a 404). `shared` so the compressed bytes are
 /// cached + deduplicated across cores; HTTP-only — never shipped over
 /// WebTransport (`to_wire_out` drops it).
-pub(crate) async fn asset<S: IsStorage<KolorinkoRT>>(
+pub(crate) async fn asset(
     site: &SafePathComponent,
     hash: &str,
-    ctx: &mut GearCtx<KolorinkoRT, S>,
+    ctx: &mut GearCtx<KolorinkoRT>,
 ) -> Option<ServedBlob> {
     // The publication root lives under the configured evakuilo directory (a
     // process global since the gear-field removal).

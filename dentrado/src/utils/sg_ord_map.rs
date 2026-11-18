@@ -2,7 +2,7 @@ use imbl::OrdMap;
 use std::ops::Bound;
 
 use crate::core::gear::IsRuntime;
-use crate::core::storage::{GroupStore, IsStorage};
+use crate::core::storage::GroupStore;
 use crate::types::{GroupEventId, Localizable, Remapper};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -80,8 +80,8 @@ impl<X> SgDiffItem<X> {
     }
 }
 
-async fn cmp_tx_sender<R: IsRuntime, S: IsStorage<R>>(
-    store: &GroupStore<'_, R, S>,
+async fn cmp_tx_sender<R: IsRuntime>(
+    store: &GroupStore<'_, R>,
     a: GroupEventId,
     b: GroupEventId,
 ) -> std::cmp::Ordering {
@@ -111,10 +111,10 @@ async fn cmp_tx_sender<R: IsRuntime, S: IsStorage<R>>(
     }
 }
 
-async fn bucket_binary_search<E, R: IsRuntime, S: IsStorage<R>>(
+async fn bucket_binary_search<E, R: IsRuntime>(
     entries: &[E],
     target_lid: GroupEventId,
-    store: &GroupStore<'_, R, S>,
+    store: &GroupStore<'_, R>,
     get_local_id: impl Fn(&E) -> GroupEventId,
 ) -> Result<usize, usize> {
     let mut left = 0;
@@ -130,10 +130,10 @@ async fn bucket_binary_search<E, R: IsRuntime, S: IsStorage<R>>(
     Err(left)
 }
 
-async fn bucket_upper_bound<E, R: IsRuntime, S: IsStorage<R>>(
+async fn bucket_upper_bound<E, R: IsRuntime>(
     entries: &[E],
     target_lid: GroupEventId,
-    store: &GroupStore<'_, R, S>,
+    store: &GroupStore<'_, R>,
     get_local_id: impl Fn(&E) -> GroupEventId,
 ) -> usize {
     match bucket_binary_search(entries, target_lid, store, get_local_id).await {
@@ -142,10 +142,10 @@ async fn bucket_upper_bound<E, R: IsRuntime, S: IsStorage<R>>(
     }
 }
 
-async fn bucket_lower_bound_inclusive<E, R: IsRuntime, S: IsStorage<R>>(
+async fn bucket_lower_bound_inclusive<E, R: IsRuntime>(
     entries: &[E],
     target_lid: GroupEventId,
-    store: &GroupStore<'_, R, S>,
+    store: &GroupStore<'_, R>,
     get_local_id: impl Fn(&E) -> GroupEventId,
 ) -> Option<usize> {
     match bucket_binary_search(entries, target_lid, store, get_local_id).await {
@@ -154,10 +154,10 @@ async fn bucket_lower_bound_inclusive<E, R: IsRuntime, S: IsStorage<R>>(
     }
 }
 
-async fn bucket_lower_bound_exclusive<E, R: IsRuntime, S: IsStorage<R>>(
+async fn bucket_lower_bound_exclusive<E, R: IsRuntime>(
     entries: &[E],
     target_lid: GroupEventId,
-    store: &GroupStore<'_, R, S>,
+    store: &GroupStore<'_, R>,
     get_local_id: impl Fn(&E) -> GroupEventId,
 ) -> Option<usize> {
     match bucket_binary_search(entries, target_lid, store, get_local_id).await {
@@ -211,11 +211,11 @@ impl<X: Clone> SgOrdMap<X> {
         self.buckets.iter().map(|(_, v)| v.len()).sum()
     }
 
-    pub async fn insert<R: IsRuntime, S: IsStorage<R>>(
+    pub async fn insert<R: IsRuntime>(
         &mut self,
         key: SGEventId,
         value: X,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) -> Option<X> {
         let bucket = key.0;
         let new_entry = SgEntry {
@@ -273,10 +273,10 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub async fn latest_at<'a, R: IsRuntime, S: IsStorage<R>>(
+    pub async fn latest_at<'a, R: IsRuntime>(
         &'a self,
         at: &SGEventId,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) -> Option<(SGEventId, &'a X)> {
         let bucket = at.0;
 
@@ -299,10 +299,10 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub async fn latest_before<'a, R: IsRuntime, S: IsStorage<R>>(
+    pub async fn latest_before<'a, R: IsRuntime>(
         &'a self,
         at: &SGEventId,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) -> Option<(SGEventId, &'a X)> {
         let bucket = at.0;
 
@@ -325,10 +325,10 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub async fn next_after<R: IsRuntime, S: IsStorage<R>>(
+    pub async fn next_after<R: IsRuntime>(
         &self,
         at: &SGEventId,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) -> Option<SGEventId> {
         let bucket = at.0;
 
@@ -371,11 +371,11 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub async fn range_between<R: IsRuntime, S: IsStorage<R>>(
+    pub async fn range_between<R: IsRuntime>(
         &self,
         at: &SGEventId,
         upper: &SGEventId,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) -> Vec<SGEventId> {
         let start_bucket = at.0;
         let end_bucket = upper.0;
@@ -425,10 +425,10 @@ impl<X: Clone> SgOrdMap<X> {
     }
 
     #[must_use]
-    pub async fn range_after<R: IsRuntime, S: IsStorage<R>>(
+    pub async fn range_after<R: IsRuntime>(
         &self,
         at: &SGEventId,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) -> Vec<SGEventId> {
         let bucket = at.0;
         let mut result = Vec::new();
@@ -553,10 +553,10 @@ impl<X: Clone + Ord> Ord for SgOrdMap<X> {
 
 impl<X: Clone + PartialEq> SgOrdMap<X> {
     #[must_use]
-    pub async fn diff_cloned<R: IsRuntime, S: IsStorage<R>>(
+    pub async fn diff_cloned<R: IsRuntime>(
         &self,
         other: &Self,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) -> Vec<SgDiffItem<X>> {
         use imbl::ordmap::DiffItem;
 
@@ -667,10 +667,10 @@ impl SgOrdSet {
         self.0.is_empty()
     }
 
-    pub async fn insert<R: IsRuntime, S: IsStorage<R>>(
+    pub async fn insert<R: IsRuntime>(
         &mut self,
         key: SGEventId,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) -> bool {
         self.0.insert(key, (), store).await.is_none()
     }
@@ -689,20 +689,20 @@ impl SgOrdSet {
     }
 
     #[must_use]
-    pub async fn range_between<R: IsRuntime, S: IsStorage<R>>(
+    pub async fn range_between<R: IsRuntime>(
         &self,
         at: &SGEventId,
         upper: &SGEventId,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) -> Vec<SGEventId> {
         self.0.range_between(at, upper, store).await
     }
 
     #[must_use]
-    pub async fn range_after<R: IsRuntime, S: IsStorage<R>>(
+    pub async fn range_after<R: IsRuntime>(
         &self,
         at: &SGEventId,
-        store: &GroupStore<'_, R, S>,
+        store: &GroupStore<'_, R>,
     ) -> Vec<SGEventId> {
         self.0.range_after(at, store).await
     }
@@ -720,7 +720,7 @@ mod tests {
     use super::*;
     use crate::core::gear::EmptyRuntime;
     use crate::core::loc_ctx::StoredEvent;
-    use crate::core::storage::{GroupStore, InMemoryStorage, IsStorage};
+    use crate::core::storage::{CacheStorage, GroupStore};
     use crate::test_support::block_on;
     use crate::types::{LocGroupId, SenderPk};
 
@@ -728,8 +728,8 @@ mod tests {
     const PK_B: SenderPk = SenderPk([1u8; 32]);
     const PK_C: SenderPk = SenderPk([2u8; 32]);
 
-    async fn make_test_storage() -> InMemoryStorage<EmptyRuntime> {
-        let storage = InMemoryStorage::<EmptyRuntime>::new();
+    async fn make_test_storage() -> CacheStorage<EmptyRuntime> {
+        let storage = CacheStorage::<EmptyRuntime>::ram();
         let sid_a = storage.mk_loc_sender(PK_A, None).await;
         let sid_b = storage.mk_loc_sender(PK_B, None).await;
         let sid_c = storage.mk_loc_sender(PK_C, None).await;
@@ -755,9 +755,7 @@ mod tests {
         storage
     }
 
-    fn gs(
-        storage: &InMemoryStorage<EmptyRuntime>,
-    ) -> GroupStore<'_, EmptyRuntime, InMemoryStorage<EmptyRuntime>> {
+    fn gs(storage: &CacheStorage<EmptyRuntime>) -> GroupStore<'_, EmptyRuntime> {
         GroupStore::new(storage, LocGroupId(0))
     }
 

@@ -9,5 +9,4 @@ pub mod core_ctx;
 pub mod gear;
 pub mod db;
 
-// `InMemoryStorage` is exposed for tests / as the reference backend.
-pub use storage::InMemoryStorage;
+pub use storage::CacheStorage;

@@ -1,18 +1,18 @@
 use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, Timeline};
 use crate::core::gear::EmptyRuntime;
 use crate::core::loc_ctx::StoredEvent;
-use crate::core::storage::{GroupStore, InMemoryStorage, IsStorage};
+use crate::core::storage::{CacheStorage, GroupStore};
 use crate::test_support::block_on;
 use crate::types::{GroupEventId, LocGroupId, LocMsgTypeId, NodeId, SenderPk};
 use imbl::OrdMap;
 use std::collections::BTreeMap;
 
 type SG<K, V> = StateGraph<(), (), (), K, V>;
-type Store = InMemoryStorage<EmptyRuntime>;
+type Store = CacheStorage<EmptyRuntime>;
 
 const PK_A: SenderPk = SenderPk([0u8; 32]);
 
-fn gs(ctx: &Store) -> GroupStore<'_, EmptyRuntime, Store> {
+fn gs(ctx: &Store) -> GroupStore<'_, EmptyRuntime> {
     GroupStore::new(ctx, LocGroupId(0))
 }
 
@@ -25,7 +25,7 @@ const fn lid(id: u64) -> GroupEventId {
 }
 
 fn make_test_ctx(num_events: u64) -> Store {
-    let ctx = InMemoryStorage::<EmptyRuntime>::default();
+    let ctx = CacheStorage::<EmptyRuntime>::default();
     let sid_a = block_on(ctx.mk_loc_sender(PK_A, None));
     block_on(ctx.mk_loc_group(LocMsgTypeId(0), ()));
     for i in 0..num_events {
@@ -52,7 +52,7 @@ enum TestEvent {
 
 async fn test_handler<R: async FnMut(&()) -> Timeline<(), ()>>(
     event: &TestEvent,
-    ctx: &mut HandlerCtx<'_, (), (), (), EmptyRuntime, Store, &'static str, i32, R>,
+    ctx: &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &'static str, i32, R>,
 ) {
     match event {
         TestEvent::SetX(val) => ctx.update("x", *val),
@@ -88,10 +88,10 @@ async fn apply_added<E: Clone, H, R>(
     events: &mut EventStore<E>,
     handler: &mut H,
     r: &mut R,
-    store: &GroupStore<'_, EmptyRuntime, Store>,
+    store: &GroupStore<'_, EmptyRuntime>,
     added: &[(u64, u32, E)],
 ) where
-    H: async FnMut(&E, &mut HandlerCtx<'_, (), (), (), EmptyRuntime, Store, &'static str, i32, R>),
+    H: async FnMut(&E, &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &'static str, i32, R>),
     R: async FnMut(&()) -> Timeline<(), ()>,
 {
     for (local_id, ts, e) in added {
@@ -115,10 +115,10 @@ async fn apply_removed<E: Clone, H, R>(
     events: &mut EventStore<E>,
     handler: &mut H,
     r: &mut R,
-    store: &GroupStore<'_, EmptyRuntime, Store>,
+    store: &GroupStore<'_, EmptyRuntime>,
     removed: &[u64],
 ) where
-    H: async FnMut(&E, &mut HandlerCtx<'_, (), (), (), EmptyRuntime, Store, &'static str, i32, R>),
+    H: async FnMut(&E, &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &'static str, i32, R>),
     R: async FnMut(&()) -> Timeline<(), ()>,
 {
     let _ = events;
@@ -307,29 +307,19 @@ fn conditional_write_changes_on_re_evaluation() {
         WriteYIfXPositive,
     }
     block_on(async {
-        let handler = async |ev: &E,
-                             ctx: &mut HandlerCtx<
-            '_,
-            (),
-            (),
-            (),
-            EmptyRuntime,
-            Store,
-            &str,
-            i32,
-            _,
-        >| {
-            match ev {
-                E::SetX(val) => ctx.update("x", *val),
-                E::WriteYIfXPositive => {
-                    if let Some(x) = ctx.query(&"x").await {
-                        if x > 0 {
-                            ctx.update("y", x * 2);
+        let handler =
+            async |ev: &E, ctx: &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &str, i32, _>| {
+                match ev {
+                    E::SetX(val) => ctx.update("x", *val),
+                    E::WriteYIfXPositive => {
+                        if let Some(x) = ctx.query(&"x").await {
+                            if x > 0 {
+                                ctx.update("y", x * 2);
+                            }
                         }
                     }
                 }
-            }
-        };
+            };
         let mut sg: SG<&str, i32> = SG::new();
         let mut events: EventStore<E> = EventStore::new();
         let loc = make_test_ctx(10);
@@ -373,28 +363,18 @@ fn bounded_propagation_skips_events_after_next_write() {
         ReadX(()),
     }
     block_on(async {
-        let handler = async |ev: &E,
-                             ctx: &mut HandlerCtx<
-            '_,
-            (),
-            (),
-            (),
-            EmptyRuntime,
-            Store,
-            &str,
-            i32,
-            _,
-        >| {
-            match ev {
-                E::SetX(val) => ctx.update("x", *val),
-                E::OverwriteX(val) => ctx.update("x", *val),
-                E::ReadX(_) => {
-                    if let Some(x) = ctx.query(&"x").await {
-                        ctx.update("out", x);
+        let handler =
+            async |ev: &E, ctx: &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &str, i32, _>| {
+                match ev {
+                    E::SetX(val) => ctx.update("x", *val),
+                    E::OverwriteX(val) => ctx.update("x", *val),
+                    E::ReadX(_) => {
+                        if let Some(x) = ctx.query(&"x").await {
+                            ctx.update("out", x);
+                        }
                     }
                 }
-            }
-        };
+            };
         let mut sg: SG<&str, i32> = SG::new();
         let mut events: EventStore<E> = EventStore::new();
         let loc = make_test_ctx(10);
@@ -444,28 +424,18 @@ fn handler_query_excludes_own_write() {
         WriteAndReadX(i32),
     }
     block_on(async {
-        let handler = async |ev: &E,
-                             ctx: &mut HandlerCtx<
-            '_,
-            (),
-            (),
-            (),
-            EmptyRuntime,
-            Store,
-            &str,
-            i32,
-            _,
-        >| {
-            match ev {
-                E::SetX(val) => ctx.update("x", *val),
-                E::WriteAndReadX(val) => {
-                    ctx.update("x", *val);
-                    if let Some(prev) = ctx.query(&"x").await {
-                        ctx.update("saw_prev", prev);
+        let handler =
+            async |ev: &E, ctx: &mut HandlerCtx<'_, (), (), (), EmptyRuntime, &str, i32, _>| {
+                match ev {
+                    E::SetX(val) => ctx.update("x", *val),
+                    E::WriteAndReadX(val) => {
+                        ctx.update("x", *val);
+                        if let Some(prev) = ctx.query(&"x").await {
+                            ctx.update("saw_prev", prev);
+                        }
                     }
                 }
-            }
-        };
+            };
         let mut sg: SG<&str, i32> = SG::new();
         let mut events: EventStore<E> = EventStore::new();
         let loc = make_test_ctx(10);

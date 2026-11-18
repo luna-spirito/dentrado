@@ -4,6 +4,10 @@
 //! width or a fixed-width prefix followed by postcard bytes; values are either
 //! fixed-width records or raw postcard bytes. Nothing here interprets a
 //! runtime value beyond what the identity types already say.
+//!
+//! One table holds every kind of localization record, so each key starts with
+//! an entity tag. The tags are part of the on-disk layout: a key written under
+//! one entity is never readable as another.
 
 use crate::types::{
     DataId, GroupEventId, IdentityServerPk, LocDataId, LocGroupId, LocSenderId, LocUserId,
@@ -15,9 +19,16 @@ use crate::types::{
 const FWD: u8 = 0;
 const REV: u8 = 1;
 
-fn key(tag: u8, parts: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + parts.iter().map(|p| p.len()).sum::<usize>());
-    out.push(tag);
+/// The localization entities sharing one table.
+const USER: u8 = 0;
+const SENDER: u8 = 1;
+const GROUP: u8 = 2;
+const DATA: u8 = 3;
+const COUNTER: u8 = 4;
+
+fn key(prefix: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prefix.len() + parts.iter().map(|p| p.len()).sum::<usize>());
+    out.extend_from_slice(prefix);
     for part in parts {
         out.extend_from_slice(part);
     }
@@ -29,46 +40,50 @@ fn le8(value: u64) -> [u8; 8] {
 }
 
 pub(crate) fn user_fwd(uid: UserId) -> Vec<u8> {
-    key(FWD, &[&uid.id.to_le_bytes(), &uid.identity_server_pk.0])
+    key(
+        &[USER, FWD],
+        &[&uid.id.to_le_bytes(), &uid.identity_server_pk.0],
+    )
 }
 
 pub(crate) fn user_rev(loc: LocUserId) -> Vec<u8> {
-    key(REV, &[&le8(loc.0)])
+    key(&[USER, REV], &[&le8(loc.0)])
 }
 
 pub(crate) fn sender_fwd(pk: SenderPk) -> Vec<u8> {
-    key(FWD, &[&pk.0])
+    key(&[SENDER, FWD], &[&pk.0])
 }
 
 pub(crate) fn sender_rev(loc: LocSenderId) -> Vec<u8> {
-    key(REV, &[&le8(loc.0)])
+    key(&[SENDER, REV], &[&le8(loc.0)])
 }
 
 pub(crate) fn group_fwd(msg_type: u64, group: &[u8]) -> Vec<u8> {
-    key(FWD, &[&le8(msg_type), group])
+    key(&[GROUP, FWD], &[&le8(msg_type), group])
 }
 
 pub(crate) fn group_rev(loc: LocGroupId) -> Vec<u8> {
-    key(REV, &[&le8(loc.0)])
+    key(&[GROUP, REV], &[&le8(loc.0)])
 }
 
 pub(crate) fn data_fwd(data: DataId) -> Vec<u8> {
-    key(FWD, &[&data.timestamp.to_le_bytes(), &data.hash])
+    key(&[DATA, FWD], &[&data.timestamp.to_le_bytes(), &data.hash])
 }
 
 pub(crate) fn data_rev(loc: LocDataId) -> Vec<u8> {
-    key(REV, &[&le8(loc.0)])
+    key(&[DATA, REV], &[&le8(loc.0)])
 }
 
 pub(crate) fn counter(tag: u8) -> Vec<u8> {
-    vec![tag]
+    key(&[COUNTER], &[&[tag]])
 }
 
+/// Event slots and removed-slot rows share one table, split by this byte.
+const EVENT: u8 = 0;
+const REMOVED: u8 = 1;
+
 pub(crate) fn event(group: LocGroupId, slot: GroupEventId) -> Vec<u8> {
-    let mut out = Vec::with_capacity(16);
-    out.extend_from_slice(&group.0.to_le_bytes());
-    out.extend_from_slice(&slot.0.to_le_bytes());
-    out
+    key(&[EVENT], &[&le8(group.0), &le8(slot.0)])
 }
 
 /// The dedup key: `group | sender | tx_id`. One group maps to one core, so the
@@ -86,10 +101,7 @@ pub(crate) fn shard(group: LocGroupId) -> [u8; 8] {
 }
 
 pub(crate) fn removed(group: LocGroupId, index: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(16);
-    out.extend_from_slice(&group.0.to_le_bytes());
-    out.extend_from_slice(&index.to_le_bytes());
-    out
+    key(&[REMOVED], &[&le8(group.0), &le8(index)])
 }
 
 // ── Values ───────────────────────────────────────────────────────────────

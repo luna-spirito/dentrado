@@ -25,7 +25,10 @@ use std::{
     sync::OnceLock,
 };
 
-use dentrado_cache::{Session, Storage, disk::IsFilesystem};
+use dentrado_cache::{
+    Session, Storage,
+    disk::{FsDisk, IsFilesystem, MemDisk},
+};
 
 use crate::core::api::{GearTable, RuntimeTypes};
 
@@ -56,7 +59,7 @@ pub(crate) fn legacy_gear_table() -> &'static [u8] {
 
 /// Could one leaf hold this record? The store would refuse the whole
 /// flush on `put`; the view must refuse it at the same point.
-pub(crate) fn check_leaf(key: &[u8], value: &[u8]) {
+fn check_leaf(key: &[u8], value: &[u8]) {
     assert!(
         dentrado_cache::core::tree::leaf_holds(key, value),
         "gear view record ({} byte key, {} byte value) does not fit one leaf; chunk it",
@@ -117,37 +120,90 @@ impl Hasher for GearHasher {
     }
 }
 
-/// The gear-facing view. Keys are gear-local; the implementation adds
-/// the gear prefix. Writes are staged in the underlying session and
-/// become visible only at [`commit`](GearView::commit).
+/// The gear-facing view: keys are gear-local, the implementation adds the
+/// gear prefix. Writes are staged in the underlying session and become
+/// visible only at [`commit`](GearView::commit).
 ///
-/// Reads are the **old** world: a value written earlier in the same run
-/// is not visible until commit. This is deliberate — a gear reads its
-/// previous cache, computes, and stages the next one.
-// REVIEW: I don't understand the point of this abstractions. I feel like traits in `dentrado/` are in a desperate nee of a cleanup.
-pub trait GearView {
+/// Reads are the **old** world: a value written earlier in the same run is not
+/// visible until commit. This is deliberate — a gear reads its previous cache,
+/// computes, and stages the next one.
+pub struct GearView {
+    kind: ViewKind,
+}
+
+enum ViewKind {
+    Ram(DiskView<MemDisk>),
+    Fs(DiskView<FsDisk>),
+}
+
+impl GearView {
+    pub(crate) fn ram(
+        store: Rc<Storage<MemDisk>>,
+        table: GearTable<'static>,
+        prefix: Vec<u8>,
+    ) -> Self {
+        Self {
+            kind: ViewKind::Ram(DiskView::new(store, table, prefix)),
+        }
+    }
+
+    pub(crate) fn fs(
+        store: Rc<Storage<FsDisk>>,
+        table: GearTable<'static>,
+        prefix: Vec<u8>,
+    ) -> Self {
+        Self {
+            kind: ViewKind::Fs(DiskView::new(store, table, prefix)),
+        }
+    }
+
     /// The old value for `key`, or `None`.
-    async fn get(&mut self, key: &[u8]) -> Option<Vec<u8>>;
+    pub async fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+        match &mut self.kind {
+            ViewKind::Ram(view) => view.get(key).await,
+            ViewKind::Fs(view) => view.get(key).await,
+        }
+    }
 
-    /// The old records under `prefix`, in key order. Returned keys keep
-    /// the caller's prefix (only the gear prefix is stripped), so they
-    /// can be passed straight back to [`del`](GearView::del).
-    async fn scan(&mut self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)>;
+    /// The old records under `prefix`, in key order. Returned keys keep the
+    /// caller's prefix (only the gear prefix is stripped), so they can be
+    /// passed straight back to [`del`](Self::del).
+    pub async fn scan(&mut self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match &mut self.kind {
+            ViewKind::Ram(view) => view.scan(prefix).await,
+            ViewKind::Fs(view) => view.scan(prefix).await,
+        }
+    }
 
-    /// Stage a value. It must fit one leaf record (the view panics
-    /// otherwise); the view does not chunk.
-    fn put(&mut self, key: &[u8], value: &[u8]);
+    /// Stage a value. It must fit one leaf record (the view panics otherwise);
+    /// the view does not chunk.
+    pub fn put(&mut self, key: &[u8], value: &[u8]) {
+        match &mut self.kind {
+            ViewKind::Ram(view) => view.put(key, value),
+            ViewKind::Fs(view) => view.put(key, value),
+        }
+    }
 
     /// Stage a deletion.
-    fn del(&mut self, key: &[u8]);
+    pub fn del(&mut self, key: &[u8]) {
+        match &mut self.kind {
+            ViewKind::Ram(view) => view.del(key),
+            ViewKind::Fs(view) => view.del(key),
+        }
+    }
 
-    /// Publish everything staged. Idempotent; a gear may call it, and
-    /// the runtime calls it again after the output is installed.
-    fn commit(&mut self);
+    /// Publish everything staged. Idempotent; a gear may call it, and the
+    /// runtime calls it again after the output is installed.
+    pub fn commit(&mut self) {
+        match &mut self.kind {
+            ViewKind::Ram(view) => view.commit(),
+            ViewKind::Fs(view) => view.commit(),
+        }
+    }
 }
 
 /// A view over one [`Session`] of the store.
-pub struct DiskView<D: IsFilesystem> {
+struct DiskView<D: IsFilesystem> {
     store: Rc<Storage<D>>,
     /// `None` between a commit and the next touch: the commit consumes the
     /// session, and a fresh one (seeing the commit) opens on demand.
@@ -159,7 +215,7 @@ pub struct DiskView<D: IsFilesystem> {
 }
 
 impl<D: IsFilesystem> DiskView<D> {
-    pub(crate) fn new(store: Rc<Storage<D>>, table: GearTable<'static>, prefix: Vec<u8>) -> Self {
+    fn new(store: Rc<Storage<D>>, table: GearTable<'static>, prefix: Vec<u8>) -> Self {
         Self {
             session: Some(store.session()),
             store,
@@ -174,18 +230,7 @@ impl<D: IsFilesystem> DiskView<D> {
         full.extend_from_slice(key);
         full
     }
-}
 
-/// The session, opening a fresh one (seeing the last commit) on demand. A free
-/// function so the caller can keep borrowing `self.table`/`self.store`.
-fn session<'s, D: IsFilesystem>(
-    slot: &'s mut Option<Session<D>>,
-    store: &Rc<Storage<D>>,
-) -> &'s mut Session<D> {
-    slot.get_or_insert_with(|| store.session())
-}
-
-impl<D: IsFilesystem> GearView for DiskView<D> {
     async fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         let full = self.full(key);
         session(&mut self.session, &self.store)
@@ -226,4 +271,13 @@ impl<D: IsFilesystem> GearView for DiskView<D> {
             session.commit().expect("gear view commit");
         }
     }
+}
+
+/// The session, opening a fresh one (seeing the last commit) on demand. A free
+/// function so the caller can keep borrowing `self.table`/`self.store`.
+fn session<'s, D: IsFilesystem>(
+    slot: &'s mut Option<Session<D>>,
+    store: &Rc<Storage<D>>,
+) -> &'s mut Session<D> {
+    slot.get_or_insert_with(|| store.session())
 }

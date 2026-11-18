@@ -25,7 +25,7 @@ use crate::{
         doorbell::DoorbellHandle,
         routing,
         stats::CoreStats,
-        storage::{GearView, GroupStore, IsStorage},
+        storage::{CacheStorage, GearView, GroupStore},
         wire::{
             MergeError, RunGearError, WireEventBody, WireLocCtx, WireLocCtxBuilder,
             WireLocCtxMerger,
@@ -50,10 +50,10 @@ pub trait IsRuntime: RuntimeTypes {
     /// runtime after the run. Must not hold any `inner` borrow across
     /// `.await` (the core's `RefCell` is shared between all concurrently
     /// polled gears on this core).
-    async fn run_step<S: IsStorage<Self>>(
-        ctx: &mut GearCtx<Self, S>,
+    async fn run_step(
+        ctx: &mut GearCtx<Self>,
         input: GearInput<Self>,
-        view: &mut S::View<'_>,
+        view: &mut GearView,
     ) -> GearProduce<Self>;
 }
 
@@ -223,9 +223,8 @@ const LIMBO_CAPACITY: usize = 64;
 const EPOCH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Epochs between throttled storage flushes (so `N * EPOCH_INTERVAL` of real
-/// time between durability points). `PagedStorage` gates internally on its
-/// own dirty flag; `InMemoryStorage`'s flush is a no-op — the call is free
-/// for a clean backend.
+/// time between durability points). The backend gates internally on its own
+/// dirty flag; a clean backend refuses the call for free.
 const FLUSH_EPOCHS: u32 = 15;
 
 /// Lifecycle of a gear's background computation task.
@@ -358,7 +357,7 @@ pub(crate) fn broadcast_core_death<R: IsRuntime>(
 }
 
 #[derive(Debug)]
-pub struct Core<R: IsRuntime, S: IsStorage<R>> {
+pub struct Core<R: IsRuntime> {
     num_cores: NonZero<u32>,
     core_id: u32,
     node_id: NodeId,
@@ -378,7 +377,7 @@ pub struct Core<R: IsRuntime, S: IsStorage<R>> {
     /// (it is interior-mutable, mirroring `fs::Fs`), so an `.await` on a storage
     /// op never holds `inner` and never collides with arena mutations. Carries
     /// localization, the event log, and the gear views (keyed by `R::GearId`).
-    storage: S,
+    storage: CacheStorage<R>,
     inner: RefCell<CoreLocCtx<R>>,
     /// Owner-local generational arena of cross-core refcounts for [`Shared`]
     /// outputs (`xcount`), kept separate from the immutable payload so refcount
@@ -396,7 +395,7 @@ pub(crate) enum HandleMsgResult {
     Die,
 }
 
-impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
+impl<R: IsRuntime> Core<R> {
     pub(crate) fn new(
         num_cores: NonZero<u32>,
         core_id: u32,
@@ -410,7 +409,7 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
             NonZero<u32>,
             Option<(mpsc::Sender<InterNodeMsg<R>>, DoorbellHandle)>,
         )>,
-        storage: S,
+        storage: CacheStorage<R>,
     ) -> Self {
         Core {
             num_cores,
@@ -437,7 +436,7 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
     }
 
     /// The per-core storage backend.
-    pub(crate) fn storage(&self) -> &S {
+    pub(crate) fn storage(&self) -> &CacheStorage<R> {
         &self.storage
     }
 
@@ -501,7 +500,7 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
     /// group a gear runs for. Cheap to construct (binds the group); gears hand
     /// it to `sg_ord_map`/`state_graph`/`text`.
     #[must_use]
-    pub fn group_store(&self, group: LocGroupId) -> GroupStore<'_, R, S> {
+    pub fn group_store(&self, group: LocGroupId) -> GroupStore<'_, R> {
         GroupStore::new(&self.storage, group)
     }
 
@@ -1761,7 +1760,7 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
     /// local and currently computing (`Running`), waits for that run to land so
     /// `current()` reads the latest value rather than a stale one. Otherwise
     /// behaves like `subscribe_gear_stale`.
-    pub async fn subscribe_gear(self: &Rc<Self>, gear: R::GearId) -> Subscription<R, S> {
+    pub async fn subscribe_gear(self: &Rc<Self>, gear: R::GearId) -> Subscription<R> {
         let key = self.force_active(&gear).await;
         // Register interest BEFORE awaiting. `inc_direct_subscriber` is
         // immediately followed by constructing `sub` with no `.await` in
@@ -1788,7 +1787,7 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
     /// is currently available — waiting only for the *first* computation if the
     /// gear is cold, never for an in-flight recompute. Reactivity reconciles
     /// later via `changed`/dependent reruns.
-    pub async fn subscribe_gear_stale(self: &Rc<Self>, gear: R::GearId) -> Subscription<R, S> {
+    pub async fn subscribe_gear_stale(self: &Rc<Self>, gear: R::GearId) -> Subscription<R> {
         let key = self.force_active(&gear).await;
         // See `subscribe_gear`: interest goes up before the await so the key
         // can't go stale and a cancelled wait still decrements via `Drop`.
@@ -1827,8 +1826,8 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
 /// working unchanged), and the per-run `deps` set
 /// accumulated by `secondary_get` calls (reconciled against the gear's stored
 /// `dep_set` at run end).
-pub struct GearCtx<R: IsRuntime, S: IsStorage<R>> {
-    pub(crate) core: Rc<Core<R, S>>,
+pub struct GearCtx<R: IsRuntime> {
+    pub(crate) core: Rc<Core<R>>,
     pub(crate) gear: R::GearId,
     /// Deps accumulated by `secondary_get`. Interior-mutable so `secondary_get`
     /// can be `&self` (lets a `dep_resolver` closure share `ctx` with sibling
@@ -1836,26 +1835,26 @@ pub struct GearCtx<R: IsRuntime, S: IsStorage<R>> {
     pub(crate) deps: RefCell<HashSet<R::GearId>>,
 }
 
-impl<R: IsRuntime, S: IsStorage<R>> Deref for GearCtx<R, S> {
-    type Target = Core<R, S>;
+impl<R: IsRuntime> Deref for GearCtx<R> {
+    type Target = Core<R>;
     fn deref(&self) -> &Self::Target {
         &self.core
     }
 }
 
-impl<R: IsRuntime, S: IsStorage<R>> GearCtx<R, S> {
+impl<R: IsRuntime> GearCtx<R> {
     /// The id of the gear currently running.
     pub fn gear(&self) -> &R::GearId {
         &self.gear
     }
 
     /// The underlying `Core`.
-    pub fn core(&self) -> &Rc<Core<R, S>> {
+    pub fn core(&self) -> &Rc<Core<R>> {
         &self.core
     }
 
     /// The per-core storage backend.
-    pub fn storage(&self) -> &S {
+    pub fn storage(&self) -> &CacheStorage<R> {
         &self.core.storage
     }
 
@@ -1901,7 +1900,7 @@ struct StopCtx<'a, R: IsRuntime> {
 /// the arena directly; a **foreign** handle forwards a `SharedUnref` over the
 /// inter-core channel (FIFO per core-pair ⇒ unrefs from one core land in order,
 /// so the owner's `xcount` never goes negative).
-impl<R: IsRuntime, S: IsStorage<R>> SharedBus for Core<R, S> {
+impl<R: IsRuntime> SharedBus for Core<R> {
     fn shared_local_unref(&self, key: SharedKey) {
         let data = self.shared_arena.borrow_mut().dec(key);
         if let Some(data) = data {
@@ -2028,8 +2027,8 @@ impl<R: IsRuntime> CoreLocCtx<R> {
 /// gear (demoting it to limbo, or evicting it under pressure). Naturally
 /// `!Sync` via `Rc<Core>`: it must live on the owning core's thread.
 #[must_use]
-pub struct Subscription<R: IsRuntime, S: IsStorage<R>> {
-    pub(crate) core: Rc<Core<R, S>>,
+pub struct Subscription<R: IsRuntime> {
+    pub(crate) core: Rc<Core<R>>,
     /// The arena key, stored directly (not the `R::GearId`) so `current`/`next`/
     /// `Drop` skip the `gear_index` lookup. Safe because a live `Subscription`
     /// holds `direct_subscriber_count >= 1`, so `has_interest` is true and the
@@ -2038,7 +2037,7 @@ pub struct Subscription<R: IsRuntime, S: IsStorage<R>> {
     pub(crate) key: GearKey,
 }
 
-impl<R: IsRuntime, S: IsStorage<R>> Subscription<R, S> {
+impl<R: IsRuntime> Subscription<R> {
     /// Read the gear's currently-cached output. The value is guaranteed to be
     /// present (subscribe awaits the first computation).
     #[must_use]
@@ -2060,7 +2059,7 @@ impl<R: IsRuntime, S: IsStorage<R>> Subscription<R, S> {
     }
 }
 
-impl<R: IsRuntime, S: IsStorage<R>> Drop for Subscription<R, S> {
+impl<R: IsRuntime> Drop for Subscription<R> {
     fn drop(&mut self) {
         if self.core.release_direct_subscriber(self.key) {
             self.core.rebalance_key(self.key);

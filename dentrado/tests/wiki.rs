@@ -4,7 +4,7 @@ use dentrado::{
     core::{
         core_ctx::GearCtx,
         gear::{GearInput, GearMeta, GearProduce, IsRuntime, RuntimeTypes},
-        storage::{GearView, InMemoryStorage, IsStorage, Watermark},
+        storage::{GearView, Watermark},
     },
     types::*,
     wire::WireEventBody,
@@ -104,10 +104,10 @@ impl IsRuntime for WikiCounterRuntime {
         }
     }
 
-    async fn run_step<S: IsStorage<Self>>(
-        ctx: &mut GearCtx<Self, S>,
+    async fn run_step(
+        ctx: &mut GearCtx<Self>,
         input: GearInput<Self>,
-        view: &mut S::View<'_>,
+        view: &mut GearView,
     ) -> GearProduce<Self> {
         let (watermark, mut out) = view
             .get(CACHE_KEY)
@@ -127,8 +127,7 @@ impl IsRuntime for WikiCounterRuntime {
 
 #[test]
 fn wiki_engine() {
-    let mut tc: TestCluster<WikiCounterRuntime, InMemoryStorage<WikiCounterRuntime>> =
-        TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<WikiCounterRuntime> = TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,

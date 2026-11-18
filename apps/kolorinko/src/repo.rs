@@ -20,7 +20,7 @@
 
 use std::rc::Rc;
 
-use dentrado::core::{core_ctx::Core, storage::PagedStorage};
+use dentrado::core::core_ctx::Core;
 use kolorinko_rt::{Body, RepoAssetPath, SafePathComponent};
 
 use crate::runtime::{KolorinkoRT, asset};
@@ -55,10 +55,7 @@ pub(crate) fn parse_ca_request(full: &str) -> Option<(SafePathComponent, String)
 /// Resolve one CA request via the [`crate::wikidot_page::asset`] gear, or
 /// `None` for anything outside the `/-/repo/` namespace or a missing blob
 /// (404). `full` is the raw request path (with query, if any).
-pub(crate) async fn serve(
-    full: &str,
-    core: &Rc<Core<KolorinkoRT, PagedStorage<KolorinkoRT>>>,
-) -> Option<RepoResp> {
+pub(crate) async fn serve(full: &str, core: &Rc<Core<KolorinkoRT>>) -> Option<RepoResp> {
     let (site, hash) = parse_ca_request(full)?;
     let blob = asset(site, hash).subscribe(core).await.current();
     (*blob).as_ref().map(|blob| RepoResp::Ok {

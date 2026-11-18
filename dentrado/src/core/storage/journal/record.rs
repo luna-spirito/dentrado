@@ -12,17 +12,7 @@
 
 use crate::types::Shape;
 
-/// A record the journal stores: a name for the declaration and a shape that
-/// identifies its layout.
-///
-/// `Shape` is a supertrait so [`schema::declare`](super::schema::declare) can
-/// intern any record without knowing its fields.
-pub trait Record: Shape {
-    /// The declaration name written to segment zero.
-    const NAME: &'static str;
-}
-
-/// `dentrado/loc-user`: a user identity, interned under a local id.
+/// A user identity, interned under a local id.
 ///
 /// `identity_server_pk` is carried verbatim: identity stays concrete (the
 /// journal never derives it), and a local id is only meaningful against the
@@ -34,11 +24,11 @@ pub struct LocUser {
     pub identity_server_pk: [u8; 32],
 }
 
-impl Record for LocUser {
-    const NAME: &'static str = "dentrado/loc-user";
+impl LocUser {
+    pub const NAME: &'static str = "loc-user";
 }
 
-/// `dentrado/loc-sender`: a sender public key, optionally linked to a user.
+/// A sender public key, optionally linked to a user.
 ///
 /// The user record is written first so `user` can be resolved during replay
 /// without ordering the fold against a future declaration.
@@ -49,11 +39,11 @@ pub struct LocSender {
     pub user: Option<u64>,
 }
 
-impl Record for LocSender {
-    const NAME: &'static str = "dentrado/loc-sender";
+impl LocSender {
+    pub const NAME: &'static str = "loc-sender";
 }
 
-/// `dentrado/loc-group`: a group key, interned under a local id.
+/// A group key, interned under a local id.
 ///
 /// `msg_type` is part of the identity (one group, one message kind);
 /// `group_schema` names the layout of `group`.
@@ -65,11 +55,11 @@ pub struct LocGroup {
     pub group: Vec<u8>,
 }
 
-impl Record for LocGroup {
-    const NAME: &'static str = "dentrado/loc-group";
+impl LocGroup {
+    pub const NAME: &'static str = "loc-group";
 }
 
-/// `dentrado/loc-data`: a content-addressed value, interned under a local id.
+/// A content-addressed value, interned under a local id.
 ///
 /// `hash` is the content address (verified before the record is written), and
 /// `content_schema` names the layout of `content`. `timestamp` is the
@@ -84,49 +74,37 @@ pub struct LocData {
     pub content: Vec<u8>,
 }
 
-impl Record for LocData {
-    const NAME: &'static str = "dentrado/loc-data";
+impl LocData {
+    pub const NAME: &'static str = "loc-data";
 }
 
-/// `dentrado/event`: one event in a group's shard.
+/// One event in a group's shard.
 ///
-/// The only hand-written record. Its envelope is a fixed 30-byte prefix so a
-/// replay can read `group`/`sender`/dedup keys and copy an event's body into
-/// the cache without decoding it. A postcard struct would prepend a length to
-/// `body`, which is exactly the byte the fold must not pay for.
+/// The envelope is a fixed 28-byte prefix so a replay can read `group`,
+/// `sender`, and the dedup keys and copy an event's body into the cache
+/// without decoding it. A postcard struct would prepend a length to `body`,
+/// which is exactly the byte the fold must not pay for.
 ///
 /// The prefix is
-/// `group u64 | sender u64 | tx_id u32 | timestamp u32 | source_node u32 | body_schema u16`,
-/// and `body` is every remaining byte.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `group u64 | sender u64 | tx_id u32 | timestamp u32 | source_node u32`,
+/// and `body` is every remaining byte. The body's layout is the runtime's one
+/// `R::Body` shape — pinned by the log's nested declarations, not repeated on
+/// every record.
+#[derive(Clone, Debug, PartialEq, Eq, Shape)]
 pub struct Event<'a> {
     pub group: u64,
     pub sender: u64,
     pub tx_id: u32,
     pub timestamp: u32,
     pub source_node: u32,
-    pub body_schema: u16, // REVIEW: body_schema is implied by the `group`.
     pub body: &'a [u8],
 }
 
-// REVIEW: No hand-written impl allowed here.
-impl Shape for Event<'_> {
-    fn shape() -> String {
-        concat!(
-            "Event{group:u64,sender:u64,tx_id:u32,timestamp:u32,",
-            "source_node:u32,body_schema:u16,body:Vec<u8>}"
-        )
-        .to_owned()
-    }
-}
-
-impl Record for Event<'_> {
-    const NAME: &'static str = "dentrado/event"; // REVIEW: NO `dentrado/` prefix. REmove the goddamn `dentrado/` prefix all over the codebase, you don't need inside of dentrado/ storage to constantly remind that we're doing dentrado/.
-}
-
 impl<'a> Event<'a> {
+    pub const NAME: &'static str = "event";
+
     /// The fixed prefix, before the body.
-    pub const HEADER_LEN: usize = 30;
+    pub const HEADER_LEN: usize = 28;
 
     /// The record's bytes: the envelope followed by the body verbatim.
     ///
@@ -141,7 +119,6 @@ impl<'a> Event<'a> {
         out.extend_from_slice(&self.tx_id.to_le_bytes());
         out.extend_from_slice(&self.timestamp.to_le_bytes());
         out.extend_from_slice(&self.source_node.to_le_bytes());
-        out.extend_from_slice(&self.body_schema.to_le_bytes());
         out.extend_from_slice(self.body);
         out
     }
@@ -156,7 +133,6 @@ impl<'a> Event<'a> {
             tx_id: u32::from_le_bytes(header[16..20].try_into().ok()?),
             timestamp: u32::from_le_bytes(header[20..24].try_into().ok()?),
             source_node: u32::from_le_bytes(header[24..28].try_into().ok()?),
-            body_schema: u16::from_le_bytes(header[28..30].try_into().ok()?),
             body: &bytes[Self::HEADER_LEN..],
         })
     }
@@ -188,18 +164,17 @@ mod tests {
         );
         assert_eq!(
             Event::shape(),
-            "Event{group:u64,sender:u64,tx_id:u32,timestamp:u32,source_node:u32,\
-             body_schema:u16,body:Vec<u8>}"
+            "Event{group:u64,sender:u64,tx_id:u32,timestamp:u32,source_node:u32,body:Vec<u8>}"
         );
     }
 
     #[test]
     fn a_name_is_stable() {
-        assert_eq!(LocUser::NAME, "dentrado/loc-user");
-        assert_eq!(LocSender::NAME, "dentrado/loc-sender");
-        assert_eq!(LocGroup::NAME, "dentrado/loc-group");
-        assert_eq!(LocData::NAME, "dentrado/loc-data");
-        assert_eq!(Event::NAME, "dentrado/event");
+        assert_eq!(LocUser::NAME, "loc-user");
+        assert_eq!(LocSender::NAME, "loc-sender");
+        assert_eq!(LocGroup::NAME, "loc-group");
+        assert_eq!(LocData::NAME, "loc-data");
+        assert_eq!(Event::NAME, "event");
     }
 
     #[test]
@@ -210,7 +185,6 @@ mod tests {
             tx_id: 3,
             timestamp: 1_700_000_000,
             source_node: 2,
-            body_schema: 19,
             body: b"payload",
         };
         let bytes = event.encode();

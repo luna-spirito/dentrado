@@ -1,4 +1,4 @@
-use dentrado::core::{core_ctx::GearCtx, gear::GearResult, storage::IsStorage};
+use dentrado::core::{core_ctx::GearCtx, gear::GearResult, storage::GearView};
 use kolorinko_rt::{
     CodeBlock, LocalId, RepoMeta, SafePathComponent, ServedBlob, SiteShell, SpaceId, wire,
 };

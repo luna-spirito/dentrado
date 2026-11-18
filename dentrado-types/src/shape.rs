@@ -118,6 +118,15 @@ impl<T: Shape> Shape for Box<T> {
     }
 }
 
+/// A byte slice encodes exactly as a `Vec<u8>`: a length prefix and the bytes.
+/// Borrowing the body of a record instead of owning it changes nothing on the
+/// wire, so it must not change the schema identity either.
+impl Shape for &[u8] {
+    fn shape() -> String {
+        "Vec<u8>".to_owned()
+    }
+}
+
 /// Phantom data names no bytes.
 impl<T> Shape for PhantomData<T> {
     fn shape() -> String {

@@ -54,10 +54,10 @@ impl Counter {
 pub(crate) enum EventOutcome {
     /// The key is new; the event belongs at this slot.
     New(GroupEventId),
-    /// The same observation is already stored at this slot.
-    Same(GroupEventId),
+    /// The same observation is already stored.
+    Same,
     /// The key is known with different bytes. Supersede is not implemented.
-    Conflict(GroupEventId),
+    Conflict,
 }
 
 /// The read/write operations shared by the live path and replay.
@@ -95,7 +95,7 @@ impl<'a, R: RuntimeTypes, D: IsFilesystem> Ops<'a, R, D> {
     // ── counters ──────────────────────────────────────────────────────────
 
     pub(crate) async fn next(&self, which: Counter) -> u64 {
-        self.get(&self.tables.counters, &codec::counter(which.tag()))
+        self.get(&self.tables.loc, &codec::counter(which.tag()))
             .await
             .and_then(|bytes| codec::parse_loc(&bytes))
             .unwrap_or(0)
@@ -104,19 +104,17 @@ impl<'a, R: RuntimeTypes, D: IsFilesystem> Ops<'a, R, D> {
     // ── localization lookups ──────────────────────────────────────────────
 
     pub(crate) async fn user_loc(&self, uid: UserId) -> Option<LocUserId> {
-        let bytes = self.get(&self.tables.users, &codec::user_fwd(uid)).await?;
+        let bytes = self.get(&self.tables.loc, &codec::user_fwd(uid)).await?;
         Some(LocUserId(codec::parse_loc(&bytes)?))
     }
 
     pub(crate) async fn loc_user(&self, loc: LocUserId) -> Option<UserId> {
-        let bytes = self.get(&self.tables.users, &codec::user_rev(loc)).await?;
+        let bytes = self.get(&self.tables.loc, &codec::user_rev(loc)).await?;
         codec::parse_user(&bytes)
     }
 
     pub(crate) async fn sender_loc(&self, pk: SenderPk) -> Option<LocSenderId> {
-        let bytes = self
-            .get(&self.tables.senders, &codec::sender_fwd(pk))
-            .await?;
+        let bytes = self.get(&self.tables.loc, &codec::sender_fwd(pk)).await?;
         Some(codec::parse_sender_fwd(&bytes)?.0)
     }
 
@@ -124,9 +122,7 @@ impl<'a, R: RuntimeTypes, D: IsFilesystem> Ops<'a, R, D> {
         &self,
         loc: LocSenderId,
     ) -> Option<(SenderPk, Option<LocUserId>)> {
-        let bytes = self
-            .get(&self.tables.senders, &codec::sender_rev(loc))
-            .await?;
+        let bytes = self.get(&self.tables.loc, &codec::sender_rev(loc)).await?;
         codec::parse_sender_rev(&bytes)
     }
 
@@ -136,20 +132,20 @@ impl<'a, R: RuntimeTypes, D: IsFilesystem> Ops<'a, R, D> {
         group: &[u8],
     ) -> Option<LocGroupId> {
         let bytes = self
-            .get(&self.tables.groups, &codec::group_fwd(msg_type.0, group))
+            .get(&self.tables.loc, &codec::group_fwd(msg_type.0, group))
             .await?;
         Some(LocGroupId(codec::parse_loc(&bytes)?))
     }
 
     pub(crate) async fn data_loc(&self, data_id: DataId) -> Option<LocDataId> {
         let bytes = self
-            .get(&self.tables.data, &codec::data_fwd(data_id))
+            .get(&self.tables.loc, &codec::data_fwd(data_id))
             .await?;
         Some(LocDataId(codec::parse_loc(&bytes)?))
     }
 
     pub(crate) async fn loc_data(&self, loc: LocDataId) -> Option<(DataId, R::Data)> {
-        let bytes = self.get(&self.tables.data, &codec::data_rev(loc)).await?;
+        let bytes = self.get(&self.tables.loc, &codec::data_rev(loc)).await?;
         let data_id = DataId {
             timestamp: u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?),
             hash: bytes.get(4..36)?.try_into().ok()?,
@@ -163,8 +159,8 @@ impl<'a, R: RuntimeTypes, D: IsFilesystem> Ops<'a, R, D> {
     pub(crate) async fn apply_user(&self, loc: LocUserId, uid: UserId) -> Result<(), String> {
         let fk = codec::user_fwd(uid);
         let rk = codec::user_rev(loc);
-        let fwd = self.get(&self.tables.users, &fk).await;
-        let rev = self.get(&self.tables.users, &rk).await;
+        let fwd = self.get(&self.tables.loc, &fk).await;
+        let rev = self.get(&self.tables.loc, &rk).await;
         match (fwd.as_deref(), rev.as_deref()) {
             (None, None) => {}
             (Some(f), Some(r))
@@ -187,10 +183,10 @@ impl<'a, R: RuntimeTypes, D: IsFilesystem> Ops<'a, R, D> {
             ));
         }
         self.put_many(&[
-            (&self.tables.users, fk, codec::loc_bytes(loc.0).to_vec()),
-            (&self.tables.users, rk, codec::user_bytes(uid).to_vec()),
+            (&self.tables.loc, fk, codec::loc_bytes(loc.0).to_vec()),
+            (&self.tables.loc, rk, codec::user_bytes(uid).to_vec()),
             (
-                &self.tables.counters,
+                &self.tables.loc,
                 codec::counter(Counter::User.tag()),
                 codec::loc_bytes(loc.0 + 1).to_vec(),
             ),
@@ -209,8 +205,8 @@ impl<'a, R: RuntimeTypes, D: IsFilesystem> Ops<'a, R, D> {
         let rk = codec::sender_rev(loc);
         let fwd_value = codec::sender_fwd_bytes(loc, user);
         let rev_value = codec::sender_rev_bytes(pk, user);
-        let fwd = self.get(&self.tables.senders, &fk).await;
-        let rev = self.get(&self.tables.senders, &rk).await;
+        let fwd = self.get(&self.tables.loc, &fk).await;
+        let rev = self.get(&self.tables.loc, &rk).await;
         match (fwd.as_deref(), rev.as_deref()) {
             (None, None) => {}
             (Some(f), Some(r)) if f == fwd_value.as_slice() && r == rev_value.as_slice() => {
@@ -236,10 +232,10 @@ impl<'a, R: RuntimeTypes, D: IsFilesystem> Ops<'a, R, D> {
             ));
         }
         self.put_many(&[
-            (&self.tables.senders, fk, fwd_value),
-            (&self.tables.senders, rk, rev_value),
+            (&self.tables.loc, fk, fwd_value),
+            (&self.tables.loc, rk, rev_value),
             (
-                &self.tables.counters,
+                &self.tables.loc,
                 codec::counter(Counter::Sender.tag()),
                 codec::loc_bytes(loc.0 + 1).to_vec(),
             ),
@@ -258,8 +254,8 @@ impl<'a, R: RuntimeTypes, D: IsFilesystem> Ops<'a, R, D> {
         let fk = codec::group_fwd(msg_type.0, &bytes);
         let rk = codec::group_rev(loc);
         let value = codec::group_bytes(msg_type.0, &bytes);
-        let fwd = self.get(&self.tables.groups, &fk).await;
-        let rev = self.get(&self.tables.groups, &rk).await;
+        let fwd = self.get(&self.tables.loc, &fk).await;
+        let rev = self.get(&self.tables.loc, &rk).await;
         match (fwd.as_deref(), rev.as_deref()) {
             (None, None) => {}
             (Some(f), Some(r))
@@ -284,10 +280,10 @@ impl<'a, R: RuntimeTypes, D: IsFilesystem> Ops<'a, R, D> {
             ));
         }
         self.put_many(&[
-            (&self.tables.groups, fk, codec::loc_bytes(loc.0).to_vec()),
-            (&self.tables.groups, rk, value),
+            (&self.tables.loc, fk, codec::loc_bytes(loc.0).to_vec()),
+            (&self.tables.loc, rk, value),
             (
-                &self.tables.counters,
+                &self.tables.loc,
                 codec::counter(Counter::Group.tag()),
                 codec::loc_bytes(loc.0 + 1).to_vec(),
             ),
@@ -336,8 +332,8 @@ impl<'a, R: RuntimeTypes, D: IsFilesystem> Ops<'a, R, D> {
         value.extend_from_slice(&data_id.timestamp.to_le_bytes());
         value.extend_from_slice(&data_id.hash);
         value.extend_from_slice(&postcard::to_stdvec(content).expect("a data value serializes"));
-        let fwd = self.get(&self.tables.data, &fk).await;
-        let rev = self.get(&self.tables.data, &rk).await;
+        let fwd = self.get(&self.tables.loc, &fk).await;
+        let rev = self.get(&self.tables.loc, &rk).await;
         match (fwd.as_deref(), rev.as_deref()) {
             (None, None) => {}
             (Some(f), Some(r))
@@ -360,10 +356,10 @@ impl<'a, R: RuntimeTypes, D: IsFilesystem> Ops<'a, R, D> {
             ));
         }
         self.put_many(&[
-            (&self.tables.data, fk, codec::loc_bytes(loc.0).to_vec()),
-            (&self.tables.data, rk, value),
+            (&self.tables.loc, fk, codec::loc_bytes(loc.0).to_vec()),
+            (&self.tables.loc, rk, value),
             (
-                &self.tables.counters,
+                &self.tables.loc,
                 codec::counter(Counter::Data.tag()),
                 codec::loc_bytes(loc.0 + 1).to_vec(),
             ),
@@ -400,8 +396,8 @@ impl<'a, R: RuntimeTypes, D: IsFilesystem> Ops<'a, R, D> {
             .get(&self.tables.events, &codec::event(group, slot))
             .await
         {
-            Some(stored) if stored == value => EventOutcome::Same(slot),
-            _ => EventOutcome::Conflict(slot),
+            Some(stored) if stored == value => EventOutcome::Same,
+            _ => EventOutcome::Conflict,
         }
     }
 
@@ -455,7 +451,7 @@ impl<'a, R: RuntimeTypes, D: IsFilesystem> Ops<'a, R, D> {
         let mut removed_ids = Vec::new();
         for index in r..removed {
             if let Some(bytes) = self
-                .get(&self.tables.removed, &codec::removed(group, index))
+                .get(&self.tables.events, &codec::removed(group, index))
                 .await
             {
                 removed_ids.push(GroupEventId(

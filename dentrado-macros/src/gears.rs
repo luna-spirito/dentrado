@@ -10,10 +10,10 @@
 //! #[gears(runtime = KolorinkoRT)]
 //! pub(crate) mod gears {
 //!     #[gear(timer(period = secs(900)), local, name = Repo)]
-//!     pub(crate) async fn repo<S: IsStorage<KolorinkoRT>>(
+//!     pub(crate) async fn repo(
 //!         repo_meta: RepoMeta,        // id field → GearId::Repo(RepoMeta)
 //!         tick: bool,                 // timer tick
-//!         view: &mut S::View<'_>,     // the gear's private store view
+//!         view: &mut GearView,        // the gear's private store view
 //!     ) -> Arc<RepoData> {}           // → GearOutLocal::RepoOut(Arc<RepoData>)
 //! }
 //! ```
@@ -220,7 +220,7 @@ enum ParamRole {
     FollowOut { name: Ident },
     /// `ctx: &mut GearCtx<…>`. The run call forwards `run_step`'s `ctx`.
     Ctx,
-    /// `view: &mut S::View<'_>`. The run call forwards `run_step`'s `view`.
+    /// `view: &mut GearView`. The run call forwards `run_step`'s `view`.
     View,
 }
 
@@ -247,9 +247,6 @@ struct GearSpec {
     /// schema's `GearId`/builders, its output passing the `is_exposed` filter.
     is_exposed: bool,
     params: Vec<ParamRole>,
-    /// The fn is generic over the storage type `S` — `run_step` must
-    /// turbofish it, since `S::View<'_>` alone does not determine `S`.
-    has_storage_generic: bool,
     out_ty: Type,
     kind: KindSpec,
     /// Follow gears only: the target's `GearOut` variant (`RepoOut`), used to
@@ -411,12 +408,12 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
         if let Some(elem) = as_mut_ref_elem(ty) {
             if path_last_ident(elem) == Some(&format_ident!("GearCtx")) {
                 params.push(ParamRole::Ctx);
-            } else if path_last_ident(elem) == Some(&format_ident!("View")) {
+            } else if path_last_ident(elem) == Some(&format_ident!("GearView")) {
                 params.push(ParamRole::View);
             } else {
                 return Err(syn::Error::new_spanned(
                     ty,
-                    "gear fn's `&mut` param must be `GearCtx` or `S::View<'_>`",
+                    "gear fn's `&mut` param must be `GearCtx` or `GearView`",
                 ));
             }
         } else {
@@ -470,7 +467,7 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
     {
         return Err(syn::Error::new_spanned(
             &fn_item.sig,
-            "gear fn must take exactly one `view: &mut S::View<'_>` param",
+            "gear fn must take exactly one `view: &mut GearView` param",
         ));
     }
 
@@ -482,12 +479,6 @@ fn extract_gear(fn_item: &syn::ItemFn) -> syn::Result<GearSpec> {
         is_local,
         is_shared,
         is_exposed,
-        has_storage_generic: fn_item
-            .sig
-            .generics
-            .params
-            .iter()
-            .any(|p| matches!(p, syn::GenericParam::Type(t) if t.ident == "S")),
         params,
         out_ty,
         kind,
@@ -992,11 +983,7 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
             ParamRole::View => quote! { view },
         });
         let step_ident = format_ident!("{}_step", g.fn_name);
-        let step_ref = if g.has_storage_generic {
-            quote! { #step_ident::<S> }
-        } else {
-            quote! { #step_ident }
-        };
+        let step_ref = quote! { #step_ident };
         let await_dot = g.is_async.then(|| quote! { .await });
         let run_call = quote! { #step_ref(#( #call_args ),*) #await_dot };
 
@@ -1268,10 +1255,10 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
                 }
             }
 
-            async fn run_step<S: ::dentrado::core::storage::IsStorage<Self>>(
-                ctx: &mut ::dentrado::core::core_ctx::GearCtx<Self, S>,
+            async fn run_step(
+                ctx: &mut ::dentrado::core::core_ctx::GearCtx<Self>,
                 input: ::dentrado::core::gear::GearInput<Self>,
-                view: &mut S::View<'_>,
+                view: &mut ::dentrado::core::storage::GearView,
             ) -> ::dentrado::core::gear::GearProduce<Self> {
                 match ctx.gear().clone() {
                     #( #run_arms )*

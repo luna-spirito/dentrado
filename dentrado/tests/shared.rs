@@ -10,7 +10,7 @@ use dentrado::{
     core::{
         core_ctx::{Core, GearCtx},
         gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime, RuntimeTypes},
-        storage::{InMemoryStorage, IsStorage},
+        storage::GearView,
     },
     types::*,
 };
@@ -87,10 +87,10 @@ impl IsRuntime for SharedRuntime {
         }
     }
 
-    async fn run_step<S: IsStorage<Self>>(
-        ctx: &mut GearCtx<Self, S>,
+    async fn run_step(
+        ctx: &mut GearCtx<Self>,
         _input: GearInput<Self>,
-        _view: &mut S::View<'_>,
+        _view: &mut GearView,
     ) -> GearProduce<Self> {
         match ctx.gear() {
             SharedGear::Src { bucket } => {
@@ -123,7 +123,7 @@ enum Cmd {
 #[test]
 fn shared_install_and_read() {
     let (cmd_tx, cmd_rx) = flume::unbounded::<Cmd>();
-    let worker = move |core: std::rc::Rc<Core<SharedRuntime, InMemoryStorage<SharedRuntime>>>| {
+    let worker = move |core: std::rc::Rc<Core<SharedRuntime>>| {
         let cmd_rx = cmd_rx.clone();
         async move {
             while let Ok(cmd) = cmd_rx.recv_async().await {
@@ -143,8 +143,7 @@ fn shared_install_and_read() {
         }
     };
 
-    let mut tc: TestCluster<SharedRuntime, InMemoryStorage<SharedRuntime>> =
-        TestCluster::start_with_worker(&[1], (), worker);
+    let mut tc: TestCluster<SharedRuntime> = TestCluster::start_with_worker(&[1], (), worker);
     let bucket = 0;
     tc.mk_loc_group(MSG_SHARED, bucket);
     tc.mk_loc_group(MSG_SHARED, bucket + 1000);
@@ -165,7 +164,7 @@ fn shared_install_and_read() {
 #[test]
 fn shared_cross_core_secondary_get() {
     let (cmd_tx, cmd_rx) = flume::unbounded::<Cmd>();
-    let worker = move |core: std::rc::Rc<Core<SharedRuntime, InMemoryStorage<SharedRuntime>>>| {
+    let worker = move |core: std::rc::Rc<Core<SharedRuntime>>| {
         let cmd_rx = cmd_rx.clone();
         async move {
             while let Ok(cmd) = cmd_rx.recv_async().await {
@@ -185,8 +184,7 @@ fn shared_cross_core_secondary_get() {
         }
     };
 
-    let mut tc: TestCluster<SharedRuntime, InMemoryStorage<SharedRuntime>> =
-        TestCluster::start_with_worker(&[4], (), worker);
+    let mut tc: TestCluster<SharedRuntime> = TestCluster::start_with_worker(&[4], (), worker);
     // Several buckets → several `Src`/`Len` pairs, raising the chance at least
     // one `Len` reads a `Src` on a genuinely different core.
     for b in 0..8 {

@@ -1,4 +1,4 @@
-//! `PagedStorage` gear-view round-trip: staged writes become visible only
+//! `CacheStorage` gear-view round-trip: staged writes become visible only
 //! after `commit`, survive flush + reopen, overwrite and delete behave, and
 //! `scan` walks one gear's prefix without leaking another gear's records.
 //!
@@ -13,7 +13,7 @@ use dentrado::{
         api::GearTable,
         core_ctx::GearCtx,
         gear::{GearInput, GearMeta, GearProduce, IsRuntime, RuntimeTypes},
-        storage::{GearView, IsStorage, PagedStorage},
+        storage::{CacheStorage, GearView},
     },
     types::*,
 };
@@ -72,17 +72,17 @@ impl IsRuntime for BlobRuntime {
         }
     }
 
-    async fn run_step<S: IsStorage<Self>>(
-        _ctx: &mut GearCtx<Self, S>,
+    async fn run_step(
+        _ctx: &mut GearCtx<Self>,
         _input: GearInput<Self>,
-        _view: &mut S::View<'_>,
+        _view: &mut GearView,
     ) -> GearProduce<Self> {
         unreachable!("this test drives storage directly")
     }
 }
 
 async fn roundtrip(file: &std::path::Path) {
-    let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.to_path_buf());
+    let st: CacheStorage<BlobRuntime> = CacheStorage::on_disk(file.to_path_buf());
     let gear = BlobGear::Blob { key: 7 };
 
     let mut view = st.gear_view(&gear).await;
@@ -105,7 +105,7 @@ async fn roundtrip(file: &std::path::Path) {
     // Reopen from disk: the record is fetched back on demand.
     drop(view);
     drop(st);
-    let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.to_path_buf());
+    let st: CacheStorage<BlobRuntime> = CacheStorage::on_disk(file.to_path_buf());
     let mut view = st.gear_view(&gear).await;
     assert_eq!(view.get(b"k").await.unwrap(), b"one");
     assert_eq!(view.get(b"big").await.unwrap(), big);
@@ -116,7 +116,7 @@ async fn roundtrip(file: &std::path::Path) {
     st.flush().await.unwrap();
     drop(view);
     drop(st);
-    let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.to_path_buf());
+    let st: CacheStorage<BlobRuntime> = CacheStorage::on_disk(file.to_path_buf());
     let mut view = st.gear_view(&gear).await;
     assert_eq!(view.get(b"k").await.unwrap(), b"two");
 
@@ -148,13 +148,13 @@ async fn roundtrip(file: &std::path::Path) {
     drop(other_view);
     drop(view);
     drop(st);
-    let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.to_path_buf());
+    let st: CacheStorage<BlobRuntime> = CacheStorage::on_disk(file.to_path_buf());
     let mut view = st.gear_view(&gear).await;
     assert!(view.get(b"k").await.is_none());
     assert_eq!(view.get(b"big").await.unwrap(), big);
 
     // RAM mode (`file = None`) is the same contract over a `BTreeMap`.
-    let ram: PagedStorage<BlobRuntime> = PagedStorage::ram();
+    let ram: CacheStorage<BlobRuntime> = CacheStorage::ram();
     let mut view = ram.gear_view(&gear).await;
     view.put(b"k", b"z");
     assert!(view.get(b"k").await.is_none());
@@ -187,7 +187,7 @@ fn paged_storage_quarantines_corruption() {
             // Two garbage pages where the SB slots live: content without a
             // valid image.
             std::fs::write(&file, [0x5Au8; 8192]).unwrap();
-            let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.clone());
+            let st: CacheStorage<BlobRuntime> = CacheStorage::on_disk(file.clone());
             let gear = BlobGear::Blob { key: 7 };
             let mut view = st.gear_view(&gear).await;
             assert!(view.get(b"k").await.is_none());
@@ -206,7 +206,7 @@ fn paged_storage_quarantines_corruption() {
                 })
                 .collect();
             assert_eq!(quarantined.len(), 1, "the corrupt file was renamed aside");
-            let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file);
+            let st: CacheStorage<BlobRuntime> = CacheStorage::on_disk(file);
             let mut view = st.gear_view(&gear).await;
             assert_eq!(view.get(b"k").await.unwrap(), b"fresh");
         });
@@ -240,8 +240,8 @@ fn paged_storage_gcs_old_gear_tables() {
                 s.commit().unwrap();
                 old.flush().await.unwrap();
             }
-            // Opening through PagedStorage drops our orphans…
-            let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.clone());
+            // Opening through CacheStorage drops our orphans…
+            let st: CacheStorage<BlobRuntime> = CacheStorage::on_disk(file.clone());
             let gear = BlobGear::Blob { key: 7 };
             let mut view = st.gear_view(&gear).await;
             view.put(b"k", b"kept");
@@ -265,7 +265,7 @@ fn paged_storage_gcs_old_gear_tables() {
             assert_eq!(found, [BLOB_KIND, NOTE_KIND]);
             drop(raw);
             // GC never touches the live kinds' records.
-            let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file);
+            let st: CacheStorage<BlobRuntime> = CacheStorage::on_disk(file);
             let mut view = st.gear_view(&gear).await;
             assert_eq!(view.get(b"k").await.unwrap(), b"kept");
         });
@@ -286,7 +286,7 @@ fn paged_storage_separates_gear_kinds() {
             let file = dir.path().join("core-0.dstore");
             let blob = BlobGear::Blob { key: 1 };
             let note = BlobGear::Note { key: 1 };
-            let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file.clone());
+            let st: CacheStorage<BlobRuntime> = CacheStorage::on_disk(file.clone());
             {
                 let mut view = st.gear_view(&blob).await;
                 view.put(b"k", b"blob");
@@ -301,7 +301,7 @@ fn paged_storage_separates_gear_kinds() {
             st.flush().await.unwrap();
             drop(st);
 
-            let st: PagedStorage<BlobRuntime> = PagedStorage::on_disk(file);
+            let st: CacheStorage<BlobRuntime> = CacheStorage::on_disk(file);
             let mut view = st.gear_view(&blob).await;
             assert_eq!(view.get(b"k").await.unwrap(), b"blob");
             let mut view = st.gear_view(&note).await;
@@ -320,17 +320,17 @@ fn paged_storage_refuses_oversized_records() {
         .block_on(async {
             let gear = BlobGear::Blob { key: 7 };
             let oversized = vec![0u8; 8192];
-            fn refuses(view: &mut impl GearView, value: &[u8]) -> bool {
+            fn refuses(view: &mut GearView, value: &[u8]) -> bool {
                 std::panic::catch_unwind(AssertUnwindSafe(|| view.put(b"k", value))).is_err()
             }
 
             let dir = tempfile::tempdir().unwrap();
-            let st: PagedStorage<BlobRuntime> =
-                PagedStorage::on_disk(dir.path().join("core-0.dstore"));
+            let st: CacheStorage<BlobRuntime> =
+                CacheStorage::on_disk(dir.path().join("core-0.dstore"));
             let mut disk = st.gear_view(&gear).await;
             assert!(refuses(&mut disk, &oversized), "disk view refuses");
 
-            let ram: PagedStorage<BlobRuntime> = PagedStorage::ram();
+            let ram: CacheStorage<BlobRuntime> = CacheStorage::ram();
             let mut ram_view = ram.gear_view(&gear).await;
             assert!(refuses(&mut ram_view, &oversized), "RAM view refuses");
         });

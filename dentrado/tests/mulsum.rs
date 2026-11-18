@@ -4,7 +4,7 @@ use dentrado::{
     core::{
         core_ctx::{Core, GearCtx},
         gear::{GearInput, GearMeta, GearProduce, IsRuntime, RuntimeTypes},
-        storage::{GearView, InMemoryStorage, IsStorage, Watermark},
+        storage::{GearView, Watermark},
     },
     types::*,
     wire::WireEventBody,
@@ -92,10 +92,10 @@ impl IsRuntime for MulSumRuntime {
         }
     }
 
-    async fn run_step<S: IsStorage<Self>>(
-        ctx: &mut GearCtx<Self, S>,
+    async fn run_step(
+        ctx: &mut GearCtx<Self>,
         input: GearInput<Self>,
-        view: &mut S::View<'_>,
+        view: &mut GearView,
     ) -> GearProduce<Self> {
         let (watermark, mut agg) = view
             .get(CACHE_KEY)
@@ -124,8 +124,7 @@ impl IsRuntime for MulSumRuntime {
 
 #[test]
 fn mulsum_engine() {
-    let mut tc: TestCluster<MulSumRuntime, InMemoryStorage<MulSumRuntime>> =
-        TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<MulSumRuntime> = TestCluster::start(&[2, 3, 4], ());
 
     let bucket: i64 = 0;
     tc.mk_loc_group(MSG_MULSUM, bucket);
@@ -200,11 +199,9 @@ enum WorkerCmd {
 fn local_gear_read_and_subscribe_via_worker() {
     let (cmd_tx, cmd_rx) = flume::unbounded::<WorkerCmd>();
 
-    let worker = move |core: std::rc::Rc<Core<MulSumRuntime, InMemoryStorage<MulSumRuntime>>>| {
+    let worker = move |core: std::rc::Rc<Core<MulSumRuntime>>| {
         let cmd_rx = cmd_rx.clone();
-        let mut held: Vec<
-            dentrado::core::core_ctx::Subscription<MulSumRuntime, InMemoryStorage<MulSumRuntime>>,
-        > = Vec::new();
+        let mut held: Vec<dentrado::core::core_ctx::Subscription<MulSumRuntime>> = Vec::new();
         async move {
             while let Ok(cmd) = cmd_rx.recv_async().await {
                 match cmd {
@@ -226,8 +223,7 @@ fn local_gear_read_and_subscribe_via_worker() {
         }
     };
 
-    let mut tc: TestCluster<MulSumRuntime, InMemoryStorage<MulSumRuntime>> =
-        TestCluster::start_with_worker(&[1], (), worker);
+    let mut tc: TestCluster<MulSumRuntime> = TestCluster::start_with_worker(&[1], (), worker);
 
     let bucket: i64 = 0;
     let alice_pk = SenderPk([42u8; 32]);

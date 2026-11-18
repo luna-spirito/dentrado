@@ -10,7 +10,7 @@ const META_KEY: &[u8] = b"meta-v2";
 
 /// Load the persisted generation from the gear view; an absent or unreadable
 /// image is a cold start (the metadata is recomputable, never authoritative).
-pub(super) async fn load_meta<V: GearView>(view: &mut V) -> Option<RepoMeta> {
+pub(super) async fn load_meta(view: &mut GearView) -> Option<RepoMeta> {
     let bytes = chunked::load(view, META_KEY).await?;
     match postcard::from_bytes::<RepoMeta>(&bytes) {
         Ok(meta) => Some(meta),
@@ -22,7 +22,7 @@ pub(super) async fn load_meta<V: GearView>(view: &mut V) -> Option<RepoMeta> {
 }
 
 /// Stage the generation as a chunked image in the view.
-pub(super) async fn store_meta<V: GearView>(view: &mut V, meta: &RepoMeta) {
+pub(super) async fn store_meta(view: &mut GearView, meta: &RepoMeta) {
     let bytes = postcard::to_stdvec(meta).expect("a repo metadata image serializes");
     chunked::store(view, META_KEY, &bytes).await;
 }
@@ -35,11 +35,11 @@ pub(super) async fn store_meta<V: GearView>(view: &mut V, meta: &RepoMeta) {
 /// Across process restarts the gear view holds the last generation: a `HEAD`
 /// match reuses it without touching any archive. A moved `HEAD` decodes the
 /// new generation; the prior one remains as the fallback if that read fails.
-pub(crate) async fn repo<S: IsStorage<KolorinkoRT>>(
+pub(crate) async fn repo(
     site: SafePathComponent,
     tick: bool,
-    ctx: &mut GearCtx<KolorinkoRT, S>,
-    view: &mut S::View<'_>,
+    ctx: &mut GearCtx<KolorinkoRT>,
+    view: &mut GearView,
 ) -> RepoMeta {
     let previous = match ctx.previous_output() {
         Some(GearResult::Shared(shared)) => match &*shared {

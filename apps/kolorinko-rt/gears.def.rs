@@ -47,21 +47,21 @@
 /// frontmatter for unchanged archive hashes. The output is `shared`, so every
 /// core holds one reference to the same [`RepoMeta`].
 #[dentrado::gear(timer(period = crate::globals::interval()), shared, name = Repo)]
-pub(crate) async fn repo<S: IsStorage<KolorinkoRT>>(
+pub(crate) async fn repo(
     site: SafePathComponent,
     tick: bool,
-    ctx: &mut GearCtx<KolorinkoRT, S>,
-    view: &mut S::View<'_>,
+    ctx: &mut GearCtx<KolorinkoRT>,
+    view: &mut GearView,
 ) -> RepoMeta {
     crate::wikidot_page::repo(site, tick, ctx, view).await
 }
 
 #[dentrado::gear(event, shared, name = Asset)]
-pub(crate) async fn asset<S: IsStorage<KolorinkoRT>>(
+pub(crate) async fn asset(
     site: SafePathComponent,
     hash: String,
-    ctx: &mut GearCtx<KolorinkoRT, S>,
-    _view: &mut S::View<'_>,
+    ctx: &mut GearCtx<KolorinkoRT>,
+    _view: &mut GearView,
 ) -> Option<ServedBlob> {
     crate::wikidot_page::asset(&site, &hash, ctx).await
 }
@@ -77,12 +77,12 @@ pub(crate) async fn asset<S: IsStorage<KolorinkoRT>>(
     shared,
     name = CodeBlock,
 )]
-pub(crate) fn code_block<S: IsStorage<KolorinkoRT>>(
+pub(crate) fn code_block(
     space: SpaceId,
     local: LocalId,
     n: u32,
     parsed: &ArticleView,
-    _view: &mut S::View<'_>,
+    _view: &mut GearView,
 ) -> Option<CodeBlock> {
     crate::wikidot_page::code_block(space, local, n, parsed)
 }
@@ -92,10 +92,10 @@ pub(crate) fn code_block<S: IsStorage<KolorinkoRT>>(
 /// pages. Reads the site's [`Repo`] metadata and resolves each nav page
 /// through an `article_latest` dependency.
 #[dentrado::gear(event, shared, exposed, name = Shell)]
-pub(crate) async fn shell<S: IsStorage<KolorinkoRT>>(
+pub(crate) async fn shell(
     space: SpaceId,
-    ctx: &mut GearCtx<KolorinkoRT, S>,
-    _view: &mut S::View<'_>,
+    ctx: &mut GearCtx<KolorinkoRT>,
+    _view: &mut GearView,
 ) -> SiteShell {
     crate::wikidot_page::shell(space, ctx).await
 }
@@ -105,11 +105,11 @@ pub(crate) async fn shell<S: IsStorage<KolorinkoRT>>(
 // the canonical address, so it lives on its own core — off `Repo`'s — and its
 // output is what `article_latest` / `code_block` statically follow.
 #[dentrado::gear(event, shared, name = ArticleLatestParsed)]
-pub(crate) async fn article_latest_parsed<S: IsStorage<KolorinkoRT>>(
+pub(crate) async fn article_latest_parsed(
     space: SpaceId,
     local: LocalId,
-    ctx: &mut GearCtx<KolorinkoRT, S>,
-    view: &mut S::View<'_>,
+    ctx: &mut GearCtx<KolorinkoRT>,
+    view: &mut GearView,
 ) -> ArticleView {
     crate::wikidot_page::article_latest_parsed(space, local, ctx, view).await
 }
@@ -118,11 +118,11 @@ pub(crate) async fn article_latest_parsed<S: IsStorage<KolorinkoRT>>(
 // cannot be reused for textual include splicing) and fetches each site's
 // metadata only when an include actually names it.
 #[dentrado::gear(event, shared, exposed, name = ArticleLatest)]
-pub(crate) async fn article_latest<S: IsStorage<KolorinkoRT>>(
+pub(crate) async fn article_latest(
     space: SpaceId,
     local: LocalId,
-    ctx: &mut GearCtx<KolorinkoRT, S>,
-    view: &mut S::View<'_>,
+    ctx: &mut GearCtx<KolorinkoRT>,
+    view: &mut GearView,
 ) -> ArticleView {
     crate::wikidot_page::article_latest(space, local, ctx, view).await
 }

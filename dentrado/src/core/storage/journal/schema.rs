@@ -10,7 +10,7 @@ use dentrado_journal::{Decl, Error, Journal, SchemaId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::record::{Event, LocData, LocGroup, LocSender, LocUser, Record};
+use super::record::{Event, LocData, LocGroup, LocSender, LocUser};
 use crate::{core::api::RuntimeTypes, types::Shape};
 
 /// The journal schemas one runtime writes: the record layouts and the nested
@@ -27,7 +27,6 @@ pub(crate) struct Schemas {
     pub event: SchemaId,
     pub group_value: SchemaId,
     pub data_value: SchemaId,
-    pub body_value: SchemaId,
 }
 
 impl Schemas {
@@ -35,23 +34,52 @@ impl Schemas {
     ///
     /// # Errors
     ///
-    /// Whatever [`Journal::intern`] refuses.
+    /// [`Error::ForeignValue`] if the log was written with a nested layout this
+    /// runtime does not have, or whatever [`Journal::intern`] refuses.
     pub(crate) async fn declare<R: RuntimeTypes>(journal: &mut Journal) -> Result<Self, Error> {
+        check_value_shapes::<R>(journal)?;
+        let user = declare::<LocUser>(journal, LocUser::NAME).await?;
+        let sender = declare::<LocSender>(journal, LocSender::NAME).await?;
+        let group = declare::<LocGroup>(journal, LocGroup::NAME).await?;
+        let data = declare::<LocData>(journal, LocData::NAME).await?;
+        let event = declare::<Event<'static>>(journal, Event::NAME).await?;
+        let group_value = intern_value::<R::Group>(journal).await?;
+        let data_value = intern_value::<R::Data>(journal).await?;
+        // No record names a body schema (an event carries raw bytes), but the
+        // log still declares the layout: a build whose `R::Body` differs must
+        // refuse the log at open rather than misdecode event bodies.
+        intern_value::<R::Body>(journal).await?;
         Ok(Self {
-            user: declare::<LocUser>(journal).await?,
-            sender: declare::<LocSender>(journal).await?,
-            group: declare::<LocGroup>(journal).await?,
-            data: declare::<LocData>(journal).await?,
-            event: declare::<Event<'static>>(journal).await?,
-            group_value: intern_value::<R::Group>(journal).await?,
-            data_value: intern_value::<R::Data>(journal).await?,
-            body_value: intern_value::<R::Body>(journal).await?,
+            user,
+            sender,
+            group,
+            data,
+            event,
+            group_value,
+            data_value,
         })
     }
 }
 
 /// The declaration name every nested value shape uses.
-const VALUE_NAME: &str = "dentrado/value";
+const VALUE_NAME: &str = "value";
+
+/// A log that already holds a nested layout this runtime does not have cannot
+/// be interpreted: event records name no body schema of their own, so their
+/// bytes would be decoded under the wrong shape.
+fn check_value_shapes<R: RuntimeTypes>(journal: &Journal) -> Result<(), Error> {
+    let known = [R::Group::shape(), R::Data::shape(), R::Body::shape()];
+    for decl in journal.decls().iter() {
+        if decl.name == VALUE_NAME && !known.contains(&decl.shape) {
+            return Err(Error::ForeignValue {
+                id: decl.id.0,
+                name: decl.name.clone(),
+                shape: decl.shape.clone(),
+            });
+        }
+    }
+    Ok(())
+}
 
 async fn intern_value<T: Shape>(journal: &mut Journal) -> Result<SchemaId, Error> {
     let shape = T::shape();
@@ -63,7 +91,7 @@ async fn intern_value<T: Shape>(journal: &mut Journal) -> Result<SchemaId, Error
         .await
 }
 
-/// Declares `R`'s layout in `journal` on first use and returns its id.
+/// Declares `shape` under `name` in `journal` on first use and returns its id.
 ///
 /// The shape is computed once per call; the journal's registry does the
 /// deduplication, so a second call is a lookup, not a second declaration.
@@ -72,11 +100,11 @@ async fn intern_value<T: Shape>(journal: &mut Journal) -> Result<SchemaId, Error
 ///
 /// Whatever [`Journal::intern`] refuses — a shape conflict, the format's own
 /// ids, or a full registry.
-pub async fn declare<R: Record>(journal: &mut Journal) -> Result<SchemaId, Error> {
-    let shape = R::shape();
+pub async fn declare<T: Shape>(journal: &mut Journal, name: &str) -> Result<SchemaId, Error> {
+    let shape = T::shape();
     journal
         .intern(Decl {
-            name: R::NAME,
+            name,
             shape: &shape,
         })
         .await

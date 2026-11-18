@@ -29,7 +29,7 @@ const PARSED_KEY: &[u8] = b"parsed";
 
 /// Load the parse cache from the view; an absent or unreadable image is a
 /// cold start (the parse is recomputable, never authoritative).
-async fn load_parsed<V: GearView>(view: &mut V) -> ParsedCache {
+async fn load_parsed(view: &mut GearView) -> ParsedCache {
     let Some(bytes) = chunked::load(view, PARSED_KEY).await else {
         return ParsedCache::default();
     };
@@ -46,7 +46,7 @@ async fn load_parsed<V: GearView>(view: &mut V) -> ParsedCache {
 }
 
 /// Stage the parse cache as a chunked image in the view.
-async fn store_parsed<V: GearView>(view: &mut V, cache: &ParsedCache) {
+async fn store_parsed(view: &mut GearView, cache: &ParsedCache) {
     let image = ParsedImage {
         archive: cache.archive.clone(),
         view: cache.view.clone(),
@@ -59,11 +59,11 @@ async fn store_parsed<V: GearView>(view: &mut V, cache: &ParsedCache) {
 /// `[[include]]` directives. Keyed canonically and living off the `repo`
 /// core, it reads the site's [`RepoMeta`] and the page's archive directly
 /// (never depending on another parse gear), so the parse layer is acyclic.
-pub(crate) async fn article_latest_parsed<S: IsStorage<KolorinkoRT>>(
+pub(crate) async fn article_latest_parsed(
     space: SpaceId,
     local: LocalId,
-    ctx: &mut GearCtx<KolorinkoRT, S>,
-    view: &mut S::View<'_>,
+    ctx: &mut GearCtx<KolorinkoRT>,
+    view: &mut GearView,
 ) -> ArticleView {
     let cache = load_parsed(view).await;
     let Some(site) = crate::globals::site_of(&space).cloned() else {
@@ -116,11 +116,11 @@ pub(crate) async fn article_latest_parsed<S: IsStorage<KolorinkoRT>>(
 /// immutable archives named by that metadata. An unregistered space or
 /// unknown local id yields an empty view (the HTTP layer turns that into a
 /// 404).
-pub(crate) async fn article_latest<S: IsStorage<KolorinkoRT>>(
+pub(crate) async fn article_latest(
     space: SpaceId,
     local: LocalId,
-    ctx: &mut GearCtx<KolorinkoRT, S>,
-    _view: &mut S::View<'_>,
+    ctx: &mut GearCtx<KolorinkoRT>,
+    _view: &mut GearView,
 ) -> ArticleView {
     let Some(site) = crate::globals::site_of(&space).cloned() else {
         return ArticleView::default();
@@ -177,13 +177,13 @@ pub(super) trait PageSource {
 
 /// The live source: `Repo` metadata through the gear graph, bodies from the
 /// publication directory the process globals name.
-pub(super) struct GearSource<'a, S: IsStorage<KolorinkoRT>> {
-    ctx: &'a mut GearCtx<KolorinkoRT, S>,
+pub(super) struct GearSource<'a> {
+    ctx: &'a mut GearCtx<KolorinkoRT>,
     metas: HashMap<SafePathComponent, RepoMeta>,
 }
 
-impl<'a, S: IsStorage<KolorinkoRT>> GearSource<'a, S> {
-    pub(super) fn new(ctx: &'a mut GearCtx<KolorinkoRT, S>) -> Self {
+impl<'a> GearSource<'a> {
+    pub(super) fn new(ctx: &'a mut GearCtx<KolorinkoRT>) -> Self {
         Self {
             ctx,
             metas: HashMap::new(),
@@ -191,7 +191,7 @@ impl<'a, S: IsStorage<KolorinkoRT>> GearSource<'a, S> {
     }
 }
 
-impl<S: IsStorage<KolorinkoRT>> PageSource for GearSource<'_, S> {
+impl PageSource for GearSource<'_> {
     async fn meta(&mut self, site: &SafePathComponent) -> Option<RepoMeta> {
         if let Some(meta) = self.metas.get(site) {
             return Some(meta.clone());

@@ -1,18 +1,18 @@
 use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, Timeline};
 use crate::core::gear::EmptyRuntime;
 use crate::core::loc_ctx::StoredEvent;
-use crate::core::storage::{GroupStore, InMemoryStorage, IsStorage};
+use crate::core::storage::{CacheStorage, GroupStore};
 use crate::test_support::block_on;
 use crate::types::{GroupEventId, LocGroupId, LocMsgTypeId, NodeId, SenderPk};
 use imbl::OrdMap;
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 
-type Store = InMemoryStorage<EmptyRuntime>;
+type Store = CacheStorage<EmptyRuntime>;
 
 const PK_A: SenderPk = SenderPk([0u8; 32]);
 
-fn gs(ctx: &Store) -> GroupStore<'_, EmptyRuntime, Store> {
+fn gs(ctx: &Store) -> GroupStore<'_, EmptyRuntime> {
     GroupStore::new(ctx, LocGroupId(0))
 }
 
@@ -21,7 +21,7 @@ fn eid(local_id: u64) -> SGEventId {
 }
 
 fn make_test_ctx(num_events: u64) -> Store {
-    let ctx = InMemoryStorage::<EmptyRuntime>::default();
+    let ctx = CacheStorage::<EmptyRuntime>::default();
     let sid_a = block_on(ctx.mk_loc_sender(PK_A, None));
     block_on(ctx.mk_loc_group(LocMsgTypeId(0), ()));
     for i in 0..num_events {
@@ -68,7 +68,7 @@ enum SiteEvent {
 
 async fn site_handler<R: async FnMut(&SGEventId) -> Timeline<(), ()>>(
     event: &SiteEvent,
-    ctx: &mut HandlerCtx<'_, SGEventId, (), (), EmptyRuntime, Store, SGEventId, SiteAccessLevel, R>,
+    ctx: &mut HandlerCtx<'_, SGEventId, (), (), EmptyRuntime, SGEventId, SiteAccessLevel, R>,
 ) {
     match event {
         SiteEvent::AdminSetAccessLevel {
@@ -90,7 +90,7 @@ async fn site_handler<R: async FnMut(&SGEventId) -> Timeline<(), ()>>(
 
 async fn oneshot(
     events: &[(SGEventId, SiteEvent)],
-    ctx: &GroupStore<'_, EmptyRuntime, Store>,
+    ctx: &GroupStore<'_, EmptyRuntime>,
 ) -> StateGraph<SGEventId, (), (), SGEventId, SiteAccessLevel> {
     let mut sg = StateGraph::new();
     let store: BTreeMap<u64, (u32, SiteEvent)> = events
@@ -127,7 +127,7 @@ async fn oneshot(
 
 async fn multishot(
     events: &[(SGEventId, SiteEvent)],
-    ctx: &GroupStore<'_, EmptyRuntime, Store>,
+    ctx: &GroupStore<'_, EmptyRuntime>,
 ) -> StateGraph<SGEventId, (), (), SGEventId, SiteAccessLevel> {
     let mut sg = StateGraph::new();
     let store: BTreeMap<u64, (u32, SiteEvent)> = events

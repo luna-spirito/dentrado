@@ -15,10 +15,7 @@ use super::*;
 /// dependency (so an edit to either re-runs this gear). The client fetches the
 /// entire site frame under one subscription that survives page navigation
 /// within the space.
-pub(crate) async fn shell<S: IsStorage<KolorinkoRT>>(
-    space: SpaceId,
-    ctx: &mut GearCtx<KolorinkoRT, S>,
-) -> SiteShell {
+pub(crate) async fn shell(space: SpaceId, ctx: &mut GearCtx<KolorinkoRT>) -> SiteShell {
     let Some(site) = crate::globals::site_of(&space).cloned() else {
         return SiteShell::default();
     };

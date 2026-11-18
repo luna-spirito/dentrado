@@ -1,4 +1,4 @@
-//! `PagedStorage` in journal mode, end to end: localization and events land in
+//! `CacheStorage` in journal mode, end to end: localization and events land in
 //! the journal, the fold rebuilds them on reopen, event bodies come back from
 //! the cache, and the gear views in the same page store survive too.
 //!
@@ -11,7 +11,7 @@ use dentrado::{
         core_ctx::GearCtx,
         gear::{GearInput, GearMeta, GearProduce, IsRuntime, RuntimeTypes},
         loc_ctx::StoredEvent,
-        storage::{GearView, IsStorage, PagedStorage, Watermark},
+        storage::{CacheStorage, GearView, Watermark},
     },
     types::*,
 };
@@ -131,10 +131,10 @@ impl IsRuntime for TestRuntime {
         }
     }
 
-    async fn run_step<S: IsStorage<Self>>(
-        _ctx: &mut GearCtx<Self, S>,
+    async fn run_step(
+        _ctx: &mut GearCtx<Self>,
         _input: GearInput<Self>,
-        _view: &mut S::View<'_>,
+        _view: &mut GearView,
     ) -> GearProduce<Self> {
         unreachable!("this test drives storage directly")
     }
@@ -164,7 +164,7 @@ fn body(text: &str, revision: u64) -> TestBody {
 
 /// Writes one user, sender, group, data value, event and gear view, then
 /// flushes.
-async fn write(st: &PagedStorage<TestRuntime>) -> Fixture {
+async fn write(st: &CacheStorage<TestRuntime>) -> Fixture {
     let user = st.mk_loc_user(UID).await;
     let sender = st.mk_loc_sender(PK, Some(UID)).await;
 
@@ -223,7 +223,7 @@ async fn write(st: &PagedStorage<TestRuntime>) -> Fixture {
 }
 
 /// Read every layer back and check it against what `write` recorded.
-async fn verify(st: &PagedStorage<TestRuntime>, fixture: &Fixture) {
+async fn verify(st: &CacheStorage<TestRuntime>, fixture: &Fixture) {
     verify_journal(st, fixture).await;
     let mut view = st.gear_view(&TestGear::Note { key: 1 }).await;
     assert_eq!(
@@ -233,7 +233,7 @@ async fn verify(st: &PagedStorage<TestRuntime>, fixture: &Fixture) {
 }
 
 /// The journal-side layers: localization, data, events, changelog.
-async fn verify_journal(st: &PagedStorage<TestRuntime>, fixture: &Fixture) {
+async fn verify_journal(st: &CacheStorage<TestRuntime>, fixture: &Fixture) {
     assert_eq!(st.user_by_local(fixture.user).await, Some(UID));
     assert_eq!(st.sender_user(fixture.sender).await, Some(fixture.user));
     assert_eq!(st.sender_pk(fixture.sender).await, Some(PK));
@@ -306,7 +306,7 @@ fn a_journaled_store_reopens_with_every_layer_intact() {
         let journal = file.with_extension("journal");
 
         let fixture = {
-            let st: PagedStorage<TestRuntime> = PagedStorage::on_disk(file.clone());
+            let st: CacheStorage<TestRuntime> = CacheStorage::on_disk(file.clone());
             let fixture = write(&st).await;
             verify(&st, &fixture).await;
             fixture
@@ -314,7 +314,7 @@ fn a_journaled_store_reopens_with_every_layer_intact() {
         assert!(journal.is_dir(), "the journal lives beside the cache");
         assert!(file.is_file(), "the cache image was written");
 
-        let st: PagedStorage<TestRuntime> = PagedStorage::on_disk(file.clone());
+        let st: CacheStorage<TestRuntime> = CacheStorage::on_disk(file.clone());
         verify(&st, &fixture).await;
 
         // A fresh event lands after the replayed ones: the dedup index and the
@@ -349,7 +349,7 @@ fn the_journal_alone_rebuilds_a_lost_cache() {
         let file = dir.path().join("core-0.dstore");
 
         let fixture = {
-            let st: PagedStorage<TestRuntime> = PagedStorage::on_disk(file.clone());
+            let st: CacheStorage<TestRuntime> = CacheStorage::on_disk(file.clone());
             write(&st).await
         };
 
@@ -358,7 +358,7 @@ fn the_journal_alone_rebuilds_a_lost_cache() {
         // events, or their bodies.
         std::fs::remove_file(&file).unwrap();
 
-        let st: PagedStorage<TestRuntime> = PagedStorage::on_disk(file);
+        let st: CacheStorage<TestRuntime> = CacheStorage::on_disk(file);
         verify_journal(&st, &fixture).await;
         let mut view = st.gear_view(&TestGear::Note { key: 1 }).await;
         assert!(
@@ -377,7 +377,7 @@ fn a_superseding_observation_removes_the_stored_slot() {
     run(async {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("core-0.dstore");
-        let st: PagedStorage<TestRuntime> = PagedStorage::on_disk(file);
+        let st: CacheStorage<TestRuntime> = CacheStorage::on_disk(file);
         let fixture = write(&st).await;
 
         // Same `(sender, tx_id)`, earlier timestamp: the earlier observation

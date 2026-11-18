@@ -32,7 +32,7 @@ fn block_key(key: &[u8], index: usize) -> Vec<u8> {
 }
 
 /// Stage `bytes` as a fresh chunked image under `key`.
-pub(super) async fn store<V: GearView>(view: &mut V, key: &[u8], bytes: &[u8]) {
+pub(super) async fn store(view: &mut GearView, key: &[u8], bytes: &[u8]) {
     // The previous image may have had a different block count; drop it all.
     for (old, _) in view.scan(&block_prefix(key)).await {
         view.del(&old);
@@ -50,7 +50,7 @@ pub(super) async fn store<V: GearView>(view: &mut V, key: &[u8], bytes: &[u8]) {
 
 /// Load and decompress the image under `key`. `None` when the manifest or
 /// any block is missing or unreadable — the caller cold-starts.
-pub(super) async fn load<V: GearView>(view: &mut V, key: &[u8]) -> Option<Vec<u8>> {
+pub(super) async fn load(view: &mut GearView, key: &[u8]) -> Option<Vec<u8>> {
     let count = view.get(key).await?;
     let count = u32::from_le_bytes(count.as_slice().try_into().ok()?);
     let mut out = Vec::new();

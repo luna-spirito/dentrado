@@ -19,7 +19,7 @@ use crate::{
         },
         gear::IsRuntime,
         routing::{route_events, route_gear},
-        storage::IsStorage,
+        storage::CacheStorage,
     },
     types::NodeId,
     wire::{MergeError, RunGearError, WireEventBody, WireLocCtx},
@@ -29,7 +29,14 @@ use futures::future::select_all;
 
 pub use crate::core::doorbell::{Doorbell, DoorbellHandle};
 
-pub struct DbConfig<R: IsRuntime, S: IsStorage<R>> {
+/// Core-thread stack size. A debug build nests the event loop's async state
+/// machines — the loop awaits a gear run, which awaits storage, which holds
+/// both disk variants of the concrete backend — and the default 2 MiB is not
+/// enough for the deepest gear chains. Virtual memory only; committed pages
+/// are what the thread actually touches.
+const CORE_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+pub struct DbConfig<R: IsRuntime> {
     pub num_cores: NonZero<u32>,
     pub node_id: NodeId,
     pub module: Arc<R::Module>,
@@ -43,7 +50,7 @@ pub struct DbConfig<R: IsRuntime, S: IsStorage<R>> {
     /// free to hold `!Send` single-threaded types like `Rc`/`RefCell`.
     /// Per-core storage constructor, given the core's id (so a disk backend
     /// can name its per-core files deterministically, not by startup order).
-    pub make_storage: Arc<dyn Fn(u32) -> S + Send + Sync>,
+    pub make_storage: Arc<dyn Fn(u32) -> CacheStorage<R> + Send + Sync>,
 }
 
 pub struct PeerChannels<R: IsRuntime> {
@@ -96,8 +103,8 @@ impl<R: IsRuntime> Db<R> {
     /// Start the database with no user worker function.
     /// Cores run only the core event loop.
     #[must_use]
-    pub fn start<S: IsStorage<R>>(config: DbConfig<R, S>) -> io::Result<Self> {
-        Self::start_with_worker::<S, _, _>(config, |_| std::future::pending::<()>())
+    pub fn start(config: DbConfig<R>) -> io::Result<Self> {
+        Self::start_with_worker(config, |_| std::future::pending::<()>())
     }
 
     /// Start the database with a user-provided worker function per core.
@@ -116,12 +123,9 @@ impl<R: IsRuntime> Db<R> {
     /// serving with a hole would only strand work routed through the
     /// dead core.
     #[must_use]
-    pub fn start_with_worker<S: IsStorage<R>, W, F>(
-        mut config: DbConfig<R, S>,
-        worker_fn: W,
-    ) -> io::Result<Self>
+    pub fn start_with_worker<W, F>(mut config: DbConfig<R>, worker_fn: W) -> io::Result<Self>
     where
-        W: Fn(Rc<Core<R, S>>) -> F + Clone + Send + 'static,
+        W: Fn(Rc<Core<R>>) -> F + Clone + Send + 'static,
         F: Future<Output = ()> + 'static,
     {
         let num_cores = config.num_cores;
@@ -218,7 +222,7 @@ impl<R: IsRuntime> Db<R> {
 
             let join = thread::Builder::new()
                 .name(format!("dentrado-core-{core_id}"))
-                // .stack_size(CORE_THREAD_STACK_SIZE)
+                .stack_size(CORE_THREAD_STACK_SIZE)
                 .spawn(move || {
                     // Death guard: if this thread exits other than via a clean
                     // event-loop shutdown (a panic, a runtime-build failure),
@@ -456,8 +460,8 @@ fn build_core_runtime(core_id: u32) -> compio::runtime::Runtime {
     unreachable!()
 }
 
-async fn core_event_loop<R: IsRuntime, S: IsStorage<R>>(
-    state: Rc<Core<R, S>>,
+async fn core_event_loop<R: IsRuntime>(
+    state: Rc<Core<R>>,
     doorbell: Doorbell,
     cmd_rx: mpsc::Receiver<CoordCmd<R>>,
     intercore_rxs: Vec<mpsc::Receiver<InterCoreMsg<R>>>,

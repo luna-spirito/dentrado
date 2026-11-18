@@ -15,7 +15,7 @@ pub struct StoredEvent<B> {
 /// An observation that changes nothing (a stale copy) stores no body and has
 /// no delta, so [`store_event`] returns `None` rather than an empty one.
 ///
-/// [`store_event`]: crate::core::storage::IsStorage::store_event
+/// [`store_event`]: crate::core::storage::CacheStorage::store_event
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GroupDelta {
     pub added: Option<GroupEventId>,

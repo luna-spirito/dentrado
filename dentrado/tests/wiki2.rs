@@ -4,7 +4,7 @@ use dentrado::{
     core::{
         core_ctx::GearCtx,
         gear::{GearInput, GearMeta, GearProduce, GearResult, IsRuntime, RuntimeTypes},
-        storage::{InMemoryStorage, IsStorage, Watermark},
+        storage::{GearView, Watermark},
     },
     types::*,
     utils::{
@@ -276,10 +276,10 @@ impl IsRuntime for Wiki2Runtime {
         }
     }
 
-    async fn run_step<S: IsStorage<Self>>(
-        ctx: &mut GearCtx<Self, S>,
+    async fn run_step(
+        ctx: &mut GearCtx<Self>,
         input: GearInput<Self>,
-        _view: &mut S::View<'_>,
+        _view: &mut GearView,
     ) -> GearProduce<Self> {
         let gear = ctx.gear().clone();
         let mut cache = take_cache(&gear);
@@ -290,8 +290,8 @@ impl IsRuntime for Wiki2Runtime {
 }
 
 impl Wiki2Runtime {
-    async fn run_gear<S: IsStorage<Self>>(
-        ctx: &mut GearCtx<Self, S>,
+    async fn run_gear(
+        ctx: &mut GearCtx<Self>,
         input: GearInput<Self>,
         cache: &mut Wiki2Cache,
     ) -> GearProduce<Self> {
@@ -321,7 +321,6 @@ impl Wiki2Runtime {
                     (),
                     (),
                     Self,
-                    S,
                     LocUserId,
                     bool,
                     _,
@@ -423,7 +422,6 @@ impl Wiki2Runtime {
                     LocUserId,
                     bool,
                     Self,
-                    S,
                     LocDataId,
                     TextAgg,
                     _,
@@ -512,10 +510,7 @@ impl Wiki2Runtime {
     }
 }
 
-fn add_seed_branch(
-    tc: &mut TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>>,
-    creator_uid: LocUserId,
-) -> LocDataId {
+fn add_seed_branch(tc: &mut TestCluster<Wiki2Runtime>, creator_uid: LocUserId) -> LocDataId {
     let b0 = tc.add_data(BranchData {
         creator: creator_uid,
         created_at: 1,
@@ -618,7 +613,7 @@ fn count_branches(sg: &Timeline<LocDataId, TextAgg>) -> usize {
 /// approves of. The gear's group and its event group are the same value, so
 /// one hash decides both.
 fn find_doc_id(
-    tc: &TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>>,
+    tc: &TestCluster<Wiki2Runtime>,
     num_cores: u32,
     accept: impl Fn(u32) -> bool,
 ) -> u64 {
@@ -628,25 +623,20 @@ fn find_doc_id(
 }
 
 fn find_cross_core_doc_id(
-    tc: &TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>>,
+    tc: &TestCluster<Wiki2Runtime>,
     invited_core: u32,
     num_cores: u32,
 ) -> u64 {
     find_doc_id(tc, num_cores, |core| core != invited_core)
 }
 
-fn find_same_core_doc_id(
-    tc: &TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>>,
-    invited_core: u32,
-    num_cores: u32,
-) -> u64 {
+fn find_same_core_doc_id(tc: &TestCluster<Wiki2Runtime>, invited_core: u32, num_cores: u32) -> u64 {
     find_doc_id(tc, num_cores, |core| core == invited_core)
 }
 
 #[test]
 fn invited_simple_e2e() {
-    let mut tc: TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>> =
-        TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -699,8 +689,7 @@ fn invited_simple_e2e() {
 
 #[test]
 fn doc_content_same_core_e2e() {
-    let mut tc: TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>> =
-        TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -768,8 +757,7 @@ fn doc_content_same_core_e2e() {
 
 #[test]
 fn doc_content_cross_core_e2e() {
-    let mut tc: TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>> =
-        TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -832,8 +820,7 @@ fn doc_content_cross_core_e2e() {
 
 #[test]
 fn retroactive_invite_cross_core_e2e() {
-    let mut tc: TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>> =
-        TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -939,8 +926,7 @@ fn retroactive_invite_cross_core_e2e() {
 
 #[test]
 fn text_agg_merge_cross_core_e2e() {
-    let mut tc: TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>> =
-        TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -1026,8 +1012,7 @@ fn text_agg_merge_cross_core_e2e() {
 
 #[test]
 fn multi_user_doc_assembly_cross_core_e2e() {
-    let mut tc: TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>> =
-        TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,
@@ -1149,8 +1134,7 @@ fn multi_user_doc_assembly_cross_core_e2e() {
 
 #[test]
 fn retroactive_invite_point_in_time_same_core_e2e() {
-    let mut tc: TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>> =
-        TestCluster::start(&[2, 3, 4], ());
+    let mut tc: TestCluster<Wiki2Runtime> = TestCluster::start(&[2, 3, 4], ());
 
     let alice_uid = UserId {
         id: 1,

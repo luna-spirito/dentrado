@@ -8,7 +8,7 @@ use crate::{
     core::{
         api::RuntimeTypes,
         loc_ctx::StoredEvent,
-        storage::{IsStorage, Watermark, journal::schema},
+        storage::{Watermark, journal::schema},
     },
     types::{
         DataId, GroupEventId, IdentityServerPk, LocDataId, LocGroupId, LocMsgTypeId, LocSenderId,
@@ -66,7 +66,7 @@ fn body() -> StoredEvent<()> {
     }
 }
 
-async fn write(st: &CacheStorage<TestRuntime, dentrado_cache::disk::FsDisk>) -> Fixture {
+async fn write(st: &CacheStorage<TestRuntime>) -> Fixture {
     let user = st.mk_loc_user(UID).await;
     let sender = st.mk_loc_sender(PK, Some(UID)).await;
     let data_id = DataId {
@@ -91,7 +91,7 @@ async fn write(st: &CacheStorage<TestRuntime, dentrado_cache::disk::FsDisk>) -> 
     }
 }
 
-async fn verify(st: &CacheStorage<TestRuntime, dentrado_cache::disk::FsDisk>, fixture: &Fixture) {
+async fn verify(st: &CacheStorage<TestRuntime>, fixture: &Fixture) {
     assert_eq!(st.user_by_local(fixture.user).await, Some(UID));
     assert_eq!(st.sender_user(fixture.sender).await, Some(fixture.user));
     assert_eq!(st.sender_pk(fixture.sender).await, Some(PK));
@@ -120,13 +120,11 @@ fn a_warm_cache_restarts_without_visiting_the_journal() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("core.dstore");
         let fixture = {
-            let st: CacheStorage<TestRuntime, dentrado_cache::disk::FsDisk> =
-                CacheStorage::on_disk(file.clone());
+            let st: CacheStorage<TestRuntime> = CacheStorage::on_disk(file.clone());
             write(&st).await
         };
 
-        let st: CacheStorage<TestRuntime, dentrado_cache::disk::FsDisk> =
-            CacheStorage::on_disk(file);
+        let st: CacheStorage<TestRuntime> = CacheStorage::on_disk(file);
         assert_eq!(st.replayed().await, 0, "the image is complete");
         verify(&st, &fixture).await;
 
@@ -151,14 +149,12 @@ fn a_lost_cache_is_refilled_from_the_journal() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("core.dstore");
         let fixture = {
-            let st: CacheStorage<TestRuntime, dentrado_cache::disk::FsDisk> =
-                CacheStorage::on_disk(file.clone());
+            let st: CacheStorage<TestRuntime> = CacheStorage::on_disk(file.clone());
             write(&st).await
         };
         std::fs::remove_file(&file).unwrap();
 
-        let st: CacheStorage<TestRuntime, dentrado_cache::disk::FsDisk> =
-            CacheStorage::on_disk(file);
+        let st: CacheStorage<TestRuntime> = CacheStorage::on_disk(file);
         assert!(st.replayed().await > 0, "the journal was replayed");
         verify(&st, &fixture).await;
     });
@@ -170,16 +166,14 @@ fn a_replaced_journal_wipes_the_stale_cache() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("core.dstore");
         let fixture = {
-            let st: CacheStorage<TestRuntime, dentrado_cache::disk::FsDisk> =
-                CacheStorage::on_disk(file.clone());
+            let st: CacheStorage<TestRuntime> = CacheStorage::on_disk(file.clone());
             write(&st).await
         };
 
         // A different log: its identity does not match the cache's meta.
         std::fs::remove_dir_all(file.with_extension("journal")).unwrap();
 
-        let st: CacheStorage<TestRuntime, dentrado_cache::disk::FsDisk> =
-            CacheStorage::on_disk(file);
+        let st: CacheStorage<TestRuntime> = CacheStorage::on_disk(file);
         assert_eq!(st.replayed().await, 0, "the new log is empty");
         assert_eq!(
             st.user_by_local(fixture.user).await,
@@ -225,7 +219,7 @@ fn replay_refuses_a_foreign_record() {
         journal.sync().await.unwrap();
         drop(journal);
 
-        let cache: CacheStorage<TestRuntime, dentrado_cache::disk::FsDisk> =
+        let cache: CacheStorage<TestRuntime> =
             CacheStorage::on_disk(dir.path().join("core.dstore"));
         let err = cache.open().await.err().expect("the open must fail");
         assert!(err.contains("is not a dentrado record"), "{err}");
@@ -269,7 +263,7 @@ fn a_nested_layout_mismatch_is_refused() {
         journal.sync().await.unwrap();
         drop(journal);
 
-        let cache: CacheStorage<TestRuntime, dentrado_cache::disk::FsDisk> =
+        let cache: CacheStorage<TestRuntime> =
             CacheStorage::on_disk(dir.path().join("core.dstore"));
         let err = cache.open().await.err().expect("the open must fail");
         assert!(err.contains("has shape"), "{err}");
