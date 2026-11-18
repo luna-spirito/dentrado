@@ -3,28 +3,20 @@
 //! The journal is domain-blind, so this adapter is where a record regains
 //! meaning: a `LocUser` becomes a localized user, a `LocGroup` carries its
 //! group value under a declared schema, and an `Event` becomes an observation
-//! of its group (its body is already raw bytes, whose layout the log declares
-//! once). Nested payloads (`group`, `content`) are decoded with the schema id
-//! the record names, after checking that the declaration is this runtime's
-//! layout.
+//! of its group. Nested payloads (`group`, `content`) are decoded with the
+//! schema id the record names, after checking that the declaration is this
+//! runtime's layout.
 //!
-//! Replay drives the very same [`Ops`] transitions the live path uses, so the
-//! two cannot disagree about dedup, slots, or counters.
-//!
-//! Declarations and the log's identity are format metadata: the adapter skips
-//! them. Any other schema id must name a dentrado record; an unknown one is a
-//! log this build cannot interpret, not something to guess about.
+//! Replay drives the same [`fold`] the live path uses; only the sink differs
+//! (replay writes straight to the cache).
 
-use std::{fmt, ops::ControlFlow};
+use std::{fmt, io, ops::ControlFlow};
 
-use dentrado_cache::disk::IsFilesystem;
+use dentrado_cache::{Storage, disk::IsFilesystem};
 use dentrado_journal::{Cursor, Frame, Journal, ReplayError, SchemaId};
 use serde::de::DeserializeOwned;
 
-use super::{
-    codec,
-    ops::{EventOutcome, Ops},
-};
+use super::{codec, delta::Sequencer, events, fold, live, rows::Row, tables::Tables};
 use crate::{
     core::{
         api::RuntimeTypes,
@@ -39,6 +31,27 @@ use crate::{
     },
 };
 
+/// Replay's sink: each record's rows land in one cache session.
+struct CacheSink<'a, D: IsFilesystem> {
+    cache: &'a Storage<D>,
+}
+
+impl<D: IsFilesystem> super::rows::Sink for CacheSink<'_, D> {
+    async fn get(&mut self, table: dentrado_cache::TableId, key: &[u8]) -> Option<Vec<u8>> {
+        self.cache.get(table, key).await.expect("read the cache")
+    }
+
+    fn put(&mut self, rows: Vec<Row>) {
+        let mut session = self.cache.session();
+        for row in rows {
+            session
+                .put(row.table, &row.key, &row.value, &[], &[])
+                .expect("stage a replayed row");
+        }
+        session.commit().expect("commit a replayed row");
+    }
+}
+
 /// What a declaration is, once its shape matches one of dentrado's records.
 #[derive(Clone, Copy)]
 enum Kind {
@@ -50,8 +63,7 @@ enum Kind {
 }
 
 /// The record schemas this log declared, plus the nested layouts the runtime
-/// expects. The writer ([`schema::Schemas::declare`]) assigned these ids, so
-/// replay never searches by shape at runtime.
+/// expects.
 struct Replay {
     records: Vec<(SchemaId, Kind)>,
     group: String,
@@ -60,26 +72,28 @@ struct Replay {
 
 impl Replay {
     fn new<R: RuntimeTypes>(schemas: &schema::Schemas) -> Self {
-        let records = vec![
-            (schemas.user, Kind::User),
-            (schemas.sender, Kind::Sender),
-            (schemas.group, Kind::Group),
-            (schemas.data, Kind::Data),
-            (schemas.event, Kind::Event),
-        ];
         Self {
-            records,
+            records: vec![
+                (schemas.user, Kind::User),
+                (schemas.sender, Kind::Sender),
+                (schemas.group, Kind::Group),
+                (schemas.data, Kind::Data),
+                (schemas.event, Kind::Event),
+            ],
             group: R::Group::shape(),
             data: R::Data::shape(),
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn apply<R: RuntimeTypes, D: IsFilesystem>(
         &self,
         journal: &Journal,
         at: Cursor,
         frame: Frame<'_>,
-        ops: &Ops<'_, R, D>,
+        cache: &Storage<D>,
+        tables: &Tables,
+        seq: &Sequencer,
     ) -> Result<bool, Error> {
         // Segment zero carries the log's own metadata, not state to apply.
         if matches!(frame.schema, SchemaId::DECL | SchemaId::IDENTITY) {
@@ -95,30 +109,42 @@ impl Replay {
                 id: frame.schema.0,
             });
         };
-        let applied = match kind {
+        let mut sink = CacheSink { cache };
+        match kind {
             Kind::User => {
                 let rec: LocUser = decode(at, "loc-user", frame.payload)?;
-                ops.apply_user(
-                    LocUserId(rec.loc),
+                let loc = LocUserId(rec.loc);
+                fold::user(
+                    &mut sink,
+                    tables,
+                    loc,
                     UserId {
                         id: rec.id,
                         identity_server_pk: IdentityServerPk(rec.identity_server_pk),
                     },
                 )
                 .await
+                .map_err(|message| Error::Apply { at, message })?;
+                seq.observe(super::delta::Counter::User, rec.loc);
             }
             Kind::Sender => {
                 let rec: LocSender = decode(at, "loc-sender", frame.payload)?;
-                ops.apply_sender(
+                fold::sender(
+                    &mut sink,
+                    tables,
                     LocSenderId(rec.loc),
                     SenderPk(rec.pk),
                     rec.user.map(LocUserId),
                 )
                 .await
+                .map_err(|message| Error::Apply { at, message })?;
+                seq.observe(super::delta::Counter::Sender, rec.loc);
             }
             Kind::Group => {
                 let rec: LocGroup = decode(at, "loc-group", frame.payload)?;
-                let group = decode_nested(
+                // Decode only to prove the named schema is this runtime's
+                // group layout; the cache keeps the bytes verbatim.
+                let _: R::Group = decode_nested(
                     journal,
                     at,
                     "group",
@@ -126,12 +152,20 @@ impl Replay {
                     rec.group_schema,
                     &rec.group,
                 )?;
-                ops.apply_group(LocGroupId(rec.loc), LocMsgTypeId(rec.msg_type), &group)
-                    .await
+                fold::group(
+                    &mut sink,
+                    tables,
+                    LocGroupId(rec.loc),
+                    LocMsgTypeId(rec.msg_type),
+                    &rec.group,
+                )
+                .await
+                .map_err(|message| Error::Apply { at, message })?;
+                seq.observe(super::delta::Counter::Group, rec.loc);
             }
             Kind::Data => {
                 let rec: LocData = decode(at, "loc-data", frame.payload)?;
-                let content = decode_nested(
+                let content: R::Data = decode_nested(
                     journal,
                     at,
                     "data",
@@ -139,39 +173,38 @@ impl Replay {
                     rec.content_schema,
                     &rec.content,
                 )?;
-                ops.apply_data(
-                    LocDataId(rec.loc),
-                    DataId {
-                        timestamp: rec.timestamp,
-                        hash: rec.hash,
-                    },
-                    &content,
-                )
-                .await
+                let data_id = DataId {
+                    timestamp: rec.timestamp,
+                    hash: rec.hash,
+                };
+                live::verify_data::<R, D>(cache, tables, seq, data_id, &content)
+                    .await
+                    .map_err(|e| Error::Apply {
+                        at,
+                        message: e.to_string(),
+                    })?;
+                fold::data(&mut sink, tables, LocDataId(rec.loc), data_id, &rec.content)
+                    .await
+                    .map_err(|message| Error::Apply { at, message })?;
+                seq.observe(super::delta::Counter::Data, rec.loc);
             }
             Kind::Event => {
                 let ev = Event::decode(frame.payload).ok_or(Error::ShortEvent { at })?;
                 let value =
                     codec::event_bytes(ev.sender, ev.tx_id, ev.timestamp, ev.source_node, ev.body);
-                let group = LocGroupId(ev.group);
-                match ops
-                    .event_outcome(group, LocSenderId(ev.sender), ev.tx_id, &value)
-                    .await
-                {
-                    EventOutcome::New(slot) => {
-                        ops.put_event(group, slot, &value).await;
-                        Ok(())
-                    }
-                    EventOutcome::Same => Ok(()),
-                    EventOutcome::Conflict => {
-                        todo!("supersede: rank by (authoritative, timestamp, source_node)")
-                    }
-                }
+                events::replay(
+                    cache,
+                    tables,
+                    LocGroupId(ev.group),
+                    LocSenderId(ev.sender),
+                    ev.tx_id,
+                    &value,
+                )
+                .await
+                .map_err(|message| Error::Apply { at, message })?;
             }
-        };
-        applied
-            .map(|()| true)
-            .map_err(|message| Error::Apply { at, message })
+        }
+        Ok(true)
     }
 }
 
@@ -218,24 +251,24 @@ fn decode<T: DeserializeOwned>(at: Cursor, what: &'static str, bytes: &[u8]) -> 
     postcard::from_bytes(bytes).map_err(|source| Error::Decode { at, what, source })
 }
 
-/// Replays `[from, head)` into `ops`, returning how many records were applied.
-///
-/// # Errors
-///
-/// [`ReplayError::Log`] if the journal is damaged, [`ReplayError::Visit`] if a
-/// record cannot be applied to this runtime (a layout mismatch, a loc id out of
-/// order, a malformed payload).
+/// Replays `[from, head)` into the cache, returning how many records were
+/// applied.
 pub(super) async fn replay<R: RuntimeTypes, D: IsFilesystem>(
     journal: &Journal,
     schemas: &schema::Schemas,
     from: Cursor,
-    ops: &Ops<'_, R, D>,
+    cache: &Storage<D>,
+    tables: &Tables,
+    seq: &Sequencer,
 ) -> Result<usize, ReplayError<Error>> {
     let replay = Replay::new::<R>(schemas);
     let mut applied = 0usize;
     journal
         .try_replay_from(from, async |at, frame| {
-            if replay.apply(journal, at, frame, ops).await? {
+            if replay
+                .apply::<R, D>(journal, at, frame, cache, tables, seq)
+                .await?
+            {
                 applied += 1;
             }
             Ok(ControlFlow::Continue(()))
@@ -304,6 +337,15 @@ impl std::error::Error for Error {
         match self {
             Self::Decode { source, .. } => Some(source),
             _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Self::Apply {
+            at: Cursor::START,
+            message: e.to_string(),
         }
     }
 }

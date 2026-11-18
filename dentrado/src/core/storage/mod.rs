@@ -23,14 +23,14 @@
 //! view is recomputable from the event log, so a lost view is a cold start,
 //! never a correctness break.
 //!
-//! ## Flush ordering
+//! ## Commit ordering
 //!
-//! `flush` must commit in this order so that, after a crash, every upper layer
-//! is interpretable in terms of the layers below it:
-//!
-//! 1. **localization** — every durable event's `LocSenderId` resolves;
-//! 2. **event log** — the dedup index + log itself commit atomically;
-//! 3. **gear view** — a gear's watermark must not survive past its events.
+//! An operation appends its journal record first. Localization rows are
+//! visible immediately through the RAM delta; events stay pending until
+//! [`CacheStorage::commit_log`], which syncs the journal and then writes the
+//! batch's rows, the shard tips, and the cache's applied cursor in one atomic
+//! session. A gear view is flushed after the events it derives from, so its
+//! watermark can never survive past them.
 //!
 //! Everything here is restart-surviving state. The RAM disk loses it all on
 //! process death — but that is a property of the disk (equally true of its

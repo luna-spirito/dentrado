@@ -10,7 +10,7 @@ use dentrado_cache::{
 };
 
 mod util;
-use util::{chain_specs, del, keys, put, read_big, run, specs};
+use util::{chain_specs, del, keys, put, read_big, run, specs, tid};
 
 /// Scan reads in key order — the standing tree pruned to the range,
 /// the delta overlaid on it (a put replaces, a deletion hides), and
@@ -29,12 +29,12 @@ fn scan_orders_and_overlays() {
         // the delta half over the tree: a fresh key, an overwrite, a kill
         {
             let mut s = st.session();
-            s.put(b"t0", b"aa", &[9], &[], &[]).unwrap();
-            s.put(b"t0", b"a", &[7], &[], &[]).unwrap();
-            s.del(b"t0", b"d", &[]).unwrap();
+            s.put(tid(&st, b"t0"), b"aa", &[9], &[], &[]).unwrap();
+            s.put(tid(&st, b"t0"), b"a", &[7], &[], &[]).unwrap();
+            s.del(tid(&st, b"t0"), b"d", &[]).unwrap();
             s.commit().unwrap();
         }
-        let all = st.scan(b"t0", b"", b"").await.unwrap();
+        let all = st.scan(tid(&st, b"t0"), b"", b"").await.unwrap();
         assert_eq!(
             all,
             [
@@ -45,23 +45,33 @@ fn scan_orders_and_overlays() {
         );
         // prefix and after (exclusive)
         assert_eq!(
-            keys(&st.scan(b"t0", b"a", b"").await.unwrap()),
+            keys(&st.scan(tid(&st, b"t0"), b"a", b"").await.unwrap()),
             [b"a".to_vec(), b"aa".to_vec()]
         );
         assert_eq!(
-            keys(&st.scan(b"t0", b"a", b"a").await.unwrap()),
+            keys(&st.scan(tid(&st, b"t0"), b"a", b"a").await.unwrap()),
             [b"aa".to_vec()]
         );
-        assert!(st.scan(b"t0", b"a", b"aa").await.unwrap().is_empty());
+        assert!(
+            st.scan(tid(&st, b"t0"), b"a", b"aa")
+                .await
+                .unwrap()
+                .is_empty()
+        );
         // an after past the prefix's span sees nothing
-        assert!(st.scan(b"t0", b"a", b"z").await.unwrap().is_empty());
+        assert!(
+            st.scan(tid(&st, b"t0"), b"a", b"z")
+                .await
+                .unwrap()
+                .is_empty()
+        );
         // the merged view survives its flush and a reopen
         st.flush().await.unwrap();
         drop(st);
         let st2 = Storage::open(&disk, "db", 8, &specs(&[b"t0"]))
             .await
             .unwrap();
-        assert_eq!(st2.scan(b"t0", b"", b"").await.unwrap(), all);
+        assert_eq!(st2.scan(tid(&st2, b"t0"), b"", b"").await.unwrap(), all);
         st2.partition_exact().await.unwrap();
     });
 }
@@ -81,17 +91,17 @@ fn deletion_empties_the_table() {
         }
         st.flush().await.unwrap();
         del(&st, b"t0", b"no").unwrap();
-        assert_eq!(st.scan(b"t0", b"", b"").await.unwrap().len(), 3);
+        assert_eq!(st.scan(tid(&st, b"t0"), b"", b"").await.unwrap().len(), 3);
         {
             let mut s = st.session();
             for k in ["x", "y", "z"] {
-                s.del(b"t0", k.as_bytes(), &[]).unwrap();
+                s.del(tid(&st, b"t0"), k.as_bytes(), &[]).unwrap();
             }
             s.commit().unwrap();
         }
-        assert!(st.scan(b"t0", b"", b"").await.unwrap().is_empty());
+        assert!(st.scan(tid(&st, b"t0"), b"", b"").await.unwrap().is_empty());
         for k in ["x", "y", "z"] {
-            assert_eq!(st.get(b"t0", k.as_bytes()).await.unwrap(), None);
+            assert_eq!(st.get(tid(&st, b"t0"), k.as_bytes()).await.unwrap(), None);
         }
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
@@ -102,8 +112,11 @@ fn deletion_empties_the_table() {
         let st2 = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
             .await
             .unwrap();
-        assert_eq!(st2.get(b"t0", b"w").await.unwrap(), Some(vec![3]));
-        assert_eq!(st2.get(b"t0", b"x").await.unwrap(), None);
+        assert_eq!(
+            st2.get(tid(&st2, b"t0"), b"w").await.unwrap(),
+            Some(vec![3])
+        );
+        assert_eq!(st2.get(tid(&st2, b"t0"), b"x").await.unwrap(), None);
         st2.partition_exact().await.unwrap();
     });
 }
@@ -122,13 +135,13 @@ fn a_batch_is_last_key_wins() {
             .unwrap();
         {
             let mut s = st.session();
-            s.put(b"t0", b"k", &[1], &[], &[]).unwrap();
-            s.put(b"t0", b"k", &[2], &[], &[]).unwrap(); // the later stage wins
-            s.put(b"t0", b"j", &[3], &[], &[]).unwrap();
+            s.put(tid(&st, b"t0"), b"k", &[1], &[], &[]).unwrap();
+            s.put(tid(&st, b"t0"), b"k", &[2], &[], &[]).unwrap(); // the later stage wins
+            s.put(tid(&st, b"t0"), b"j", &[3], &[], &[]).unwrap();
             s.commit().unwrap();
         }
-        assert_eq!(st.get(b"t0", b"k").await.unwrap(), Some(vec![2]));
-        assert_eq!(st.scan(b"t0", b"", b"").await.unwrap().len(), 2);
+        assert_eq!(st.get(tid(&st, b"t0"), b"k").await.unwrap(), Some(vec![2]));
+        assert_eq!(st.scan(tid(&st, b"t0"), b"", b"").await.unwrap().len(), 2);
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
         // the vanished take: one draft discarded, one alive — the
@@ -137,11 +150,11 @@ fn a_batch_is_last_key_wins() {
         let gone = s.alloc().await.unwrap();
         s.discard(gone).unwrap();
         let fresh = s.alloc().await.unwrap();
-        let r = s.put(b"t0", b"good", b"v", &[gone, fresh], &[]);
+        let r = s.put(tid(&st, b"t0"), b"good", b"v", &[gone, fresh], &[]);
         assert!(matches!(r, Err(StoreError::UnknownDraft)));
-        s.del(b"t0", b"j", &[]).unwrap();
-        assert_eq!(st.get(b"t0", b"good").await.unwrap(), None);
-        assert_eq!(st.get(b"t0", b"j").await.unwrap(), Some(vec![3]));
+        s.del(tid(&st, b"t0"), b"j", &[]).unwrap();
+        assert_eq!(st.get(tid(&st, b"t0"), b"good").await.unwrap(), None);
+        assert_eq!(st.get(tid(&st, b"t0"), b"j").await.unwrap(), Some(vec![3]));
         // the live draft stayed held: the retry publishes it alone,
         // the record naming its page (a chain head, `next` = 0)
         let p = s.page(fresh).unwrap();
@@ -151,7 +164,7 @@ fn a_batch_is_last_key_wins() {
         })
         .await
         .unwrap();
-        s.put(b"t0", b"good", &p.to_le_bytes(), &[fresh], &[])
+        s.put(tid(&st, b"t0"), b"good", &p.to_le_bytes(), &[fresh], &[])
             .unwrap();
         s.commit().unwrap();
         assert!(
@@ -230,13 +243,13 @@ fn a_shared_closure_dies_once() {
             v[8..].copy_from_slice(&p.to_le_bytes());
             v
         };
-        s.put(b"t0", b"c", &namer(2), &ks, &[]).unwrap();
-        s.put(b"t0", b"h", &namer(2), &[], &[]).unwrap();
-        s.put(b"t0", b"t", &namer(4), &[], &[]).unwrap();
+        s.put(tid(&st, b"t0"), b"c", &namer(2), &ks, &[]).unwrap();
+        s.put(tid(&st, b"t0"), b"h", &namer(2), &[], &[]).unwrap();
+        s.put(tid(&st, b"t0"), b"t", &namer(4), &[], &[]).unwrap();
         s.commit().unwrap();
         st.flush().await.unwrap();
         // the world: tree {3}, the pair {2, 4} — one set of three deaths
-        st.drop_table(b"t0").await.unwrap();
+        st.drop_table(tid(&st, b"t0")).await.unwrap();
         assert_eq!(st.debug_state().dying_len, 3);
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
@@ -273,11 +286,14 @@ fn a_refusing_schema_keeps_the_world() {
         put(&st, b"t0", b"k", &[0xFF, 1]).unwrap();
         st.flush().await.unwrap();
         assert!(matches!(
-            st.drop_table(b"t0").await,
+            st.drop_table(tid(&st, b"t0")).await,
             Err(StoreError::CorruptValue(_))
         ));
         assert_eq!(st.tables(), [b"t0".to_vec()]);
-        assert_eq!(st.get(b"t0", b"k").await.unwrap(), Some(vec![0xFF, 1]));
+        assert_eq!(
+            st.get(tid(&st, b"t0"), b"k").await.unwrap(),
+            Some(vec![0xFF, 1])
+        );
         assert_eq!(st.debug_state().dying_len, 0);
         st.flush().await.unwrap();
         let v = st
@@ -309,7 +325,7 @@ fn untaken_pages_show_in_the_partition() {
         let mut s = st.session();
         let k = s.alloc().await.unwrap();
         let p = s.page(k).unwrap();
-        s.put(b"t0", b"kk", b"v", &[k], &[]).unwrap();
+        s.put(tid(&st, b"t0"), b"kk", b"v", &[k], &[]).unwrap();
         s.commit().unwrap();
         st.flush().await.unwrap();
         let v = st.partition_exact().await.expect_err("orphaned page");

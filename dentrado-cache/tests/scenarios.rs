@@ -22,6 +22,10 @@ fn specs(ids: &[&[u8]]) -> Vec<TableSpec> {
     ids.iter().map(|i| TableSpec::flat(i.to_vec())).collect()
 }
 
+fn tid<D: IsFilesystem>(st: &Storage<D>, name: &[u8]) -> dentrado_cache::TableId {
+    st.table(name).expect("the test table is configured")
+}
+
 /// Публикация значения: инлайн-запись, никаких страниц — своя
 /// однострочная сессия.
 fn put_v<D: IsFilesystem>(
@@ -31,7 +35,7 @@ fn put_v<D: IsFilesystem>(
     val: &[u8],
 ) -> Result<(), StoreError> {
     let mut s = st.session();
-    s.put(table, key, val, &[], &[])?;
+    s.put(tid(st, table), key, val, &[], &[])?;
     s.commit()
 }
 
@@ -48,14 +52,17 @@ fn repl_flow() {
         put_v(&st, b"t0", KEY7, V1).unwrap();
         st.flush().await.unwrap();
         assert_eq!(
-            st.get(b"t0", KEY7).await.unwrap(),
+            st.get(tid(&st, b"t0"), KEY7).await.unwrap(),
             Some(V1.to_vec()),
             "miss-after-commit"
         );
         // замена на v2 — старое дерево умирает прививкой, без слова звонящего
         put_v(&st, b"t0", KEY7, V2).unwrap();
         // дельта прежде дерева: свежая замена видна до flush'а
-        assert_eq!(st.get(b"t0", KEY7).await.unwrap(), Some(V2.to_vec()));
+        assert_eq!(
+            st.get(tid(&st, b"t0"), KEY7).await.unwrap(),
+            Some(V2.to_vec())
+        );
         st.flush().await.unwrap();
         let dbg = st.debug_state();
         assert_eq!(dbg.delta_len, 0, "дельта вычищена: {dbg:?}");
@@ -71,7 +78,10 @@ fn repl_flow() {
         let st2 = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
             .await
             .unwrap();
-        assert_eq!(st2.get(b"t0", KEY7).await.unwrap(), Some(V2.to_vec()));
+        assert_eq!(
+            st2.get(tid(&st2, b"t0"), KEY7).await.unwrap(),
+            Some(V2.to_vec())
+        );
     });
 }
 
@@ -91,7 +101,7 @@ async fn act3(disk: &MemDisk) -> Option<u8> {
     let st = Storage::open(disk, "db", 4, &specs(&[b"t0"]))
         .await
         .unwrap();
-    let v = st.get(b"t0", KEY7).await.unwrap()?;
+    let v = st.get(tid(&st, b"t0"), KEY7).await.unwrap()?;
     // восстановленный образ обязан быть биективным и против байтов файла
     st.partition_exact().await.expect("биекция после краша");
     assert!(st.ok_store().await, "инвариант после краша");
@@ -209,7 +219,11 @@ fn concurrent_workers() {
             .await
             .unwrap();
         for kb in [5u8, 9u8] {
-            let v = st2.get(b"t0", &[kb]).await.unwrap().expect("ключ потерян");
+            let v = st2
+                .get(tid(&st2, b"t0"), &[kb])
+                .await
+                .unwrap()
+                .expect("ключ потерян");
             assert_eq!((v[0], v[1]), (kb, 6));
         }
     });
@@ -266,22 +280,24 @@ fn table_set_roundtrip() {
             .unwrap();
         assert_eq!(st2.tables(), [b"a", b"b", b"c"].map(|s| s.to_vec()));
         assert_eq!(
-            st2.get(b"a", b"a").await.unwrap(),
+            st2.get(tid(&st2, b"a"), b"a").await.unwrap(),
             Some(V1.to_vec()),
             "ключ таблицы a"
         );
         assert!(
-            st2.get(b"b", b"a").await.unwrap().is_none(),
+            st2.get(tid(&st2, b"b"), b"a").await.unwrap().is_none(),
             "средняя таблица пуста"
         );
-        assert_eq!(st2.get(b"c", b"a").await.unwrap(), Some(vec![2; 3]));
-        // дроп: имя уходит, страницы умирают, биекция целых таблиц цела
-        st2.drop_table(b"c").await.unwrap();
+        assert_eq!(
+            st2.get(tid(&st2, b"c"), b"a").await.unwrap(),
+            Some(vec![2; 3])
+        );
+        // дроп: имя уходит, страницы умирают, биекция целых таблиц цела;
+        // хэндл, взятый до дропа, отказывает
+        let c = tid(&st2, b"c");
+        st2.drop_table(c).await.unwrap();
         assert_eq!(st2.tables(), [b"a", b"b"].map(|s| s.to_vec()));
-        assert!(matches!(
-            st2.get(b"c", b"a").await,
-            Err(StoreError::NoTable)
-        ));
+        assert!(matches!(st2.get(c, b"a").await, Err(StoreError::NoTable)));
         st2.flush().await.unwrap();
         st2.partition_exact().await.expect("биекция после дропа");
         drop(st2);
@@ -290,11 +306,8 @@ fn table_set_roundtrip() {
             .await
             .unwrap();
         assert_eq!(st3.tables(), [b"a", b"b", b"c"].map(|s| s.to_vec()));
-        assert!(st3.get(b"c", b"a").await.unwrap().is_none());
-        assert!(matches!(
-            st3.get(b"z", b"a").await,
-            Err(StoreError::NoTable)
-        ));
+        assert!(st3.get(tid(&st3, b"c"), b"a").await.unwrap().is_none());
+        assert!(st3.table(b"z").is_none(), "no handle for an unknown name");
     });
 }
 
@@ -312,7 +325,7 @@ fn fresh_flush_and_reopen() {
             .await
             .unwrap();
         assert_eq!(st2.debug_state().r#gen, 1);
-        assert!(st2.get(b"t0", KEY7).await.unwrap().is_none());
+        assert!(st2.get(tid(&st2, b"t0"), KEY7).await.unwrap().is_none());
     });
 }
 
@@ -349,13 +362,16 @@ fn fs_disk_smoke() {
             put_v(&st, b"t0", KEY7, V1).unwrap();
             st.flush().await.unwrap();
             assert!(st.ok_store().await);
-            assert_eq!(st.get(b"t0", KEY7).await.unwrap(), Some(V1.to_vec()));
+            assert_eq!(
+                st.get(tid(&st, b"t0"), KEY7).await.unwrap(),
+                Some(V1.to_vec())
+            );
         }
         let st = Storage::<FsDisk>::open(&FsDisk, path.to_str().unwrap(), 4, &specs(&[b"t0"]))
             .await
             .unwrap();
         assert_eq!(
-            st.get(b"t0", KEY7).await.unwrap(),
+            st.get(tid(&st, b"t0"), KEY7).await.unwrap(),
             Some(V1.to_vec()),
             "ключ потерян после рестарта"
         );

@@ -74,11 +74,12 @@ pub(crate) struct Snap {
 }
 
 impl Snap {
-    /// A live id's slot in this snapshot (a tombstone never matches).
-    pub(crate) fn table(&self, id: &[u8]) -> Option<usize> {
+    /// Is `slot` a live table in this snapshot (a tombstone never is)?
+    pub(crate) fn table(&self, slot: usize) -> Option<usize> {
         self.names
-            .iter()
-            .position(|n| !n.is_empty() && n.as_slice() == id)
+            .get(slot)
+            .is_some_and(|name| !name.is_empty())
+            .then_some(slot)
     }
 
     /// A slot's standing tree root.
@@ -338,6 +339,11 @@ impl<D: IsFilesystem> Core<D> {
     /// dropped slot.
     pub(crate) fn table_index(&self, id: &[u8]) -> Option<usize> {
         self.tables.idx(id)
+    }
+
+    /// Is `slot` a live table?
+    pub(crate) fn table_live(&self, slot: usize) -> bool {
+        self.tables.live(slot)
     }
 
     /// A slot's id (empty — a dropped slot's tombstone) and the slot

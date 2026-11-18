@@ -752,6 +752,7 @@ mod tests {
                 )
                 .await;
         }
+        storage.commit_log().await.expect("commit the test events");
         storage
     }
 

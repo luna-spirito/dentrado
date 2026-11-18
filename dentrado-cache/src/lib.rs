@@ -56,4 +56,4 @@ pub use disk::{Fault, FsDisk, IsFilesystem, MemDisk, MemFile};
 pub use error::StoreError;
 pub use page::{AlignedPage, PageId};
 pub use schema::{Dep, NO_DEPS, NO_DEPS_PAGE, PageSchema, TableSchema, TableSpec};
-pub use storage::{DebugState, DraftPageId, Session, Storage, Violation};
+pub use storage::{DebugState, DraftPageId, Session, Storage, TableId, Violation};

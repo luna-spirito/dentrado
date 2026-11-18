@@ -204,7 +204,10 @@ impl<D: IsFilesystem + Default + Clone> Store<D> {
             if (layout.keep)(&name) {
                 continue;
             }
-            if let Err(e) = store.drop_table(&name).await {
+            let Some(table) = store.table(&name) else {
+                continue;
+            };
+            if let Err(e) = store.drop_table(table).await {
                 log::warn!("page store: GC of table {name:?} failed: {e:?}");
             }
         }

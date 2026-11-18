@@ -12,7 +12,7 @@ use std::task::Poll;
 
 use common::{expect_turns, race_turns};
 use dentrado_cache::{Fault, MemDisk, Storage, StoreError};
-use util::{PAYLOAD, chain_specs, put, put_big, put_free, run, specs};
+use util::{PAYLOAD, chain_specs, put, put_big, put_free, run, specs, tid};
 
 const KEY: &[u8] = b"k";
 const KEY2: &[u8] = b"j";
@@ -24,13 +24,17 @@ fn put_v(st: &Storage<MemDisk>, key: &[u8], val: u8) {
 
 /// Прочитать первый байт значения (со сверкой по теневой версии).
 async fn first_byte(st: &Storage<MemDisk>, key: &[u8]) -> Option<u8> {
-    st.get(b"t0", key).await.unwrap().map(|v| v[0])
+    st.get(tid(&st, b"t0"), key).await.unwrap().map(|v| v[0])
 }
 
 /// Страницы живой цепи ключа — по `mt`, ходом `next`-заголовков, без
 /// чтения содержимого: список для `free`.
 async fn chain_pages(st: &Storage<MemDisk>, key: &[u8]) -> Vec<dentrado_cache::PageId> {
-    let mt = st.get(b"t0", key).await.unwrap().expect("ключ есть");
+    let mt = st
+        .get(tid(&st, b"t0"), key)
+        .await
+        .unwrap()
+        .expect("ключ есть");
     let mut head = u64::from_le_bytes(mt[..8].try_into().unwrap());
     let mut ps = Vec::new();
     let s = st.session();
@@ -219,9 +223,9 @@ fn get_cancel_is_harmless() {
         put_v(&st, KEY, 1);
         st.flush().await.unwrap();
         for j in 0..16u32 {
-            let _ = race_turns(st.get(b"t0", KEY), j).await;
+            let _ = race_turns(st.get(tid(&st, b"t0"), KEY), j).await;
         }
-        let v = expect_turns(st.get(b"t0", KEY), 256, "get после отмен")
+        let v = expect_turns(st.get(tid(&st, b"t0"), KEY), 256, "get после отмен")
             .await
             .unwrap()
             .unwrap();
@@ -360,7 +364,7 @@ async fn worker(st: Rc<Storage<MemDisk>>, kb: u8, mut seed: u64, rounds: u8) -> 
                 s.discard(k).unwrap();
             }
             _ => {
-                if let Some(b) = st.get(b"t0", &key).await.unwrap() {
+                if let Some(b) = st.get(tid(&st, b"t0"), &key).await.unwrap() {
                     assert_eq!(b, vec![kb, ver], "чтение работника {kb}");
                 }
             }
@@ -397,7 +401,11 @@ fn chaos_workers_partition() {
             .await
             .unwrap();
         for (kb, v) in &expected {
-            let b = st2.get(b"t0", &[*kb]).await.unwrap().expect("ключ потерян");
+            let b = st2
+                .get(tid(&st2, b"t0"), &[*kb])
+                .await
+                .unwrap()
+                .expect("ключ потерян");
             assert_eq!(b[1], *v, "работник {kb} после рестарта");
         }
         st2.partition_exact().await.expect("биекция после рестарта");

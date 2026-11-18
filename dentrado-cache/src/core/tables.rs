@@ -82,6 +82,11 @@ impl Tables {
         self.index.get(id).copied()
     }
 
+    /// Is `slot` a live table (in range and not a tombstone)?
+    pub(crate) fn live(&self, slot: usize) -> bool {
+        self.names.get(slot).is_some_and(|name| !name.is_empty())
+    }
+
     /// A slot's id (empty — a dropped slot's tombstone).
     pub(crate) fn name(&self, t: usize) -> &[u8] {
         &self.names[t]

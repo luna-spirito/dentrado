@@ -32,6 +32,11 @@ pub fn keys(recs: &[(Vec<u8>, Vec<u8>)]) -> Vec<Vec<u8>> {
     recs.iter().map(|(k, _)| k.clone()).collect()
 }
 
+/// Resolve a test table name to its handle.
+pub fn tid<D: IsFilesystem>(st: &Storage<D>, name: &[u8]) -> dentrado_cache::TableId {
+    st.table(name).expect("the test table is configured")
+}
+
 /// The tests' shorthand: an inline record, no pages on either list —
 /// its own one-record session.
 pub fn put<D: IsFilesystem>(
@@ -41,7 +46,7 @@ pub fn put<D: IsFilesystem>(
     val: &[u8],
 ) -> Result<(), StoreError> {
     let mut s = st.session();
-    s.put(table, key, val, &[], &[])?;
+    s.put(tid(st, table), key, val, &[], &[])?;
     s.commit()
 }
 
@@ -55,14 +60,14 @@ pub fn put_free<D: IsFilesystem>(
     free: &[PageId],
 ) -> Result<(), StoreError> {
     let mut s = st.session();
-    s.put(table, key, val, &[], free)?;
+    s.put(tid(st, table), key, val, &[], free)?;
     s.commit()
 }
 
 /// A deletion — its own one-record session.
 pub fn del<D: IsFilesystem>(st: &Storage<D>, table: &[u8], key: &[u8]) -> Result<(), StoreError> {
     let mut s = st.session();
-    s.del(table, key, &[])?;
+    s.del(tid(st, table), key, &[])?;
     s.commit()
 }
 
@@ -136,7 +141,7 @@ pub async fn put_big<D: IsFilesystem>(
         })
         .await?;
     }
-    s.put(table, key, &pages[0].to_le_bytes(), &ks, free)?;
+    s.put(tid(st, table), key, &pages[0].to_le_bytes(), &ks, free)?;
     s.commit()?;
     Ok(pages)
 }
@@ -148,7 +153,7 @@ pub async fn read_big<D: IsFilesystem>(
     table: &[u8],
     key: &[u8],
 ) -> Result<Vec<u8>, StoreError> {
-    let mt = st.get(table, key).await?.expect("ключ есть");
+    let mt = st.get(tid(st, table), key).await?.expect("ключ есть");
     let mut head = u64::from_le_bytes(mt[..8].try_into().unwrap());
     let mut out = Vec::new();
     let s = st.session();

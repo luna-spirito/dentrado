@@ -291,6 +291,81 @@ async fn verify_journal(st: &CacheStorage<TestRuntime>, fixture: &Fixture) {
     assert_eq!(tail.watermark, diff.watermark);
 }
 
+#[test]
+fn concurrent_allocations_are_unique_and_replay() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core.dstore");
+        let st = CacheStorage::<TestRuntime>::on_disk(path.clone());
+
+        let users: Vec<UserId> = (0..32)
+            .map(|i| UserId {
+                id: 100 + i,
+                identity_server_pk: IdentityServerPk([i as u8; 32]),
+            })
+            .collect();
+        let located = futures::future::join_all(users.iter().map(|uid| st.mk_loc_user(*uid))).await;
+        let unique: std::collections::HashSet<_> = located.iter().copied().collect();
+        assert_eq!(unique.len(), users.len(), "each identity got its own id");
+        for (uid, loc) in users.iter().zip(&located) {
+            assert_eq!(st.user_by_local(*loc).await, Some(*uid));
+        }
+
+        // The same identity from many callers shares one allocation.
+        let same = futures::future::join_all((0..16).map(|_| st.mk_loc_user(users[0]))).await;
+        assert!(same.iter().all(|loc| *loc == located[0]));
+
+        let sender = st.mk_loc_sender(PK, Some(UID)).await;
+        let group = st.mk_loc_group(LocMsgTypeId(1), TestGroup::Doc(7)).await;
+        let stored = futures::future::join_all((0..16).map(|tx_id| {
+            st.store_event(
+                group,
+                StoredEvent {
+                    sender,
+                    tx_id,
+                    timestamp: tx_id,
+                    source_node: NodeId(1),
+                    body: body("concurrent", u64::from(tx_id)),
+                },
+            )
+        }))
+        .await;
+        let mut slots: Vec<_> = stored
+            .iter()
+            .map(|delta| delta.expect("a new event").added.expect("an added slot"))
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), 16, "concurrent events got distinct slots");
+
+        // The commit point makes the batch visible to diff and durable.
+        st.commit_log().await.expect("commit the log");
+        let diff = st.diff_group(group, Watermark::default()).await;
+        assert_eq!(diff.added, slots);
+        assert_eq!(diff.watermark.added, 16);
+        st.flush().await.expect("flush the journal and the cache");
+        drop(st);
+
+        let st = CacheStorage::<TestRuntime>::on_disk(path);
+        for (uid, loc) in users.iter().zip(&located) {
+            assert_eq!(st.user_by_local(*loc).await, Some(*uid));
+        }
+        let diff = st.diff_group(group, Watermark::default()).await;
+        assert_eq!(diff.added, slots);
+        let mut found = Vec::new();
+        for slot in &slots {
+            let ev = st
+                .fetch_event(group, *slot)
+                .await
+                .expect("the replayed event");
+            assert_eq!(ev.body, body("concurrent", u64::from(ev.tx_id)));
+            found.push(ev.tx_id);
+        }
+        found.sort_unstable();
+        assert_eq!(found, (0..16).collect::<Vec<_>>());
+    });
+}
+
 fn run<F: Future>(f: F) -> F::Output {
     compio::runtime::RuntimeBuilder::new()
         .build()
@@ -332,6 +407,13 @@ fn a_journaled_store_reopens_with_every_layer_intact() {
             .expect("a new key");
         assert_eq!(inserted.added, Some(GroupEventId(1)));
         assert_eq!(inserted.removed, None);
+        assert!(
+            st.fetch_event(fixture.group, GroupEventId(1))
+                .await
+                .is_none(),
+            "an uncommitted event is not served"
+        );
+        st.commit_log().await.expect("commit the log");
         assert_eq!(
             st.fetch_event(fixture.group, GroupEventId(1))
                 .await

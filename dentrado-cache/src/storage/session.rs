@@ -34,7 +34,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::Storage;
+use super::{Storage, TableId};
 use crate::core::tree::leaf_holds;
 use crate::core::{AllocAct, SealBatch, SealRec, Snap};
 use crate::disk::IsFilesystem;
@@ -50,12 +50,12 @@ pub struct DraftPageId {
     i: usize,
 }
 
-/// One staged record: the table it belongs to (the id, re-resolved at
+/// One staged record: the table it belongs to (the handle, re-checked at
 /// the commit — a dropped table refuses then), the key, the record's
 /// inline bytes (`None` — a deletion), the drafts it publishes, the
 /// pages that die with it.
 struct Staged {
-    t: Vec<u8>,
+    t: TableId,
     k: Vec<u8>,
     put: Option<Vec<u8>>,
     take: Vec<usize>,
@@ -272,7 +272,7 @@ impl<D: IsFilesystem> Session<D> {
     /// replaces the earlier — its takes die, the frees union.
     pub fn put(
         &mut self,
-        table: &[u8],
+        table: TableId,
         key: &[u8],
         val: &[u8],
         take: &[DraftPageId],
@@ -282,13 +282,13 @@ impl<D: IsFilesystem> Session<D> {
     }
 
     /// Stage a deletion: `free` — the dying record's pages.
-    pub fn del(&mut self, table: &[u8], key: &[u8], free: &[PageId]) -> Result<(), StoreError> {
+    pub fn del(&mut self, table: TableId, key: &[u8], free: &[PageId]) -> Result<(), StoreError> {
         self.stage(table, key, None, &[], free)
     }
 
     fn stage(
         &mut self,
-        table: &[u8],
+        table: TableId,
         key: &[u8],
         val: Option<&[u8]>,
         take: &[DraftPageId],
@@ -299,7 +299,7 @@ impl<D: IsFilesystem> Session<D> {
             if inner.poisoned {
                 return Err(StoreError::Poisoned);
             }
-            if inner.core.table_index(table).is_none() {
+            if !inner.core.table_live(table.slot()) {
                 return Err(StoreError::NoTable);
             }
         }
@@ -334,7 +334,7 @@ impl<D: IsFilesystem> Session<D> {
             free.extend(old.free);
         }
         self.staged.push(Staged {
-            t: table.to_vec(),
+            t: table,
             k: key.to_vec(),
             put: val.map(|v| v.to_vec()),
             take: ts,
@@ -363,8 +363,11 @@ impl<D: IsFilesystem> Session<D> {
             .staged
             .iter()
             .map(|s| {
+                if !inner.core.table_live(s.t.slot()) {
+                    return Err(StoreError::NoTable);
+                }
                 Ok(SealBatch {
-                    t: inner.core.table_index(&s.t).ok_or(StoreError::NoTable)?,
+                    t: s.t.slot(),
                     recs: vec![SealRec {
                         k: s.k.clone(),
                         put: s.put.clone(),

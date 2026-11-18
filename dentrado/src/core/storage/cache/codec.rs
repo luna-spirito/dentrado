@@ -1,34 +1,15 @@
 //! The cache's key and value encodings.
 //!
-//! Every encoding is little-endian and self-delimiting: keys are either fixed
-//! width or a fixed-width prefix followed by postcard bytes; values are either
-//! fixed-width records or raw postcard bytes. Nothing here interprets a
-//! runtime value beyond what the identity types already say.
-//!
-//! One table holds every kind of localization record, so each key starts with
-//! an entity tag. The tags are part of the on-disk layout: a key written under
-//! one entity is never readable as another.
+//! Every encoding is little-endian. Keys are fixed-width or a fixed-width
+//! prefix followed by the value's bytes; values are fixed-width records or raw
+//! postcard bytes. The tables are separate, so keys carry no entity tags.
 
 use crate::types::{
-    DataId, GroupEventId, IdentityServerPk, LocDataId, LocGroupId, LocSenderId, LocUserId,
-    SenderPk, UserId,
+    DataId, GroupEventId, LocDataId, LocGroupId, LocSenderId, LocUserId, SenderPk, UserId,
 };
 
-/// Forward maps (`global identity → loc`) and reverse maps (`loc → identity`)
-/// share a table, split by this byte.
-const FWD: u8 = 0;
-const REV: u8 = 1;
-
-/// The localization entities sharing one table.
-const USER: u8 = 0;
-const SENDER: u8 = 1;
-const GROUP: u8 = 2;
-const DATA: u8 = 3;
-const COUNTER: u8 = 4;
-
-fn key(prefix: &[u8], parts: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(prefix.len() + parts.iter().map(|p| p.len()).sum::<usize>());
-    out.extend_from_slice(prefix);
+fn key(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(parts.iter().map(|p| p.len()).sum());
     for part in parts {
         out.extend_from_slice(part);
     }
@@ -39,72 +20,73 @@ fn le8(value: u64) -> [u8; 8] {
     value.to_le_bytes()
 }
 
+// ── Localization keys ────────────────────────────────────────────────────
+
 pub(crate) fn user_fwd(uid: UserId) -> Vec<u8> {
-    key(
-        &[USER, FWD],
-        &[&uid.id.to_le_bytes(), &uid.identity_server_pk.0],
-    )
+    key(&[&uid.id.to_le_bytes(), &uid.identity_server_pk.0])
 }
 
-pub(crate) fn user_rev(loc: LocUserId) -> Vec<u8> {
-    key(&[USER, REV], &[&le8(loc.0)])
+pub(crate) fn user_rev(loc: LocUserId) -> [u8; 8] {
+    le8(loc.0)
 }
 
-pub(crate) fn sender_fwd(pk: SenderPk) -> Vec<u8> {
-    key(&[SENDER, FWD], &[&pk.0])
+pub(crate) fn sender_fwd(pk: SenderPk) -> [u8; 32] {
+    pk.0
 }
 
-pub(crate) fn sender_rev(loc: LocSenderId) -> Vec<u8> {
-    key(&[SENDER, REV], &[&le8(loc.0)])
+pub(crate) fn sender_rev(loc: LocSenderId) -> [u8; 8] {
+    le8(loc.0)
 }
 
 pub(crate) fn group_fwd(msg_type: u64, group: &[u8]) -> Vec<u8> {
-    key(&[GROUP, FWD], &[&le8(msg_type), group])
-}
-
-pub(crate) fn group_rev(loc: LocGroupId) -> Vec<u8> {
-    key(&[GROUP, REV], &[&le8(loc.0)])
+    key(&[&le8(msg_type), group])
 }
 
 pub(crate) fn data_fwd(data: DataId) -> Vec<u8> {
-    key(&[DATA, FWD], &[&data.timestamp.to_le_bytes(), &data.hash])
+    key(&[&data.timestamp.to_le_bytes(), &data.hash])
 }
 
-pub(crate) fn data_rev(loc: LocDataId) -> Vec<u8> {
-    key(&[DATA, REV], &[&le8(loc.0)])
+pub(crate) fn data_rev(loc: LocDataId) -> [u8; 8] {
+    le8(loc.0)
 }
 
-pub(crate) fn counter(tag: u8) -> Vec<u8> {
-    key(&[COUNTER], &[&[tag]])
-}
-
-/// Event slots and removed-slot rows share one table, split by this byte.
-const EVENT: u8 = 0;
-const REMOVED: u8 = 1;
+// ── Event keys ───────────────────────────────────────────────────────────
 
 pub(crate) fn event(group: LocGroupId, slot: GroupEventId) -> Vec<u8> {
-    key(&[EVENT], &[&le8(group.0), &le8(slot.0)])
+    key(&[&le8(group.0), &le8(slot.0)])
 }
 
 /// The dedup key: `group | sender | tx_id`. One group maps to one core, so the
 /// core id would carry no information and is not part of the key.
-pub(crate) fn event_key(group: LocGroupId, sender: u64, tx_id: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(20);
-    out.extend_from_slice(&group.0.to_le_bytes());
-    out.extend_from_slice(&sender.to_le_bytes());
-    out.extend_from_slice(&tx_id.to_le_bytes());
-    out
+pub(crate) fn event_key(group: LocGroupId, sender: LocSenderId, tx_id: u32) -> Vec<u8> {
+    key(&[&le8(group.0), &le8(sender.0), &tx_id.to_le_bytes()])
 }
 
 pub(crate) fn shard(group: LocGroupId) -> [u8; 8] {
-    group.0.to_le_bytes()
-}
-
-pub(crate) fn removed(group: LocGroupId, index: u64) -> Vec<u8> {
-    key(&[REMOVED], &[&le8(group.0), &le8(index)])
+    le8(group.0)
 }
 
 // ── Values ───────────────────────────────────────────────────────────────
+
+/// A local id value (forward maps, dedup slots).
+pub(crate) fn loc_bytes(loc: u64) -> [u8; 8] {
+    le8(loc)
+}
+
+pub(crate) fn parse_loc(bytes: &[u8]) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?))
+}
+
+/// The reverse data value: the content address and the raw content bytes.
+pub(crate) fn parse_data_value(bytes: &[u8]) -> Option<(DataId, &[u8])> {
+    Some((
+        DataId {
+            timestamp: u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?),
+            hash: bytes.get(4..36)?.try_into().ok()?,
+        },
+        bytes.get(36..)?,
+    ))
+}
 
 /// A user's raw identity: `id | identity_server_pk`.
 pub(crate) type UserBytes = [u8; 40];
@@ -121,16 +103,8 @@ pub(crate) fn parse_user(bytes: &[u8]) -> Option<UserId> {
     let pk = bytes.get(8..40)?.try_into().ok()?;
     Some(UserId {
         id,
-        identity_server_pk: IdentityServerPk(pk),
+        identity_server_pk: crate::types::IdentityServerPk(pk),
     })
-}
-
-pub(crate) fn loc_bytes(loc: u64) -> [u8; 8] {
-    loc.to_le_bytes()
-}
-
-pub(crate) fn parse_loc(bytes: &[u8]) -> Option<u64> {
-    Some(u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?))
 }
 
 /// The forward sender value: `loc | has_user | [user_loc]`.
@@ -159,10 +133,26 @@ fn append_user(out: &mut Vec<u8>, user: Option<LocUserId>) {
     }
 }
 
-fn parse_user_ref(bytes: &[u8], at: usize) -> Option<Option<LocUserId>> {
+/// A parsed sender's optional user reference: the sender either has no local
+/// user or is bound to one.
+enum SenderUser {
+    Absent,
+    Bound(LocUserId),
+}
+
+impl SenderUser {
+    fn option(self) -> Option<LocUserId> {
+        match self {
+            Self::Absent => None,
+            Self::Bound(user) => Some(user),
+        }
+    }
+}
+
+fn parse_user_ref(bytes: &[u8], at: usize) -> Option<SenderUser> {
     match bytes.get(at)? {
-        0 => Some(None),
-        1 => Some(Some(LocUserId(u64::from_le_bytes(
+        0 => Some(SenderUser::Absent),
+        1 => Some(SenderUser::Bound(LocUserId(u64::from_le_bytes(
             bytes.get(at + 1..at + 9)?.try_into().ok()?,
         )))),
         _ => None,
@@ -171,28 +161,15 @@ fn parse_user_ref(bytes: &[u8], at: usize) -> Option<Option<LocUserId>> {
 
 pub(crate) fn parse_sender_fwd(bytes: &[u8]) -> Option<(LocSenderId, Option<LocUserId>)> {
     let loc = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
-    Some((LocSenderId(loc), parse_user_ref(bytes, 8)?))
+    Some((LocSenderId(loc), parse_user_ref(bytes, 8)?.option()))
 }
 
 pub(crate) fn parse_sender_rev(bytes: &[u8]) -> Option<(SenderPk, Option<LocUserId>)> {
     let pk = bytes.get(..32)?.try_into().ok()?;
-    Some((SenderPk(pk), parse_user_ref(bytes, 32)?))
+    Some((SenderPk(pk), parse_user_ref(bytes, 32)?.option()))
 }
 
-/// A group's reverse value: `msg_type | group bytes`.
-pub(crate) fn group_bytes(msg_type: u64, group: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + group.len());
-    out.extend_from_slice(&msg_type.to_le_bytes());
-    out.extend_from_slice(group);
-    out
-}
-
-pub(crate) fn parse_group(bytes: &[u8]) -> Option<(u64, &[u8])> {
-    Some((
-        u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?),
-        bytes.get(8..)?,
-    ))
-}
+// ── Event values ─────────────────────────────────────────────────────────
 
 /// Event value: `sender | tx_id | timestamp | source_node | body`.
 pub(crate) fn event_bytes(
@@ -252,6 +229,7 @@ pub(crate) fn parse_shard(bytes: &[u8]) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::IdentityServerPk;
 
     #[test]
     fn a_user_round_trips() {

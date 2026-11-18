@@ -35,6 +35,26 @@ pub use session::{DraftPageId, Session};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// A table handle issued by an open store.
+///
+/// The durable identity of a table is its name (the bytes in [`TableSpec`]);
+/// a `TableId` is the slot that name resolved to in *this* open. It is cheap
+/// to copy and is the only table identifier the record API accepts. Resolve
+/// handles again after every open; a handle from an earlier store is not
+/// meaningful.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TableId(u32);
+
+impl TableId {
+    pub(crate) fn new(slot: usize) -> Self {
+        Self(slot as u32)
+    }
+
+    pub(crate) fn slot(self) -> usize {
+        self.0 as usize
+    }
+}
+
 use compio::runtime::JoinHandle;
 
 use crate::disk::IsFilesystem;

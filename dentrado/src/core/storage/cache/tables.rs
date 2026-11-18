@@ -1,20 +1,18 @@
-//! The tables the backend materializes layers 1–3 into.
+//! The tables this backend materializes, and the image's checkpoint.
 //!
-//! The page cache is the complete materialization of everything below a
-//! gear's private view: localization, the per-group event shards, content
-//! data, and the gear views themselves. The journal stays the source of
-//! truth; a cache image is a checkpoint that lets a restart replay only the
-//! journal tail.
+//! Each table has a stable name (its durable identity) and a [`TableId`]
+//! issued by the open page store. The names below are the whole fixed set:
+//! localization forward/reverse maps, one event table, the event dedup index,
+//! per-group shard watermarks, and the cache meta. Gear views add one table
+//! per gear kind.
 //!
-//! Table ids are two bytes (`magic, kind`). They are not versioned per table:
-//! [`Meta`] records the cache layout, the log identity, and the runtime's
-//! value shapes, and any mismatch wipes the image and refills it from the
-//! journal. A table id therefore only names a *kind* of data, never a
-//! particular generation of it.
-//!
-//! The keys and values live in [`super::codec`].
+//! [`Meta`] is the checkpoint: the log identity, the runtime fingerprint, the
+//! journal cursor whose records are in the image, and the allocator counters.
+//! A mismatch wipes the image and refills it from the journal.
 
-use dentrado_cache::{Session, Storage, StoreError, TableSpec, disk::IsFilesystem};
+use std::collections::HashSet;
+
+use dentrado_cache::{Session, Storage, StoreError, TableId, TableSpec, disk::IsFilesystem};
 use dentrado_journal::Cursor;
 use serde::{Deserialize, Serialize};
 
@@ -29,120 +27,101 @@ use crate::{
     types::Shape,
 };
 
-/// The first byte of every table id this module owns. Chosen to be invalid as
-/// a postcard string length, so [`GearTable::decode`] never mistakes one of
-/// our ids for a gear table (and vice versa).
-const MAGIC: u8 = 0xD5;
-
 /// The cache layout version. Bump whenever a record encoding below changes in
 /// a way replay could not reconstruct.
-pub(crate) const CACHE_VERSION: u32 = 2;
+pub(crate) const CACHE_VERSION: u32 = 3;
 
-/// One table this backend owns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Table {
-    Meta,
-    /// Every localization record: users, senders, groups, data, counters.
-    Loc,
-    /// Event slots and removed-slot rows.
-    Events,
-    /// The `(group, sender, tx_id)` dedup index.
-    EventKeys,
-    /// Per-group shard counters.
-    Shards,
-}
+const META: &[u8] = b"dentrado/meta";
+const USERS_FWD: &[u8] = b"dentrado/users/fwd";
+const USERS_REV: &[u8] = b"dentrado/users/rev";
+const SENDERS_FWD: &[u8] = b"dentrado/senders/fwd";
+const SENDERS_REV: &[u8] = b"dentrado/senders/rev";
+const GROUPS_FWD: &[u8] = b"dentrado/groups/fwd";
+const DATA_FWD: &[u8] = b"dentrado/data/fwd";
+const DATA_REV: &[u8] = b"dentrado/data/rev";
+const EVENTS: &[u8] = b"dentrado/events";
+const EVENT_KEYS: &[u8] = b"dentrado/event-keys";
+const SHARDS: &[u8] = b"dentrado/shards";
 
-impl Table {
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 5] = [
-        Self::Meta,
-        Self::Loc,
-        Self::Events,
-        Self::EventKeys,
-        Self::Shards,
-    ];
+/// The fixed table names, in declaration order.
+const FIXED: [&[u8]; 11] = [
+    META,
+    USERS_FWD,
+    USERS_REV,
+    SENDERS_FWD,
+    SENDERS_REV,
+    GROUPS_FWD,
+    DATA_FWD,
+    DATA_REV,
+    EVENTS,
+    EVENT_KEYS,
+    SHARDS,
+];
 
-    const fn tag(self) -> u8 {
-        match self {
-            Self::Meta => 0,
-            Self::Loc => 1,
-            Self::Events => 2,
-            Self::EventKeys => 3,
-            Self::Shards => 4,
-        }
-    }
-
-    const fn from_tag(tag: u8) -> Option<Self> {
-        Some(match tag {
-            0 => Self::Meta,
-            1 => Self::Loc,
-            2 => Self::Events,
-            3 => Self::EventKeys,
-            4 => Self::Shards,
-            _ => return None,
-        })
-    }
-
-    pub(crate) fn id(self) -> Vec<u8> {
-        vec![MAGIC, self.tag()]
-    }
-
-    /// The table an id names, if it is ours.
-    pub(crate) fn decode(id: &[u8]) -> Option<Self> {
-        match id {
-            [MAGIC, tag] => Self::from_tag(*tag),
-            _ => None,
-        }
-    }
-}
-
-/// The pre-refactor ids (`postcard(("dentrado", ...))`). They name the same
-/// data under a different layout; the startup GC drops them.
-fn is_legacy_backend(id: &[u8]) -> bool {
-    id.len() >= 9 && id[0] == 8 && &id[1..9] == b"dentrado"
-}
-
-/// This backend's table ids, resolved once per store.
-#[derive(Debug, Clone)]
+/// This backend's handles, resolved once per open.
+#[derive(Clone)]
 pub(crate) struct Tables {
-    pub meta: Vec<u8>,
-    pub loc: Vec<u8>,
-    pub events: Vec<u8>,
-    pub event_keys: Vec<u8>,
-    pub shards: Vec<u8>,
+    pub meta: TableId,
+    pub users_fwd: TableId,
+    pub users_rev: TableId,
+    pub senders_fwd: TableId,
+    pub senders_rev: TableId,
+    pub groups_fwd: TableId,
+    pub data_fwd: TableId,
+    pub data_rev: TableId,
+    pub events: TableId,
+    pub event_keys: TableId,
+    pub shards: TableId,
+    gears: Vec<(&'static str, TableId)>,
 }
 
 impl Tables {
-    pub(crate) fn new() -> Self {
+    /// Resolve every name in the configured layout to its handle.
+    pub(crate) fn resolve<R: RuntimeTypes, D: IsFilesystem>(cache: &Storage<D>) -> Self {
+        let get = |name: &[u8]| {
+            cache
+                .table(name)
+                .unwrap_or_else(|| panic!("table {name:?} is not in the store layout"))
+        };
         Self {
-            meta: Table::Meta.id(),
-            loc: Table::Loc.id(),
-            events: Table::Events.id(),
-            event_keys: Table::EventKeys.id(),
-            shards: Table::Shards.id(),
+            meta: get(META),
+            users_fwd: get(USERS_FWD),
+            users_rev: get(USERS_REV),
+            senders_fwd: get(SENDERS_FWD),
+            senders_rev: get(SENDERS_REV),
+            groups_fwd: get(GROUPS_FWD),
+            data_fwd: get(DATA_FWD),
+            data_rev: get(DATA_REV),
+            events: get(EVENTS),
+            event_keys: get(EVENT_KEYS),
+            shards: get(SHARDS),
+            gears: R::gear_kinds()
+                .iter()
+                .map(|&kind| (kind, get(&GearTable::of(kind).encode())))
+                .collect(),
         }
     }
 
-    fn specs(&self) -> Vec<TableSpec> {
-        [
-            &self.meta,
-            &self.loc,
-            &self.events,
-            &self.event_keys,
-            &self.shards,
-        ]
-        .map(|id| TableSpec::flat(id.clone()))
-        .to_vec()
+    /// The gear kind's table.
+    pub(crate) fn gear(&self, kind: &str) -> TableId {
+        self.gears
+            .iter()
+            .find_map(|&(name, table)| (name == kind).then_some(table))
+            .unwrap_or_else(|| panic!("gear kind {kind:?} has no table"))
     }
 }
 
-/// The store's tables: gear views plus this backend's own.
-pub(crate) fn layout<R: RuntimeTypes>(tables: &Tables) -> Layout {
+/// The store's tables: gear views plus this backend's fixed set.
+pub(crate) fn layout<R: RuntimeTypes>() -> Layout {
     let gear = gear_tables::<R>();
     let mut specs = gear_specs(&gear);
-    specs.extend(tables.specs());
+    let mut expected: HashSet<Vec<u8>> = specs.iter().map(|s| s.id.clone()).collect();
+    for name in FIXED {
+        specs.push(TableSpec::flat(name.to_vec()));
+        expected.insert(name.to_vec());
+    }
     Layout::new(specs, move |id| {
-        if Table::decode(id).is_some() {
+        if expected.contains(id) {
             return true;
         }
         if let Some(table) = GearTable::decode(id) {
@@ -153,6 +132,12 @@ pub(crate) fn layout<R: RuntimeTypes>(tables: &Tables) -> Layout {
         }
         true
     })
+}
+
+/// The pre-refactor ids (`postcard(("dentrado", ...))`). The startup GC drops
+/// them.
+fn is_legacy_backend(id: &[u8]) -> bool {
+    id.len() >= 9 && id[0] == 8 && &id[1..9] == b"dentrado"
 }
 
 /// `blake3` over every runtime layout the cache stores. A change here makes
@@ -173,11 +158,17 @@ pub(crate) struct Meta {
     log: [u8; 16],
     fingerprint: [u8; 32],
     applied: (u64, u64),
+    /// Next ids for users, senders, groups, data.
+    next: [u64; 4],
 }
 
 impl Meta {
-    fn applied(&self) -> Cursor {
+    pub(crate) fn applied(&self) -> Cursor {
         Cursor::new(self.applied.0, self.applied.1)
+    }
+
+    pub(crate) fn next(&self) -> [u64; 4] {
+        self.next
     }
 }
 
@@ -188,7 +179,7 @@ pub(crate) enum MetaState {
     Fresh,
     /// The image belongs to this log and this runtime, applied through the
     /// given cursor.
-    Valid(Cursor),
+    Valid(Meta),
     /// The image belongs to another log or runtime. It must be wiped.
     Stale,
 }
@@ -197,7 +188,7 @@ impl MetaState {
     /// The cursor to start from, after the caller has wiped a stale image.
     pub(crate) fn start(self) -> Cursor {
         match self {
-            Self::Valid(at) => at,
+            Self::Valid(meta) => meta.applied(),
             Self::Fresh | Self::Stale => Cursor::START,
         }
     }
@@ -209,7 +200,7 @@ pub(crate) async fn read_meta<D: IsFilesystem>(
     log: [u8; 16],
     fingerprint: [u8; 32],
 ) -> MetaState {
-    let bytes = cache.get(&tables.meta, &[]).await.expect("read cache meta");
+    let bytes = cache.get(tables.meta, &[]).await.expect("read cache meta");
     let Some(bytes) = bytes else {
         return MetaState::Fresh;
     };
@@ -218,7 +209,7 @@ pub(crate) async fn read_meta<D: IsFilesystem>(
         return MetaState::Stale;
     };
     if meta.version == CACHE_VERSION && meta.log == log && meta.fingerprint == fingerprint {
-        MetaState::Valid(meta.applied())
+        MetaState::Valid(meta)
     } else {
         log::warn!(
             "cache belongs to another log or runtime (version {}, log {:?}); \
@@ -236,15 +227,17 @@ pub(crate) fn write_meta<D: IsFilesystem>(
     log: [u8; 16],
     fingerprint: [u8; 32],
     applied: Cursor,
+    next: [u64; 4],
 ) -> Result<(), StoreError> {
     let meta = Meta {
         version: CACHE_VERSION,
         log,
         fingerprint,
         applied: (applied.segment, applied.offset),
+        next,
     };
     let bytes = postcard::to_stdvec(&meta).expect("a meta record serializes");
-    session.put(&tables.meta, &[], &bytes, &[], &[])
+    session.put(tables.meta, &[], &bytes, &[], &[])
 }
 
 #[cfg(test)]
@@ -252,18 +245,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_ids_round_trip_and_do_not_look_like_gear_tables() {
-        for table in Table::ALL {
-            assert_eq!(Table::decode(&table.id()), Some(table));
-            assert!(GearTable::decode(&table.id()).is_none(), "{table:?}");
-        }
-        assert_eq!(Table::decode(b"dentrado"), None);
-    }
-
-    #[test]
     fn the_old_backend_ids_are_recognized_as_legacy() {
         let old = postcard::to_stdvec(&("dentrado", 0u8)).unwrap();
         assert!(is_legacy_backend(&old));
-        assert!(!is_legacy_backend(&Table::Meta.id()));
+        assert!(!is_legacy_backend(META));
     }
 }

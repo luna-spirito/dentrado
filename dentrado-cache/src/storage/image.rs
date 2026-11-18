@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 
-use super::{Storage, Violation};
+use super::{Storage, TableId, Violation};
 use crate::core::sb::{MAX_TABLE_ID, MAX_TABLES, Sb, parse_sb};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
@@ -87,15 +87,16 @@ impl<D: IsFilesystem> Storage<D> {
     /// rest: a live flush round is already rebuilding this very tree,
     /// and its commit would resurrect it — `PoolTaken` refuses, the
     /// caller drops after the round.
-    pub async fn drop_table(&self, table: &[u8]) -> Result<(), StoreError> {
+    pub async fn drop_table(&self, table: TableId) -> Result<(), StoreError> {
         let (t, schema, root, bound) = {
             let inner = self.inner.borrow_mut();
             if inner.poisoned {
                 return Err(StoreError::Poisoned);
             }
-            let Some(t) = inner.core.table_index(table) else {
+            let t = table.slot();
+            if !inner.core.table_live(t) {
                 return Err(StoreError::NoTable);
-            };
+            }
             if inner.core.round_live() {
                 return Err(StoreError::PoolTaken);
             }

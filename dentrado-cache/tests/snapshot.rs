@@ -5,7 +5,7 @@
 use dentrado_cache::{IsFilesystem, MemDisk, Session, Storage};
 
 mod util;
-use util::{chain_specs, put, run, specs};
+use util::{chain_specs, put, run, specs, tid};
 
 /// Read a chain through a session's physical page read.
 async fn read_chain<D: IsFilesystem>(s: &mut Session<D>, mt: &[u8]) -> Vec<u8> {
@@ -39,30 +39,39 @@ fn session_reads_one_world() {
             .unwrap();
         put(&st, b"t0", b"a", b"one").unwrap();
         let mut s = st.session();
-        assert_eq!(s.get_old(b"t0", b"a").await.unwrap(), Some(b"one".to_vec()));
-        let scan = s.scan_old(b"t0", b"", b"").await.unwrap();
+        assert_eq!(
+            s.get_old(tid(&st, b"t0"), b"a").await.unwrap(),
+            Some(b"one".to_vec())
+        );
+        let scan = s.scan_old(tid(&st, b"t0"), b"", b"").await.unwrap();
         assert_eq!(scan, [(b"a".to_vec(), b"one".to_vec())]);
 
         // The live world moves on; the session does not.
         put(&st, b"t0", b"a", b"two").unwrap();
         put(&st, b"t0", b"b", b"new").unwrap();
         put(&st, b"t1", b"a", b"other").unwrap();
-        assert_eq!(s.get_old(b"t0", b"a").await.unwrap(), Some(b"one".to_vec()));
-        assert_eq!(s.get_old(b"t0", b"b").await.unwrap(), None);
-        assert_eq!(s.scan_old(b"t0", b"", b"").await.unwrap(), scan);
-        assert_eq!(s.get_old(b"t1", b"a").await.unwrap(), None);
+        assert_eq!(
+            s.get_old(tid(&st, b"t0"), b"a").await.unwrap(),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(s.get_old(tid(&st, b"t0"), b"b").await.unwrap(), None);
+        assert_eq!(s.scan_old(tid(&st, b"t0"), b"", b"").await.unwrap(), scan);
+        assert_eq!(s.get_old(tid(&st, b"t1"), b"a").await.unwrap(), None);
 
         // The commit consumes the session; the next session sees its
         // records at once, alongside everything committed before it.
-        s.put(b"t0", b"a", b"three", &[], &[]).unwrap();
+        s.put(tid(&st, b"t0"), b"a", b"three", &[], &[]).unwrap();
         s.commit().unwrap();
 
         let mut s = st.session();
         assert_eq!(
-            s.get_old(b"t0", b"a").await.unwrap(),
+            s.get_old(tid(&st, b"t0"), b"a").await.unwrap(),
             Some(b"three".to_vec())
         );
-        assert_eq!(s.get_old(b"t0", b"b").await.unwrap(), Some(b"new".to_vec()));
+        assert_eq!(
+            s.get_old(tid(&st, b"t0"), b"b").await.unwrap(),
+            Some(b"new".to_vec())
+        );
         st.partition_exact().await.unwrap();
     });
 }
@@ -84,7 +93,7 @@ fn a_snapshot_survives_flush_and_reuse() {
 
         let mut s = st.session();
         let old_mt = s
-            .get_old(b"t0", b"k")
+            .get_old(tid(&st, b"t0"), b"k")
             .await
             .unwrap()
             .expect("the old record");
@@ -99,7 +108,10 @@ fn a_snapshot_survives_flush_and_reuse() {
         st.flush().await.unwrap();
 
         // The session still reads the old world, pages included.
-        assert_eq!(s.get_old(b"t0", b"k").await.unwrap(), Some(old_mt.clone()));
+        assert_eq!(
+            s.get_old(tid(&st, b"t0"), b"k").await.unwrap(),
+            Some(old_mt.clone())
+        );
         assert_eq!(read_chain(&mut s, &old_mt).await, old);
 
         // Letting go releases the deaths; the next flush spends them.
@@ -129,7 +141,7 @@ fn a_write_only_session_never_pins() {
         put(&st, b"t0", b"k", b"one").unwrap();
         st.flush().await.unwrap();
         let mut s = st.session();
-        s.put(b"t0", b"k", b"two", &[], &[]).unwrap();
+        s.put(tid(&st, b"t0"), b"k", b"two", &[], &[]).unwrap();
         s.commit().unwrap();
         st.flush().await.unwrap();
         assert!(

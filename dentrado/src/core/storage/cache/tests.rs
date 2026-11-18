@@ -115,6 +115,57 @@ async fn verify(st: &CacheStorage<TestRuntime>, fixture: &Fixture) {
 }
 
 #[test]
+fn localization_is_live_through_the_delta() {
+    run(async {
+        let st: CacheStorage<TestRuntime> = CacheStorage::ram();
+        let user = st.mk_loc_user(UID).await;
+        assert_eq!(st.user_by_local(user).await, Some(UID), "user delta");
+        let sender = st.mk_loc_sender(PK, Some(UID)).await;
+        assert_eq!(st.sender_user(sender).await, Some(user), "sender delta");
+        let data_id = DataId {
+            timestamp: 42,
+            hash: [0; 32],
+        };
+        let data = st.mk_data(data_id, ()).await.expect("intern the data");
+        assert_eq!(st.find_data(&data_id).await, Some(data), "data fwd delta");
+        assert_eq!(
+            st.fetch_data(data).await,
+            Some((data_id, ())),
+            "data rev delta"
+        );
+    });
+}
+
+#[test]
+fn a_repeated_observation_is_ignored() {
+    run(async {
+        let st: CacheStorage<TestRuntime> = CacheStorage::ram();
+        let sender = st.mk_loc_sender(PK, None).await;
+        let group = st.mk_loc_group(LocMsgTypeId(1), ()).await;
+        let ev = StoredEvent {
+            sender,
+            tx_id: 5,
+            timestamp: 1,
+            source_node: NodeId(0),
+            body: (),
+        };
+        assert!(
+            st.store_event(group, ev.clone()).await.is_some(),
+            "the first observation is new"
+        );
+        assert!(
+            st.store_event(group, ev).await.is_none(),
+            "an identical observation changes nothing"
+        );
+        st.commit_log().await.expect("commit");
+        assert_eq!(
+            st.diff_group(group, Watermark::default()).await.added,
+            [GroupEventId(0)]
+        );
+    });
+}
+
+#[test]
 fn a_warm_cache_restarts_without_visiting_the_journal() {
     run(async {
         let dir = tempfile::tempdir().unwrap();

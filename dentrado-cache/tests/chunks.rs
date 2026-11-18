@@ -11,7 +11,7 @@ use std::task::Poll;
 use dentrado_cache::{MemDisk, Storage};
 
 mod util;
-use util::{PAYLOAD, chain_specs, offset_image, put_big, put_free, read_big, run, specs};
+use util::{PAYLOAD, chain_specs, offset_image, put_big, put_free, read_big, run, specs, tid};
 
 // ## Многочанковые цепочки
 
@@ -58,7 +58,10 @@ fn multi_chunk_flush() {
         let st2 = Storage::open(&disk, "db", 4, &chain_specs(&[b"t0"]))
             .await
             .unwrap();
-        assert_eq!(st2.get(b"t0", key).await.unwrap(), Some(vec![1, 2, 3]));
+        assert_eq!(
+            st2.get(tid(&st2, b"t0"), key).await.unwrap(),
+            Some(vec![1, 2, 3])
+        );
         let dbg2 = st2.debug_state();
         assert!(
             dbg2.heads[0].is_empty() && dbg2.heads[1].is_empty(),
@@ -121,7 +124,7 @@ fn death_pending_bucket() {
             // пропускают. (Блок, а не drop(reader): pin! одалживает
             // скрытое будущее — бросание ссылки его не роняет, роняет
             // только выход из области.)
-            let mut reader = std::pin::pin!(st.get(b"t0", key));
+            let mut reader = std::pin::pin!(st.get(tid(&st, b"t0"), key));
             let mut n = 1u32;
             futures::future::poll_fn(|cx| {
                 if n == 0 {
@@ -189,7 +192,7 @@ fn pending_deaths_survive_crash() {
         // читатель паркуется посреди спуска — его пин пережил бы печать;
         // здесь он брошен сразу: снятие пина
         {
-            let mut reader = std::pin::pin!(st.get(b"t0", key));
+            let mut reader = std::pin::pin!(st.get(tid(&st, b"t0"), key));
             let mut n = 1u32;
             futures::future::poll_fn(|cx| {
                 if n == 0 {
@@ -337,7 +340,10 @@ fn recovered_tail_behind_new_chunk() {
         let st2 = Storage::open(&disk, "db", 4, &chain_specs(&[b"t0"]))
             .await
             .unwrap();
-        assert_eq!(st2.get(b"t0", b"k").await.unwrap(), Some(vec![9; 3]));
+        assert_eq!(
+            st2.get(tid(&st2, b"t0"), b"k").await.unwrap(),
+            Some(vec![9; 3])
+        );
         assert!(st2.ok_store().await);
     });
 }

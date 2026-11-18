@@ -26,7 +26,7 @@ use std::{
 };
 
 use dentrado_cache::{
-    Session, Storage,
+    Session, Storage, TableId,
     disk::{FsDisk, IsFilesystem, MemDisk},
 };
 
@@ -148,21 +148,13 @@ macro_rules! on_view {
 }
 
 impl GearView {
-    pub(crate) fn ram(
-        store: Rc<Storage<MemDisk>>,
-        table: GearTable<'static>,
-        prefix: Vec<u8>,
-    ) -> Self {
+    pub(crate) fn ram(store: Rc<Storage<MemDisk>>, table: TableId, prefix: Vec<u8>) -> Self {
         Self {
             kind: ViewKind::Ram(DiskView::new(store, table, prefix)),
         }
     }
 
-    pub(crate) fn fs(
-        store: Rc<Storage<FsDisk>>,
-        table: GearTable<'static>,
-        prefix: Vec<u8>,
-    ) -> Self {
+    pub(crate) fn fs(store: Rc<Storage<FsDisk>>, table: TableId, prefix: Vec<u8>) -> Self {
         Self {
             kind: ViewKind::Fs(DiskView::new(store, table, prefix)),
         }
@@ -183,18 +175,18 @@ impl GearView {
     /// Stage a value. It must fit one leaf record (the view panics otherwise);
     /// the view does not chunk.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
-        on_view!(self, |view| view.put(key, value))
+        on_view!(self, |view| view.put(key, value));
     }
 
     /// Stage a deletion.
     pub fn del(&mut self, key: &[u8]) {
-        on_view!(self, |view| view.del(key))
+        on_view!(self, |view| view.del(key));
     }
 
     /// Publish everything staged. Idempotent; a gear may call it, and the
     /// runtime calls it again after the output is installed.
     pub fn commit(&mut self) {
-        on_view!(self, |view| view.commit())
+        on_view!(self, |view| view.commit());
     }
 }
 
@@ -204,18 +196,18 @@ struct DiskView<D: IsFilesystem> {
     /// `None` between a commit and the next touch: the commit consumes the
     /// session, and a fresh one (seeing the commit) opens on demand.
     session: Option<Session<D>>,
-    /// The gear kind's table, encoded once here ([`GearTable::encode`]); the
-    /// key prefix only separates gears within it.
-    table: Vec<u8>,
+    /// The gear kind's table handle; the key prefix only separates gears
+    /// within it.
+    table: TableId,
     prefix: Vec<u8>,
 }
 
 impl<D: IsFilesystem> DiskView<D> {
-    fn new(store: Rc<Storage<D>>, table: GearTable<'static>, prefix: Vec<u8>) -> Self {
+    fn new(store: Rc<Storage<D>>, table: TableId, prefix: Vec<u8>) -> Self {
         Self {
             session: Some(store.session()),
             store,
-            table: table.encode(),
+            table,
             prefix,
         }
     }
@@ -230,7 +222,7 @@ impl<D: IsFilesystem> DiskView<D> {
     async fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         let full = self.full(key);
         session(&mut self.session, &self.store)
-            .get_old(&self.table, &full)
+            .get_old(self.table, &full)
             .await
             .expect("gear view get")
     }
@@ -238,7 +230,7 @@ impl<D: IsFilesystem> DiskView<D> {
     async fn scan(&mut self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         let full = self.full(prefix);
         let rows = session(&mut self.session, &self.store)
-            .scan_old(&self.table, &full, &[])
+            .scan_old(self.table, &full, &[])
             .await
             .expect("gear view scan");
         let strip = self.prefix.len();
@@ -251,14 +243,14 @@ impl<D: IsFilesystem> DiskView<D> {
         let full = self.full(key);
         check_leaf(&full, value);
         session(&mut self.session, &self.store)
-            .put(&self.table, &full, value, &[], &[])
+            .put(self.table, &full, value, &[], &[])
             .expect("gear view put");
     }
 
     fn del(&mut self, key: &[u8]) {
         let full = self.full(key);
         session(&mut self.session, &self.store)
-            .del(&self.table, &full, &[])
+            .del(self.table, &full, &[])
             .expect("gear view del");
     }
 

@@ -235,7 +235,8 @@ fn paged_storage_gcs_old_gear_tables() {
                 let old = Storage::open(&FsDisk, &path, 4, &specs).await.unwrap();
                 let mut s = old.session();
                 for id in [&legacy, &orphan, &foreign] {
-                    s.put(id, b"gear", b"ancient", &[], &[]).unwrap();
+                    let table = old.table(id).expect("the table was just opened");
+                    s.put(table, b"gear", b"ancient", &[], &[]).unwrap();
                 }
                 s.commit().unwrap();
                 old.flush().await.unwrap();

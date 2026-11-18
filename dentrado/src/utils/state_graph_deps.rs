@@ -39,6 +39,7 @@ fn make_test_ctx(num_events: u64) -> Store {
             },
         ));
     }
+    block_on(ctx.commit_log()).expect("commit the test events");
     ctx
 }
 

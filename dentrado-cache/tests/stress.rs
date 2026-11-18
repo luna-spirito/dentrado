@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use dentrado_cache::{MemDisk, Storage};
 
 mod util;
-use util::{del, offset_image, put, run, specs};
+use util::{del, offset_image, put, run, specs, tid};
 
 // ## Вход со смещением: off — атрибут входа, не страницы
 
@@ -79,7 +79,7 @@ fn random_ops_smoke() {
                     shadow.insert(key, payload);
                 }
                 12..=16 => {
-                    let got = st.get(b"t0", &[key]).await.unwrap();
+                    let got = st.get(tid(&st, b"t0"), &[key]).await.unwrap();
                     let want = shadow.get(&key).cloned();
                     assert_eq!(got, want, "op {op}, ключ {key}");
                 }
@@ -109,7 +109,7 @@ fn random_ops_smoke() {
             .unwrap();
         for key in 0..8u8 {
             assert_eq!(
-                st2.get(b"t0", &[key]).await.unwrap(),
+                st2.get(tid(&st2, b"t0"), &[key]).await.unwrap(),
                 shadow.get(&key).cloned(),
                 "ключ {key} после рестарта"
             );
@@ -136,13 +136,19 @@ fn tiny_pool_stress() {
         st.flush().await.unwrap();
         assert!(st.ok_store().await);
         for r in 0..40u8 {
-            assert_eq!(st.get(b"t0", &[r]).await.unwrap(), Some(vec![r; 100]));
+            assert_eq!(
+                st.get(tid(&st, b"t0"), &[r]).await.unwrap(),
+                Some(vec![r; 100])
+            );
         }
         drop(st);
         let st2 = Storage::open(&disk, "db", 2, &specs(&[b"t0"]))
             .await
             .unwrap();
-        assert_eq!(st2.get(b"t0", &[7]).await.unwrap(), Some(vec![7; 100]));
+        assert_eq!(
+            st2.get(tid(&st2, b"t0"), &[7]).await.unwrap(),
+            Some(vec![7; 100])
+        );
         assert!(st2.ok_store().await);
     });
 }
@@ -193,7 +199,7 @@ fn tree_holds_many_keys() {
         expect.sort_unstable();
         for k in &expect {
             let v = st2
-                .get(b"t0", k)
+                .get(tid(&st2, b"t0"), k)
                 .await
                 .unwrap()
                 .unwrap_or_else(|| panic!("ключ {k:?} потерян"));

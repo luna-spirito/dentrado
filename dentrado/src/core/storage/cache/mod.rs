@@ -10,13 +10,16 @@
 //!
 //! ## Ordering
 //!
-//! An operation appends its journal record first (buffered), then commits the
-//! cache state. Durability is [`CacheStorage::commit_log`]: the journal is
-//! synced, and *then* the cache's applied cursor advances.
+//! An operation appends its journal record first (buffered), then stages the
+//! rows it will make visible. Localization rows enter the RAM delta at once
+//! and are served from it; events stay pending and are not served at all until
+//! [`CacheStorage::commit_log`] writes them to the cache. Durability is the
+//! same call: the journal is synced, and *then* the cache's applied cursor
+//! advances in one atomic session with the rows it covers.
 //! [`CacheStorage::flush`] does the same and additionally flushes the page
-//! store. A crash therefore loses
-//! cache writes past the last applied cursor, which replay re-derives from the
-//! journal; it can never lose a journal record the cache claimed to have.
+//! store. A crash therefore loses cache writes past the last applied cursor,
+//! which replay re-derives from the journal; it can never lose a journal record
+//! the cache claimed to have.
 //!
 //! ## Idempotence
 //!
@@ -28,16 +31,26 @@
 //!
 //! - `codec` — key and value encodings;
 //! - `tables` — table ids, layout, meta;
-//! - `ops` — the idempotent transitions shared by live writes and replay;
+//! - `rows` — a staged row and the sink the fold writes through;
+//! - `delta` — the RAM coordination layer: counters, delta, per-key queues;
+//! - `fold` — the one record → rows interpretation;
+//! - `events` — committed event reads and replay;
+//! - `live` — loc allocation, journal appends, event storage, commit;
 //! - `replay` — journal records into those transitions;
-//! - `live` — loc allocation, journal appends, event storage;
-//! - `storage` — the handle, lazy open, startup replay, durability.
+//! - `flights` — per-key single-flight dispatch for the opened backend;
+//! - `open` — startup replay and the materialized image;
+//! - `storage` — the handle, lazy open, durability.
 
 pub(crate) mod codec;
 pub(crate) mod tables;
-mod ops;
-mod replay;
+mod rows;
+mod delta;
+mod fold;
+mod events;
 mod live;
+mod replay;
+mod flights;
+mod open;
 mod storage;
 #[cfg(test)]
 mod tests;

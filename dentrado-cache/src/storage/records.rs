@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use super::{Guard, Session, Storage};
+use super::{Guard, Session, Storage, TableId};
 use crate::core::tree::{leaf_find, parse_node, route};
 use crate::core::{DeltaV, StepHit};
 use crate::disk::IsFilesystem;
@@ -21,26 +21,32 @@ use crate::persist::PersistentCore;
 use crate::persist::walks::walk_range;
 
 /// The table's slot and the world's page bound — one section.
-fn table_at<D: IsFilesystem>(s: &Storage<D>, id: &[u8]) -> Result<(usize, u64), StoreError> {
+fn table_at<D: IsFilesystem>(s: &Storage<D>, table: TableId) -> Result<(usize, u64), StoreError> {
     let inner = s.inner.borrow();
     if inner.poisoned {
         return Err(StoreError::Poisoned);
     }
-    let Some(t) = inner.core.table_index(id) else {
+    let t = table.slot();
+    if !inner.core.table_live(t) {
         return Err(StoreError::NoTable);
-    };
+    }
     Ok((t, inner.core.bound()))
 }
 
 impl<D: IsFilesystem> Storage<D> {
+    /// The handle `name` resolved to in this open.
+    pub fn table(&self, name: &[u8]) -> Option<TableId> {
+        self.inner.borrow().core.table_index(name).map(TableId::new)
+    }
+
     /// Read one record's value whole from the live world: the delta
     /// first, the standing tree second. The bytes are the record's
     /// inline half — pages a record names are read through
     /// [`Session::read`] by the owner's own codec. The EBR pin lives
     /// inside the walk; the answer is owned bytes, no page references
     /// out.
-    pub async fn get(&self, id: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        let (t, bound) = table_at(self, id)?;
+    pub async fn get(&self, table: TableId, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        let (t, bound) = table_at(self, table)?;
         let (bucket, hit, root) = {
             let mut inner = self.inner.borrow_mut();
             if inner.poisoned {
@@ -74,11 +80,11 @@ impl<D: IsFilesystem> Storage<D> {
     /// is owned bytes.
     pub async fn scan(
         &self,
-        id: &[u8],
+        table: TableId,
         prefix: &[u8],
         after: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
-        let (t, bound) = table_at(self, id)?;
+        let (t, bound) = table_at(self, table)?;
         let end = prefix_end(prefix);
         let lo: &[u8] = if after > prefix { after } else { prefix };
         let (bucket, root, overlay) = {
@@ -112,11 +118,15 @@ impl<D: IsFilesystem> Session<D> {
     /// The name is the contract: a `put`/`del` staged in this session
     /// is invisible here. Use it when you need the record you are about
     /// to replace (its page closure, its old value), not the new one.
-    pub async fn get_old(&mut self, id: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+    pub async fn get_old(
+        &mut self,
+        table: TableId,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, StoreError> {
         self.ensure_snapshot()?;
         let (root, bound) = {
             let snap = self.snap.as_ref().expect("the snapshot was just ensured");
-            let t = snap.table(id).ok_or(StoreError::NoTable)?;
+            let t = snap.table(table.slot()).ok_or(StoreError::NoTable)?;
             match snap.delta(t, key) {
                 Some(DeltaV::Put(mt)) => return Ok(Some(mt.clone())),
                 Some(DeltaV::Del) => return Ok(None),
@@ -134,7 +144,7 @@ impl<D: IsFilesystem> Session<D> {
     /// session's own staged records.
     pub async fn scan_old(
         &mut self,
-        id: &[u8],
+        table: TableId,
         prefix: &[u8],
         after: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
@@ -143,7 +153,7 @@ impl<D: IsFilesystem> Session<D> {
         let lo: &[u8] = if after > prefix { after } else { prefix };
         let (root, bound, overlay) = {
             let snap = self.snap.as_ref().expect("the snapshot was just ensured");
-            let t = snap.table(id).ok_or(StoreError::NoTable)?;
+            let t = snap.table(table.slot()).ok_or(StoreError::NoTable)?;
             (
                 snap.root(t),
                 snap.bound(),

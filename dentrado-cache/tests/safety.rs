@@ -6,29 +6,32 @@
 use dentrado_cache::{Fault, MemDisk, Storage, StoreError, TableSpec};
 
 mod util;
-use util::{put, run, specs};
+use util::{put, run, specs, tid};
 
-/// A table the store never heard of: reads, scans and publications
-/// alike refuse — never a phantom root read, never a written byte.
+/// A table the store never heard of has no handle; a handle whose table
+/// was dropped afterward refuses reads, scans and publications alike —
+/// never a phantom root read, never a written byte.
 #[test]
 fn a_missing_table_refuses_honestly() {
     run(async {
         let disk = MemDisk::default();
-        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0"]))
+        let st = Storage::open(&disk, "db", 4, &specs(&[b"t0", b"t1"]))
             .await
             .unwrap();
+        assert!(st.table(b"gone").is_none(), "no handle for an unknown name");
+        let t1 = tid(&st, b"t1");
+        st.drop_table(t1).await.unwrap();
+        assert!(matches!(st.get(t1, b"k").await, Err(StoreError::NoTable)));
         assert!(matches!(
-            st.get(b"t1", b"k").await,
+            st.scan(t1, b"", b"").await,
             Err(StoreError::NoTable)
         ));
+        let mut s = st.session();
         assert!(matches!(
-            st.scan(b"t1", b"", b"").await,
+            s.put(t1, b"k", b"v", &[], &[]),
             Err(StoreError::NoTable)
         ));
-        assert!(matches!(
-            put(&st, b"t1", b"k", b"v"),
-            Err(StoreError::NoTable)
-        ));
+        drop(s);
         // the refusal swallowed nothing: the well-formed twin publishes
         put(&st, b"t0", b"j", b"v").unwrap();
         st.flush().await.unwrap();
@@ -74,18 +77,18 @@ fn a_bad_key_refuses_the_batch_whole() {
         // a key no leaf could hold refuses its stage, and the session
         // dies whole: its good stage lands none of it
         let mut s = st.session();
-        s.put(b"t0", b"good", b"v", &[], &[]).unwrap();
+        s.put(tid(&st, b"t0"), b"good", b"v", &[], &[]).unwrap();
         assert!(matches!(
-            s.put(b"t0", &huge, b"v", &[], &[]),
+            s.put(tid(&st, b"t0"), &huge, b"v", &[], &[]),
             Err(StoreError::BadKey)
         ));
         drop(s);
-        assert_eq!(st.get(b"t0", b"good").await.unwrap(), None);
+        assert_eq!(st.get(tid(&st, b"t0"), b"good").await.unwrap(), None);
         // a value no leaf could hold beside the oversized key: refused
         // alike, and nothing of it lands
         let mut s = st.session();
         assert!(matches!(
-            s.put(b"t0", &huge, &[7u8; 600], &[], &[]),
+            s.put(tid(&st, b"t0"), &huge, &[7u8; 600], &[], &[]),
             Err(StoreError::BadKey)
         ));
         drop(s);
@@ -126,12 +129,12 @@ fn an_untaken_draft_refuses_the_commit() {
             .unwrap();
         let mut s = st.session();
         let _leak = s.alloc().await.unwrap();
-        s.put(b"t0", b"k", b"v", &[], &[]).unwrap();
+        s.put(tid(&st, b"t0"), b"k", b"v", &[], &[]).unwrap();
         assert!(matches!(
             s.commit(),
             Err(StoreError::BadSeal("an untaken draft at the commit"))
         ));
-        assert_eq!(st.get(b"t0", b"k").await.unwrap(), None);
+        assert_eq!(st.get(tid(&st, b"t0"), b"k").await.unwrap(), None);
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
     });
@@ -158,7 +161,10 @@ fn a_transient_fault_rolls_back_the_round() {
         disk.file("db").set_fault(Fault::None);
         // the world came back: the sealed value still reads, a fresh
         // round lands
-        assert_eq!(st.get(b"t0", b"k").await.unwrap(), Some(vec![2u8; 3]));
+        assert_eq!(
+            st.get(tid(&st, b"t0"), b"k").await.unwrap(),
+            Some(vec![2u8; 3])
+        );
         put(&st, b"t0", b"j", &[3u8; 3]).unwrap();
         st.flush().await.unwrap();
         st.partition_exact().await.unwrap();
