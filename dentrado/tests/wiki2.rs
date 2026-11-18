@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap, fmt::Debug, num::NonZero};
+use std::{cell::RefCell, collections::HashMap, fmt::Debug};
 
 use dentrado::{
     core::{
@@ -139,8 +139,11 @@ impl Localizable for BranchData {
 }
 
 impl GlobalHash for BranchData {
-    fn global_hash(&self, resolver: &dyn GlobalResolver) -> Result<[u8; 32], GroupRouteError> {
-        let resolved_creator = resolver.resolve_user(self.creator)?;
+    async fn global_hash(
+        &self,
+        resolver: &impl GlobalResolver,
+    ) -> Result<[u8; 32], GroupRouteError> {
+        let resolved_creator = resolver.resolve_user(self.creator).await?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(&resolved_creator.id.to_le_bytes());
         hasher.update(&resolved_creator.identity_server_pk.0);
@@ -215,11 +218,14 @@ impl Localizable for Wiki2Group {
 }
 
 impl GlobalHash for Wiki2Group {
-    fn global_hash(&self, resolver: &dyn GlobalResolver) -> Result<[u8; 32], GroupRouteError> {
+    async fn global_hash(
+        &self,
+        resolver: &impl GlobalResolver,
+    ) -> Result<[u8; 32], GroupRouteError> {
         let mut hasher = blake3::Hasher::new();
         match self {
             Wiki2Group::Branch(did) => {
-                let resolved = resolver.resolve_data(*did)?;
+                let resolved = resolver.resolve_data(*did).await?;
                 hasher.update(&resolved.timestamp.to_le_bytes());
                 hasher.update(&resolved.hash);
             }
@@ -608,33 +614,25 @@ fn count_branches(sg: &Timeline<LocDataId, TextAgg>) -> usize {
     sg.iter().count()
 }
 
+/// The first doc id whose `DocContent` gear routes onto a core that `accept`
+/// approves of. The gear's group and its event group are the same value, so
+/// one hash decides both.
+fn find_doc_id(
+    tc: &TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>>,
+    num_cores: u32,
+    accept: impl Fn(u32) -> bool,
+) -> u64 {
+    (1..10_000)
+        .find(|&d| accept(tc.group_core(Wiki2Group::Doc(Id(d)), num_cores)))
+        .expect("should find a suitable doc id for this routing test")
+}
+
 fn find_cross_core_doc_id(
     tc: &TestCluster<Wiki2Runtime, InMemoryStorage<Wiki2Runtime>>,
     invited_core: u32,
     num_cores: u32,
 ) -> u64 {
-    (1..10_000)
-        .find(|&d| {
-            let doc_gear = Wiki2Gear::DocContent { doc: Id(d) };
-            let (doc_gear_wire, wc) = tc.remap_gear(doc_gear);
-
-            let gear_core = Wiki2Runtime::meta(&doc_gear_wire)
-                .group()
-                .global_hash(&wc)
-                .map(GlobalCoreId::from_hash)
-                .unwrap()
-                .route(NonZero::new(num_cores).unwrap());
-            if gear_core == invited_core {
-                return false;
-            }
-            let event_core = Wiki2Group::Doc(Id(d))
-                .global_hash(&wc)
-                .map(GlobalCoreId::from_hash)
-                .unwrap()
-                .route(NonZero::new(num_cores).unwrap());
-            event_core == gear_core
-        })
-        .expect("should find a suitable doc_id for cross-core routing")
+    find_doc_id(tc, num_cores, |core| core != invited_core)
 }
 
 fn find_same_core_doc_id(
@@ -642,28 +640,7 @@ fn find_same_core_doc_id(
     invited_core: u32,
     num_cores: u32,
 ) -> u64 {
-    (1..10_000)
-        .find(|&d| {
-            let doc_gear = Wiki2Gear::DocContent { doc: Id(d) };
-            let (doc_gear_wire, wc) = tc.remap_gear(doc_gear);
-
-            let gear_core = Wiki2Runtime::meta(&doc_gear_wire)
-                .group()
-                .global_hash(&wc)
-                .map(GlobalCoreId::from_hash)
-                .unwrap()
-                .route(NonZero::new(num_cores).unwrap());
-            if gear_core != invited_core {
-                return false;
-            }
-            let event_core = Wiki2Group::Doc(Id(d))
-                .global_hash(&wc)
-                .map(GlobalCoreId::from_hash)
-                .unwrap()
-                .route(NonZero::new(num_cores).unwrap());
-            event_core == gear_core
-        })
-        .expect("should find a suitable doc_id for same-core routing")
+    find_doc_id(tc, num_cores, |core| core == invited_core)
 }
 
 #[test]
@@ -749,14 +726,7 @@ fn doc_content_same_core_e2e() {
 
     tc.post_events(vec![make_invite_event(alice, 0, b0, bob_loc_uid)], 1);
 
-    let invited_gear = Wiki2Gear::Invited { branch: b0 };
-    let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear);
-    let invited_core = Wiki2Runtime::meta(&invited_gear_wire)
-        .group()
-        .global_hash(&invited_wire_ctx)
-        .map(GlobalCoreId::from_hash)
-        .unwrap()
-        .route(NonZero::new(2).unwrap());
+    let invited_core = tc.group_core(Wiki2Group::Branch(b0), 2);
 
     let doc_id = find_same_core_doc_id(&tc, invited_core, 2);
     tc.mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
@@ -818,14 +788,7 @@ fn doc_content_cross_core_e2e() {
 
     let b0 = add_seed_branch(&mut tc, alice_loc_uid);
 
-    let invited_gear = Wiki2Gear::Invited { branch: b0 };
-    let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear);
-    let invited_core = Wiki2Runtime::meta(&invited_gear_wire)
-        .group()
-        .global_hash(&invited_wire_ctx)
-        .map(GlobalCoreId::from_hash)
-        .unwrap()
-        .route(NonZero::new(2).unwrap());
+    let invited_core = tc.group_core(Wiki2Group::Branch(b0), 2);
 
     let doc_id = find_cross_core_doc_id(&tc, invited_core, 2);
     tc.mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
@@ -844,13 +807,7 @@ fn doc_content_cross_core_e2e() {
     );
 
     let doc_gear = Wiki2Gear::DocContent { doc: Id(doc_id) };
-    let (doc_gear_wire, doc_wire_ctx) = tc.remap_gear(doc_gear.clone());
-    let doc_core = Wiki2Runtime::meta(&doc_gear_wire)
-        .group()
-        .global_hash(&doc_wire_ctx)
-        .map(GlobalCoreId::from_hash)
-        .unwrap()
-        .route(NonZero::new(2).unwrap());
+    let doc_core = tc.group_core(Wiki2Group::Doc(Id(doc_id)), 2);
     assert_ne!(
         invited_core, doc_core,
         "gears must be on different cores for cross-core test"
@@ -912,14 +869,7 @@ fn retroactive_invite_cross_core_e2e() {
 
     let b0 = add_seed_branch(&mut tc, alice_loc_uid);
 
-    let invited_gear = Wiki2Gear::Invited { branch: b0 };
-    let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear);
-    let invited_core = Wiki2Runtime::meta(&invited_gear_wire)
-        .group()
-        .global_hash(&invited_wire_ctx)
-        .map(GlobalCoreId::from_hash)
-        .unwrap()
-        .route(NonZero::new(2).unwrap());
+    let invited_core = tc.group_core(Wiki2Group::Branch(b0), 2);
 
     let doc_id = find_cross_core_doc_id(&tc, invited_core, 2);
     tc.mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
@@ -967,13 +917,7 @@ fn retroactive_invite_cross_core_e2e() {
     );
 
     let doc_gear = Wiki2Gear::DocContent { doc: Id(doc_id) };
-    let (doc_gear_wire, doc_wire_ctx) = tc.remap_gear(doc_gear.clone());
-    let doc_core = Wiki2Runtime::meta(&doc_gear_wire)
-        .group()
-        .global_hash(&doc_wire_ctx)
-        .map(GlobalCoreId::from_hash)
-        .unwrap()
-        .route(NonZero::new(2).unwrap());
+    let doc_core = tc.group_core(Wiki2Group::Doc(Id(doc_id)), 2);
     assert_ne!(invited_core, doc_core, "gears must be on different cores");
 
     let output1 = tc.run_gear_on(0, doc_gear.clone());
@@ -1021,14 +965,7 @@ fn text_agg_merge_cross_core_e2e() {
     let b0 = add_seed_branch(&mut tc, alice_loc_uid);
     let b1 = add_seed_branch(&mut tc, carol_loc_uid);
 
-    let invited_gear = Wiki2Gear::Invited { branch: b0 };
-    let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear);
-    let invited_core = Wiki2Runtime::meta(&invited_gear_wire)
-        .group()
-        .global_hash(&invited_wire_ctx)
-        .map(GlobalCoreId::from_hash)
-        .unwrap()
-        .route(NonZero::new(2).unwrap());
+    let invited_core = tc.group_core(Wiki2Group::Branch(b0), 2);
 
     let doc_id = find_cross_core_doc_id(&tc, invited_core, 2);
     tc.mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
@@ -1069,13 +1006,7 @@ fn text_agg_merge_cross_core_e2e() {
     let _invited_output_b1 = tc.run_gear(invited_gear_b1);
 
     let doc_gear = Wiki2Gear::DocContent { doc: Id(doc_id) };
-    let (doc_gear_wire, doc_wire_ctx) = tc.remap_gear(doc_gear.clone());
-    let doc_core = Wiki2Runtime::meta(&doc_gear_wire)
-        .group()
-        .global_hash(&doc_wire_ctx)
-        .map(GlobalCoreId::from_hash)
-        .unwrap()
-        .route(NonZero::new(2).unwrap());
+    let doc_core = tc.group_core(Wiki2Group::Doc(Id(doc_id)), 2);
     assert_ne!(invited_core, doc_core, "gears must be on different cores");
 
     let output1 = tc.run_gear_on(0, doc_gear);
@@ -1132,14 +1063,7 @@ fn multi_user_doc_assembly_cross_core_e2e() {
 
     let b0 = add_seed_branch(&mut tc, alice_loc_uid);
 
-    let invited_gear = Wiki2Gear::Invited { branch: b0 };
-    let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear);
-    let invited_core = Wiki2Runtime::meta(&invited_gear_wire)
-        .group()
-        .global_hash(&invited_wire_ctx)
-        .map(GlobalCoreId::from_hash)
-        .unwrap()
-        .route(NonZero::new(2).unwrap());
+    let invited_core = tc.group_core(Wiki2Group::Branch(b0), 2);
 
     let doc_id = find_cross_core_doc_id(&tc, invited_core, 2);
     tc.mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));
@@ -1196,13 +1120,7 @@ fn multi_user_doc_assembly_cross_core_e2e() {
     );
 
     let doc_gear = Wiki2Gear::DocContent { doc: Id(doc_id) };
-    let (doc_gear_wire, doc_wire_ctx) = tc.remap_gear(doc_gear.clone());
-    let doc_core = Wiki2Runtime::meta(&doc_gear_wire)
-        .group()
-        .global_hash(&doc_wire_ctx)
-        .map(GlobalCoreId::from_hash)
-        .unwrap()
-        .route(NonZero::new(2).unwrap());
+    let doc_core = tc.group_core(Wiki2Group::Doc(Id(doc_id)), 2);
     assert_ne!(invited_core, doc_core, "gears must be on different cores");
 
     let output1 = tc.run_gear_on(0, doc_gear.clone());
@@ -1251,14 +1169,7 @@ fn retroactive_invite_point_in_time_same_core_e2e() {
 
     let b0 = add_seed_branch(&mut tc, alice_loc_uid);
 
-    let invited_gear = Wiki2Gear::Invited { branch: b0 };
-    let (invited_gear_wire, invited_wire_ctx) = tc.remap_gear(invited_gear);
-    let invited_core = Wiki2Runtime::meta(&invited_gear_wire)
-        .group()
-        .global_hash(&invited_wire_ctx)
-        .map(GlobalCoreId::from_hash)
-        .unwrap()
-        .route(NonZero::new(2).unwrap());
+    let invited_core = tc.group_core(Wiki2Group::Branch(b0), 2);
 
     let doc_id = find_same_core_doc_id(&tc, invited_core, 2);
     tc.mk_loc_group(MSG_ATTACH, Wiki2Group::Doc(Id(doc_id)));

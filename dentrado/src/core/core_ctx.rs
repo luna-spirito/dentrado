@@ -1300,7 +1300,10 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
         }
         // Every event in this batch is appended; one sync makes the whole
         // batch durable before any reply. This is the group-commit point.
-        self.storage.sync_log().await.map_err(MergeError::Storage)?;
+        self.storage
+            .commit_log()
+            .await
+            .map_err(MergeError::Storage)?;
         {
             let mut inner = self.inner.borrow_mut();
             let CoreLocCtx {
@@ -1684,7 +1687,7 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
             impl FnMut() -> Option<flume::Sender<Result<(), MergeError>>>,
         ),
     ) -> Result<(), MergeError> {
-        let routed = routing::route_events(wire_ctx, events, self.num_cores())?;
+        let routed = routing::route_events(wire_ctx, events, self.num_cores()).await?;
 
         let mut our_task = None;
         for (target_core, seed_indices) in routed.core_seeds {
@@ -1731,7 +1734,7 @@ impl<R: IsRuntime, S: IsStorage<R>> Core<R, S> {
         gear: R::GearId,
         wire_ctx: WireLocCtx<R>,
     ) -> Result<R::GearOut, RunGearError> {
-        let target_core = routing::route_gear(&R::meta(&gear), &wire_ctx, self.num_cores())?;
+        let target_core = routing::route_gear(&R::meta(&gear), &wire_ctx, self.num_cores()).await?;
 
         if target_core == self.core_id {
             // Direct call on this core.

@@ -299,7 +299,7 @@ impl<R: IsRuntime> Db<R> {
         })
     }
 
-    pub fn post_events(
+    pub async fn post_events(
         &self,
         wire_ctx: WireLocCtx<R>,
         events: Vec<WireEventBody<R::Group, R::Body>>,
@@ -309,7 +309,8 @@ impl<R: IsRuntime> Db<R> {
             wire_ctx,
             events,
             NonZero::new(self.handles.len() as u32).unwrap(),
-        )?;
+        )
+        .await?;
 
         let mut reply_rxs = Vec::with_capacity(routed.core_seeds.len());
         for (target_core, seed_indices) in routed.core_seeds {
@@ -337,7 +338,7 @@ impl<R: IsRuntime> Db<R> {
         Ok(())
     }
 
-    pub fn run_gear(
+    pub async fn run_gear(
         &self,
         gear: R::GearId,
         wire_ctx: WireLocCtx<R>,
@@ -346,7 +347,8 @@ impl<R: IsRuntime> Db<R> {
             &R::meta(&gear),
             &wire_ctx,
             NonZero::new(self.handles.len() as u32).unwrap(),
-        )?;
+        )
+        .await?;
         let handle = &self.handles[target_core as usize];
 
         let (reply_tx, reply_rx) = flume::bounded(1);

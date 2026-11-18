@@ -59,8 +59,11 @@ impl Localizable for BranchData {
 }
 
 impl GlobalHash for BranchData {
-    fn global_hash(&self, resolver: &dyn GlobalResolver) -> Result<[u8; 32], GroupRouteError> {
-        let resolved_creator = resolver.resolve_user(self.creator)?;
+    async fn global_hash(
+        &self,
+        resolver: &impl GlobalResolver,
+    ) -> Result<[u8; 32], GroupRouteError> {
+        let resolved_creator = resolver.resolve_user(self.creator).await?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(&resolved_creator.id.to_le_bytes());
         hasher.update(&resolved_creator.identity_server_pk.0);

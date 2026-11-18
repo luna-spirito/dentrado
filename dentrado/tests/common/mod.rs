@@ -48,26 +48,17 @@ pub(crate) struct TestCluster<R: IsRuntime, S: IsStorage<R>> {
     rng: XorShift64,
 }
 
-/// Drive a client-side future to completion. The Db cores run on their own
-/// per-thread compio runtimes; this only drives client-side `R::Storage` ops,
-/// which are trivially `RefCell` work — the `InMemoryStorage` futures are
-/// immediately ready and never yield. A single-pass no-op executor is enough
-/// and avoids the cost (and FD/memory pressure) of building a compio runtime
-/// per call.
+thread_local! {
+    /// The test thread's compio runtime. The client's page store opens on the
+    /// first call and keeps its driver tasks here, so one runtime must outlive
+    /// every call a test makes.
+    static RUNTIME: compio::runtime::Runtime =
+        compio::runtime::Runtime::new().expect("a compio runtime for the test thread");
+}
+
+/// Drive `fut` to completion on this test thread's runtime.
 pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
-    struct Noop;
-    impl Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
-    let waker = Waker::from(Arc::new(Noop));
-    let mut cx = Context::from_waker(&waker);
-    let mut fut = std::pin::pin!(fut);
-    match fut.as_mut().poll(&mut cx) {
-        Poll::Ready(v) => v,
-        Poll::Pending => panic!("client storage op yielded unexpectedly"),
-    }
+    RUNTIME.with(|rt| rt.block_on(fut))
 }
 
 impl<R: IsRuntime, S: IsStorage<R>> TestCluster<R, S>
@@ -207,6 +198,7 @@ where
             let handle = self.random_db();
             handle
                 .post_events(wire_ctx, wire_events, timestamp)
+                .await
                 .expect("post_events failed");
         });
     }
@@ -214,19 +206,19 @@ where
     pub(crate) fn run_gear(&self, gear: R::GearId) -> R::GearOut {
         self.drain();
         let (wire_gear, wire_ctx) = self.remap_gear(gear);
-        let handle = self.random_db();
-        handle
-            .run_gear(wire_gear, wire_ctx)
-            .expect("run_gear failed")
+        block_on(async {
+            self.random_db()
+                .run_gear(wire_gear, wire_ctx)
+                .await
+                .expect("run_gear failed")
+        })
     }
 
     pub(crate) fn run_gear_on(&self, machine_idx: usize, gear: R::GearId) -> R::GearOut {
         self.drain();
         let (wire_gear, wire_ctx) = self.remap_gear(gear);
         let handle = &self.nodes[machine_idx].db;
-        handle
-            .run_gear(wire_gear, wire_ctx)
-            .expect("run_gear failed")
+        block_on(handle.run_gear(wire_gear, wire_ctx)).expect("run_gear failed")
     }
 
     #[must_use]
@@ -240,6 +232,18 @@ where
         let wire_gear = block_on(builder.remap(gear)).expect("WireLocCtxBuilder: remap gear");
         let wire_ctx = builder.build();
         (wire_gear, wire_ctx)
+    }
+
+    /// The core that owns `group`, routed exactly as the engine routes it.
+    /// The test backend answers on the first poll, so `block_on` is sound.
+    pub(crate) fn group_core(&self, group: R::Group, num_cores: u32) -> u32 {
+        let mut builder = WireLocCtxBuilder::new(&self.client);
+        let wire_group = block_on(builder.remap(group)).expect("WireLocCtxBuilder: remap group");
+        let wire_ctx = builder.build();
+        block_on(wire_group.global_hash(&wire_ctx))
+            .map(GlobalCoreId::from_hash)
+            .expect("a group hash")
+            .route(NonZero::new(num_cores).unwrap())
     }
 
     fn random_db(&self) -> &Db<R> {

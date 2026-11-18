@@ -103,9 +103,13 @@ pub struct DataId {
     pub hash: [u8; 32],
 }
 
+/// Resolves local ids into their global identities.
+///
+/// Resolution is asynchronous: the only production backend keeps its
+/// localization maps in the page cache, where a lookup is a store read.
 pub trait GlobalResolver {
-    fn resolve_user(&self, lid: LocUserId) -> Result<UserId, GroupRouteError>;
-    fn resolve_data(&self, did: LocDataId) -> Result<DataId, GroupRouteError>;
+    async fn resolve_user(&self, lid: LocUserId) -> Result<UserId, GroupRouteError>;
+    async fn resolve_data(&self, did: LocDataId) -> Result<DataId, GroupRouteError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,16 +240,21 @@ pub(crate) const SEGMENT_SIZE_BYTES: usize = 256 * 1024 * 1024;
 /// [`GlobalCoreId::from_hash`] → [`GlobalCoreId::route`], and content
 /// addressing keeps the full `[u8; 32]`.
 ///
-/// `resolver` resolves embedded [`LocDataId`] refs — the reason the old
-/// `IsRuntime::hash_data` took a resolver (see `storage/in_memory.rs`). For
-/// id/key types with no embedded content-addressed refs this is a pure
-/// `Hash` fold that ignores the resolver.
+/// `resolver` resolves embedded [`LocDataId`] refs; a value with none ignores
+/// it. Resolution is async because a backend's localization maps may live in
+/// the page cache.
 pub trait GlobalHash: Localizable {
-    fn global_hash(&self, resolver: &dyn GlobalResolver) -> Result<[u8; 32], GroupRouteError>;
+    async fn global_hash(
+        &self,
+        resolver: &impl GlobalResolver,
+    ) -> Result<[u8; 32], GroupRouteError>;
 }
 
 impl GlobalHash for () {
-    fn global_hash(&self, _resolver: &dyn GlobalResolver) -> Result<[u8; 32], GroupRouteError> {
+    async fn global_hash(
+        &self,
+        _resolver: &impl GlobalResolver,
+    ) -> Result<[u8; 32], GroupRouteError> {
         Ok([0; 32])
     }
 }
@@ -255,8 +264,11 @@ impl GlobalHash for () {
 /// content-address a local data id; routing then truncates via
 /// [`GlobalCoreId::from_hash`].
 impl GlobalHash for LocDataId {
-    fn global_hash(&self, resolver: &dyn GlobalResolver) -> Result<[u8; 32], GroupRouteError> {
-        let resolved = resolver.resolve_data(*self)?;
+    async fn global_hash(
+        &self,
+        resolver: &impl GlobalResolver,
+    ) -> Result<[u8; 32], GroupRouteError> {
+        let resolved = resolver.resolve_data(*self).await?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(&resolved.timestamp.to_le_bytes());
         hasher.update(&resolved.hash);
@@ -267,7 +279,10 @@ impl GlobalHash for LocDataId {
 /// An `i64` used as a routing key hashes via blake3 of its little-endian bytes
 /// (deterministic placement; matches the former hand-written runtime impl).
 impl GlobalHash for i64 {
-    fn global_hash(&self, _resolver: &dyn GlobalResolver) -> Result<[u8; 32], GroupRouteError> {
+    async fn global_hash(
+        &self,
+        _resolver: &impl GlobalResolver,
+    ) -> Result<[u8; 32], GroupRouteError> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&self.to_le_bytes());
         Ok(*hasher.finalize().as_bytes())

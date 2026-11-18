@@ -721,20 +721,12 @@ mod tests {
     use crate::core::gear::EmptyRuntime;
     use crate::core::loc_ctx::StoredEvent;
     use crate::core::storage::{GroupStore, InMemoryStorage, IsStorage};
+    use crate::test_support::block_on;
     use crate::types::{LocGroupId, SenderPk};
 
     const PK_A: SenderPk = SenderPk([0u8; 32]);
     const PK_B: SenderPk = SenderPk([1u8; 32]);
     const PK_C: SenderPk = SenderPk([2u8; 32]);
-
-    /// Drive a future on a throwaway compio runtime (sg_ord_map is async but
-    /// I/O-free; `InMemoryStorage` completes eagerly).
-    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-        compio::runtime::RuntimeBuilder::new()
-            .build()
-            .expect("compio runtime build failed")
-            .block_on(fut)
-    }
 
     async fn make_test_storage() -> InMemoryStorage<EmptyRuntime> {
         let storage = InMemoryStorage::<EmptyRuntime>::new();

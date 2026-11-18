@@ -609,23 +609,8 @@ mod tests {
     use super::*;
     use crate::core::gear::EmptyRuntime;
     use crate::core::storage::{GroupStore, InMemoryStorage};
+    use crate::test_support::block_on;
     use crate::types::LocGroupId;
-
-    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-        use std::sync::Arc;
-        use std::task::{Context, Poll, Wake, Waker};
-        struct Noop;
-        impl Wake for Noop {
-            fn wake(self: Arc<Self>) {}
-        }
-        let waker = Waker::from(Arc::new(Noop));
-        let mut cx = Context::from_waker(&waker);
-        let mut fut = std::pin::pin!(fut);
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => v,
-            Poll::Pending => panic!("future yielded unexpectedly"),
-        }
-    }
 
     /// Empty group-bound store. Text's RGA ordering only consults `sender_pk`
     /// lazily (on a full tie only), so an empty store works — `sender_pk` is

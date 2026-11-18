@@ -11,6 +11,10 @@ pub extern crate self as dentrado;
 /// gears can be authored as plain `async fn`s.
 pub use dentrado_macros::{gear, gears};
 
+/// Test-only helpers (a per-thread compio runtime and its `block_on`).
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub mod types;
 pub mod core;
 pub mod utils;

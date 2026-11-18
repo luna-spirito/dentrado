@@ -1224,9 +1224,9 @@ fn expand(attr: GearsAttr, mut item_mod: ItemMod) -> syn::Result<TokenStream2> {
         }
 
         impl dentrado::types::GlobalHash for Group {
-            fn global_hash(
+            async fn global_hash(
                 &self,
-                _resolver: &dyn dentrado::types::GlobalResolver,
+                _resolver: &impl dentrado::types::GlobalResolver,
             ) -> ::core::result::Result<[u8; 32], dentrado::types::GroupRouteError> {
                 let mut hash = [0u8; 32];
                 let Group::Phantom(x) = *self;

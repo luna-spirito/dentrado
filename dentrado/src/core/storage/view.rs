@@ -3,12 +3,11 @@
 //!
 //! A gear never names the store's tables. It gets a [`GearView`] whose
 //! keys are prefixed by a stable per-gear subkey, so two gears can use
-//! the same key names without colliding. The disk view is a thin wrapper
+//! the same key names without colliding. The view is a thin wrapper
 //! around one [`Session`]: reads use the session's snapshot
 //! ([`Session::get_old`]/[`Session::scan_old`]), writes are staged by
 //! [`Session::put`]/[`Session::del`], and [`Session::commit`] publishes
-//! the whole batch atomically. The RAM view is the same contract over a
-//! `BTreeMap`, used by [`InMemoryStorage`](super::InMemoryStorage).
+//! the whole batch atomically.
 //!
 //! The base view is deliberately flat: values must fit one leaf record.
 //! A gear that needs bigger values stores several records (e.g.
@@ -21,14 +20,12 @@
 //! Per-gear isolation *within* a kind is still the key prefix.
 
 use std::{
-    cell::RefCell,
-    collections::BTreeMap,
     hash::{Hash, Hasher},
     rc::Rc,
     sync::OnceLock,
 };
 
-use dentrado_cache::{Session, Storage, disk::FsDisk};
+use dentrado_cache::{Session, Storage, disk::IsFilesystem};
 
 use crate::core::api::{GearTable, RuntimeTypes};
 
@@ -57,9 +54,8 @@ pub(crate) fn legacy_gear_table() -> &'static [u8] {
     })
 }
 
-/// Could one leaf hold this record? The disk view would refuse the whole
-/// flush on `put`; the RAM view must refuse it at the same point, or the two
-/// backends disagree on what a gear may store.
+/// Could one leaf hold this record? The store would refuse the whole
+/// flush on `put`; the view must refuse it at the same point.
 pub(crate) fn check_leaf(key: &[u8], value: &[u8]) {
     assert!(
         dentrado_cache::core::tree::leaf_holds(key, value),
@@ -128,6 +124,7 @@ impl Hasher for GearHasher {
 /// Reads are the **old** world: a value written earlier in the same run
 /// is not visible until commit. This is deliberate — a gear reads its
 /// previous cache, computes, and stages the next one.
+// REVIEW: I don't understand the point of this abstractions. I feel like traits in `dentrado/` are in a desperate nee of a cleanup.
 pub trait GearView {
     /// The old value for `key`, or `None`.
     async fn get(&mut self, key: &[u8]) -> Option<Vec<u8>>;
@@ -138,7 +135,7 @@ pub trait GearView {
     async fn scan(&mut self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)>;
 
     /// Stage a value. It must fit one leaf record (the view panics
-    /// otherwise, in both backends); the view does not chunk.
+    /// otherwise); the view does not chunk.
     fn put(&mut self, key: &[u8], value: &[u8]);
 
     /// Stage a deletion.
@@ -149,24 +146,20 @@ pub trait GearView {
     fn commit(&mut self);
 }
 
-/// A view over one [`Session`] of the disk store.
-pub struct DiskView {
-    store: Rc<Storage<FsDisk>>,
+/// A view over one [`Session`] of the store.
+pub struct DiskView<D: IsFilesystem> {
+    store: Rc<Storage<D>>,
     /// `None` between a commit and the next touch: the commit consumes the
     /// session, and a fresh one (seeing the commit) opens on demand.
-    session: Option<Session<FsDisk>>,
+    session: Option<Session<D>>,
     /// The gear kind's table, encoded once here ([`GearTable::encode`]); the
     /// key prefix only separates gears within it.
     table: Vec<u8>,
     prefix: Vec<u8>,
 }
 
-impl DiskView {
-    pub(crate) fn new(
-        store: Rc<Storage<FsDisk>>,
-        table: GearTable<'static>,
-        prefix: Vec<u8>,
-    ) -> Self {
+impl<D: IsFilesystem> DiskView<D> {
+    pub(crate) fn new(store: Rc<Storage<D>>, table: GearTable<'static>, prefix: Vec<u8>) -> Self {
         Self {
             session: Some(store.session()),
             store,
@@ -185,14 +178,14 @@ impl DiskView {
 
 /// The session, opening a fresh one (seeing the last commit) on demand. A free
 /// function so the caller can keep borrowing `self.table`/`self.store`.
-fn session<'s>(
-    slot: &'s mut Option<Session<FsDisk>>,
-    store: &Rc<Storage<FsDisk>>,
-) -> &'s mut Session<FsDisk> {
+fn session<'s, D: IsFilesystem>(
+    slot: &'s mut Option<Session<D>>,
+    store: &Rc<Storage<D>>,
+) -> &'s mut Session<D> {
     slot.get_or_insert_with(|| store.session())
 }
 
-impl GearView for DiskView {
+impl<D: IsFilesystem> GearView for DiskView<D> {
     async fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         let full = self.full(key);
         session(&mut self.session, &self.store)
@@ -231,72 +224,6 @@ impl GearView for DiskView {
     fn commit(&mut self) {
         if let Some(session) = self.session.take() {
             session.commit().expect("gear view commit");
-        }
-    }
-}
-
-/// A view over a plain `BTreeMap`, keyed by the full (prefixed) key. The
-/// staging contract matches [`DiskView`]: reads see the committed map,
-/// writes land on [`commit`](GearView::commit).
-pub struct RamView<'a> {
-    map: &'a RefCell<BTreeMap<Vec<u8>, Vec<u8>>>,
-    /// Staged ops by full key; `None` is a deletion.
-    staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-    prefix: Vec<u8>,
-}
-
-impl<'a> RamView<'a> {
-    pub(crate) fn new(map: &'a RefCell<BTreeMap<Vec<u8>, Vec<u8>>>, prefix: Vec<u8>) -> Self {
-        Self {
-            map,
-            staged: BTreeMap::new(),
-            prefix,
-        }
-    }
-
-    fn full(&self, key: &[u8]) -> Vec<u8> {
-        let mut full = Vec::with_capacity(self.prefix.len() + key.len());
-        full.extend_from_slice(&self.prefix);
-        full.extend_from_slice(key);
-        full
-    }
-}
-
-impl GearView for RamView<'_> {
-    async fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
-        self.map.borrow().get(&self.full(key)).cloned()
-    }
-
-    async fn scan(&mut self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let full = self.full(prefix);
-        let strip = self.prefix.len();
-        let map = self.map.borrow();
-        map.range(full.clone()..)
-            .take_while(|(key, _)| key.starts_with(&full))
-            .map(|(key, value)| (key[strip..].to_vec(), value.clone()))
-            .collect()
-    }
-
-    fn put(&mut self, key: &[u8], value: &[u8]) {
-        let full = self.full(key);
-        check_leaf(&full, value);
-        self.staged.insert(full, Some(value.to_vec()));
-    }
-
-    fn del(&mut self, key: &[u8]) {
-        self.staged.insert(self.full(key), None);
-    }
-
-    fn commit(&mut self) {
-        if self.staged.is_empty() {
-            return;
-        }
-        let mut map = self.map.borrow_mut();
-        for (key, value) in std::mem::take(&mut self.staged) {
-            match value {
-                Some(value) => drop(map.insert(key, value)),
-                None => drop(map.remove(&key)),
-            }
         }
     }
 }

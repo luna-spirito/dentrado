@@ -1,18 +1,16 @@
 //! Per-core, single-threaded storage contract — **typed over `R`**.
 //!
 //! `Storage<R>` describes, directly and with full type safety, the operations
-//! dentrado performs against persistent (restart-surviving) state. No byte
-//! keys, no serialization at this level: each operation is a named, typed
-//! dentrado interaction, and the in-memory implementation is the `HashMap`s
-//! from `loc_ctx.rs` behind the trait — zero overhead.
+//! dentrado performs against persistent (restart-surviving) state. Each
+//! operation is a named, typed dentrado interaction: no caller ever names a
+//! byte key or serializes a value at this level.
 //!
-//! ## Why typed (and generic over `R`)
-//!//! A bytes/generic-KV trait would force even the in-memory backend to serialize
-//! every `SenderPk`/`UserId`/`R::Group`/`R::Data`/`R::Body` on every op —
-//! pointless work in RAM and a source of key/value bugs. Since dentrado ships
-//! exactly one disk backend (which knows `R` anyway), the "backend reusable
-//! without `R`" flexibility is worthless; a typed trait gives zero-overhead
-//! in-memory, a self-documenting spec, and type safety.
+//! ## One implementation
+//!
+//! Both shipped backends are the same page-cache code: the journaled one
+//! pairs it with an append-only log, the RAM one runs it over a memory disk.
+//! The typed interface keeps that code honest and lets replay reuse the live
+//! applies instead of maintaining a second, subtly different fold.
 //!
 //! ## Durability of the gear view
 //!
@@ -33,9 +31,9 @@
 //! 3. **gear view** — a gear's watermark must not survive past its events.
 //!
 //! Everything in this trait is restart-surviving state. A *RAM-only* backend
-//! like [`InMemoryStorage`](crate::core::storage::in_memory::InMemoryStorage)
-//! loses it all on process death — but that is a property of the backend
-//! (equally true of its events and localization), not of any one layer here.
+//! like [`InMemoryStorage`](crate::core::storage::InMemoryStorage) loses it
+//! all on process death — but that is a property of the backend (equally true
+//! of its events and localization), not of any one layer here.
 //!
 //! ## Concurrency
 //!
@@ -53,15 +51,14 @@
 //! an opaque session token instead of reading localization.
 
 pub mod store;
-pub(crate) mod fold;
 pub mod view;
-pub mod in_memory;
 pub mod journal;
+pub mod cache;
 pub mod paged;
 
-pub use in_memory::InMemoryStorage;
+pub use cache::{CacheStorage, InMemoryStorage};
 pub use paged::PagedStorage;
-pub use view::{DiskView, GearView, RamView};
+pub use view::{DiskView, GearView};
 
 use std::{fmt::Debug, future::Future, io, marker::PhantomData};
 
@@ -184,30 +181,25 @@ pub trait IsStorage<R: RuntimeTypes>: 'static {
 
     // ── Durability ────────────────────────────────────────────────────────
 
-    // REVIEW: 1) Inconsistent naming `flush` vs `log`
-    // REVIEW: Relationship between `flush` and `sync_log` isn't clear. I assume `flush` must imply `sync_log`.
-    // REVIEW: English comments.
-    /// Commit point: после успешного `flush` всё, записанное до него,
-    /// переживает крах процесса. Порядок внутри: layer 1 → layer 2 →
-    /// gear view.
-    fn flush(&self) -> impl Future<Output = io::Result<()>>;
+    /// The log's durability point. Once it returns, every event appended so
+    /// far survives a crash; called once per `post_events` batch before any
+    /// reply.
+    fn commit_log(&self) -> impl Future<Output = io::Result<()>>;
 
-    /// The log's durability point, without the gear-view flush. Called once
-    /// per `post_events` batch before the replies: everything acknowledged
-    /// after `sync_log` survives a crash. The default is a no-op for a backend
-    /// with no log.
-    fn sync_log(&self) -> impl Future<Output = io::Result<()>> {
-        async { Ok(()) }
-    }
+    /// The full commit point: after a successful `flush`, everything written
+    /// before it survives a crash. A flush implies [`commit_log`](Self::commit_log),
+    /// then persists the remaining state in dependency order — localization,
+    /// the event log, the gear views.
+    fn flush(&self) -> impl Future<Output = io::Result<()>>;
 }
 
-/// Группа-bound асинхронный read-view над бекендом [`Storage`]. Связывает группу
-/// один раз (на границе запуска gear), чтобы CPU-алгоритмы ниже оставались
-/// group-agnostic: они видят только `&GroupStore` + slot, никогда `LocGroupId`.
+/// A group-bound async read view over a [`Storage`] backend. It binds the
+/// group once (at the gear-run boundary) so CPU algorithms below stay
+/// group-agnostic: they see only `&GroupStore` plus a slot, never a
+/// `LocGroupId`.
 ///
-/// Методы `async` и делегируют unboxed в [`Storage`] (без аллокаций сверх тех,
-/// что делает сам бекенд). Заменяет прежнюю синхронную пару
-/// `loc_ctx::GroupStore`/`EventStore`, теперь когда бекенд — `async`.
+/// The methods are `async` and delegate unboxed to the backend (no extra
+/// allocations beyond what the backend does itself).
 pub struct GroupStore<'a, R: RuntimeTypes, S: IsStorage<R>> {
     storage: &'a S,
     group: LocGroupId,
@@ -224,28 +216,28 @@ impl<'a, R: RuntimeTypes, S: IsStorage<R>> GroupStore<'a, R, S> {
         }
     }
 
-    /// Привязанная группа (один gear = одна группа).
+    /// The bound group (one gear = one group).
     #[must_use]
     pub fn group(&self) -> LocGroupId {
         self.group
     }
 
-    /// Тело события по слоту в этой группе.
+    /// The event body at `slot` in this group.
     pub async fn stored_event(&self, slot: GroupEventId) -> Option<StoredEvent<R::Body>> {
         self.storage.fetch_event(self.group, slot).await
     }
 
-    /// Локальный user сендера.
+    /// The sender's local user.
     pub async fn sender_user(&self, sid: LocSenderId) -> Option<LocUserId> {
         self.storage.sender_user(sid).await
     }
 
-    /// Публичный ключ сендера.
+    /// The sender's public key.
     pub async fn sender_pk(&self, sid: LocSenderId) -> Option<SenderPk> {
         self.storage.sender_pk(sid).await
     }
 
-    /// Запись данных `(DataId, content)` по локальному id.
+    /// The data record `(DataId, content)` behind a local id.
     pub async fn data(&self, did: LocDataId) -> Option<(DataId, R::Data)> {
         self.storage.fetch_data(did).await
     }

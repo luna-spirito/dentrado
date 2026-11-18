@@ -2,6 +2,7 @@ use super::{DeltaList, HandlerCtx, SGBucketId, SGEventId, StateGraph, Timeline};
 use crate::core::gear::EmptyRuntime;
 use crate::core::loc_ctx::StoredEvent;
 use crate::core::storage::{GroupStore, InMemoryStorage, IsStorage};
+use crate::test_support::block_on;
 use crate::types::{GroupEventId, LocGroupId, LocMsgTypeId, NodeId, SenderPk};
 use imbl::OrdMap;
 use std::collections::BTreeMap;
@@ -9,23 +10,6 @@ use std::collections::BTreeMap;
 type Store = InMemoryStorage<EmptyRuntime>;
 
 const PK_A: SenderPk = SenderPk([0u8; 32]);
-
-/// Drive a future on a throwaway compio runtime.
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
-    struct Noop;
-    impl Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
-    let waker = Waker::from(Arc::new(Noop));
-    let mut cx = Context::from_waker(&waker);
-    let mut fut = std::pin::pin!(fut);
-    match fut.as_mut().poll(&mut cx) {
-        Poll::Ready(v) => v,
-        Poll::Pending => panic!("future yielded unexpectedly"),
-    }
-}
 
 fn gs(ctx: &Store) -> GroupStore<'_, EmptyRuntime, Store> {
     GroupStore::new(ctx, LocGroupId(0))

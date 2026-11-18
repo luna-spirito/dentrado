@@ -20,16 +20,20 @@ pub(crate) struct RoutedEvents<R: RuntimeTypes> {
 }
 
 /// Route events to their target cores.
-pub(crate) fn route_events<R: RuntimeTypes>(
+pub(crate) async fn route_events<R: RuntimeTypes>(
     wire_ctx: WireLocCtx<R>,
     events: Vec<WireEventBody<R::Group, R::Body>>,
     num_cores: NonZero<u32>,
 ) -> Result<RoutedEvents<R>, MergeError> {
-    let global_core_ids: Vec<GlobalCoreId> = events
-        .iter()
-        .map(|e| e.group.global_hash(&wire_ctx).map(GlobalCoreId::from_hash))
-        .collect::<Result<_, _>>()
-        .map_err(MergeError::Route)?;
+    let mut global_core_ids = Vec::with_capacity(events.len());
+    for event in &events {
+        let hash = event
+            .group
+            .global_hash(&wire_ctx)
+            .await
+            .map_err(MergeError::Route)?;
+        global_core_ids.push(GlobalCoreId::from_hash(hash));
+    }
 
     let wire_ctx = Arc::new(wire_ctx);
     let events: Arc<[WireEventBody<R::Group, R::Body>]> = Arc::from(events);
@@ -50,7 +54,7 @@ pub(crate) fn route_events<R: RuntimeTypes>(
 }
 
 /// Route a gear to the core that owns its group.
-pub(crate) fn route_gear<R: RuntimeTypes>(
+pub(crate) async fn route_gear<R: RuntimeTypes>(
     meta: &GearMeta<R>,
     wire_ctx: &WireLocCtx<R>,
     num_cores: NonZero<u32>,
@@ -58,6 +62,7 @@ pub(crate) fn route_gear<R: RuntimeTypes>(
     let global_core_id = meta
         .group()
         .global_hash(wire_ctx)
+        .await
         .map(GlobalCoreId::from_hash)
         .map_err(RunGearError::Route)?;
     Ok(global_core_id.route(num_cores))

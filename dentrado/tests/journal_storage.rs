@@ -33,11 +33,14 @@ impl Localizable for TestGroup {
 }
 
 impl GlobalHash for TestGroup {
-    fn global_hash(&self, resolver: &dyn GlobalResolver) -> Result<[u8; 32], GroupRouteError> {
+    async fn global_hash(
+        &self,
+        resolver: &impl GlobalResolver,
+    ) -> Result<[u8; 32], GroupRouteError> {
         let mut hasher = blake3::Hasher::new();
         match self {
             Self::Branch(data) => {
-                hasher.update(&data.global_hash(resolver)?);
+                hasher.update(&data.global_hash(resolver).await?);
             }
             Self::Doc(doc) => {
                 hasher.update(&doc.to_le_bytes());
@@ -73,8 +76,11 @@ impl Localizable for TestData {
 }
 
 impl GlobalHash for TestData {
-    fn global_hash(&self, resolver: &dyn GlobalResolver) -> Result<[u8; 32], GroupRouteError> {
-        let creator = resolver.resolve_user(self.creator)?;
+    async fn global_hash(
+        &self,
+        resolver: &impl GlobalResolver,
+    ) -> Result<[u8; 32], GroupRouteError> {
+        let creator = resolver.resolve_user(self.creator).await?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(&creator.id.to_le_bytes());
         hasher.update(&creator.identity_server_pk.0);
@@ -366,7 +372,7 @@ fn the_journal_alone_rebuilds_a_lost_cache() {
 /// homeserver, which nothing records yet. This pins the delta it must produce
 /// once observations can be ranked by authority.
 #[test]
-#[ignore = "supersede is a todo!(); see Fold::store_event"]
+#[ignore = "supersede is a todo!(); see storage::cache"]
 fn a_superseding_observation_removes_the_stored_slot() {
     run(async {
         let dir = tempfile::tempdir().unwrap();

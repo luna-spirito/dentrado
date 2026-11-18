@@ -105,10 +105,11 @@ pub struct Event<'a> {
     pub tx_id: u32,
     pub timestamp: u32,
     pub source_node: u32,
-    pub body_schema: u16,
+    pub body_schema: u16, // REVIEW: body_schema is implied by the `group`.
     pub body: &'a [u8],
 }
 
+// REVIEW: No hand-written impl allowed here.
 impl Shape for Event<'_> {
     fn shape() -> String {
         concat!(
@@ -120,7 +121,7 @@ impl Shape for Event<'_> {
 }
 
 impl Record for Event<'_> {
-    const NAME: &'static str = "dentrado/event";
+    const NAME: &'static str = "dentrado/event"; // REVIEW: NO `dentrado/` prefix. REmove the goddamn `dentrado/` prefix all over the codebase, you don't need inside of dentrado/ storage to constantly remind that we're doing dentrado/.
 }
 
 impl<'a> Event<'a> {

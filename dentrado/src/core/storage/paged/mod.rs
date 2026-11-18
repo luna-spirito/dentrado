@@ -1,11 +1,12 @@
 //! The storage facade: RAM or journaled.
 //!
-//! Disk mode is entirely [`JournalStorage`]: layers 1–2 live in the journal,
-//! the fold, and the body cache; gear views live in the same page store. RAM
-//! mode is [`InMemoryStorage`], the non-durable reference backend.
+//! Both modes are the same cache-backed backend. Disk mode adds the journal:
+//! it is the source of truth, while `<file>` is the cache image that makes a
+//! restart replay only the journal tail. RAM mode has no journal, so nothing
+//! survives the process.
 //!
 //! A view is a flat key-value overlay scoped to one gear (see [`GearView`]).
-//! The disk view is one `Session` over the store: reads use the session's old
+//! The view is one `Session` over the store: reads use the session's old
 //! snapshot, writes are staged by the session, and the runtime commits the
 //! whole batch after the gear run.
 //!
@@ -19,16 +20,17 @@
 
 use std::{io, path::PathBuf};
 
+use dentrado_cache::disk::{FsDisk, MemDisk};
+
+use super::{
+    GroupDiff, IsStorage, Watermark,
+    cache::CacheStorage,
+    view::{DiskView, GearView},
+};
 use crate::{
     core::{
         api::RuntimeTypes,
         loc_ctx::{GroupDelta, StoredEvent},
-        storage::{
-            GroupDiff, IsStorage, Watermark,
-            in_memory::InMemoryStorage,
-            journal::JournalStorage,
-            view::{DiskView, GearView, RamView},
-        },
     },
     types::{
         DataId, DataVerifyError, GlobalHash, GroupEventId, GroupRouteError, LocDataId, LocGroupId,
@@ -44,8 +46,8 @@ pub struct PagedStorage<R: RuntimeTypes> {
 enum Backend<R: RuntimeTypes> {
     /// Boxed: a storage is constructed once per core, never per call, and the
     /// two backends differ in size enough to make an inline enum wasteful.
-    Ram(Box<InMemoryStorage<R>>),
-    Journal(Box<JournalStorage<R>>),
+    Ram(Box<CacheStorage<R, MemDisk>>),
+    Journal(Box<CacheStorage<R, FsDisk>>),
 }
 
 impl<R: RuntimeTypes> Default for PagedStorage<R> {
@@ -55,67 +57,65 @@ impl<R: RuntimeTypes> Default for PagedStorage<R> {
 }
 
 impl<R: RuntimeTypes> PagedStorage<R> {
-    /// Non-durable mode: every layer in RAM.
+    /// Non-durable mode: the cache over memory, no journal.
     #[must_use]
     pub fn ram() -> Self {
         Self {
-            backend: Backend::Ram(Box::default()),
+            backend: Backend::Ram(Box::new(CacheStorage::new())),
         }
     }
 
     /// Disk mode: `<file>.journal/` is the source of truth and `<file>` is the
-    /// recomputable cache for event bodies and gear views. The parent
-    /// directory must already exist; both open lazily inside the core's
-    /// runtime on the first storage call.
+    /// recomputable cache. The parent directory must already exist; both open
+    /// lazily inside the core's runtime on the first storage call.
     #[must_use]
     pub fn on_disk(file: PathBuf) -> Self {
         Self {
-            backend: Backend::Journal(Box::new(JournalStorage::new(file))),
+            backend: Backend::Journal(Box::new(CacheStorage::on_disk(file))),
         }
     }
 }
 
-/// The two representations a [`PagedStorage`] view can take. The disk
-/// branch is a `Session` + gear prefix; the RAM branch is the same
-/// contract over a `BTreeMap` (the `ram()` toggle).
-pub enum PagedView<'a> {
-    Disk(DiskView),
-    Ram(RamView<'a>),
+/// The two store types a [`PagedStorage`] view can wrap. The contract is the
+/// same; only the disk differs.
+pub enum PagedView {
+    Ram(DiskView<MemDisk>),
+    Disk(DiskView<FsDisk>),
 }
 
-impl GearView for PagedView<'_> {
+impl GearView for PagedView {
     async fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         match self {
-            Self::Disk(view) => view.get(key).await,
             Self::Ram(view) => view.get(key).await,
+            Self::Disk(view) => view.get(key).await,
         }
     }
 
     async fn scan(&mut self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         match self {
-            Self::Disk(view) => view.scan(prefix).await,
             Self::Ram(view) => view.scan(prefix).await,
+            Self::Disk(view) => view.scan(prefix).await,
         }
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) {
         match self {
-            Self::Disk(view) => view.put(key, value),
             Self::Ram(view) => view.put(key, value),
+            Self::Disk(view) => view.put(key, value),
         }
     }
 
     fn del(&mut self, key: &[u8]) {
         match self {
-            Self::Disk(view) => view.del(key),
             Self::Ram(view) => view.del(key),
+            Self::Disk(view) => view.del(key),
         }
     }
 
     fn commit(&mut self) {
         match self {
-            Self::Disk(view) => view.commit(),
             Self::Ram(view) => view.commit(),
+            Self::Disk(view) => view.commit(),
         }
     }
 }
@@ -227,7 +227,7 @@ impl<R: RuntimeTypes> IsStorage<R> for PagedStorage<R> {
     // ── layer 3: the gear's private view ──────────────────────────────────
 
     type View<'a>
-        = PagedView<'a>
+        = PagedView
     where
         Self: 'a;
 
@@ -240,10 +240,10 @@ impl<R: RuntimeTypes> IsStorage<R> for PagedStorage<R> {
 
     // ── durability ────────────────────────────────────────────────────────
 
-    async fn sync_log(&self) -> io::Result<()> {
+    async fn commit_log(&self) -> io::Result<()> {
         match &self.backend {
-            Backend::Ram(_) => Ok(()),
-            Backend::Journal(storage) => storage.sync_log().await,
+            Backend::Ram(storage) => storage.commit_log().await,
+            Backend::Journal(storage) => storage.commit_log().await,
         }
     }
 

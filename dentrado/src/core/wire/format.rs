@@ -65,7 +65,7 @@ impl<R: RuntimeTypes> Default for WireLocCtx<R> {
 }
 
 impl<R: RuntimeTypes> crate::types::GlobalResolver for WireLocCtx<R> {
-    fn resolve_user(
+    async fn resolve_user(
         &self,
         lid: crate::types::LocUserId,
     ) -> Result<crate::types::UserId, crate::types::GroupRouteError> {
@@ -77,7 +77,7 @@ impl<R: RuntimeTypes> crate::types::GlobalResolver for WireLocCtx<R> {
         })
     }
 
-    fn resolve_data(
+    async fn resolve_data(
         &self,
         did: crate::types::LocDataId,
     ) -> Result<crate::types::DataId, crate::types::GroupRouteError> {
