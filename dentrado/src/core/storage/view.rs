@@ -136,6 +136,17 @@ enum ViewKind {
     Fs(DiskView<FsDisk>),
 }
 
+/// The two disks are distinct types, so every method repeats the same
+/// two-arm dispatch. This is the one place that shape lives.
+macro_rules! on_view {
+    ($view:expr, |$v:ident| $call:expr) => {
+        match &mut $view.kind {
+            ViewKind::Ram($v) => $call,
+            ViewKind::Fs($v) => $call,
+        }
+    };
+}
+
 impl GearView {
     pub(crate) fn ram(
         store: Rc<Storage<MemDisk>>,
@@ -159,46 +170,31 @@ impl GearView {
 
     /// The old value for `key`, or `None`.
     pub async fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
-        match &mut self.kind {
-            ViewKind::Ram(view) => view.get(key).await,
-            ViewKind::Fs(view) => view.get(key).await,
-        }
+        on_view!(self, |view| view.get(key).await)
     }
 
     /// The old records under `prefix`, in key order. Returned keys keep the
     /// caller's prefix (only the gear prefix is stripped), so they can be
     /// passed straight back to [`del`](Self::del).
     pub async fn scan(&mut self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        match &mut self.kind {
-            ViewKind::Ram(view) => view.scan(prefix).await,
-            ViewKind::Fs(view) => view.scan(prefix).await,
-        }
+        on_view!(self, |view| view.scan(prefix).await)
     }
 
     /// Stage a value. It must fit one leaf record (the view panics otherwise);
     /// the view does not chunk.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
-        match &mut self.kind {
-            ViewKind::Ram(view) => view.put(key, value),
-            ViewKind::Fs(view) => view.put(key, value),
-        }
+        on_view!(self, |view| view.put(key, value))
     }
 
     /// Stage a deletion.
     pub fn del(&mut self, key: &[u8]) {
-        match &mut self.kind {
-            ViewKind::Ram(view) => view.del(key),
-            ViewKind::Fs(view) => view.del(key),
-        }
+        on_view!(self, |view| view.del(key))
     }
 
     /// Publish everything staged. Idempotent; a gear may call it, and the
     /// runtime calls it again after the output is installed.
     pub fn commit(&mut self) {
-        match &mut self.kind {
-            ViewKind::Ram(view) => view.commit(),
-            ViewKind::Fs(view) => view.commit(),
-        }
+        on_view!(self, |view| view.commit())
     }
 }
 

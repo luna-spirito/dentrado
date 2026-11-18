@@ -87,13 +87,17 @@ pub(crate) async fn ensure_saved<D: IsFilesystem>(
     rx.await.map_err(|_| StoreError::ChannelClosed)?
 }
 
-/// A cache checkpoint — a barrier over every queue and all dirt: the
-/// answer comes when they have settled onto the disk (written — the
-/// sync is the caller's business). A failure is a terminal error.
+/// A cache checkpoint — every dirty resident and every save already in
+/// the air (the latter must be awaited too: its write may land after the
+/// caller's sync otherwise): the answers come when their bytes have
+/// settled onto the disk (written — the sync is the caller's business).
+/// A failure is a terminal error.
 pub(crate) async fn write_back_all<D: IsFilesystem>(
     inner: &Rc<RefCell<PersistentCore<D>>>,
 ) -> Result<(), StoreError> {
-    let (tx, rx) = oneshot::channel();
-    inner.borrow_mut().core.checkpoint(tx);
-    rx.await.map_err(|_| StoreError::ChannelClosed)?
+    let rxs = inner.borrow_mut().core.checkpoint();
+    for rx in rxs {
+        rx.await.map_err(|_| StoreError::ChannelClosed)??;
+    }
+    Ok(())
 }

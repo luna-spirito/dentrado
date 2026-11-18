@@ -33,7 +33,7 @@ use self::freelist::{ChainEntry, FreeAct, Frees};
 use self::sb::Sb;
 use self::tables::Tables;
 pub(crate) use self::tables::{Delta, DeltaV};
-use crate::blockcache::{BlockCache, Reply, Submit};
+use crate::blockcache::{BlockCache, Reply, ReplyRx, Submit};
 use crate::disk::IsFilesystem;
 use crate::error::StoreError;
 use crate::page::{AlignedPage, PageId};
@@ -440,9 +440,10 @@ impl<D: IsFilesystem> Core<D> {
         self.bc.persist(id, tx);
     }
 
-    /// The checkpoint barrier (`write_back_all`).
-    pub(crate) fn checkpoint(&mut self, tx: Reply) {
-        self.bc.checkpoint(tx);
+    /// The checkpoint sweep (`write_back_all`): one save request per
+    /// dirty resident and per save in the air.
+    pub(crate) fn checkpoint(&mut self) -> Vec<ReplyRx> {
+        self.bc.checkpoint()
     }
 
     /// The driver's tick: poll the wings, land the ready flights —

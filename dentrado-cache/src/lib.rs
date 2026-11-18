@@ -15,7 +15,7 @@
 //! kind's codec lives with its machine); [`disk`] — the [`Storage`]
 //! trait and its implementations (memory with fault injection, an OS
 //! file on compio); [`blockcache`] — the page cache (the arena of
-//! slots, the flight registry, the queues); [`crate::core`] — the
+//! slots, the flight registry, the parked work); [`crate::core`] — the
 //! store's flush-agnostic core: the machines (`freelist` — the
 //! two-pool page dispenser, `ebr` — deaths), the drafts arena and the
 //! named tables (each a B-tree plus its delta; the set unions at open,

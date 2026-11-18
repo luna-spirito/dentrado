@@ -17,9 +17,9 @@ use crate::page::{AlignedPage, PAGE_SIZE};
 // TODO: В будущем стоило бы посмотреть на bitmap (маловероятно) или хотя бы сжать до байта гарантирванно, но это потом.
 /// Slot state: free / under a loading flight (the kernel writes the
 /// bytes — exclusive) / under a saving flight (the kernel reads — the
-/// sole reader: everyone else queues behind the flight, keeping the
-/// issue order; dirty, the dirt returns on failure) / resident —
-/// ready for synchronous service, with touched and dirty bits.
+/// sole reader: every other access parks until the flight settles;
+/// dirty, the dirt returns on failure) / resident — ready for
+/// synchronous service, with touched and dirty bits.
 #[derive(Clone, Copy)]
 pub(super) enum SlotSt {
     Free,
@@ -314,8 +314,8 @@ pub(super) struct LoadPage {
 
 /// A save's lease of a slot: the kernel reads the bytes — the sole
 /// window on them while the lease lives (the Saving state keeps every
-/// other reader and all writers out; user reads queue behind the
-/// flight, so read-write causality holds through a save).
+/// other reader and all writers out; in-memory work parks until the
+/// flight settles, so read-write causality holds through a save).
 pub(super) struct SavePage {
     s: SlotId,
     page: &'static AlignedPage,

@@ -60,14 +60,13 @@ impl<R: RuntimeTypes, D: IsFilesystem> Ready<R, D> {
     /// is nothing to name, and the caller cannot know a log-local id.
     async fn append<T: Serialize>(
         journal: Option<&mut JournalState>,
-        schema: impl FnOnce(&JournalState) -> SchemaId,
-        record: &T,
+        frame: impl FnOnce(&JournalState) -> (SchemaId, T),
     ) {
         let Some(journal) = journal else {
             return;
         };
-        let bytes = schema::encode(record).expect("a journal record serializes");
-        let schema = schema(journal);
+        let (schema, record) = frame(journal);
+        let bytes = schema::encode(&record).expect("a journal record serializes");
         journal
             .log
             .append(&[Frame::new(schema, &bytes)])
@@ -102,15 +101,16 @@ impl<R: RuntimeTypes, D: IsFilesystem> Ready<R, D> {
             }
             LocUserId(ops.next(Counter::User).await)
         };
-        Self::append(
-            self.journal.as_mut(),
-            |j| j.schemas.user,
-            &record::LocUser {
-                loc: loc.0,
-                id: uid.id,
-                identity_server_pk: uid.identity_server_pk.0,
-            },
-        )
+        Self::append(self.journal.as_mut(), |j| {
+            (
+                j.schemas.user,
+                record::LocUser {
+                    loc: loc.0,
+                    id: uid.id,
+                    identity_server_pk: uid.identity_server_pk.0,
+                },
+            )
+        })
         .await;
         self.ops().apply_user(loc, uid).await.expect("apply a user");
         loc
@@ -128,15 +128,16 @@ impl<R: RuntimeTypes, D: IsFilesystem> Ready<R, D> {
             }
             LocSenderId(ops.next(Counter::Sender).await)
         };
-        Self::append(
-            self.journal.as_mut(),
-            |j| j.schemas.sender,
-            &record::LocSender {
-                loc: loc.0,
-                pk: pk.0,
-                user: user.map(|u| u.0),
-            },
-        )
+        Self::append(self.journal.as_mut(), |j| {
+            (
+                j.schemas.sender,
+                record::LocSender {
+                    loc: loc.0,
+                    pk: pk.0,
+                    user: user.map(|u| u.0),
+                },
+            )
+        })
         .await;
         self.ops()
             .apply_sender(loc, pk, user)
@@ -158,15 +159,18 @@ impl<R: RuntimeTypes, D: IsFilesystem> Ready<R, D> {
             }
             LocGroupId(ops.next(Counter::Group).await)
         };
-        if let Some(journal) = &self.journal {
-            let record = record::LocGroup {
-                loc: loc.0,
-                msg_type: msg_type.0,
-                group_schema: journal.schemas.group_value.0,
-                group: bytes,
-            };
-            Self::append(self.journal.as_mut(), |j| j.schemas.group, &record).await;
-        }
+        Self::append(self.journal.as_mut(), |j| {
+            (
+                j.schemas.group,
+                record::LocGroup {
+                    loc: loc.0,
+                    msg_type: msg_type.0,
+                    group_schema: j.schemas.group_value.0,
+                    group: bytes,
+                },
+            )
+        })
+        .await;
         self.ops()
             .apply_group(loc, msg_type, &group)
             .await
@@ -187,16 +191,19 @@ impl<R: RuntimeTypes, D: IsFilesystem> Ready<R, D> {
             LocDataId(ops.next(Counter::Data).await)
         };
         self.ops().verify_data(data_id, &content).await?;
-        if let Some(journal) = &self.journal {
-            let record = record::LocData {
-                loc: loc.0,
-                timestamp: data_id.timestamp,
-                hash: data_id.hash,
-                content_schema: journal.schemas.data_value.0,
-                content: postcard::to_stdvec(&content).expect("a data value serializes"),
-            };
-            Self::append(self.journal.as_mut(), |j| j.schemas.data, &record).await;
-        }
+        Self::append(self.journal.as_mut(), |j| {
+            (
+                j.schemas.data,
+                record::LocData {
+                    loc: loc.0,
+                    timestamp: data_id.timestamp,
+                    hash: data_id.hash,
+                    content_schema: j.schemas.data_value.0,
+                    content: postcard::to_stdvec(&content).expect("a data value serializes"),
+                },
+            )
+        })
+        .await;
         self.ops()
             .put_data(loc, data_id, &content)
             .await

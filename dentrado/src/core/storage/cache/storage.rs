@@ -334,16 +334,8 @@ impl<R: RuntimeTypes> CacheStorage<R> {
 
     #[cfg(test)]
     pub(crate) async fn replayed(&self) -> usize {
-        let state = self.ready().await;
-        match &*state {
-            State::Ram {
-                ready: Some(ready), ..
-            } => ready.replayed,
-            State::Fs {
-                ready: Some(ready), ..
-            } => ready.replayed,
-            _ => unreachable!("ready() returns an opened state"),
-        }
+        let mut state = self.ready().await;
+        on_ready!(state, |s| s.replayed)
     }
 }
 
